@@ -1,0 +1,27 @@
+# Python environments and generated files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+
+# Bulk assets and experiment outputs
+/artifacts/
+/checkpoints/
+/datasets/
+/outputs/
+/runs/
