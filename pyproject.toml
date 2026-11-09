@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The distribution name is provisional; see docs/design.md §22 (name conflict on PyPI).
+name = "xinfer"
+version = "0.0.1.dev0"
+description = "Inference serving for vision-language-action models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.4",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+# Tokenization, image processing, and pose conversion for Wall-OSS.
+models = [
+    "tokenizers>=0.19",
+    "opencv-python-headless>=4.10",
+    "pyyaml>=6",
+    "numba>=0.60",
+    "pillow>=10",
+]
+# processing.image_preprocess_device = "gpu": JPEG decoding with nvJPEG (batched CUDA decode_jpeg).
+gpu-image = [
+    "torchvision>=0.19",
+]
+serve = [
+    "websockets>=12",
+    "msgpack>=1.0",
+    "msgpack-numpy>=0.4.8",
+]
+test = [
+    "pytest>=7",
+    "websockets>=12",
+    "msgpack>=1.0",
+    "msgpack-numpy>=0.4.8",
+    "tokenizers>=0.19",
+    "opencv-python-headless>=4.10",
+    "pyyaml>=6",
+    "numba>=0.60",
+    "pillow>=10",
+]
+
+[project.scripts]
+xinfer-serve = "xinfer.entrypoints.serve:main"
+xinfer-profile = "xinfer.entrypoints.profile:main"
+
+[tool.setuptools.packages.find]
+include = ["xinfer*"]
+
+[tool.setuptools.package-data]
+xinfer = ["tuned/*/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA device",
+    "assets: requires external model assets (see docs/models)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# Markdown tables in the module docstrings
+"xinfer/ops/backends/flash_attn.py" = ["E501"]
+"xinfer/ops/backends/xcompute.py" = ["E501"]
