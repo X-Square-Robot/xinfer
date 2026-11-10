@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from xinfer.layers.vision.qwen2_5_vit import vision_layout
+from xinfer.models.layers.vision.qwen2_5_vit import vision_layout
 from xinfer.models.interface import BucketSpec, PreparedRequest
 from xinfer.models.processing import (
     SegmentTokenizer,
@@ -560,7 +560,7 @@ class WallOSSInputProcessor:
             - ``input_ids`` ``[1, P + H]`` int64: the prompt followed by ``H`` ``<|action|>`` tokens;
             - ``position_ids`` ``[3, 1, P + H]`` int64: M-RoPE positions;
             - ``image_<i>`` ``[h_i, w_i, 3]`` uint8 RGB: the resized views in camera order (the vision stage
-              normalizes and packs them, ``xinfer.layers.image_pack``); with ``image_preprocess_device="gpu"``
+              normalizes and packs them, ``xinfer.models.layers.image_pack``); with ``image_preprocess_device="gpu"``
               instead ``DeviceImage`` values of the views as they arrived (``device_image``), which the engine
               turns into the same views on the device;
             - ``image_grid_thw`` ``[num_views, 3]`` int64, ``proprioception`` ``[1, 1, state_dim]`` float64

@@ -1,7 +1,7 @@
 """CPU helpers shared by the models' input processors.
 
 Camera views cross from a processor to the model as resized ``[h, w, 3]`` uint8 tensors named ``image_<i>`` in
-camera order; the model's first stage normalizes them on its device (``xinfer.layers.image_pack``). With
+camera order; the model's first stage normalizes them on its device (``xinfer.models.layers.image_pack``). With
 ``image_preprocess_device="gpu"`` the processor sends each view undecoded and unresized instead, as a
 ``DeviceImage`` (``device_image``), and the engine decodes and resizes it on the device before the first stage.
 """

@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from xinfer.layers.basic import GatedMLP, Linear, RMSNorm
-from xinfer.layers.rotary import vision_rotary_angles
+from xinfer.models.layers.basic import GatedMLP, Linear, RMSNorm
+from xinfer.models.layers.rotary import vision_rotary_angles
 from xinfer.ops import active_ops
 
 

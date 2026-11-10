@@ -7,8 +7,7 @@ of the embodied-serving ``nvfp4_v2.patch``) and the GEMMs they feed:
   two per byte as uint8 ``[M, K/2]``: column ``2j`` in the low nibble,
   ``2j + 1`` in the high nibble; bit 3 of a nibble is the sign.
 - one E4M3 (``float8_e4m3fn``) scale per 16 columns of K, stored in the
-  SWIZZLE_32_4_4 layout of ``mxfp8`` (rows padded to 128, 16-column blocks
-  padded to 4; padding bytes zero).
+  SWIZZLE_32_4_4 layout (``xinfer.ops.layout.nvfp4``; padding bytes zero).
 - a weight may carry a per-tensor FP32 global scale ``g``; a value is
   ``e2m1 · scale · g``. Activations have ``g = 1``.
 - block scale, ``mse=False``: ``e4m3(clamp(amax / (6g), 2^-6, 448))``, rounded
@@ -20,7 +19,8 @@ of the embodied-serving ``nvfp4_v2.patch``) and the GEMMs they feed:
   (ties to the even code) and saturated to ±6; a negative value that rounds
   to zero keeps its sign bit.
 
-``global_scale`` is ``amax / (448 · 6)`` of the whole weight, rounded to FP32,
+The weight global scale is ``amax / (448 · 6)`` of the whole weight, rounded to FP32
+(``xinfer.models.layers.quantization.nvfp4.global_scale``),
 the Wall-X ``nvfp4_mse_1d1d_16bs`` recipe. ``gemm`` multiplies the dequantized
 operands in FP32 and applies ``alpha`` (the weight's global scale) and the
 bias to the FP32 accumulator, rounding once to BF16.
@@ -42,9 +42,9 @@ from __future__ import annotations
 
 import torch
 
-from xinfer.ops import mxfp8
+from xinfer.ops.reference import mxfp8
+from xinfer.ops.layout.nvfp4 import BLOCK, scale_elements, scale_offsets
 
-BLOCK = 16
 E2M1_MAX = 6.0
 E4M3_MAX = 448.0
 MIN_SCALE = 2.0 ** -6  # smallest normal E4M3: the floor of an amax block scale
@@ -52,16 +52,6 @@ NORM_THREADS = 256  # one CTA of 256 threads per row in the fused RMSNorm kernel
 _FLT_MAX = torch.finfo(torch.float32).max
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
-
-
-def scale_elements(rows: int, k: int) -> int:
-    """Bytes of the swizzled E4M3 scales of a logical ``[rows, k]`` matrix, padding included."""
-    return mxfp8.scale_elements(rows, k, block=BLOCK)
-
-
-def scale_offsets(rows: int, k: int, device=None) -> torch.Tensor:
-    """int64 ``[rows, padded block count]`` offsets of each 16-column block's scale (``mxfp8.scale_offsets``)."""
-    return mxfp8.scale_offsets(rows, k, device, block=BLOCK)
 
 
 def e2m1_codes(v: torch.Tensor) -> torch.Tensor:
@@ -86,18 +76,6 @@ def e2m1_values(codes: torch.Tensor) -> torch.Tensor:
     """FP32 values of E2M1 codes (``e2m1_codes``), any shape."""
     table = torch.tensor(_E2M1_VALUES + tuple(-v for v in _E2M1_VALUES), device=codes.device)
     return table[codes.long()]
-
-
-def global_scale(weight: torch.Tensor) -> float:
-    """Per-tensor scale of a weight with MSE block scales: ``amax / (448 · 6)`` rounded to FP32, 1.0 if all zero.
-
-    The quotient is taken in double precision and then rounded to FP32, as the Wall-X recipe computes it on the
-    host. Reads the amax back to the host.
-    """
-    amax = float(weight.detach().float().abs().amax())
-    if amax == 0.0:
-        return 1.0
-    return float(torch.tensor(amax / (E4M3_MAX * E2M1_MAX), dtype=torch.float32))
 
 
 def _block_sum(e: torch.Tensor) -> torch.Tensor:

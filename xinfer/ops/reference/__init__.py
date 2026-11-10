@@ -6,6 +6,10 @@ RMSNorm normalizes and applies the weight in FP32 and rounds once, as Wall-X
 does) so that
 a model built on reference operators can be compared with its source model.
 Backends with the same semantics register through ``xinfer.ops.registry``.
+
+The reference runs on every platform, next to the hardware backends in
+``xinfer/ops/backends/``. This package holds the basic operators; the fused BF16
+operators are in ``fused``, the low-precision ones in ``mxfp8`` and ``nvfp4``.
 """
 
 from __future__ import annotations

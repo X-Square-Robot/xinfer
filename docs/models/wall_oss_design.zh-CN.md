@@ -6,7 +6,7 @@
 
 ## 语义来源
 
-参考实现是 Wall-X `02c5351d`（加上 embodied-serving 独立补丁 `1e24f619`）中 eager `Qwen2_5_VLMoEForAction` 的 flow 路径；请求处理部分以 embodied-serving Wall-X 4B 服务（es `9633ffd`）为参考。HarriX 对该服务的逐位移植（`qwen2_5`、`mxfp8-sm120`）是第二个来源。文件：`xinfer/models/wall_oss/`（`config.py`、`model.py`、`processing.py`、`geometry.py`）以及 `xinfer/layers/` 中的共享层。
+参考实现是 Wall-X `02c5351d`（加上 embodied-serving 独立补丁 `1e24f619`）中 eager `Qwen2_5_VLMoEForAction` 的 flow 路径；请求处理部分以 embodied-serving Wall-X 4B 服务（es `9633ffd`）为参考。HarriX 对该服务的逐位移植（`qwen2_5`、`mxfp8-sm120`）是第二个来源。文件：`xinfer/models/wall_oss/`（`config.py`、`model.py`、`processing.py`、`geometry.py`）以及 `xinfer/models/layers/` 中的共享层。
 
 ## 阶段划分
 
@@ -33,7 +33,7 @@
 
 ## Optimized 组合
 
-`numerics="optimized"`（默认，`xinfer/models/wall_oss/optimized.py`）在 `xinfer/ops/fused.py` 的算子上运行参考组合的步骤：xcompute 为该形状列出 kernel 时，每个算子是一次 xcompute 调用（xcompute `7336b0d`），否则用算子的 torch 参考实现。与参考组合一样全部为 BF16。
+`numerics="optimized"`（默认，`xinfer/models/wall_oss/optimized.py`）在 `xinfer/ops/reference/fused.py` 的算子上运行参考组合的步骤：xcompute 为该形状列出 kernel 时，每个算子是一次 xcompute 调用（xcompute `7336b0d`），否则用算子的 torch 参考实现。与参考组合一样全部为 BF16。
 
 | 步骤 | 算子 | 本模型形状下的 kernel |
 |---|---|---|
@@ -101,7 +101,7 @@ torch 参考实现精确复现 eager 模型的 SDPA 调用（相同的 mask 和�
 
 `WallOSSInputProcessor` 复现参考服务：OpenCV INTER_CUBIC 缩放到长边 448，然后 `smart_resize(28)`；embodied system prompt；512 分箱的状态字符串；checkpoint 的 tokenizer 加上 `<|propri|>`=151665 和 `<|action|>`=151666；在 host 上计算的 M-RoPE 位置；float64 的本体感知量和 mask；以及从绝对末端位姿转换为相对 6D 模型布局的 RTC 动作。`WallOSSOutputProcessor` 把相对动作与请求状态组合为每条手臂 17 行绝对位姿。旋转辅助函数是参考实现中 numba 函数的原样移植（`geometry.py`）：它们的 float32 特化和 libm 调用都是服务数值的一部分。
 
-各视角图像并发解码和缩放，prompt 用缓存的固定片段做 tokenize（`xinfer.models.processing` 中的 `map_views` 和 `SegmentTokenizer`）。缩放后的视角图像以 uint8 传给引擎。vision 阶段对其打包（`xinfer.layers.image_pack.ImagePack`）：先用每个通道取值的 float32 查找表，再按 Qwen2.5-VL 14/2/2 patch 布局排列，并在两个时间槽上重复同一图像。它只做索引和拷贝，因此在 CPU 和 GPU 上、在 CUDA graph 内外，生成的行都逐位一致，而请求只需携带打包后 float32 数据八分之一的字节。
+各视角图像并发解码和缩放，prompt 用缓存的固定片段做 tokenize（`xinfer.models.processing` 中的 `map_views` 和 `SegmentTokenizer`）。缩放后的视角图像以 uint8 传给引擎。vision 阶段对其打包（`xinfer.models.layers.image_pack.ImagePack`）：先用每个通道取值的 float32 查找表，再按 Qwen2.5-VL 14/2/2 patch 布局排列，并在两个时间槽上重复同一图像。它只做索引和拷贝，因此在 CPU 和 GPU 上、在 CUDA graph 内外，生成的行都逐位一致，而请求只需携带打包后 float32 数据八分之一的字节。
 
 使用 `image_preprocess_device="gpu"` 时，处理器不解码也不缩放：它把每个 JPEG 视角的字节（其他编码在 CPU 上解码）或原始帧作为 `DeviceImage` 发送，附带 CPU 路径会缩放到的尺寸（从 JPEG 头读取）和处理方案 `DEVICE_RESIZE`，因此 prompt、grid 和 vision 布局不变。在第一个阶段之前，引擎用一次 torchvision `decode_jpeg` 调用解码该请求的全部 JPEG，并用 FP32 bicubic 插值（a = −0.75，无抗锯齿，与 INTER_CUBIC 相同）缩放每个视角，再按四舍五入（half up）取整为 uint8（[引擎](../engine.zh-CN.md#设备图像)）。vision 阶段读取视角图像的方式与 CPU 预处理时相同，形状也与 CPU 路径一致，因此 vision graph 及其键不变。原始帧的缩放结果与 OpenCV 相差不超过一个灰度级；解码后的 JPEG 在锐利的色度边缘附近与 libjpeg-turbo 不同，因此动作与 CPU 路径不同，该选项默认关闭。
 

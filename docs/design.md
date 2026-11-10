@@ -58,7 +58,7 @@ The other sections describe the target design. The table below shows how far eac
 | §11.4 Bundled model | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the quick100 gate. |
 | §12 Quantization | Partially implemented | The framework supports per-group `QuantConfig`. Wall-OSS runs in BF16. MXFP8 and NVFP4 have PyTorch reference operators. See [quantization](quantization.md). |
 | §13 Platform | Partially implemented | Only device capability descriptions and CUDA / CPU resolution (`xinfer/platforms/`); streams, events, copy primitives, `register_host` (`frontend/shm.py` currently calls `cudaHostRegister` directly), `classify_error`, `derive` / `validate` and plugin activation are not implemented; Thor (sm110) is unverified |
-| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI) and flash-attn, loaded with `xinfer.ops` entry points through one protocol (§14.2); `xinfer.ops.conformance` is not implemented |
+| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI) and flash-attn, registered by the `cuda` backend modules and loaded with the `xinfer.ops` entry points (§14.2); `xinfer.ops.conformance` is not implemented |
 | §15 Protocol and frontend | Partially implemented | WebSocket + msgpack, compatible with the x2robot client; `xinfer.Policy` in-process API; Client SDK and compatibility adapters not implemented |
 | §16 Observability and benchmark tools | Partially implemented | The service exposes [Prometheus metrics](metrics.md). Use the [benchmarks](benchmark.md) for single-request latency and closed-loop capacity, and [xinfer-profile](profiling.md) to measure operator, queue and stage times. |
 | §17 Testing | Partially implemented | CPU unit and contract tests; GPU and asset tests need local assets and are run manually; CI (`.gitlab-ci.yml`) runs only ruff and CPU tests |
@@ -139,7 +139,7 @@ So VLA serving cannot simply reuse the token-level scheduling and paged KV of vL
  └──────┬────────────────────────────────────────────────────────────────────────────────┘
         │ stage functions
  ┌──────▼────────────────────────────────────────────────────────────────────────────────┐
- │ models/ · layers/ · quantization/ · loader/                                           │
+ │ models/ (with models/layers/, models/layers/quantization/) · loader/                  │
  └──────┬────────────────────────────────────────────────────────────────────────────────┘
         │ ops.<name>(...)
  ┌──────▼────────────────────────────────────────────────────────────────────────────────┐
@@ -160,14 +160,14 @@ Two principles:
 
 | Module | May depend on | Must not depend on |
 |---|---|---|
-| `engine/` | `platforms/`, the model interface (abstract classes), `observability.annotate` (stage spans) | Any concrete model, quantization method or kernel package; `config/`, `layers/`, `loader/`, `ops/`, `frontend/` |
-| `models/` | `layers/`, `ops/`, the `quantization/` interface, `loader/` | `engine/` internals, concrete platforms |
-| `layers/`, `quantization/` | `ops/` | Concrete kernel packages (only through ops registration) |
+| `engine/` | `platforms/`, the model interface (abstract classes), `observability.annotate` (stage spans) | Any concrete model, quantization method or kernel package; `config/`, `models/layers/`, `loader/`, `ops/`, `frontend/` |
+| `models/` | `models/layers/` (including the `models/layers/quantization/` interface), `ops/`, `loader/` | `engine/` internals, concrete platforms |
+| `models/layers/` (including `models/layers/quantization/`) | `ops/` | Concrete kernel packages (only through ops registration) |
 | `ops/` | `platforms/` | Models, `observability/` |
 | `frontend/` | The model's Input/OutputProcessor | `engine/` and other runtime internals; `torch.cuda` and any device runtime (Frontend processes do not initialize CUDA or any other device runtime) |
-| `config/` | `platforms/`, `engine/` (`EngineConfig`), the built model | `frontend/`, `layers/`, `loader/` |
-| `loader/` | None | `models/`, `layers/`, `engine/` |
-| `observability/` | `ops/`, `platforms/` | `engine/`, `models/`, `layers/`, `frontend/`, `quantization/`, `loader/`, `config/` |
+| `config/` | `platforms/`, `engine/` (`EngineConfig`), the built model | `frontend/`, `models/layers/`, `loader/` |
+| `loader/` | None | `models/`, `models/layers/`, `engine/` |
+| `observability/` | `ops/`, `platforms/` | `engine/`, `models/`, `models/layers/`, `frontend/`, `loader/`, `config/` |
 | `entrypoints/` | Any package above | None (no other package depends on it) |
 
 The startup order is: build the model (operators are selected here) → `config.resolve` reads the built model's `capabilities()` and the platform capabilities → create the Engine. So what the built model supports, such as its batch sizes, reaches the engine through the model interface, and the engine depends on neither ops nor config; the Frontend's shared memory and the Engine are connected by `entrypoints/serve.py`, so the engine does not depend on frontend.
@@ -527,7 +527,7 @@ A platform declares its capabilities at build time. The runtime derives the conf
 - **dtypes and quantization are capabilities.** If `supported_dtypes` lacks a dtype the model needs (for example, some NPUs have no bf16), or `supported_quant` does not include the selected quantization method, configuration resolution fails, without waiting for model build.
 - **External platforms** register through the `xinfer.platforms` entry point (§18.3); the built-in cuda and cpu platforms use the same mechanism.
 - `ipc`, `mps` and `spatial_partition` are read by no code in v1 (§9.3); they will be added when needed.
-- **The core decides by capability, not by identity.** Platform provides no identity predicates such as `is_cuda()`; `engine/`, `layers/` and `models/` read only caps, and undeclared caps take conservative values (unsupported). Every Platform method must have a caller in the core and a contract test, or it is not added (SGLang's platform interface has a set of methods the core never calls, while the core still hard-codes `torch.cuda`, so overriding them has no effect).
+- **The core decides by capability, not by identity.** Platform provides no identity predicates such as `is_cuda()`; `engine/`, `models/layers/` and `models/` read only caps, and undeclared caps take conservative values (unsupported). Every Platform method must have a caller in the core and a contract test, or it is not added (SGLang's platform interface has a set of methods the core never calls, while the core still hard-codes `torch.cuda`, so overriding them has no effect).
 
 ### 13.2 First platforms
 
@@ -580,24 +580,28 @@ Validation requirements:
 
 ### 14.2 Backend registration and selection
 
-An extension exposes `register(registry) -> list[str]` through an entry point in the `xinfer.ops` group. `OpRegistry.load_plugins()` loads xcompute and flash-attn before loading the entry points. Each registration returns the operator names it added, or an empty list when its dependencies are unavailable.
-
-A backend uses `registry.implementer(...)` to set the platforms, version, priority and shared numerical contract for its operators. The flash-attn backend registers an implementation like this.
+A backend is the hardware an implementation runs on (`cuda`); the torch reference (`reference`) runs on every platform. Each backend is a package under `xinfer/ops/backends/` with one module per operator category (`cuda/attn.py`, `gemm.py`, `norm.py`, `flow.py`). Every module imports the kernel libraries it calls as it would any library and declares its implementations at module level with the same `xinfer.ops.register`, passing the library as `requires`. A library that does not import is None: its implementations are not registered and the operators run on their references. xcompute, which will serve more backends than CUDA, is imported once by `backends/_xcompute.py`, which checks that its Python package matches the shared library and passes the architectures the build targets as `platforms`.
 
 ```python
-implements = registry.implementer("flash_attn", platforms=("cuda",), version=f"flash-attn {flash_attn.__version__}")
+try:
+    import flash_attn
+except ImportError:
+    flash_attn = None
 
-@implements("causal_attention")
-def _causal(q, k, v, *, scale=None): ...
+@register("causal_attention", backend="cuda", requires=flash_attn)
+def causal_attention(q, k, v, *, scale=None): ...
 ```
 
-- The implementation is selected at model build time, not dispatched on every call.
+`register` adds to the process-wide registry, so importing a backend module registers its implementations; `OpRegistry.load_plugins()` imports the built-in backend modules, then the modules named by the `xinfer.ops` entry point group. `OpRegistry.add`, the one way into a registry, checks that each implementation takes the parameters of the operator's reference and registers it as `backend:library` (`cuda:xcompute`). `XINFER_XCOMPUTE=0` and `XINFER_FLASH_ATTN=0` leave a library out. The process-wide registry loads the plugins before its first `build_table`. A pin (`--op-backends`) names a backend, a library or both.
+
+- The implementation is selected at model build time, not dispatched on every call. An implementation that supports only some calls of an operator runs the others on the reference itself, as xcompute's `prefix_kvcache_attention` does for the cache shapes its kernel does not take.
+- When operators a model calls run on a fused reference on a CUDA device, one warning names them. `XINFER_OPS_STRICT=1` turns this warning into an error (CI and benchmarks).
 - The selection, library versions and hashes are written to the engine metadata, and an "operator selection table" is printed at startup.
 - A missing implementation fails explicitly; it can also be configured to fall back to the reference implementation with a warning.
 
 **Operator binding strategy:**
 
-- **Default path**: xcompute integrates through TVM-FFI; `xinfer/ops/backends/xcompute.py` wraps it and registers it in XInfer's operator registry.
+- **Default path**: xcompute integrates through TVM-FFI; `xinfer/ops/backends/_xcompute.py` imports it and the modules of `xinfer/ops/backends/cuda/` register its operators in XInfer's operator registry.
 - **Adapters as needed**: when an operator has a concrete PyTorch integration need such as `torch.compile` or `torch.export`, a `torch.library` registration is added. The wrapper reuses the existing underlying implementation and can call the same xcompute kernel through TVM-FFI, so two sets of kernels need not be maintained.
 - **Responsibility boundary**: the `torch.library` adapter covers the operator signature, input mutation and alias declarations, and the required FakeTensor/shape inference rules; hardware implementation selection and numerical policy stay with XInfer's operator registry and contracts.
 - **Unified call surface**: models and layers call only XInfer's operator interface and do not depend directly on the binding method. Registering with XInfer is not the same as registering a PyTorch custom operator.
@@ -745,21 +749,21 @@ XInfer/
 │   │   │   ├── model.py            # stage graph and the three stage functions (assembled from layers)
 │   │   │   ├── processing.py       # IOSchema, Input/OutputProcessor
 │   │   │   └── weights.py          # weight mapping
-│   ├── layers/                     # building blocks reused across models; call only ops
-│   │   ├── linear.py               # quantization-aware Linear (delegates to QuantMethod)
-│   │   ├── attention.py            # bidirectional vision / prefix prefill / joint attention
-│   │   ├── norm.py                 # RMSNorm, adaRMS
-│   │   ├── rotary.py               # RoPE, M-RoPE
-│   │   ├── mlp.py
-│   │   ├── image_pack.py           # uint8 views → normalized images / patches (on device)
-│   │   ├── vision/                 # qwen2_5_vit.py
-│   │   ├── backbones/              # qwen2_5.py
-│   │   └── action/                 # wallx_expert.py, flow.py (with RTC)
-│   ├── quantization/
-│   │   ├── base.py                 # QuantMethod, QuantConfig, per-module policy matching
-│   │   ├── bf16.py
-│   │   ├── mxfp8.py
-│   │   └── nvfp4.py                # M2
+│   │   └── layers/                 # building blocks reused across models; call only ops
+│   │       ├── linear.py           # quantization-aware Linear (delegates to QuantMethod)
+│   │       ├── attention.py        # bidirectional vision / prefix prefill / joint attention
+│   │       ├── norm.py             # RMSNorm, adaRMS
+│   │       ├── rotary.py           # RoPE, M-RoPE
+│   │       ├── mlp.py
+│   │       ├── image_pack.py       # uint8 views → normalized images / patches (on device)
+│   │       ├── vision/             # qwen2_5_vit.py
+│   │       ├── backbones/          # qwen2_5.py
+│   │       ├── action/             # wallx_expert.py, flow.py (with RTC)
+│   │       └── quantization/       # how a Linear stores its weight and which operators it calls
+│   │           ├── base.py         # QuantMethod, QuantConfig, per-module policy matching
+│   │           ├── bf16.py
+│   │           ├── mxfp8.py
+│   │           └── nvfp4.py        # M2
 │   ├── loader/
 │   │   ├── safetensors.py          # sharded reads, dtype conversion
 │   │   └── mapping.py              # weight-mapping rule engine (rename, split, merge)
@@ -772,9 +776,11 @@ XInfer/
 │   ├── ops/
 │   │   ├── spec.py                 # operator signatures and numerical contracts
 │   │   ├── registry.py             # backend registration, build-time selection, selection table
-│   │   ├── reference/              # torch reference implementations: gemm, attention, norm, rope, image, sampler
+│   │   ├── reference/              # torch reference implementations on every platform: basic operators, fused.py, mxfp8.py, nvfp4.py
+│   │   ├── layout/                 # storage layouts of the low-precision formats: mxfp8.py, nvfp4.py
 │   │   ├── backends/
-│   │   │   └── xcompute.py         # binds and registers xcompute implementations (currently via TVM-FFI)
+│   │   │   ├── _xcompute.py        # imports the xcompute library (currently via TVM-FFI), shared by the backends
+│   │   │   └── cuda/               # one module per operator category: attn.py, gemm.py, norm.py, flow.py
 │   │   └── conformance/            # conformance test suite (also run in the xcompute repository CI)
 │   │       ├── cases.py            # per-operator shape and dtype cases, taken from the first models
 │   │       └── checks.py           # numerics, determinism, graph capture checks
@@ -821,7 +827,7 @@ The existing xcompute repository and its engineering structure are kept, maintai
 | Item | Convention |
 |---|---|
 | Implementation | xcompute provides high-performance operators for each platform, such as GEMM, fused quantization, attention, norm/RoPE and image processing, with the scope driven by the first models' operator list |
-| Binding | By default wrapped and registered through TVM-FFI by XInfer's `ops/backends/xcompute.py`; `torch.library` adapters that reuse the underlying implementation are added for concrete PyTorch integration needs (§14.2) |
+| Binding | By default wrapped and registered through TVM-FFI by XInfer's `ops/backends/cuda/`; `torch.library` adapters that reuse the underlying implementation are added for concrete PyTorch integration needs (§14.2) |
 | Validation | Besides xcompute's own tests, its CI runs `xinfer.ops.conformance`, and it delivers microbenchmarks and roofline tables; XInfer adds the §14.1 and §17 validation for new `torch.library` adapters |
 | Versioning and release | Build artifacts delivered per platform, recording the library version, hash and supported capabilities; XInfer checks the compatible range and the build fingerprint (§14.3) |
 | Third-party dependencies | xcompute keeps records of sources and licenses, reviewed before public release |
@@ -853,9 +859,9 @@ M0–M3 all use `colocated` as the GPU execution layout and include no split exe
 
 | Milestone | Mainly in |
 |---|---|
-| M0 | `platforms/`, `ops/`, `layers/`, `models/wall_oss`, engine stages and slots, policy and benchmark entry points |
+| M0 | `platforms/`, `ops/`, `models/layers/`, `models/wall_oss`, engine stages and slots, policy and benchmark entry points |
 | M1 | `frontend/` (multi-process), all of `engine/scheduler/`, `memory/planner.py`, `config/resolve.py`, `benchmarks/fleet.py`, `tune.py`, `tuned/`, `client/` |
-| M2 | `quantization/nvfp4.py`, precision gates and building blocks for model extensions |
+| M2 | `models/layers/quantization/nvfp4.py`, precision gates and building blocks for model extensions |
 | M3 | Compatibility adapters, Router, docs, Docker images, GitHub release |
 
 ### 18.5 Where key files are migrated from
@@ -867,7 +873,7 @@ M0–M3 all use `colocated` as the GPU execution layout and include no split exe
 | `engine/scheduler/batching.py` | embodied-serving `multiprocess/batching.py` (`BatchIssuer` rules) |
 | `frontend/shm.py`, `worker.py` | The shared-memory transport and frontend workers in embodied-serving |
 | `models/wall_oss/` | HarriX `mxfp8-sm120` / `mxfp8-thor`, split into shared layers and model files |
-| `ops/backends/xcompute.py` | embodied-serving `adapters/wallx/mxfp8_ops.py`, the `ops.py` of each HarriX track |
+| `ops/backends/_xcompute.py` | embodied-serving `adapters/wallx/mxfp8_ops.py`, the `ops.py` of each HarriX track |
 | `config/schema.py` | The strict loading approach of HarriX `launch_config.py` |
 
 ---

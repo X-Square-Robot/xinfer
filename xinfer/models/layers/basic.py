@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from xinfer.ops import active_ops
-from xinfer.quantization import GatedLayout, QKVLayout, active_quant, make_method
+from xinfer.models.layers.quantization import GatedLayout, QKVLayout, active_quant, make_method
 
 
 def _meta_param(*shape: int) -> nn.Parameter:

@@ -1,7 +1,7 @@
 """Wall-OSS on xcompute (``numerics="optimized"``, the default), BF16.
 
 Each stage runs the steps of the reference composition (``numerics="reference"``, the Wall-X eager model) on
-operators of ``xinfer/ops/fused.py`` (each an xcompute call where xcompute lists a kernel, else its torch
+operators of ``xinfer/ops/reference/fused.py`` (each an xcompute call where xcompute lists a kernel, else its torch
 reference). GEMM weights are ``[N, K]``; the action stage's output and down projections are stored ``[K, N]``,
 which selects xcompute's small-M kernel. Differences to the reference:
 
@@ -19,8 +19,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from xinfer.layers.basic import _meta_param
-from xinfer.layers.rotary import inverse_frequencies, mrope_cos_sin, vision_rotary_angles
+from xinfer.models.layers.basic import _meta_param
+from xinfer.models.layers.rotary import inverse_frequencies, mrope_cos_sin, vision_rotary_angles
 from xinfer.loader import Source
 from xinfer.ops import active_ops
 

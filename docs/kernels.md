@@ -4,7 +4,7 @@ English | [简体中文](kernels.zh-CN.md)
 
 The default Wall-OSS BF16 composition uses xcompute's fused operators on CUDA. XInfer can run the same composition using PyTorch reference implementations when a compatible xcompute build is unavailable. Install the optional `flash-attn` package for vision and prompt attention.
 
-The built-in xcompute and flash-attn backends use the same [registration protocol](design.md#142-backend-registration-and-selection) as extensions in the `xinfer.ops` entry point group. For example, set `XINFER_FLASH_ATTN=0` to skip flash-attn at load time.
+The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the xcompute and flash-attn libraries and load the same way as extensions in the `xinfer.ops` entry point group ([registration](design.md#142-backend-registration-and-selection)). Operators whose library does not import run on their torch references, and a warning lists the slow ones; `XINFER_OPS_STRICT=1` makes that warning an error. For example, set `XINFER_FLASH_ATTN=0` to skip flash-attn at load time.
 
 ## GPU support
 
@@ -39,7 +39,7 @@ xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue':
 
 `--resolved-config FILE` writes the same list to `FILE`, and in Python `Policy.describe()["ops"]` lists it. With a
 working build the fused operators (`gemm_epilogue`, `gemm_glu_epilogue`, `qkv_rope_kvcache` and the other
-operators of `xinfer/ops/fused.py` that the model uses) report `xcompute`. `reference` for them means XInfer found no
+operators of `xinfer/ops/reference/fused.py` that the model uses) report `xcompute`. `reference` for them means XInfer found no
 usable build:
 
 - no `xcompute` package is importable and `XINFER_XCOMPUTE_LIBRARY` is unset, or it points to a missing file;

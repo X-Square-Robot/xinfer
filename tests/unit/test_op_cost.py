@@ -124,8 +124,8 @@ def test_other_operators_move_their_inputs_and_outputs_once():
     out = ops.reference.silu_and_mul(gate, up)
     assert op_cost("silu_and_mul", (gate, up), {}, out) == OpCost(0, 768 + 768, 768, "memory")
     x = torch.randn(4, 64, dtype=BF16)  # 512 bytes
-    q, scales = ops.mxfp8.quantize(x, share_scale_128=False)  # E4M3 [4, 64] and 512 swizzled scale bytes
+    q, scales = ops.reference.mxfp8.quantize(x, share_scale_128=False)  # E4M3 [4, 64] and 512 swizzled scale bytes
     assert op_cost("mxfp8_quantize", (x,), {"share_scale_128": False}, (q, scales)) == \
         OpCost(0, 512, 4 * 64 + 512, "memory")
-    q, scales = ops.nvfp4.quantize(x)  # packed E2M1 [4, 32] and 512 swizzled scale bytes
+    q, scales = ops.reference.nvfp4.quantize(x)  # packed E2M1 [4, 32] and 512 swizzled scale bytes
     assert op_cost("nvfp4_quantize", (x,), {}, (q, scales)) == OpCost(0, 512, 4 * 32 + 512, "memory")
