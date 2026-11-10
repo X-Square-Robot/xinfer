@@ -148,8 +148,8 @@ def profiled_ops(table):
     """``table`` (an ``xinfer.ops.OpTable``) with every operator called inside a span.
 
     Each call runs in ``span(f"op::{name}", **args)`` with ``args`` the call's arguments by parameter name: tensors
-    as ``dtype[shape]``, host sequences as ``[a,b]``, other values as they are, None omitted. The batch-invariant
-    companion table is wrapped too. Build a model inside ``use_ops(profiled_ops(table))`` to profile it; ``table``
-    itself is unchanged and binds the selected functions directly.
+    as ``dtype[shape]``, host sequences as ``[a,b]``, other values as they are, None omitted. Build a model inside
+    ``use_ops(profiled_ops(table))`` to profile it; ``table`` itself is unchanged and binds the selected functions
+    directly.
     """
     return table.wrapped(_profiled)

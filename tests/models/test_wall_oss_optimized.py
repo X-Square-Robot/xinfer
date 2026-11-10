@@ -2,7 +2,7 @@
 
 Uses the assets of ``test_wall_oss_parity.py`` (``XINFER_WALL_OSS_CHECKPOINT``, ``XINFER_WALL_OSS_REFERENCE``,
 ``XINFER_WALL_OSS_BF16_REFERENCE``) and ``XINFER_XCOMPUTE_LIBRARY``, an xcompute build with the unified entries
-(``651195d``) and its Python package importable.
+(``main`` ``7336b0d``) and its Python package importable.
 
 The composition rounds at other points than the eager model, so each stage is compared with the reference's
 result from the reference's inputs to it within a tolerance, the full chain must stay closer to the BF16 reference

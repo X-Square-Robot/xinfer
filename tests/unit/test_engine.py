@@ -23,12 +23,11 @@ class Pipe(VLAModel):
     stage_graph = StageGraph(Stage("a", "first"), Stage("b", "second", depends_on="a"))
     handoffs = (HandoffSpec("a", "b", {"h": TensorSpec(batch_axis=1)}),)
 
-    def __init__(self, invariant=True, gate=None):
-        self.invariant, self.gate, self.batch_sizes = invariant, gate, []
+    def __init__(self, gate=None):
+        self.gate, self.batch_sizes = gate, []
 
     def capabilities(self):
-        return Capabilities(batch_sizes={"a": (1,), "b": (1, 2, 4)}, num_steps=0,
-                            batch_invariant={"b": self.invariant})
+        return Capabilities(batch_sizes={"a": (1,), "b": (1, 2, 4)}, num_steps=0)
 
     def stage_outputs(self, stage, batch):
         n = batch.inputs["x"].shape[-1]
@@ -86,9 +85,13 @@ def test_stage_dispatches_run_in_spans_that_are_free_when_annotation_is_off(monk
     finally:
         annotate.configure()
         engine.shutdown()
-    stages = [("stage::a", {"batch_size": 1}), ("stage::b", {"batch_size": 1})]
-    assert [(name, args) for name, args, _ in calls] == stages * 2 and recorded == stages
-    assert all(context is annotate.span("off") for _, _, context in calls[:2])  # off: the shared no-op context
+    def spans(request_id):
+        return [("admit", {"request": request_id, "robot": None}),
+                ("stage::a", {"batch_size": 1, "lane": 0, "requests": str(request_id)}), ("wait", {}),
+                ("stage::b", {"batch_size": 1, "lane": 0, "requests": str(request_id)}), ("wait", {})]
+
+    assert [(name, args) for name, args, _ in calls] == spans(0) + spans(1) and recorded == spans(1)
+    assert all(context is annotate.span("off") for _, _, context in calls[:5])  # off: the shared no-op context
 
 
 def test_concurrent_submissions_get_their_own_results():
@@ -120,24 +123,6 @@ def test_zero_wait_batching_splits_rows_back():
     # The first dispatch of a stage runs alone (it learns which inputs the stage
     # reads); then the largest allowed sizes, never padding rows.
     assert model.batch_sizes == [1, 4, 2, 1]
-    engine.shutdown()
-
-
-def test_non_invariant_stage_does_not_batch_by_default():
-    model = Pipe(invariant=False)
-    engine = Engine(model, CPU, EngineConfig(max_running_requests=8, max_batch={"b": 4}), start=False)
-    futures = [engine.submit(_req(i)) for i in range(5)]
-    engine.start()
-    wait(futures, timeout=10)
-    assert model.batch_sizes == [1, 1, 1, 1, 1]
-    engine.shutdown()
-    forced = Pipe(invariant=False)
-    engine = Engine(forced, CPU, EngineConfig(max_running_requests=8, max_batch={"b": 4},
-                                              allow_non_invariant_batching=True), start=False)
-    futures = [engine.submit(_req(i)) for i in range(5)]
-    engine.start()
-    wait(futures, timeout=10)
-    assert forced.batch_sizes == [1, 4]
     engine.shutdown()
 
 
@@ -280,7 +265,7 @@ class Ragged(VLAModel):
         self.calls = []
 
     def capabilities(self):
-        return Capabilities(batch_sizes={"a": (1,), "b": (1, 2, 4)}, num_steps=0, batch_invariant={"b": True})
+        return Capabilities(batch_sizes={"a": (1,), "b": (1, 2, 4)}, num_steps=0)
 
     def stage_outputs(self, stage, batch):
         if stage == "a":

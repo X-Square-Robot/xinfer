@@ -53,8 +53,6 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 def silu_and_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Gated activation ``silu(gate) * up``, each rounded to the input dtype.
 
-    Elementwise, so batch invariant.
-
     Args:
         gate: gate half, any shape.
         up: up half, same shape and dtype as ``gate``.
@@ -83,8 +81,6 @@ def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
 def gelu_tanh_and_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Gated activation ``gelu_tanh(gate) * up`` (Gemma MLP), each rounded to the input dtype.
 
-    Elementwise, so batch invariant.
-
     Args:
         gate: gate half, any shape.
         up: up half, same shape and dtype as ``gate``.
@@ -97,8 +93,6 @@ def gelu_tanh_and_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
 
 def gated_residual(x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """``x + y * gate`` (an action expert's gated residual), the product rounded to the input dtype before the add.
-
-    Elementwise, so batch invariant.
 
     Args:
         x: ``[B, L, K]`` residual.
@@ -302,8 +296,7 @@ def rotary_embedding(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
 
     ``cos``/``sin`` are FP32 ``[..., 1, D]`` (broadcast over the heads):
     ``(x32 * cos + rotate_half(x32) * sin).to(x.dtype)``, each product and the
-    sum rounded separately (no fused multiply-add). Elementwise over tokens and
-    heads, so batch invariant.
+    sum rounded separately (no fused multiply-add).
 
     Args:
         x: ``[..., H, D]`` queries or keys (``D`` even).
@@ -321,7 +314,7 @@ def rotary_embedding_rounded(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tens
 
     ``cos``/``sin`` have ``x``'s dtype and shape ``[..., 1, D]``:
     ``x * cos + rotate_half(x) * sin`` with ``x * cos`` and ``rotate_half(x) * sin`` each rounded to
-    ``x.dtype`` before the add. Elementwise, so batch invariant.
+    ``x.dtype`` before the add.
 
     Args:
         x: ``[..., H, D]`` queries or keys (``D`` even).

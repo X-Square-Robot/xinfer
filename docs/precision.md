@@ -27,8 +27,8 @@ XInfer runs the gate through an adapter for the embodied-serving harness
 
 What the adapter does for each request group:
 - runs XInfer's input processing on the wire observation, with the request's saved FP32 noise (prompts padded to
-  `processing.prompt_bucket`, 16 tokens by default, as served); with `processing.image_preprocess_device="gpu"` it
-  decodes and resizes the views on the GPU before the vision stage, as the engine does (`xinfer.engine.device_images`);
+  `processing.prompt_bucket`, 16 tokens by default, as served); with `image_preprocess_device="gpu"` (a top-level key of
+  its config) it decodes and resizes the views on the GPU before the vision stage, as the engine does (`xinfer.engine.device_images`);
 - runs vision and prefill per request;
 - runs one action-stage call over the whole group (B1 or the scenario's BN). Different prompt lengths, for example 760 and 761 tokens, are merged left-padded as the engine does (`xinfer.engine.batching`). The optimized composition takes one request per action call: the adapter raises for a batched group, so the harness stops after B1 and the run is scored with `quick100_b1_score.py`;
 - reports that call's actual batch and delays.
@@ -59,12 +59,12 @@ edited `config.yml`.
 
 ## Wall-OSS quick100 gate
 
-Result (2026-11-07, RTX 5090, torch 2.10.0+cu130): `numerics="optimized"` with the default backends (xcompute `651195d`,
+Result (2026-11-08, RTX 5090, torch 2.10.0+cu130): `numerics="optimized"` with the default backends (xcompute `0c48a46`,
 flash-attn), B1:
 
 | Scenario | GT-MSE vs BF16 | Episode 95 % CI | vs old service (target) |
 |---|---|---|---|
-| quick100 B1, delay 5 (100 windows) | **−6.09 %: PASS** | [−12.07, +0.32] | +0.57 % |
+| quick100 B1, delay 5 (100 windows) | **−6.58 %: PASS** | [−12.48, −0.34] | +0.05 % |
 
 - Scored the same way: the old MXFP8 service −6.62 %, XInfer's reference composition with the eager model's kernels
   −6.28 % (torch 2.9.1), and the optimized composition under torch 2.9.1 −6.25 % (CI [−12.17, −0.25]; its actions
@@ -76,5 +76,6 @@ flash-attn), B1:
 - The GPU tests compare each stage with the eager BF16 model and check graphs bit for bit; output quality is judged
   by this gate only.
 
-Evidence: runs `q100-wos210-run` (torch 2.10) and `q100-wos-run` (2.9.1) in `xinfer-wall-oss-optimized-20261107.tar.gz` (hash in
+Evidence: run `gates/q100-run` in `xinfer-xcompute-prepack-20261108.tar.gz`; the earlier runs `q100-wos210-run`
+(torch 2.10) and `q100-wos-run` (2.9.1) in `xinfer-wall-oss-optimized-20261107.tar.gz` (hashes in
 docs/models/wall_oss_validation.md).

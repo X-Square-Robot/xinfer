@@ -65,42 +65,25 @@ class Implementation:
 class OpTable:
     """The operators selected for one platform; attribute access returns callables.
 
-    ``batch_invariant_table()`` is the companion table for stages that batch
-    requests: each operator's highest-priority batch-invariant implementation
-    (the default selection where none exists).
-
     Built by ``OpRegistry.build_table``.
 
     Args:
         platform_name: name of the platform the selections were made for.
         selections: the selected implementation per operator name.
-        invariant: the companion batch-invariant table, or None if this table is itself that companion.
 
     Attributes:
         platform_name: name of the platform the selections were made for.
     """
 
-    def __init__(self, platform_name: str, selections: Mapping[str, Implementation],
-                 invariant: "OpTable | None" = None):
+    def __init__(self, platform_name: str, selections: Mapping[str, Implementation]):
         self.platform_name = platform_name
         self._selections = dict(selections)
-        self._invariant = invariant
-
-    def batch_invariant_table(self) -> "OpTable":
-        """The op table for stages that batch requests.
-
-        Returns:
-            The companion table, or ``self`` when this table has none (it is itself a companion table).
-            Operators with no batch-invariant implementation, and operators pinned by ``backends`` or chosen
-            with ``reference_only``, have the same selection in both tables.
-        """
-        return self if self._invariant is None else self._invariant
 
     def wrapped(self, wrap: Callable[[Implementation], Callable]) -> "OpTable":
         """A copy of this table whose operators call ``wrap(implementation)`` instead, for instrumentation.
 
-        The companion batch-invariant table is wrapped the same way. Selections, contracts and ``report()`` are
-        unchanged; only ``Implementation.function`` differs. This table is not modified.
+        Selections, contracts and ``report()`` are unchanged; only ``Implementation.function`` differs. This table
+        is not modified.
 
         Args:
             wrap: given each selected ``Implementation``, returns the callable that layers bind.
@@ -108,9 +91,8 @@ class OpTable:
         Returns:
             The wrapped ``OpTable``.
         """
-        invariant = None if self._invariant is None else self._invariant.wrapped(wrap)
         selections = {name: replace(i, function=wrap(i)) for name, i in self._selections.items()}
-        return OpTable(self.platform_name, selections, invariant)
+        return OpTable(self.platform_name, selections)
 
     def __getattr__(self, name: str) -> Callable:
         """The selected implementation's callable for operator ``name``.
@@ -132,7 +114,7 @@ class OpTable:
 
         Returns:
             Rows sorted by operator name, each a dict with keys ``op``, ``backend``, ``version``, ``numerics``,
-            ``deterministic``, ``batch_invariant`` and ``graph_safe``.
+            ``deterministic`` and ``graph_safe``.
         """
         rows = []
         for name in sorted(self._selections):
@@ -144,7 +126,6 @@ class OpTable:
                     version=implementation.version,
                     numerics=implementation.contract.numerics,
                     deterministic=implementation.contract.deterministic,
-                    batch_invariant=implementation.contract.batch_invariant,
                     graph_safe=implementation.contract.graph_safe,
                 )
             )
@@ -168,7 +149,7 @@ class OpRegistry:
     def define(self, spec: OpSpec) -> OpSpec:
         """Define an operator and register its reference as the ``"reference"`` backend.
 
-        The reference supports every platform (``"*"``) with priority ``-1`` and ``spec.reference_contract``.
+        The reference supports every platform (``"*"``) with priority ``-1`` and the default ``Contract()``.
 
         Args:
             spec: the operator specification.
@@ -188,7 +169,7 @@ class OpRegistry:
                 backend=REFERENCE_BACKEND,
                 function=spec.reference,
                 platforms=("*",),
-                contract=spec.reference_contract,
+                contract=Contract(),
                 priority=-1,
             )
         ]
@@ -264,9 +245,9 @@ class OpRegistry:
     def load_plugins(self) -> list[str]:
         """Register built-in backends that are configured, then every ``xinfer.ops`` entry point.
 
-        Built-in: xcompute when ``XINFER_XCOMPUTE_LIBRARY`` points at a library;
-        flash-attn when the package imports (``XINFER_FLASH_ATTN=0`` skips it);
-        the batch-invariant Triton kernels on CUDA (``XINFER_BATCH_INVARIANT=0``).
+        Built-in: xcompute when ``XINFER_XCOMPUTE_LIBRARY`` points at a library or the ``xcompute`` package is
+        installed (``XINFER_XCOMPUTE=0`` skips it);
+        flash-attn when the package imports (``XINFER_FLASH_ATTN=0`` skips it).
 
         Runs once per registry; later calls do nothing. Errors raised by a backend's ``register`` (for
         example a missing ``XINFER_XCOMPUTE_LIBRARY`` file) propagate.
@@ -280,15 +261,13 @@ class OpRegistry:
         import os
         from importlib.metadata import entry_points
 
-        from xinfer.ops.backends import flash_attn, batch_invariant, xcompute
+        from xinfer.ops.backends import flash_attn, xcompute
 
         loaded = []
-        if xcompute.register(self) is not None:
+        if os.environ.get("XINFER_XCOMPUTE", "1") != "0" and xcompute.register(self) is not None:
             loaded.append(xcompute.BACKEND)
         if os.environ.get("XINFER_FLASH_ATTN", "1") != "0" and flash_attn.register(self) is not None:
             loaded.append(flash_attn.BACKEND)
-        if os.environ.get("XINFER_BATCH_INVARIANT", "1") != "0" and batch_invariant.register(self) is not None:
-            loaded.append(batch_invariant.BACKEND)
         for entry_point in entry_points(group=PLUGIN_GROUP):
             register = entry_point.load()
             register(self)
@@ -309,17 +288,13 @@ class OpRegistry:
         support the platform is an error. Otherwise the highest-priority
         supported implementation wins and the reference is the fallback.
 
-        The companion batch-invariant table (``OpTable.batch_invariant_table()``) takes, per operator, the
-        highest-priority supported implementation whose contract is batch invariant, or the default choice if
-        there is none; pinned operators and ``reference_only`` use the same choice in both tables.
-
         Args:
             platform: the platform to select for.
             backends: operator name → backend name to pin; takes precedence over ``reference_only``.
             reference_only: select the torch reference for every operator that is not pinned.
 
         Returns:
-            The ``OpTable`` for ``platform``, with its batch-invariant companion table.
+            The ``OpTable`` for ``platform``.
 
         Raises:
             KeyError: ``backends`` names an operator that is not defined.
@@ -329,7 +304,7 @@ class OpRegistry:
         unknown = set(backends) - set(self._specs)
         if unknown:
             raise KeyError(f"unknown operators in backend selection: {sorted(unknown)}")
-        selections, invariant = {}, {}
+        selections = {}
         for name in self._specs:
             candidates = [i for i in self._impls[name] if i.supports(platform)]
             if name in backends:
@@ -338,15 +313,12 @@ class OpRegistry:
                     raise RuntimeError(
                         f"backend {backends[name]!r} for {name!r} does not support {platform.name}"
                     )
-                choice = invariant_choice = pinned[0]
+                selections[name] = pinned[0]
             elif reference_only:
-                choice = invariant_choice = next(i for i in candidates if i.backend == REFERENCE_BACKEND)
+                selections[name] = next(i for i in candidates if i.backend == REFERENCE_BACKEND)
             else:
-                choice = max(candidates, key=lambda i: i.priority)
-                stable = [i for i in candidates if i.contract.batch_invariant]
-                invariant_choice = max(stable, key=lambda i: i.priority) if stable else choice
-            selections[name], invariant[name] = choice, invariant_choice
-        return OpTable(platform.name, selections, OpTable(platform.name, invariant))
+                selections[name] = max(candidates, key=lambda i: i.priority)
+        return OpTable(platform.name, selections)
 
 
 _active: contextvars.ContextVar[OpTable | None] = contextvars.ContextVar("xinfer_ops", default=None)

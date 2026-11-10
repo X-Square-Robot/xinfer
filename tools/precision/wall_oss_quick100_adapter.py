@@ -14,8 +14,9 @@ delays the model used. The optimized composition takes one request per action ca
 scenario only; a batched request group raises.
 
 Config JSON keys: ``xinfer_src``, ``checkpoint``, ``numerics`` ("optimized" | "reference"), optional
-``xcompute_library``, ``op_backends`` ({op: backend}), ``processing`` (ProcessingConfig fields, e.g.
-``image_preprocess_device``), ``norm_key``.
+``xcompute_library``, ``op_backends`` ({op: backend}), ``processing`` (ProcessingConfig fields),
+``image_preprocess_device`` ("cpu", the default, or "gpu"; the top-level model option of docs/configuration.md),
+``norm_key``.
 
 Use: PRECISION_ADAPTER=wall_oss_quick100_adapter:Adapter with this directory on PYTHONPATH.
 """
@@ -61,6 +62,7 @@ class Adapter:
         import torch
 
         from xinfer import ops
+        from xinfer.config import apply_image_preprocess_device
         from xinfer.engine.device_images import DeviceImageDecoder
         from xinfer.models.wall_oss.model import WallOSS
         from xinfer.models.wall_oss.processing import ProcessingConfig
@@ -74,7 +76,10 @@ class Adapter:
         self.platform = resolve_platform("cuda")
         ops.registry.load_plugins()
         self.table = ops.registry.build_table(self.platform, backends=config.get("op_backends") or None)
-        processing = ProcessingConfig(**config.get("processing", {}))
+        options = {"processing": config.get("processing", {}),
+                   "image_preprocess_device": config.get("image_preprocess_device")}
+        options = apply_image_preprocess_device(options, self.platform, default="cpu")
+        processing = ProcessingConfig(**options["processing"])
         with ops.use_ops(self.table):
             self.model = WallOSS.from_checkpoint(ckpt, device=self.platform.device,
                                                  numerics=config.get("numerics", "optimized"), processing=processing)
@@ -97,10 +102,7 @@ class Adapter:
             raise ValueError("XInfer source changed during the precision run")
         library = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
         return {"engine": "xinfer", "xinfer_src": str(self.xinfer_src), "source_sha256": self.source_hashes,
-                "config": self.config, "ops": self.table.report(),
-                "action_stage_ops": (self.table if self.model.numerics == "optimized"
-                                     else self.table.batch_invariant_table()).report(),
-                "numerics": self.model.numerics,
+                "config": self.config, "ops": self.table.report(), "numerics": self.model.numerics,
                 "xcompute_sha256": _sha256(library) if library else None, "adapter_sha256": _sha256(__file__),
                 "torch": self.torch.__version__, "cuda": self.torch.version.cuda,
                 "gpu": self.torch.cuda.get_device_name()}

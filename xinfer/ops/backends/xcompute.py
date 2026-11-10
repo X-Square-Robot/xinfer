@@ -1,8 +1,9 @@
 """Transitional backend: xcompute kernels through TVM-FFI (design §14, §18.1).
 
-Enabled by ``register(registry, library=...)`` or the ``XINFER_XCOMPUTE_LIBRARY``
-environment variable (path to an ``xcompute.so``). The library is loaded as
-is; no build is triggered. Kernels run on the caller's current torch stream.
+Enabled by ``register(registry, library=...)``, the ``XINFER_XCOMPUTE_LIBRARY``
+environment variable (path to an ``xcompute.so``) or, without it, the library
+of the installed ``xcompute`` package. The library is loaded as is; no build
+is triggered. Kernels run on the caller's current torch stream.
 
 SM120 (RTX 5090) uses xcompute's ``wallx_sm120`` module (xcompute
 ``0.1.0+wallx2``): the MXFP8 kernels the Wall-X 4B service ran, kept bit for
@@ -19,8 +20,7 @@ bit.
 | ``mxfp8_gemm_residual`` | ``wallx_sm120_oproj_resid_add_bf16`` | tolerance: as above; no bias |
 
 The three CUTLASS GEMMs (Expert 0 of the Wall-X service) use fixed tiles
-without split-K and need no workspace: each output row depends only on its
-own input row (batch invariant), and they capture in graphs at any time.
+without split-K and need no workspace, so they capture in graphs at any time.
 Scale buffers are allocated with ``torch.empty``, as the service did: the
 kernels leave the padding rows unwritten and the GEMMs never store the
 outputs those rows produce.
@@ -32,14 +32,14 @@ running every new graph key eagerly first. Autotuning picks the fastest of
 the cuBLASLt candidates, so the algorithm, and therefore the low bits, can
 differ between processes; within a process every lane uses the same one.
 
-xcompute builds without the ``wallx_sm120`` module can provide SM120 BF16 kernels, registered with the
-unified entries of the build's Python package by ``xcompute_bf16``. They also export SM110 (Thor) MXFP8 kernels;
-those are not registered until validated on Thor hardware.
+Builds of xcompute ``main`` register the fused operators through the unified entries of the build's Python
+package, on every architecture the build targets (``xcompute_bf16``).
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -107,19 +107,19 @@ def register(registry, library: str | None = None) -> _Library | None:
     """Register the xcompute implementations the library provides; returns it, or None.
 
     When the library exports every ``WALLX_SM120`` function, the seven MXFP8 operators are registered for
-    ``sm120`` at priority 10 with tolerance contracts (all batch invariant except ``mxfp8_gemm``), versioned
-    by the build-info arch and the library hash. A matching Python package with the unified BF16 entries also
-    registers the fused Wall-OSS operators.
+    ``sm120`` at priority 10 with tolerance contracts, versioned
+    by the build-info arch and the library hash. When it is a build of xcompute ``main`` and its Python package has
+    the unified entries, the operators of ``xcompute_bf16`` are registered as well.
 
     Args:
         registry: the ``OpRegistry`` to register into.
-        library: path to ``xcompute.so``; defaults to ``$XINFER_XCOMPUTE_LIBRARY``.
+        library: path to ``xcompute.so``; defaults to ``$XINFER_XCOMPUTE_LIBRARY``, else the installed package's.
 
     Returns:
-        The loaded ``_Library`` (``registered`` lists the registered operators, possibly none), or None when no
-        library path is given.
+        The loaded ``_Library`` (``registered`` lists the registered operators, possibly none), or None when there is
+        no library.
     """
-    path = library or os.environ.get(ENV)
+    path = library or os.environ.get(ENV) or _package_library()
     if not path:
         return None
     xcompute = _Library(path)
@@ -143,7 +143,7 @@ def register(registry, library: str | None = None) -> _Library | None:
             return (torch.empty((rows, k), dtype=torch.float8_e4m3fn, device=device),
                     torch.empty(mxfp8.scale_elements(rows, k), dtype=torch.uint8, device=device))
 
-        @sm120("mxfp8_quantize", batch_invariant=True)
+        @sm120("mxfp8_quantize")
         def _quantize(x, *, share_scale_128=True):
             """``mxfp8_quantize`` via ``wallx_sm120_quantize_mxfp8``.
 
@@ -159,7 +159,7 @@ def register(registry, library: str | None = None) -> _Library | None:
             xcompute.call("wallx_sm120_quantize_mxfp8", q, scales, x.contiguous(), bool(share_scale_128))
             return q, scales
 
-        @sm120("mxfp8_rmsnorm_quantize", batch_invariant=True)
+        @sm120("mxfp8_rmsnorm_quantize")
         def _rmsnorm_quantize(x, weight, eps, *, share_scale_128=True):
             """``mxfp8_rmsnorm_quantize`` via ``wallx_sm120_rmsnorm_quant_mxfp8`` without the residual add.
 
@@ -185,7 +185,7 @@ def register(registry, library: str | None = None) -> _Library | None:
                           False, bool(share_scale_128))
             return q, scales
 
-        @sm120("mxfp8_silu_mul_quantize", batch_invariant=True)
+        @sm120("mxfp8_silu_mul_quantize")
         def _silu_mul_quantize(gate_up, *, share_scale_128=True):
             """``mxfp8_silu_mul_quantize`` via ``wallx_sm120_silu_mul_quant_mxfp8``.
 
@@ -205,7 +205,7 @@ def register(registry, library: str | None = None) -> _Library | None:
         def _gemm(a_q, a_scales, w_q, w_scales, bias=None, *, fast_accum=False):
             """``mxfp8_gemm`` via ``wallx_sm120_mxfp8_gemm_bf16`` (cuBLASLt block-scaled GEMM).
 
-            Not batch invariant: the algorithm is autotuned per shape on the first eager call.
+            The algorithm is autotuned per shape on the first eager call.
 
             Args:
                 a_q: ``float8_e4m3fn [M, K]`` activations.
@@ -232,7 +232,7 @@ def register(registry, library: str | None = None) -> _Library | None:
                                   else torch.empty(0, dtype=torch.float32, device=device))
             return constants[key]
 
-        @sm120("mxfp8_gemm_rope", batch_invariant=True)
+        @sm120("mxfp8_gemm_rope")
         def _gemm_rope(a_q, a_scales, w_q, w_scales, bias, table, q_dim, k_dim, head_dim):
             """``mxfp8_gemm_rope`` via ``wallx_sm120_mxfp8_qkv_rope`` mode 0 (CUTLASS, fixed tiles, no split-K).
 
@@ -257,7 +257,7 @@ def register(registry, library: str | None = None) -> _Library | None:
                           int(q_dim), int(k_dim), int(head_dim), 0)
             return out
 
-        @sm120("mxfp8_gemm_silu_mul", batch_invariant=True)
+        @sm120("mxfp8_gemm_silu_mul")
         def _gemm_silu_mul(a_q, a_scales, w_q, w_scales, bias=None):
             """``mxfp8_gemm_silu_mul`` via ``wallx_sm120_mxfp8_qkv_rope`` mode 1 (CUTLASS, fixed tiles, no split-K).
 
@@ -278,7 +278,7 @@ def register(registry, library: str | None = None) -> _Library | None:
                           constant("table", 0, a_q.device), 0, 0, 4, 1)
             return out
 
-        @sm120("mxfp8_gemm_residual", batch_invariant=True)
+        @sm120("mxfp8_gemm_residual")
         def _gemm_residual(a_q, a_scales, w_q, w_scales, residual, bias=None):
             """``mxfp8_gemm_residual`` via ``wallx_sm120_oproj_resid_add_bf16`` (CUTLASS, fixed tiles, no split-K).
 
@@ -306,5 +306,17 @@ def register(registry, library: str | None = None) -> _Library | None:
         xcompute.registered += ["mxfp8_quantize", "mxfp8_rmsnorm_quantize", "mxfp8_silu_mul_quantize", "mxfp8_gemm",
                            "mxfp8_gemm_rope", "mxfp8_gemm_silu_mul", "mxfp8_gemm_residual"]
     xcompute.registered += xcompute_bf16.register(registry, xcompute, BACKEND,
-                                                    f"bf16_sm120 xcompute.so sha256:{xcompute.sha256[:12]}")
+                                                    f"unified xcompute.so sha256:{xcompute.sha256[:12]}")
     return xcompute
+
+
+def _package_library() -> str | None:
+    """The library of the installed ``xcompute`` package, or None when the package is missing or finds no library."""
+    if importlib.util.find_spec("xcompute") is None:
+        return None
+    os.environ.setdefault("XCOMPUTE_SKIP_AUTO_BUILD", "1")  # load the built library; never build at import
+    try:
+        import xcompute
+    except Exception:  # noqa: BLE001 - installed without a loadable library
+        return None
+    return xcompute.KERNEL_LIB_PATH

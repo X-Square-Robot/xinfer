@@ -9,9 +9,10 @@
 | 标注 | `xinfer.observability.annotate` | torch profiler 和 Nsight Systems trace 中带名字的 host 区间 |
 | 剖析用算子表 | `annotate.profiled_ops` | 每次算子调用外的一个 span，带调用的形状 |
 | 算子代价 | `xinfer.observability.op_cost` | 一次调用的 FLOPs、读写字节数和计算管线 |
-| 阶段 span | `xinfer.engine` | 每次阶段发射外的一个 `stage::<stage>` span |
+| 引擎 span | `xinfer.engine` | 每次阶段发射外的 `stage::<stage>` span、其中通道等待外的 `wait` span、每次准入上传外的 `admit` span |
 | roofline 下限 | `xinfer.observability.roofline` | 由调用的代价和 GPU 峰值得到的下限 |
 | 算子剖析 | `xinfer-profile ops`、`xinfer.observability.op_profile` | 模型每种算子调用形状在各阶段的 GPU 时间、代价和下限 |
+| 负载剖析 | `xinfer-profile load`、`xinfer.observability.load_profile` | 闭环机器人负载下每个请求在引擎中的时间：准入，以及每个阶段的排队、GPU 等待与执行和批大小 |
 
 ## 标注
 
@@ -30,7 +31,7 @@ with annotate.span("vision", batch_size=2):
   - `nvtx`：供 Nsight Systems 使用的 NVTX 区间（`nsys profile --trace=cuda,nvtx`）；需要 CUDA 版的 torch。
 - sink 是任何返回上下文管理器的可调用对象 `sink(name, args)`，因此其他 sink（例如进程内记录器）通过 `configure` 加入，不用改调用点。
 - span 标记的是 host 代码。CUDA graph 回放不运行 host 代码：捕获时记录的 span 标记的是捕获本身而不是之后的回放，所以要在 eager 模式下标注。
-- 引擎把每次阶段发射放在 `span("stage::<stage>", batch_size=B)` 中：输入合并、阶段本身（或其 graph 回放）以及输出的拷贝。不开启标注时它就是共享的空上下文。
+- 引擎把每次阶段发射放在 `span("stage::<stage>", batch_size=B, lane=i, requests="<id>,...")` 中：输入合并、阶段本身（或其 graph 回放）以及输出的拷贝。其中 `span("wait")` 覆盖通道等待该批输入和上游阶段的过程。每次准入的上传放在 `span("admit", request=<id>, robot=<robot>)` 中。不开启标注时它们都是共享的空上下文。
 
 ## 剖析用算子表
 
@@ -44,7 +45,7 @@ with ops.use_ops(profiled):
 ```
 
 - 在剖析用算子表下构建的模型，每次算子调用都在 `span("op::<operator>", **args)` 中运行，参数按实现的参数名命名：张量记为 `dtype[shape]`，host 端序列记为 `[a,b,...]`，其他值原样记录；`None` 省略。
-- 批次不变的伴随表（`batch_invariant_table()`）也一并包装。算子选择、契约和选择表与普通算子表相同。
+- 算子选择、契约和选择表与普通算子表相同。
 - 在普通算子表下构建的模型直接绑定所选实现的函数对象本身，因此不剖析时没有包装，也没有开销。`profiled_ops` 使用 `OpTable.wrapped(wrap)`：它复制一张表，把每个可调用对象换成 `wrap(implementation)`。
 
 ## 算子代价（`op_cost`）
@@ -143,3 +144,63 @@ xinfer-profile ops --model wall_oss --checkpoint /path/to/checkpoint \
 - 覆盖率写在输出的开头几行，是落在算子 span 和阶段 span 内的 GPU 活动占比；阶段之前的活动（输入上传）两者都不在。
 - eager 发射在 kernel 之间要等 Python，所以阶段的 eager GPU 区间大部分是空闲。算子时间是 kernel 时间，不含这些间隙；graph 回放区间才是服务时的情况。
 - 没有显式公式的算子使用通用的数据搬运代价（`generic`），所以下限是访存下限。
+
+## 负载剖析（`xinfer-profile load`）
+
+```bash
+xinfer-profile load --model wall_oss --checkpoint /path/to/checkpoint --requests observation.msgpack \
+  --robots 8 --out artifacts/wall-oss-load
+```
+
+多台机器人共用引擎时，请求的时间花在引擎的哪里：这是一次只跑一个请求的 `xinfer-profile ops` 看不到的。
+
+1. **引擎。** 模型和一个按 `xinfer-serve` 解析出的默认值（通道、批大小、CUDA graph）构建的 `Engine`，像 `--warmup` 一样用 `--requests` 的请求预热。
+2. **负载。** `--robots` 台虚拟机器人（默认 8 台）轮流提交准备好的请求，每台 `--requests-per-robot` 个（默认 80），同时最多一个在途：机器人在上一个请求发出 `--period-ms`（默认 180）毫秒后发出下一个，若响应到得更晚则在响应到达时发出。每台机器人的前 `--warmup-requests` 个（默认 20）不计入统计。`--start spread`（默认）时第 `r` 台机器人比第一台晚 `r / N` 个周期发出第一个请求，就像相互独立的机器人；`--start together` 时所有机器人同时发出第一个请求，只要响应在周期内到达，它们之后就一直同步，这是对队列最不利的情况。结果取决于这种到达方式：`benchmarks/robot_load.py` 压测 `xinfer-serve` 的结果介于两者之间。
+3. **记录。** 一个 span sink（`load_profile.SpanRecorder`）记录引擎的 `admit`、`stage::` 和 `wait` span：host 时间，以及在 CUDA 上于各 span 两端、在通道的 stream 上记录的计时 event。event 在负载结束后才读取，所以运行中不做任何同步。一次派发的第一个 event 在空闲通道上大约于派发的 host 时刻执行，由此把 GPU 时间换算到 host 时钟上。
+
+每个请求的分段（ms）：
+
+| 分段 | 时间 |
+|---|---|
+| `admit_ms` | 提交到准入：等待 slot |
+| `inputs_ms` | 准入时的上传 |
+| `<stage>.delay_ms` | 从阶段的输入就绪（首个阶段为上传结束，否则为上游阶段在 GPU 上完成）到它在 GPU 上开始 |
+| `<stage>.run_ms` | 阶段在 GPU 上执行（CPU 上为 host 时间） |
+| `complete_ms` | 最终阶段在 GPU 上完成到拿到结果：拷回 host 和完成线程 |
+| `total_ms` | 提交到拿到结果 |
+
+阶段串成一条链时（现有模型都是如此），这些分段相加等于 `total_ms`，所以尾部各分段多出的时间相加等于总时间多出的时间。`requests.csv` 中还有每个阶段与上游执行重叠的时间，用来查延迟从哪里来：
+
+| 列 | 时间 |
+|---|---|
+| `<stage>.queue_ms` | host 上从上传或上游派发结束到本阶段派发：等待空闲通道 |
+| `<stage>.wait_ms` | 通道在 GPU 上等待输入和上游阶段 |
+
+链式派发下，请求的上游阶段一经派发，它就进入下游阶段的队列；而通道要等它的派发在 GPU 上完成才空闲。所以某阶段的排队和等待发生在上游阶段执行期间，只有体现在 `delay_ms` 中的部分才真正耗时。
+
+| 文件 | 内容 |
+|---|---|
+| `requests.csv` | 每个请求一行：机器人、序号、各分段，以及每个阶段的批大小、排队和等待时间 |
+| `summary.md`、`summary.json` | 相加等于 `total_ms` 的各分段的 P50/P95/P99、每个阶段各批大小的请求数、吞吐，以及对 `total_ms` 处于 P95 和 P99 及以上的请求，各分段均值减去中位带（P45–P55）均值 |
+| `meta.json` | 命令、模型选项、请求文件的 sha256、负载设置、解析出的配置、算子选择，以及在 CUDA 上的 GPU、版本和源码 |
+
+- 进程内没有前端进程：请求只准备一次，输出不做处理，所以输入输出处理、网络和进程间传输不在这些时间里。`--serve` 会把它们加进来（见下）。
+- 带 `DeviceImage` 输入时，设备上的解码计入首个阶段的延迟。
+
+### 经过 `xinfer-serve`（`--serve`）
+
+加 `--serve` 时，命令会为这次运行启动一个 `xinfer-serve`（同样的模型、checkpoint 和选项，用 `--requests` 预热，另加 `--serve-args`），并带上 `--profile-dir <out>/engine`；虚拟机器人变成 WebSocket 客户端，轮流发送 `--requests` 中的原始请求。这样每个请求都像机器人的请求一样，经过前端的输入和输出处理、共享内存和管道。`--profile-dir` 让服务的引擎进程记录同样的 span，并在服务停止时把每个请求的引擎侧写到 `engine/engine-requests.json`。
+
+每台机器人保持一条连接、同时只有一个请求在途，并在上一台连上之后才连接，所以每个前端按机器人顺序给连接编号；引擎通过连接识别请求，由此把每个请求的客户端时间、`server_timing` 和引擎 span 对上。每个请求的分段（ms）：
+
+| 分段 | 时间 |
+|---|---|
+| `network_ms` | 客户端时间减去 `server_timing.infer_ms`：网络和消息编解码 |
+| `prepare_ms`、`output_ms` | 前端的输入和输出处理（`server_timing`） |
+| `handoff_ms` | `server_timing.engine_ms` 减去引擎从准入到最终阶段完成的区间：共享内存缓冲区、管道、等待 slot、拷回 host 和完成 |
+| `inputs_ms`、`<stage>.delay_ms`、`<stage>.run_ms` | 与进程内相同 |
+| `total_ms` | 客户端从发出到收到 |
+
+和进程内一样，这些分段相加等于 `total_ms`；`requests.csv` 中还有各阶段的排队和等待时间。
+
+负载结束后命令会停止服务；`serve.log` 中有服务的日志和解析出的配置。

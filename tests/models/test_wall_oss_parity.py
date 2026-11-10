@@ -50,7 +50,7 @@ def setup():
 
     platform = resolve_platform("cuda")
     table = ops.registry.build_table(platform, reference_only=True)
-    with ops.use_ops(table):  # exact prompts: the reference operators are not invariant to padding
+    with ops.use_ops(table):  # exact prompts: padding changes the reference operators' rounding
         model = WallOSS.from_checkpoint(CKPT, device=platform.device, numerics="reference",
                                         processing=ProcessingConfig(instruction_override=INSTRUCTION, prompt_bucket=0))
     names = [r["name"] for r in json.loads((Path(BF16) / "bf16_reference.json").read_text())["requests"]]
@@ -64,6 +64,12 @@ def setup():
 def _tensor(array, device, bf16=False):
     x = torch.from_numpy(np.ascontiguousarray(array))
     return (x.view(torch.bfloat16) if bf16 else x).to(device)
+
+
+def _relative(got, want):
+    """Relative norm of ``got - want``: rounding-level for batched or padded requests (measured up to 0.01; bound
+    0.05); a wrong mask or mixed-up rows give errors of order 1."""
+    return float((got.float() - want.float()).norm() / want.float().norm())
 
 
 def _inputs(s, name):
@@ -152,12 +158,11 @@ def test_concurrent_multilane_results_equal_single_request(setup):
 
 @pytest.fixture(scope="module")
 def served_model(setup):
-    """The reference composition as served: flash-attn attention, the batch-invariant action stage and the default
-    16-token prompt buckets."""
+    """The reference composition as served: flash-attn attention and the default 16-token prompt buckets."""
     from xinfer import ops
     from xinfer.models.wall_oss.model import WallOSS
     from xinfer.models.wall_oss.processing import ProcessingConfig
-    from xinfer.ops.backends import batch_invariant, flash_attn
+    from xinfer.ops.backends import flash_attn
     from xinfer.platforms import resolve_platform
 
     platform = resolve_platform("cuda")
@@ -165,7 +170,6 @@ def served_model(setup):
     for name in ops.registry.names():
         registry.define(ops.registry.spec(name))
     flash_attn.register(registry)
-    batch_invariant.register(registry)  # batch-invariant linear / RMSNorm
     table = registry.build_table(platform)
     with ops.use_ops(table):
         return WallOSS.from_checkpoint(CKPT, device=platform.device, numerics="reference",
@@ -173,7 +177,7 @@ def served_model(setup):
 
 
 def test_served_reference_composition_stays_closer_than_production_mxfp8(setup, served_model):
-    """The reference composition as served (flash-attn, batch-invariant action stage, prompt buckets): graphs equal
+    """The reference composition as served (flash-attn, prompt buckets): graphs equal
     eager, and every request is closer to the eager BF16 reference than the MXFP8 service is (flash-attn is a
     tolerance backend)."""
     from xinfer.engine import Engine, EngineConfig
@@ -197,9 +201,9 @@ def test_served_reference_composition_stays_closer_than_production_mxfp8(setup, 
         assert ours < service, (name, float(ours), float(service))
 
 
-def test_action_batches_equal_single_requests(setup, served_model):
-    """Batch-invariant action stage: requests batched B2..B8, with different prompt lengths
-    (left-padded) and RTC delays, get the bits each gets alone."""
+def test_action_batches_match_single_requests(setup, served_model):
+    """Requests batched B2..B8 in the action stage, with different prompt lengths (left-padded) and RTC delays, get
+    each request's result alone within rounding."""
     import copy
 
     from xinfer.engine import Engine, EngineConfig
@@ -208,8 +212,6 @@ def test_action_batches_equal_single_requests(setup, served_model):
     from xinfer.platforms import resolve_platform
 
     s, model = setup, served_model
-    if not model.capabilities().batch_invariant["action"]:
-        pytest.skip("action stage operators are not batch-invariant here (needs flash-attn and Triton)")
     platform = resolve_platform("cuda")
     names = sorted(s["requests"])[:16]
     requests, lengths = [], set()
@@ -231,8 +233,9 @@ def test_action_batches_equal_single_requests(setup, served_model):
     engine = Engine(model, platform, config, start=False)
     futures = [(i, engine.submit(r)) for _ in range(2) for i, r in enumerate(requests)]
     engine.start()
-    for i, future in futures:
-        assert torch.equal(future.result(timeout=600)["predict_action"], expected[i]), i
+    worst = max(_relative(future.result(timeout=600)["predict_action"], expected[i]) for i, future in futures)
+    print(f"batched vs alone, largest relative difference: {worst:.2e}")
+    assert worst < 0.05
     stats = dict(engine.stats)
     engine.shutdown()
     batched = sum(v for k, v in stats.items() if k.startswith("dispatch_action_b") and k != "dispatch_action_b1")
@@ -241,8 +244,8 @@ def test_action_batches_equal_single_requests(setup, served_model):
 
 
 def test_padded_prompts_give_the_actions_of_exact_prompts(setup, served_model):
-    """Prompts padded to 16-token buckets get the bits of their exact prompts: eager, with graphs, and batched
-    with requests of other buckets."""
+    """Prompts padded to 16-token buckets get the actions of their exact prompts within rounding: eager, with
+    graphs, and batched with requests of other buckets."""
     import copy
 
     from xinfer.engine import Engine, EngineConfig
@@ -251,8 +254,6 @@ def test_padded_prompts_give_the_actions_of_exact_prompts(setup, served_model):
     from xinfer.platforms import resolve_platform
 
     s, model = setup, served_model
-    if not model.capabilities().batch_invariant["action"]:
-        pytest.skip("action stage operators are not batch-invariant here (needs flash-attn and Triton)")
     platform = resolve_platform("cuda")
     padded_prepare = model.input_processor()  # prompt_bucket 16; setup's processor keeps exact prompts
     rng = np.random.default_rng(0)
@@ -275,20 +276,20 @@ def test_padded_prompts_give_the_actions_of_exact_prompts(setup, served_model):
     assert len(lengths) > len(buckets) > 1, (lengths, buckets)
     eager = Engine(model, platform)
     expected = [eager.run(r)["predict_action"] for r in exact]
-    for i, r in enumerate(padded):
-        assert torch.equal(eager.run(r)["predict_action"], expected[i]), i
+    worst = {"eager": max(_relative(eager.run(r)["predict_action"], expected[i]) for i, r in enumerate(padded))}
     eager.shutdown()
     graphed = Engine(model, platform, EngineConfig(cudagraphs=CUDAGraphConfig()))
-    for i, r in enumerate(padded):
-        assert torch.equal(graphed.run(r)["predict_action"], expected[i]), i
+    worst["graphs"] = max(_relative(graphed.run(r)["predict_action"], expected[i]) for i, r in enumerate(padded))
     graphed.shutdown()
     config = EngineConfig(lanes={"vision": 2, "prefill": 2, "action": 1}, max_batch={"action": 8},
                           max_running_requests=64, cudagraphs=CUDAGraphConfig())
     engine = Engine(model, platform, config, start=False)
     futures = [(i, engine.submit(r)) for _ in range(2) for i, r in enumerate(padded)]
     engine.start()
-    for i, future in futures:
-        assert torch.equal(future.result(timeout=600)["predict_action"], expected[i]), i
+    worst["batched"] = max(_relative(future.result(timeout=600)["predict_action"], expected[i])
+                           for i, future in futures)
+    print("padded vs exact prompts, largest relative difference:", {k: f"{v:.2e}" for k, v in worst.items()})
+    assert max(worst.values()) < 0.05, worst
     stats = dict(engine.stats)
     engine.shutdown()
     assert stats.get("padded_dispatch_action", 0) > 0, stats  # batches mixed buckets
@@ -303,8 +304,6 @@ def test_warmup_from_one_request_of_each_kind_covers_every_pose(setup, served_mo
     from xinfer.platforms import resolve_platform
 
     s, model = setup, served_model
-    if not model.capabilities().batch_invariant["action"]:
-        pytest.skip("action stage operators are not batch-invariant here (needs flash-attn and Triton)")
     prepare = model.input_processor()  # prompt_bucket 16
     flow = next(n for n in sorted(s["requests"]) if not s["requests"][n].get("use_rtc"))
     rtc = next(n for n in sorted(s["requests"]) if s["requests"][n].get("use_rtc"))

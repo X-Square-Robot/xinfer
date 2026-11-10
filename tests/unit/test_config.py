@@ -14,12 +14,8 @@ class ThreeStage(VLAModel):
     stage_graph = StageGraph(Stage("vision", "f"), Stage("prefill", "f", depends_on="vision"),
                              Stage("action", "f", depends_on="prefill"))
 
-    def __init__(self, invariant=False):
-        self.invariant = invariant
-
     def capabilities(self):
-        return Capabilities(num_steps=5, batch_sizes={"vision": (1,), "prefill": (1,), "action": (1, 2, 4)},
-                            batch_invariant={"vision": True, "prefill": True, "action": self.invariant})
+        return Capabilities(num_steps=5, batch_sizes={"vision": (1,), "prefill": (1,), "action": (1, 2, 4)})
 
 
 def _platform(cudagraphs=True, arch="sm120"):
@@ -67,18 +63,16 @@ def test_the_tuned_table_sets_the_lanes():
     r = resolve(ThreeStage(), _platform(), model_name="m", tuned=TABLE, cpus=24)
     assert (r.value("lanes.vision"), r.value("lanes.prefill"), r.value("lanes.action")) == (2, 3, 2)
     assert r.settings["lanes.prefill"].source == "tuned:m/sm120-mxfp8@abc1234"
-    assert r.value("batch_sizes.action") == [1]
-    assert r.settings["batch_sizes.action"].source == "model:not batch-invariant"
     engine_config = r.engine_config()
     assert engine_config.lanes == {"vision": 2, "prefill": 3, "action": 2}
     assert engine_config.max_running_requests == 32 and engine_config.cudagraphs is not None
-    assert engine_config.max_batch == {"vision": 1, "prefill": 1, "action": 1}
+    assert engine_config.max_batch == {"vision": 1, "prefill": 1, "action": 4}
 
 
-def test_batch_invariant_stages_allow_every_declared_size():
-    r = resolve(ThreeStage(invariant=True), _platform(), model_name="m", tuned=None)
+def test_stages_batch_every_declared_size_by_default():
+    r = resolve(ThreeStage(), _platform(), model_name="m", tuned=None)
     assert r.value("batch_sizes.action") == [1, 2, 4]
-    assert r.settings["batch_sizes.action"].source == "model:batch-invariant, declared sizes"
+    assert r.settings["batch_sizes.action"].source == "model:declared sizes"
     assert r.value("batch_sizes.vision") == [1] and r.settings["batch_sizes.vision"].source == "model:declares B1 only"
     assert r.engine_config().max_batch["action"] == 4
 
@@ -92,15 +86,11 @@ def test_explicit_values_win_and_are_checked():
     values = [r.value(k) for k in ("max_running_requests", "cudagraphs", "frontends", "frontend_workers",
                                    "shm_buffers")]
     assert values == [5, False, 3, 6, 7]
-    with pytest.raises(ConfigError, match="not batch-invariant"):
-        resolve(ThreeStage(), _platform(), model_name="m", tuned=None,
-                explicit=ExplicitSettings(max_batch={"action": 2}))
     r = resolve(ThreeStage(), _platform(), model_name="m", tuned=None,
-                explicit=ExplicitSettings(max_batch={"action": 2}, allow_non_invariant_batching=True))
-    assert r.value("batch_sizes.action") == [1, 2] and r.value("allow_non_invariant_batching") is True
+                explicit=ExplicitSettings(max_batch={"action": 2}))
+    assert r.value("batch_sizes.action") == [1, 2] and r.settings["batch_sizes.action"].source == "explicit"
     with pytest.raises(ConfigError, match="supports batch sizes"):
-        resolve(ThreeStage(invariant=True), _platform(), model_name="m",
-                explicit=ExplicitSettings(max_batch={"action": 8}))
+        resolve(ThreeStage(), _platform(), model_name="m", explicit=ExplicitSettings(max_batch={"action": 8}))
     with pytest.raises(ConfigError, match="unknown stage"):
         resolve(ThreeStage(), _platform(), model_name="m", explicit=ExplicitSettings(lanes={"decode": 2}))
     with pytest.raises(ConfigError, match="graph capture"):

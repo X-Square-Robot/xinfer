@@ -13,8 +13,6 @@ Scheduling rules (§6.3):
 
 1. *Zero-wait batching*: a dispatch takes the queued compatible requests that
    are already waiting, up to the stage's batch limit, never waiting for more.
-   A stage batches only if the model declares it batch-invariant, unless
-   ``allow_non_invariant_batching`` is set.
 2. *Chained dispatch*: a request enters a stage's queue as soon as its
    upstream stages are *dispatched*; its lane waits for them on the GPU. With
    free lanes a request therefore runs vision→prefill→action without host
@@ -49,6 +47,7 @@ from xinfer.engine.cudagraph import CUDAGraphConfig, LaneCUDAGraphs, _ReadTracke
 from xinfer.engine.slots import PoolExhausted, SlotPool
 from xinfer.models.interface import DeviceImage, PreparedRequest, StageBatch, VLAModel
 from xinfer.observability.annotate import span
+from xinfer.observability.stats import RequestStats, StageStats
 from xinfer.platforms.interface import Platform
 
 logger = logging.getLogger(__name__)
@@ -60,15 +59,13 @@ class EngineConfig:
 
     Attributes:
         lanes: lanes (stream, plus a graph pool with CUDA graphs) per stage name; stages not listed get 1.
-        max_batch: batch limit per stage name (default 1); capped by ``Capabilities.batch_sizes`` and, unless
-            ``allow_non_invariant_batching`` is set, limited to 1 for stages that are not batch-invariant.
+        max_batch: batch limit per stage name (default 1); capped by ``Capabilities.batch_sizes``.
         max_running_requests: admitted requests in flight (size of the engine's ``SlotPool``).
         max_queued_requests: submitted requests waiting for admission; beyond it ``submit`` fails with
             ``AdmitError("queue_full")``.
         per_robot_inflight: submitted and unfinished requests per robot id; beyond it ``submit`` fails with
             ``AdmitError("per_robot_limit")``. Requests without a robot id are not limited.
         cudagraphs: capture and replay CUDA graphs per lane with these settings; None runs stages eagerly.
-        allow_non_invariant_batching: batch stages the model does not declare batch-invariant (changes numerics).
         poll_interval_s: longest time the idle engine thread sleeps before polling the lanes' events again.
         stream_priorities: CUDA stream priority per stage (default 0); smaller integers have higher priority.
     """
@@ -79,7 +76,6 @@ class EngineConfig:
     max_queued_requests: int = 256  # submitted requests waiting for admission
     per_robot_inflight: int = 1  # submitted and unfinished requests per robot
     cudagraphs: CUDAGraphConfig | None = None
-    allow_non_invariant_batching: bool = False
     poll_interval_s: float = 0.0002
     stream_priorities: Mapping[str, int] = field(default_factory=dict)
 
@@ -121,10 +117,13 @@ class _Request:
         dispatched: names of the stages already dispatched.
         submitted_at: ``time.perf_counter()`` at submission.
         admitted_at: ``time.perf_counter()`` at admission, or None.
+        ready_at: ``time.perf_counter()`` when the request was queued for its first stages (its inputs ready).
+        timing: ``{stage: (began, ended, batch size)}`` of the stage's dispatch, with a stats sink: timing events
+            after the dispatch's waits and after the stage (host times on the CPU).
     """
 
     __slots__ = ("id", "robot", "prepared", "future", "handle", "inputs", "inputs_ready", "events", "outputs",
-                 "dispatched", "submitted_at", "admitted_at")
+                 "dispatched", "submitted_at", "admitted_at", "ready_at", "timing")
 
     def __init__(self, request_id, robot, prepared, future):
         self.id, self.robot, self.prepared, self.future = request_id, robot, prepared, future
@@ -134,6 +133,17 @@ class _Request:
         self.dispatched: set[str] = set()
         self.submitted_at = time.perf_counter()
         self.admitted_at = None
+        self.ready_at = None
+        self.timing: dict[str, tuple] = {}
+
+
+def _timing_event(lane):
+    """A timing CUDA event recorded on ``lane``'s stream, or None on the CPU."""
+    if lane.stream is None:
+        return None
+    event = torch.cuda.Event(enable_timing=True)
+    event.record(lane.stream)
+    return event
 
 
 class Engine:
@@ -159,9 +169,8 @@ class Engine:
                  *, start: bool = True):
         """Validate the model's handoffs, derive the batch sizes, create the lanes and start the threads.
 
-        Each stage's allowed batch sizes are its ``Capabilities.batch_sizes`` plus 1, up to its ``max_batch``; a
-        stage that is not batch-invariant is limited to 1 (with a warning) unless ``allow_non_invariant_batching``
-        is set. With CUDA every lane gets its own stream and admission uploads use one separate upload stream.
+        Each stage's allowed batch sizes are its ``Capabilities.batch_sizes`` plus 1, up to its ``max_batch``.
+        With CUDA every lane gets its own stream and admission uploads use one separate upload stream.
 
         Args:
             model: the model to serve.
@@ -206,10 +215,6 @@ class Engine:
         for stage in self.order:
             allowed = sorted(set(capabilities.batch_sizes.get(stage, (1,))) | {1})
             limit = config.max_batch.get(stage, 1)
-            invariant = capabilities.batch_invariant.get(stage, False)
-            if limit > 1 and not invariant and not config.allow_non_invariant_batching:
-                logger.warning("stage %s is not batch-invariant; batching disabled", stage)
-                limit = 1
             self._batch_sizes[stage] = [b for b in allowed if b <= limit]
 
         if config.cudagraphs is not None and not platform.capabilities.cudagraphs:
@@ -242,6 +247,9 @@ class Engine:
         self._request_ids = itertools.count()
         self._stopping = False
         self.stats = Counter()
+        # Called on the completer thread with each completed request's RequestStats (xinfer.observability.stats), or
+        # None; xinfer-serve sets it after the warmup to record its metrics.
+        self.stats_sink = None
         self._engine_thread = threading.Thread(target=self._run_engine_loop, name="xinfer-engine", daemon=True)
         self._completer = threading.Thread(target=self._completion_loop, name="xinfer-completer", daemon=True)
         # DeviceImage inputs are decoded off the engine thread: on one thread (torchvision shares one nvJPEG decoder
@@ -361,8 +369,9 @@ class Engine:
         """Per-stage CUDA graph counters, summed over the stage's lanes (read without locking: a snapshot).
 
         Returns:
-            ``{stage: {"captures", "replays", "eager", "evictions", "capture_ms", "graphs"}}``, where ``graphs`` is
-            the number of graphs currently kept (see ``LaneCUDAGraphs.stats``); empty without CUDA graphs.
+            ``{stage: {"captures", "captures_after_warmup", "replays", "eager", "evictions", "capture_ms", "graphs"}}``,
+            where ``graphs`` is the number of graphs currently kept (see ``LaneCUDAGraphs.stats``); empty without
+            CUDA graphs.
         """
         out = {}
         for stage, lanes in self.lanes.items():
@@ -374,6 +383,10 @@ class Engine:
             if total:
                 out[stage] = dict(total)
         return out
+
+    def request_counts(self) -> tuple[int, int]:
+        """Requests waiting for admission, and admitted requests whose slots are not free yet."""
+        return len(self._waiting), self.slots.in_use()
 
     def health(self) -> str | None:
         """Why the engine can no longer serve, or None while it can: its engine, completion or device-image thread
@@ -467,8 +480,9 @@ class Engine:
 
         For each admitted request: allocate a slot, upload ``prepared.tensors`` to the device (with CUDA on the
         upload stream, CPU tensors pinned first; ``DeviceImage`` values stay as they are) and record
-        ``request.inputs_ready``, then hand the request to the device-image thread if it has ``DeviceImage`` values,
-        else append it to the queue of every stage without dependencies. A request whose upload raises fails with
+        ``request.inputs_ready`` (inside ``span("admit", request=<id>, robot=<robot>)``), then hand the request to the
+        device-image thread if it has ``DeviceImage`` values, else append it to the queue of every stage without
+        dependencies. A request whose upload raises fails with
         that exception. A cancelled request at the head is finished and dropped. Admission stops at the first request
         that gets no slot, so later requests never overtake it.
 
@@ -495,11 +509,11 @@ class Engine:
             stream_context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
             admitted = True
             try:
-                with stream_context:
+                with stream_context, span("admit", request=request.id, robot=request.robot):
                     request.inputs = {name: _to_device(value, self.platform.device)
                                       for name, value in request.prepared.tensors.items()}
                     if stream is not None:
-                        request.inputs_ready = torch.cuda.Event()
+                        request.inputs_ready = torch.cuda.Event(enable_timing=self.stats_sink is not None)
                         request.inputs_ready.record(stream)
             except Exception as exc:  # noqa: BLE001 - only this request fails
                 self._fail_request(request, exc)
@@ -512,6 +526,7 @@ class Engine:
 
     def _queue_for_first_stages(self, request: _Request) -> None:
         """Append ``request`` to the queue of every stage without dependencies (engine thread)."""
+        request.ready_at = time.perf_counter()
         for stage in self.order:
             if not self.stages[stage].depends_on:
                 self._queues[stage].append(request)
@@ -545,7 +560,7 @@ class Engine:
                 error = exc
             if stream is not None:
                 try:
-                    event = torch.cuda.Event()
+                    event = torch.cuda.Event(enable_timing=self.stats_sink is not None)
                     event.record(stream)
                 except Exception:  # noqa: BLE001 - the device is in an error state; the request still fails or runs
                     logger.exception("could not record the device images' completion")
@@ -723,8 +738,9 @@ class Engine:
         lane's event is recorded: at the final stage each request's row goes to the host (``_copy_to_host``);
         otherwise each request's row of every handed-off output is cloned into ``request.outputs[stage]``.
 
-        The dispatch runs inside ``span("stage::<stage>", batch_size=batch_size)``
-        (``xinfer.observability.annotate``), the shared no-op context unless a profiler sink is configured. The lane
+        The dispatch runs inside ``span("stage::<stage>", batch_size=B, lane=i, requests="<id>,...")``, and the lane's
+        waits for the inputs and upstream stages inside ``span("wait")`` (``xinfer.observability.annotate``): the
+        shared no-op context unless a profiler sink is configured. The lane
         stays busy until the recorded event completes. A final batch goes to the completer; otherwise each request is
         appended to the queue of every consumer stage whose dependencies are all dispatched.
 
@@ -741,12 +757,19 @@ class Engine:
         """
         batch_size = len(batch)
         final = stage in self.final_stages
+        timed = self.stats_sink is not None
         try:
-            with lane.use_stream(), torch.inference_mode(), span(self._span_names[stage], batch_size=batch_size):
-                for request in batch:
-                    lane.wait(request.inputs_ready)
-                    for dependency in self.stages[stage].depends_on:
-                        lane.wait(request.events[dependency])
+            with lane.use_stream(), torch.inference_mode(), span(
+                    self._span_names[stage], batch_size=batch_size, lane=lane.index,
+                    requests=",".join(str(request.id) for request in batch)):
+                with span("wait"):
+                    for request in batch:
+                        lane.wait(request.inputs_ready)
+                        for dependency in self.stages[stage].depends_on:
+                            lane.wait(request.events[dependency])
+                if timed:
+                    began = _timing_event(lane)
+                    began_at = time.perf_counter()
                 inputs = self._merge(stage, [self._stage_inputs(stage, r) for r in batch])
                 if lane.cudagraphs is not None:
                     out = lane.cudagraphs.run(stage, batch_size, inputs)
@@ -759,6 +782,9 @@ class Engine:
                     self._reads.setdefault(stage, set()).update(tracked.names)
                     out = stage_batch.out
                 self._check_declared(stage, out)
+                if timed:
+                    ended = _timing_event(lane)
+                    ended_at = time.perf_counter()
                 if final:
                     hosts, event = self._copy_to_host(stage, lane, out, batch_size)
                 else:  # copy out of the lane's buffers before its next dispatch
@@ -780,6 +806,10 @@ class Engine:
             raise
         lane.event = event
         self.stats[f"dispatch_{stage}_b{batch_size}"] += 1
+        if timed:
+            timing = (began_at, ended_at, batch_size) if ended is None else (began, ended, batch_size)
+            for request in batch:
+                request.timing[stage] = timing
         for request in batch:
             request.events[stage] = event
             request.dispatched.add(stage)
@@ -901,6 +931,44 @@ class Engine:
                 self._finish_request(request)
                 if not request.future.done():
                     request.future.set_result(host)
+            sink = self.stats_sink
+            if sink is not None:
+                for request in batch:
+                    stats = self._request_stats(request)
+                    if stats is not None:
+                        try:
+                            sink(stats)
+                        except Exception:  # noqa: BLE001 - statistics never stop the completer
+                            logger.exception("the stats sink failed")
+
+    def _request_stats(self, request: _Request) -> RequestStats | None:
+        """A completed request's ``RequestStats`` (completer).
+
+        A stage waits from the moment it can start (the request's inputs are ready on the device, or its upstream
+        stages have finished) to the start of its dispatch, then executes; along the request the waits and execution
+        times add up to its inputs being ready to its final stage finishing. The times come from timing events on
+        CUDA (all complete once the final stage is) and from host times on the CPU.
+
+        Returns:
+            The stats, or None for a request admitted before the sink was set (it has no timing).
+        """
+        if set(request.timing) != set(self.order):
+            return None
+        try:
+            if request.inputs_ready is None:  # CPU: host times
+                times = {stage: (began - request.ready_at, ended - request.ready_at)
+                         for stage, (began, ended, _) in request.timing.items()}
+            else:
+                since = request.inputs_ready.elapsed_time
+                times = {stage: (since(began) / 1000, since(ended) / 1000)
+                         for stage, (began, ended, _) in request.timing.items()}
+        except RuntimeError:  # an event recorded without timing, before the sink was set
+            return None
+        stages = {}
+        for stage, (began, ended) in times.items():
+            ready = max((times[upstream][1] for upstream in self.stages[stage].depends_on), default=0.0)
+            stages[stage] = StageStats(wait=began - ready, execution=ended - began, batch_size=request.timing[stage][2])
+        return RequestStats(admission_wait=request.admitted_at - request.submitted_at, stages=stages)
 
     def _fail_request(self, request: _Request, exc: BaseException, *, after: Any = None) -> None:
         """Finish ``request``, then fail its future with ``exc`` unless the future is already done.

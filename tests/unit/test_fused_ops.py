@@ -92,6 +92,110 @@ def test_add_rms_norm_is_the_rounded_sum_and_its_norm():
     assert torch.equal(fused.rms_norm_cast(x, w, 1e-6), reference.rms_norm(x, w, 1e-6))
 
 
+def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path):
+    """A package whose library lacks the unified entries' functions (another build, such as the MXFP8 one) would fail
+    at the first GEMM: the fused operators stay on their references."""
+    import sys
+    import types
+
+    from xinfer.ops.backends import xcompute_bf16
+
+    path = tmp_path / "xcompute.so"
+    path.write_bytes(b"")
+    package = types.ModuleType("xcompute")
+    package.KERNEL_LIB_PATH = str(path)
+    for name in xcompute_bf16.UNIFIED:
+        setattr(package, name, object())
+    monkeypatch.setitem(sys.modules, "xcompute", package)
+    monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
+
+    class Library:
+        def __init__(self, functions):
+            self.path, self.functions = str(path), functions
+
+        def has_function(self, name):
+            return name in self.functions
+
+    assert xcompute_bf16._python_package(Library(xcompute_bf16.LIBRARY_ENTRIES)) is package
+    assert xcompute_bf16._python_package(Library(())) is None
+
+
+def _fake_package(monkeypatch, tmp_path):
+    """A stand-in ``xcompute`` package whose library is ``tmp_path/xcompute.so``, importable as ``xcompute``."""
+    import importlib.machinery
+    import sys
+    import types
+
+    from xinfer.ops.backends import xcompute_bf16
+
+    path = tmp_path / "xcompute.so"
+    path.write_bytes(b"")
+    package = types.ModuleType("xcompute")
+    package.__spec__ = importlib.machinery.ModuleSpec("xcompute", None)
+    package.KERNEL_LIB_PATH = str(path)
+    for name in xcompute_bf16.UNIFIED:
+        setattr(package, name, object())
+    monkeypatch.setitem(sys.modules, "xcompute", package)
+    monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
+    return package
+
+
+@pytest.mark.parametrize("archs,platforms", [("110,120", ("sm110", "sm120")), ("120", ("sm120",)), ("", None)])
+def test_xcompute_operators_register_on_the_architectures_the_build_targets(monkeypatch, tmp_path, archs, platforms):
+    from xinfer.ops.backends import xcompute_bf16
+
+    package = _fake_package(monkeypatch, tmp_path)
+
+    class Library:
+        path = package.KERNEL_LIB_PATH
+
+        def has_function(self, name):
+            return True
+
+        def function(self, name):
+            assert name == "build_target_archs"
+            return lambda: archs
+
+        def call(self, name, *args):
+            raise AssertionError("no kernel runs at registration")
+
+    class Registry:
+        def __init__(self):
+            self.platforms = {}
+
+        def register(self, op, *, platforms, **kwargs):
+            self.platforms[op] = platforms
+            return lambda function: function
+
+    registry = Registry()
+    names = xcompute_bf16.register(registry, Library(), "xcompute", "v")
+    if platforms is None:
+        assert names == [] and registry.platforms == {}
+    else:
+        assert set(names) == set(registry.platforms) and set(names) == {*FUSED, "rms_norm"}
+        assert set(registry.platforms.values()) == {platforms}
+
+
+def test_the_xcompute_library_comes_from_the_installed_package(monkeypatch, tmp_path):
+    from xinfer.ops.backends import xcompute
+
+    package = _fake_package(monkeypatch, tmp_path)
+    assert xcompute._package_library() == package.KERNEL_LIB_PATH
+    monkeypatch.setattr(xcompute.importlib.util, "find_spec", lambda name: None)
+    assert xcompute._package_library() is None
+
+
+def test_xinfer_xcompute_0_skips_the_xcompute_backend(monkeypatch):
+    from xinfer.ops.backends import xcompute
+    from xinfer.ops.registry import OpRegistry
+
+    calls = []
+    monkeypatch.setattr(xcompute, "register", lambda registry: calls.append(registry))
+    monkeypatch.setenv("XINFER_XCOMPUTE", "0")
+    monkeypatch.setenv("XINFER_FLASH_ATTN", "0")
+    assert "xcompute" not in OpRegistry().load_plugins() and calls == []
+
+
 # --------------------------------------------------------------------------- xcompute (GPU, RTX 5090)
 XCOMPUTE = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
 gpu = pytest.mark.skipif(not (XCOMPUTE and torch.cuda.is_available()
@@ -111,7 +215,7 @@ def xc():
         registry.define(ops.registry.spec(name))
     library = xcompute.register(registry, XCOMPUTE)
     if "gemm_epilogue" not in library.registered:
-        pytest.skip("needs the SM120 BF16 kernels and the xcompute Python package of the same build")
+        pytest.skip("needs a build of xcompute main and the xcompute Python package of the same build")
     missing = set(FUSED) - set(library.registered)
     assert not missing, missing
     return registry.build_table(resolve_platform("cuda"))
@@ -168,3 +272,19 @@ def test_xcompute_matches_the_references_at_wall_oss_shapes(xc):
     _check(xc, "prefix_kvcache_attention", (r(1, m, 16, 128), r(1, p + m, 2, 128), r(1, p + m, 2, 128),
                                             torch.tensor([p], dtype=torch.int32, device="cuda"), p),
            kwargs=dict(flash_mask=flash_mask.contiguous()), relative=0.01)
+
+
+@gpu
+@pytest.mark.gpu
+def test_xcompute_gemm_packs_a_weight_only_a_packed_layout_lists(xc):
+    """At 16 rows xcompute lists the gate/up GEMM only for a packed weight: the binding packs the raw weight and runs
+    the listed kernel."""
+    import xcompute
+
+    g = torch.Generator().manual_seed(17)
+    x = _randn(16, 1024, dtype=BF16, device="cuda", generator=g)
+    w = _randn(4096, 1024, scale=1 / 32, dtype=BF16, device="cuda", generator=g)
+    packed = xcompute.prepack_weight(w, op="gemm_glu")
+    assert xcompute.selected_backend("gemm_glu", x, w, activation="silu") == "generic"
+    assert xcompute.selected_backend("gemm_glu", x, packed, activation="silu") != "generic"
+    assert torch.equal(xc.gemm_glu_epilogue(x, w), xcompute.gemm_glu(x, packed, activation="silu"))

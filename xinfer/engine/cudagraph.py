@@ -167,8 +167,8 @@ class LaneCUDAGraphs:
         warmed_up: set by ``finish_warmup``; misses afterwards follow ``policy.on_miss_after_warmup``.
         warmup_inputs: ``{stage: [inputs, ...]}`` of the graphs captured at batch size 1 before ``finish_warmup``,
             for ``capture_batch_sizes``; cleared by ``finish_warmup``.
-        stats: counters ``captures``, ``replays``, ``eager``, ``evictions`` (LRU and static-buffer growth) and
-            ``capture_ms`` (total capture time, eager pre-runs included).
+        stats: counters ``captures`` (of which ``captures_after_warmup``), ``replays``, ``eager``, ``evictions`` (LRU
+            and static-buffer growth) and ``capture_ms`` (total capture time, eager pre-runs included).
     """
 
     def __init__(self, model: VLAModel, stream: torch.cuda.Stream, device: str, policy: CUDAGraphConfig,
@@ -194,7 +194,7 @@ class LaneCUDAGraphs:
         self._reads: dict[str, set[str]] = reads if reads is not None else {}
         self.warmed_up = False
         self.warmup_inputs: dict[str, list[Mapping[str, Any]]] = {}
-        self.stats = dict(captures=0, replays=0, eager=0, evictions=0, capture_ms=0.0)
+        self.stats = dict(captures=0, captures_after_warmup=0, replays=0, eager=0, evictions=0, capture_ms=0.0)
 
     # -------------------------------------------------------------- keys
     def _key(self, stage: str, batch_size: int, inputs: Mapping[str, Any]) -> tuple:
@@ -296,6 +296,7 @@ class LaneCUDAGraphs:
                 return self._eager(stage, batch_size, inputs, stage_function)
             if self.warmed_up:
                 logger.warning("capturing a graph after warmup for %s: %s", stage, key[2])
+                self.stats["captures_after_warmup"] += 1
             captured = self._capture(stage, batch_size, inputs, stage_function)
             key = self._key(stage, batch_size, inputs)  # reads may have grown during capture
             if not self.warmed_up and batch_size == 1:

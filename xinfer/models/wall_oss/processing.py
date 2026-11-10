@@ -82,9 +82,8 @@ class ProcessingConfig:
         rtc_wire_delay_range: Inclusive range admitted for the raw wire ``inference_delay`` of RTC requests.
         noise_seed: Seed of the CPU generator of the initial flow noise; ``None`` seeds from the OS.
         prompt_bucket: Prompts are padded at their end, before the action tokens, to a multiple of this many
-            tokens (``pad_prompt``); 0 keeps their exact length. Padding leaves the actions unchanged bit for
-            bit with batch-invariant action-stage operators, which ``WallOSS.from_checkpoint`` requires when it
-            is set.
+            tokens (``pad_prompt``); 0 keeps their exact length. The padding is masked out, so it changes the
+            actions at rounding level only.
         resize_factor: ``smart_resize`` grid factor in pixels (patch size · merge size).
         min_pixels: ``smart_resize`` lower bound on the pixel count.
         max_pixels: ``smart_resize`` upper bound on the pixel count.
@@ -135,7 +134,7 @@ class ProcessingConfig:
         check_image_preprocess_device(self.image_preprocess_device)
 
     def bucket_spec(self) -> BucketSpec:
-        """The prompt policy (``WallOSS.from_checkpoint`` requires batch-invariant action-stage operators to pad)."""
+        """The prompt policy: pad to multiples of ``prompt_bucket`` tokens (0: exact lengths)."""
         return BucketSpec(self.prompt_bucket)
 
 

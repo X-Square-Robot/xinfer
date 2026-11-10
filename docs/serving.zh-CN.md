@@ -32,7 +32,7 @@ robot ◀──WebSocket── frontend: release the buffer → OutputProcessor 
 准入、组批和各阶段见 [engine.md](engine.zh-CN.md)，设备图像线程见[设备图像](engine.zh-CN.md#设备图像)。
 
 - **前端**从不初始化 CUDA。每个前端拥有一个共享内存缓冲区环；缓冲区在其响应返回后复用。每个前端在 `--frontend-workers` 个线程（默认 4）上处理请求，因此不同连接的请求同时处理；单个连接仍然一次只发送一个请求。
-- **引擎进程。** 加载模型，运行引擎（见 [engine.md](engine.zh-CN.md)），映射这些缓冲区并将其注册为锁页（pinned）主机内存，使上传可直接读取它们。在 `processing.image_preprocess_device="gpu"` 时，前端只读取 JPEG 文件头；`DeviceImage` 值中的 JPEG 字节和原始帧经缓冲区传递，其大小写在清单（manifest）中，引擎直接从缓冲区解码 JPEG（[配置](configuration.zh-CN.md#在-gpu-上做图像预处理)）。
+- **引擎进程。** 加载模型，运行引擎（见 [engine.md](engine.zh-CN.md)），映射这些缓冲区并将其注册为锁页（pinned）主机内存，使上传可直接读取它们。在 `image_preprocess_device="gpu"` 时，前端只读取 JPEG 文件头；`DeviceImage` 值中的 JPEG 字节和原始帧经缓冲区传递，其大小写在清单（manifest）中，引擎直接从缓冲区解码 JPEG（[配置](configuration.zh-CN.md#在-gpu-上做图像预处理)）。
 - **启动。** 前端在引擎完成预热之后才开始监听，因此端口打开即表示已就绪。使用 `--warmup` 时，每个前端先让预热请求经过模型的 InputProcessor，并用引擎对这些请求的输出运行 OutputProcessor，这样最先接入的机器人不必承担首次调用的开销（如 numba 编译）。这些调用使用专为预热构建的处理器；服务用的处理器不会从中继承任何状态。
 
 ## 协议
@@ -54,6 +54,7 @@ robot ◀──WebSocket── frontend: release the buffer → OutputProcessor 
 
   凡 `status` 不是 `"ok"` 的响应都应计为失败。
 - 同一端口上的 `GET /healthz`（或 `/ready`）返回 200。
+- 同一端口上的 `GET /metrics` 返回引擎和所有前端的 Prometheus 指标（[指标](metrics.zh-CN.md)）。
 
 ## 运行
 
@@ -67,10 +68,12 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/5_2500
 |---|---|
 | `--model-options` | 传给 `from_checkpoint` 和 `build_processors` 的 JSON（Wall-OSS：`processing` = `ProcessingConfig` 的字段） |
 | `--frontends`, `--frontend-workers`, `--shm-buffers`, `--shm-buffer-mib` | 前端进程数（默认 2）、每个前端的处理线程数（默认 4）和每个前端的共享内存缓冲区数；缓冲区大小 |
-| `--lanes`, `--max-batch`, `--allow-non-invariant-batching`, `--max-running-requests`, `--max-queued-requests`, `--per-robot-inflight` | 引擎设置（[engine.md](engine.zh-CN.md)）；会经过检查，从不改写 |
+| `--lanes`, `--max-batch`, `--max-running-requests`, `--max-queued-requests`, `--per-robot-inflight` | 引擎设置（[engine.md](engine.zh-CN.md)）；会经过检查，从不改写 |
 | `--enforce-eager` | 以 eager 模式运行所有阶段，不使用 CUDA graph（默认：平台支持捕获时使用 CUDA graph）；`--warmup` 请求文件（JSON 或 msgpack，每个文件一个请求或一个列表）：在开始服务之前，按模型从中推导出的每个形状桶（一个 flow 请求和一个 RTC 请求即可覆盖 Wall-OSS），在每个通道和每个允许的批大小上捕获它们的 graph，并由每个前端让它们经过模型的处理器 |
 | `--tuned` | 调优表选择：`auto`、`none` 或路径 |
 | `--resolved-config`, `--dry-run` | 写出解析后的设置及其来源；打印这些设置后退出 |
+| `--profile-dir` | 记录引擎的 span，停止时把每个请求的引擎分段写到该目录；用于剖析运行（`xinfer-profile load --serve`，[剖析](profiling.zh-CN.md#经过-xinfer-serve--serve)），记录随请求数增长 |
+| `--disable-metrics` | 不记录 Prometheus 指标；`GET /metrics` 返回 404（[指标](metrics.zh-CN.md)） |
 | `--reference-ops`, `--op-backends` | 只使用 torch 参考算子；为每个算子固定后端（`op=backend,...`），固定的后端优先于 `--reference-ops` |
 
 SIGINT/SIGTERM 会停止前端，释放 graph 和锁页缓冲区，并以 0 退出。服务每 0.5 s 检查一次 `Engine.health()`；当引擎无法继续服务（引擎线程或完成线程已停止）时，它以同样的方式关闭并以 1 退出，以便其监管进程重启它。
