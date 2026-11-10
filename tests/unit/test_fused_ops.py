@@ -97,13 +97,13 @@ def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path)
     import sys
     import types
 
-    from xinfer.ops.backends import xcompute_bf16
+    from xinfer.ops.backends import xcompute_unified
 
     path = tmp_path / "xcompute.so"
     path.write_bytes(b"")
     package = types.ModuleType("xcompute")
     package.KERNEL_LIB_PATH = str(path)
-    for name in xcompute_bf16.UNIFIED:
+    for name in xcompute_unified.UNIFIED:
         setattr(package, name, object())
     monkeypatch.setitem(sys.modules, "xcompute", package)
     monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
@@ -115,8 +115,8 @@ def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path)
         def has_function(self, name):
             return name in self.functions
 
-    assert xcompute_bf16._python_package(Library(xcompute_bf16.LIBRARY_ENTRIES)) is package
-    assert xcompute_bf16._python_package(Library(())) is None
+    assert xcompute_unified._python_package(Library(xcompute_unified.LIBRARY_ENTRIES)) is package
+    assert xcompute_unified._python_package(Library(())) is None
 
 
 def _fake_package(monkeypatch, tmp_path):
@@ -125,14 +125,14 @@ def _fake_package(monkeypatch, tmp_path):
     import sys
     import types
 
-    from xinfer.ops.backends import xcompute_bf16
+    from xinfer.ops.backends import xcompute_unified
 
     path = tmp_path / "xcompute.so"
     path.write_bytes(b"")
     package = types.ModuleType("xcompute")
     package.__spec__ = importlib.machinery.ModuleSpec("xcompute", None)
     package.KERNEL_LIB_PATH = str(path)
-    for name in xcompute_bf16.UNIFIED:
+    for name in xcompute_unified.UNIFIED:
         setattr(package, name, object())
     monkeypatch.setitem(sys.modules, "xcompute", package)
     monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
@@ -141,7 +141,7 @@ def _fake_package(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("archs,platforms", [("110,120", ("sm110", "sm120")), ("120", ("sm120",)), ("", None)])
 def test_xcompute_operators_register_on_the_architectures_the_build_targets(monkeypatch, tmp_path, archs, platforms):
-    from xinfer.ops.backends import xcompute_bf16
+    from xinfer.ops.backends import xcompute_unified
     from xinfer.ops.registry import OpRegistry
 
     package = _fake_package(monkeypatch, tmp_path)
@@ -163,7 +163,7 @@ def test_xcompute_operators_register_on_the_architectures_the_build_targets(monk
     registry = OpRegistry()
     for name in ops.registry.names():
         registry.define(ops.registry.spec(name))
-    xcompute_bf16.register_unified(registry, Library())
+    xcompute_unified.register_unified(registry, Library())
     names = registry.backend_ops("xcompute")
     if platforms is None:
         assert names == []
