@@ -97,7 +97,7 @@ class RopeTables:
         return self._rotary(x, cos, sin)
 
     def packed(self) -> torch.Tensor:
-        """``mxfp8.rope_table`` of the FP32 values: ``[D/4, B·L, 4]``.
+        """``layout.mxfp8.rope_table`` of the FP32 values: ``[D/4, B·L, 4]``.
 
         Entry ``[i, m]`` is ``(cos[m, 2i], sin[m, 2i], cos[m, 2i+1], sin[m, 2i+1])`` of the band-selected,
         unrounded half tables; read by ``mxfp8_gemm_rope``. Built once per ``RopeTables``.
@@ -106,7 +106,7 @@ class RopeTables:
             ``[D/4, B·L, 4]`` FP32.
         """
         if self._packed is None:
-            from xinfer.ops.mxfp8 import rope_table
+            from xinfer.ops.layout.mxfp8 import rope_table
 
             cos, sin = (self._select(t) for t in (self._cos, self._sin))
             self._packed = rope_table(cos.reshape(-1, cos.shape[-1]), sin.reshape(-1, sin.shape[-1]))

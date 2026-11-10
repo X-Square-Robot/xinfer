@@ -99,7 +99,7 @@ def composition(request, tiny, tiny_optimized):
 
 
 def _request(model, delay=0, rtc_rows=0, seed=1):
-    from xinfer.layers.vision.qwen2_5_vit import vision_layout
+    from xinfer.models.layers.vision.qwen2_5_vit import vision_layout
     from xinfer.models.wall_oss.model import vision_config
 
     g = torch.Generator().manual_seed(seed)
@@ -146,7 +146,7 @@ def test_split_equals_joint_prefill_action_forward(tiny):
         p = x["prompt_len"]
         # Joint pass: prompt rows through expert 0, action rows through expert 1,
         # one attention over both with prompt rows blind to action rows.
-        from xinfer.layers.rotary import mrope_cos_sin
+        from xinfer.models.layers.rotary import mrope_cos_sin
 
         h0 = tiny.embed_tokens[x["input_ids"][:, :p]]
         h0 = h0.masked_scatter((x["input_ids"][:, :p] == IMAGE_TOKEN)[..., None].expand_as(h0), image)

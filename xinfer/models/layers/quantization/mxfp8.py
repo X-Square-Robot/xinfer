@@ -31,8 +31,8 @@ from __future__ import annotations
 import torch
 
 from xinfer.ops import active_ops
-from xinfer.ops import mxfp8 as fmt
-from xinfer.quantization.base import METHODS, GatedLayout, QKVLayout, QuantMethod
+from xinfer.ops.layout import mxfp8 as fmt
+from xinfer.models.layers.quantization.base import METHODS, GatedLayout, QKVLayout, QuantMethod
 
 
 class MXFP8(QuantMethod):

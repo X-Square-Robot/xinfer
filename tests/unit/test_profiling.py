@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from xinfer import ops
-from xinfer.layers.basic import RMSNorm
+from xinfer.models.layers.basic import RMSNorm
 from xinfer.observability import annotate
 from xinfer.ops import Contract, OpRegistry, OpSpec, use_ops
 from xinfer.platforms import resolve_platform
@@ -38,10 +38,11 @@ def _registry():
     reg, calls = OpRegistry(), []
     reg.define(OpSpec("mm", "mm(x, w, *, scale=1.0)", lambda x, w, *, scale=1.0: x @ w * scale))
 
-    @reg.register("mm", backend="fast", contract=Contract(numerics="tolerance"), priority=5)
     def fast(x, w, *, scale=1.0):
         calls.append("fast")
         return x @ w * scale
+
+    reg.add("mm", fast, backend="fast", contract=Contract(numerics="tolerance"), priority=5)
 
     return reg, fast, calls
 

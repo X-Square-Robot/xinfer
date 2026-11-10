@@ -83,18 +83,13 @@ def test_rtc_pinned_mask():
 
 # ------------------------------------------------------------------ flash-attn (GPU)
 def _flash_table():
-    from xinfer.ops.backends import flash_attn
-    from xinfer.ops.registry import OpRegistry
+    from xinfer.ops.backends.cuda import attn
 
-    if not (torch.cuda.is_available() and flash_attn.available()):
+    if not (torch.cuda.is_available() and attn.flash_attn is not None):
         pytest.skip("flash-attn + CUDA required")
-    reg = OpRegistry()
     names = ("varlen_attention", "causal_attention", "action_attention", "prefix_attention", "kvcache_attention")
-    for name in names:
-        reg.define(ops.registry.spec(name))
-    flash_attn.register(reg)
-    table = reg.build_table(resolve_platform("cuda"))
-    assert all(table.selection(n).backend == "flash_attn" for n in names)
+    table = ops.registry.build_table(resolve_platform("cuda"))
+    assert all(table.selection(n).name == "cuda:flash_attn" for n in names)
     return table
 
 

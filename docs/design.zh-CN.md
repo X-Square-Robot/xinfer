@@ -58,7 +58,7 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 | §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过 quick100 门禁。 |
 | §12 量化 | 部分实现 | 框架支持按模块组配置 `QuantConfig`。Wall-OSS 使用 BF16。MXFP8 和 NVFP4 具有 PyTorch 参考实现，详见[量化](quantization.zh-CN.md)。 |
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
-| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn，与 `xinfer.ops` entry point 按同一协议加载（§14.2）；`xinfer.ops.conformance` 未实现 |
+| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn，由 `cuda` 后端模块注册，与 `xinfer.ops` entry point 一起加载（§14.2）；`xinfer.ops.conformance` 未实现 |
 | §15 协议与前端 | 部分实现 | WebSocket + msgpack，兼容 x2robot 客户端；`xinfer.Policy` 进程内 API；Client SDK 与兼容适配未实现 |
 | §16 可观测性与基准工具 | 部分实现 | 服务通过 [/metrics](metrics.zh-CN.md) 导出 Prometheus 指标。使用[压测工具](benchmark.zh-CN.md)测单请求延迟和闭环容量，或用 [xinfer-profile](profiling.zh-CN.md) 分析算子、排队及各阶段执行时间。 |
 | §17 测试 | 部分实现 | CPU 单元与契约测试；GPU 与资产测试需要本地资产，手动运行；CI（`.gitlab-ci.yml`）只跑 ruff 与 CPU 测试 |
@@ -139,7 +139,7 @@ Wall-OSS 各项测量的条件见性能和验证指南。
  └──────┬──────────────────────────────────────────────────────────┘
         │ 阶段函数
  ┌──────▼──────────────────────────────────────────────────────────┐
- │ models/ · layers/ · quantization/ · loader/                      │
+ │ models/（含 models/layers/ 与其 quantization/）· loader/        │
  └──────┬──────────────────────────────────────────────────────────┘
         │ ops.<name>(...)
  ┌──────▼──────────────────────────────────────────────────────────┐
@@ -160,14 +160,14 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 
 | 模块 | 可以依赖 | 不得依赖 |
 |---|---|---|
-| `engine/` | `platforms/`、模型接口（抽象类）、`observability.annotate`（阶段 span） | 任何具体模型、量化方法、kernel 包；`config/`、`layers/`、`loader/`、`ops/`、`frontend/` |
-| `models/` | `layers/`、`ops/`、`quantization/` 接口、`loader/` | `engine/` 内部、具体平台 |
-| `layers/`、`quantization/` | `ops/` | 具体 kernel 包（只能经 ops 注册） |
+| `engine/` | `platforms/`、模型接口（抽象类）、`observability.annotate`（阶段 span） | 任何具体模型、量化方法、kernel 包；`config/`、`models/layers/`、`loader/`、`ops/`、`frontend/` |
+| `models/` | `models/layers/`（含 `models/layers/quantization/` 接口）、`ops/`、`loader/` | `engine/` 内部、具体平台 |
+| `models/layers/`（含 `models/layers/quantization/`） | `ops/` | 具体 kernel 包（只能经 ops 注册） |
 | `ops/` | `platforms/` | 模型、`observability/` |
 | `frontend/` | 模型的 Input/OutputProcessor | `engine/` 等运行时内部；`torch.cuda` 与任何设备运行时（Frontend 进程不初始化 CUDA 或其他设备运行时） |
-| `config/` | `platforms/`、`engine/`（`EngineConfig`）、已构建的模型 | `frontend/`、`layers/`、`loader/` |
-| `loader/` | 无 | `models/`、`layers/`、`engine/` |
-| `observability/` | `ops/`、`platforms/` | `engine/`、`models/`、`layers/`、`frontend/`、`quantization/`、`loader/`、`config/` |
+| `config/` | `platforms/`、`engine/`（`EngineConfig`）、已构建的模型 | `frontend/`、`models/layers/`、`loader/` |
+| `loader/` | 无 | `models/`、`models/layers/`、`engine/` |
+| `observability/` | `ops/`、`platforms/` | `engine/`、`models/`、`models/layers/`、`frontend/`、`loader/`、`config/` |
 | `entrypoints/` | 以上任何包 | 无（其他包都不依赖它） |
 
 启动顺序是：构建模型（算子在此时选定）→ `config.resolve` 读取已构建模型的 `capabilities()` 与平台能力 → 创建 Engine。所以已构建模型支持的能力（例如批大小）经模型接口交给 engine，engine 不依赖 ops，也不依赖 config；Frontend 的共享内存与 Engine 之间由 `entrypoints/serve.py` 衔接，engine 不依赖 frontend。
@@ -527,7 +527,7 @@ class Platform:
 - **dtype 与量化是能力。** `supported_dtypes` 缺少模型所需的 dtype（例如部分 NPU 没有 bf16），或 `supported_quant` 不含所选量化方法时，在配置解析阶段报错，不等到模型构建。
 - **外部平台**通过 `xinfer.platforms` 入口注册（§18.3），内置的 cuda 和 cpu 走同一机制。
 - `ipc`、`mps`、`spatial_partition` 在 v1 没有代码读取（§9.3），需要时再加入。
-- **核心按能力判断，不按身份判断。** Platform 不提供 `is_cuda()` 一类的身份谓词；`engine/`、`layers/`、`models/` 只读 caps，未声明的 caps 取保守值（不支持）。Platform 的每个方法都必须有核心里的调用方和契约测试，否则不加（SGLang 的平台接口里有一批核心并未调用的方法，核心仍硬编码 `torch.cuda`，覆盖无效）。
+- **核心按能力判断，不按身份判断。** Platform 不提供 `is_cuda()` 一类的身份谓词；`engine/`、`models/layers/`、`models/` 只读 caps，未声明的 caps 取保守值（不支持）。Platform 的每个方法都必须有核心里的调用方和契约测试，否则不加（SGLang 的平台接口里有一批核心并未调用的方法，核心仍硬编码 `torch.cuda`，覆盖无效）。
 
 ### 13.2 首批平台
 
@@ -580,24 +580,28 @@ XInfer 作为开源项目接入不同厂商的芯片，厂商包在树外维护�
 
 ### 14.2 后端注册与选择
 
-扩展通过 `xinfer.ops` 入口点导出 `register(registry) -> list[str]`。`OpRegistry.load_plugins()` 先加载内置的 xcompute 和 flash-attn，再加载入口点。注册函数返回本次注册的算子名，依赖不可用时返回空列表。
-
-后端调用 `registry.implementer(...)` 设置平台、版本、优先级和公共数值契约。下面展示 flash-attn 后端如何注册一个实现。
+后端指实现运行的硬件（`cuda`）；torch 参考实现（`reference`）在所有平台上运行。每个后端是 `xinfer/ops/backends/` 下的一个包，每类算子一个模块（`cuda/attn.py`、`gemm.py`、`norm.py`、`flow.py`）。每个模块像使用普通库一样直接 import 它调用的 kernel 库，在模块顶层用同一个 `xinfer.ops.register` 声明实现，并把库作为 `requires` 传入。库 import 失败时为 None：其实现不注册，这些算子运行参考实现。xcompute 以后会支持 CUDA 之外的后端，由各后端共用的 `backends/_xcompute.py` import 一次，它检查 Python 包与共享库是否属于同一构建，并把构建目标架构作为 `platforms` 传入。
 
 ```python
-implements = registry.implementer("flash_attn", platforms=("cuda",), version=f"flash-attn {flash_attn.__version__}")
+try:
+    import flash_attn
+except ImportError:
+    flash_attn = None
 
-@implements("causal_attention")
-def _causal(q, k, v, *, scale=None): ...
+@register("causal_attention", backend="cuda", requires=flash_attn)
+def causal_attention(q, k, v, *, scale=None): ...
 ```
 
-- 在模型构建时选定实现，不在每次调用时分派。
+`register` 直接写入进程级 registry，因此 import 后端模块即完成其实现的注册；`OpRegistry.load_plugins()` 先 import 内置后端模块，再 import `xinfer.ops` 入口点指向的模块。`OpRegistry.add` 是写入 registry 的唯一入口，它检查每个实现的参数与算子参考实现一致后，以 `backend:library`（`cuda:xcompute`）注册。`XINFER_XCOMPUTE=0` 和 `XINFER_FLASH_ATTN=0` 不使用对应的库。进程级 registry 在第一次 `build_table` 前自动加载插件。固定选择（`--op-backends`）可以写后端、库或两者。
+
+- 在模型构建时选定实现，不在每次调用时分派。只支持算子部分调用的实现自行把其余调用交给参考实现，例如 xcompute 的 `prefix_kvcache_attention` 对 kernel 不支持的 cache 形状就这样处理。
+- 在 CUDA 设备上，模型调用的算子落到融合算子的参考实现时，一条告警列出这些算子。`XINFER_OPS_STRICT=1` 把这条告警变成错误（用于 CI 和 benchmark）。
 - 选择结果和库版本、哈希写入引擎元数据，启动时打印"算子选择表"。
 - 缺少实现时显式失败；也可配置为回退到参考实现，并告警。
 
 **算子绑定策略：**
 
-- **默认路径**：xcompute 通过 TVM-FFI 接入，由 `xinfer/ops/backends/xcompute.py` 统一包装并注册到 XInfer 的算子注册表。
+- **默认路径**：xcompute 通过 TVM-FFI 接入，由 `xinfer/ops/backends/_xcompute.py` import，`xinfer/ops/backends/cuda/` 的模块把其算子注册到 XInfer 的算子注册表。
 - **按需适配**：当某个算子有明确的 `torch.compile`、`torch.export` 等 PyTorch 集成需求时，再增加 `torch.library` 注册。包装层复用已有底层实现，可通过 TVM-FFI 调用同一份 xcompute kernel，不要求维护两套 kernel。
 - **职责边界**：`torch.library` 适配负责算子签名、输入修改与别名声明，以及所需的 FakeTensor／形状推导规则；硬件实现选择和数值策略仍由 XInfer 的算子注册表与契约管理。
 - **统一调用面**：模型和 layer 只调用 XInfer 的算子接口，不直接依赖绑定方式。注册到 XInfer 不等于注册为 PyTorch 自定义算子。
@@ -745,21 +749,21 @@ XInfer/
 │   │   │   ├── model.py            # 阶段图与三个阶段函数（组装 layers）
 │   │   │   ├── processing.py       # IOSchema、Input/OutputProcessor
 │   │   │   └── weights.py          # 权重映射
-│   ├── layers/                     # 跨模型复用的构件，只调用 ops
-│   │   ├── linear.py               # 量化感知 Linear（委托 QuantMethod）
-│   │   ├── attention.py            # 视觉双向 / 前缀 prefill / 联合注意力
-│   │   ├── norm.py                 # RMSNorm、adaRMS
-│   │   ├── rotary.py               # RoPE、M-RoPE
-│   │   ├── mlp.py
-│   │   ├── image_pack.py           # uint8 视图 → 归一化图像 / patch（设备上）
-│   │   ├── vision/                 # qwen2_5_vit.py
-│   │   ├── backbones/              # qwen2_5.py
-│   │   └── action/                 # wallx_expert.py、flow.py（含 RTC）
-│   ├── quantization/
-│   │   ├── base.py                 # QuantMethod、QuantConfig、按模块策略匹配
-│   │   ├── bf16.py
-│   │   ├── mxfp8.py
-│   │   └── nvfp4.py                # M2
+│   │   └── layers/                 # 跨模型复用的构件，只调用 ops
+│   │       ├── linear.py           # 量化感知 Linear（委托 QuantMethod）
+│   │       ├── attention.py        # 视觉双向 / 前缀 prefill / 联合注意力
+│   │       ├── norm.py             # RMSNorm、adaRMS
+│   │       ├── rotary.py           # RoPE、M-RoPE
+│   │       ├── mlp.py
+│   │       ├── image_pack.py       # uint8 视图 → 归一化图像 / patch（设备上）
+│   │       ├── vision/             # qwen2_5_vit.py
+│   │       ├── backbones/          # qwen2_5.py
+│   │       ├── action/             # wallx_expert.py、flow.py（含 RTC）
+│   │       └── quantization/       # Linear 怎么存权重、调用哪些算子
+│   │           ├── base.py         # QuantMethod、QuantConfig、按模块策略匹配
+│   │           ├── bf16.py
+│   │           ├── mxfp8.py
+│   │           └── nvfp4.py        # M2
 │   ├── loader/
 │   │   ├── safetensors.py          # 分片读取、dtype 转换
 │   │   └── mapping.py              # 权重映射规则引擎（重命名、拆分、合并）
@@ -772,9 +776,11 @@ XInfer/
 │   ├── ops/
 │   │   ├── spec.py                 # 算子签名与数值契约
 │   │   ├── registry.py             # 后端注册、构建时选择、选择表
-│   │   ├── reference/              # torch 参考实现：gemm、attention、norm、rope、image、sampler
+│   │   ├── reference/              # 所有平台上的 torch 参考实现：基础算子、fused.py、mxfp8.py、nvfp4.py
+│   │   ├── layout/                 # 低精度格式的存储布局：mxfp8.py、nvfp4.py
 │   │   ├── backends/
-│   │   │   └── xcompute.py         # 绑定并注册 xcompute 实现（现用 TVM-FFI）
+│   │   │   ├── _xcompute.py        # import xcompute 库（现用 TVM-FFI），各后端共用
+│   │   │   └── cuda/               # 每类算子一个模块：attn.py、gemm.py、norm.py、flow.py
 │   │   └── conformance/            # 一致性测试套件（xcompute 仓库 CI 也运行）
 │   │       ├── cases.py            # 各算子的形状与 dtype 用例，取自首批模型
 │   │       └── checks.py           # 数值、确定性、图捕获检查
@@ -821,7 +827,7 @@ XInfer/
 | 项 | 约定 |
 |---|---|
 | 实现 | xcompute 提供各平台的 GEMM、量化融合、注意力、norm/RoPE、图像处理等高性能算子，范围由首批模型的算子清单驱动 |
-| 绑定 | 默认由 XInfer 的 `ops/backends/xcompute.py` 通过 TVM-FFI 包装并注册；按明确的 PyTorch 集成需求增加复用底层实现的 `torch.library` 适配（§14.2） |
+| 绑定 | 默认由 XInfer 的 `ops/backends/cuda/` 通过 TVM-FFI 包装并注册；按明确的 PyTorch 集成需求增加复用底层实现的 `torch.library` 适配（§14.2） |
 | 验证 | xcompute 自有测试之外，在其 CI 中运行 `xinfer.ops.conformance`，交付 microbenchmark 与 roofline 表；XInfer 为新增的 `torch.library` 适配补充 §14.1、§17 的验证 |
 | 版本与发布 | 按平台交付构建产物，记录库版本、哈希和支持能力；XInfer 校验兼容范围与构建指纹（§14.3） |
 | 第三方依赖 | 由 xcompute 维护来源与许可记录，公开发布前完成审查 |
@@ -853,9 +859,9 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 
 | 里程碑 | 主要落在 |
 |---|---|
-| M0 | `platforms/`、`ops/`、`layers/`、`models/wall_oss`、引擎阶段与 slot、Policy 和基准测试入口 |
+| M0 | `platforms/`、`ops/`、`models/layers/`、`models/wall_oss`、引擎阶段与 slot、Policy 和基准测试入口 |
 | M1 | `frontend/`（多进程）、`engine/scheduler/` 全部、`memory/planner.py`、`config/resolve.py`、`benchmarks/fleet.py`、`tune.py`、`tuned/`、`client/` |
-| M2 | `quantization/nvfp4.py`、精度门禁和扩展模型所用的构件 |
+| M2 | `models/layers/quantization/nvfp4.py`、精度门禁和扩展模型所用的构件 |
 | M3 | 兼容适配、Router、文档、Docker 镜像、GitHub 发布 |
 
 ### 18.5 关键文件的迁移来源
@@ -867,7 +873,7 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 | `engine/scheduler/batching.py` | embodied-serving `multiprocess/batching.py`（`BatchIssuer` 规则） |
 | `frontend/shm.py`、`worker.py` | embodied-serving 的共享内存传输与前端工作进程 |
 | `models/wall_oss/` | HarriX `mxfp8-sm120` / `mxfp8-thor`，拆为共享 layers 与模型文件 |
-| `ops/backends/xcompute.py` | embodied-serving `adapters/wallx/mxfp8_ops.py`、HarriX 各 track 的 `ops.py` |
+| `ops/backends/_xcompute.py` | embodied-serving `adapters/wallx/mxfp8_ops.py`、HarriX 各 track 的 `ops.py` |
 | `config/schema.py` | HarriX `launch_config.py` 的严格加载方式 |
 
 ---

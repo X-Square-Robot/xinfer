@@ -4,7 +4,7 @@
 
 Wall-OSS 默认的 BF16 组合在 CUDA 上使用 xcompute 融合算子。没有兼容的 xcompute 构建时，XInfer 用 PyTorch 参考实现运行同一组合。安装可选的 `flash-attn` 包可启用视觉和 prompt 注意力的优化实现。
 
-内置的 xcompute 和 flash-attn 后端与通过 `xinfer.ops` 入口点加载的扩展使用相同的[注册协议](design.zh-CN.md#142-后端注册与选择)。例如，设置 `XINFER_FLASH_ATTN=0` 会在加载时跳过 flash-attn。
+内置的 `cuda` 后端模块（`xinfer/ops/backends/cuda/`）调用 xcompute 和 flash-attn 库，与 `xinfer.ops` 入口点中的扩展以同样方式加载（[注册](design.zh-CN.md#142-后端注册与选择)）。库 import 失败时，相应算子运行 torch 参考实现，并由一条告警列出变慢的算子；设置 `XINFER_OPS_STRICT=1` 时这条告警变成错误。例如，设置 `XINFER_FLASH_ATTN=0` 会在加载时跳过 flash-attn。
 
 ## GPU 支持
 
@@ -34,7 +34,7 @@ XInfer 加载可导入的 `xcompute` 包所用的库，并使用其统一的 GEM
 xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue': 'xcompute', 'gemm_glu_epilogue': 'xcompute', ...}
 ```
 
-`--resolved-config FILE` 会把同样的列表写入 `FILE`；在 Python 中，`Policy.describe()["ops"]` 也会列出它。构建可用时，融合算子（`gemm_epilogue`、`gemm_glu_epilogue`、`qkv_rope_kvcache`，以及模型用到的 `xinfer/ops/fused.py` 中的其他算子）显示为 `xcompute`。它们显示为 `reference` 说明 XInfer 没有找到可用的构建：
+`--resolved-config FILE` 会把同样的列表写入 `FILE`；在 Python 中，`Policy.describe()["ops"]` 也会列出它。构建可用时，融合算子（`gemm_epilogue`、`gemm_glu_epilogue`、`qkv_rope_kvcache`，以及模型用到的 `xinfer/ops/reference/fused.py` 中的其他算子）显示为 `xcompute`。它们显示为 `reference` 说明 XInfer 没有找到可用的构建：
 
 - 没有可导入的 `xcompute` 包且没有设置 `XINFER_XCOMPUTE_LIBRARY`，或它指向的文件不存在；
 - 构建没有针对当前 GPU 的架构（`python -c "import xcompute; print(xcompute.build_target_archs())"`）；

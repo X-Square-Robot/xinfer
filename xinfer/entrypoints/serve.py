@@ -33,10 +33,10 @@ def _op_backends(text: str | None) -> dict[str, str]:
     """Parse ``--op-backends`` such as ``"varlen_attention=flash_attn"``.
 
     Args:
-        text: comma-separated ``operator=backend`` items, or ``None``/empty.
+        text: comma-separated ``operator=pin`` items (a backend, library or ``backend:library``), or ``None``/empty.
 
     Returns:
-        Operator name to backend name; ``build_table`` checks both.
+        Operator name to pin; ``build_table`` checks both.
     """
     if not text:
         return {}
@@ -113,7 +113,8 @@ def parse_args(argv=None):
                         "(xinfer-profile load --serve; docs/profiling.md)")
     p.add_argument("--reference-ops", action="store_true")
     p.add_argument("--op-backends", default=None,
-                   help="pin backends per operator, e.g. varlen_attention=flash_attn; pins win over --reference-ops")
+                   help="pin implementations per operator by backend, library or both, e.g. "
+                        "varlen_attention=flash_attn or rms_norm=cuda:xcompute; pins win over --reference-ops")
     p.add_argument("--warmup", nargs="*", default=(),
                    help="request files run before serving (JSON or msgpack, each one request or a list)")
     return p.parse_args(argv)
@@ -233,7 +234,7 @@ def main(argv=None) -> None:
                        quantization=quantization if isinstance(quantization, str) else None,
                        explicit=explicit, tuned=tuned)
     logger.info("model loaded in %.1fs on %s; ops %s", time.perf_counter() - started, platform.name,
-                {r["op"]: r["backend"] for r in table.report()})
+                {r["op"]: f"{r['backend']}:{r['library']}" if r["library"] else r["backend"] for r in table.report()})
     ops.warn_slow_fallbacks(args.model, table, model.capabilities().stage_ops, platform.device)
     logger.info("resolved configuration:\n%s", resolved.report())
     if args.resolved_config:

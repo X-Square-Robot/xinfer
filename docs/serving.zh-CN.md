@@ -74,7 +74,7 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/5_2500
 | `--resolved-config`, `--dry-run` | 写出解析后的设置及其来源；打印这些设置后退出 |
 | `--profile-dir` | 记录引擎的 span，停止时把每个请求的引擎分段写到该目录；用于剖析运行（`xinfer-profile load --serve`，[剖析](profiling.zh-CN.md#经过-xinfer-serve--serve)），记录随请求数增长 |
 | `--disable-metrics` | 不记录 Prometheus 指标；`GET /metrics` 返回 404（[指标](metrics.zh-CN.md)） |
-| `--reference-ops`, `--op-backends` | 只使用 torch 参考算子；为每个算子固定后端（`op=backend,...`），固定的后端优先于 `--reference-ops` |
+| `--reference-ops`, `--op-backends` | 只使用 torch 参考算子；为每个算子按后端、库或两者固定实现（`op=cuda`、`op=xcompute`、`op=cuda:xcompute`、`op=reference`），固定的实现优先于 `--reference-ops` |
 
 SIGINT/SIGTERM 会停止前端，释放 graph 和锁页缓冲区，并以 0 退出。服务每 0.5 s 检查一次 `Engine.health()`；当引擎无法继续服务（引擎线程或完成线程已停止）时，它以同样的方式关闭并以 1 退出，以便其监管进程重启它。
 

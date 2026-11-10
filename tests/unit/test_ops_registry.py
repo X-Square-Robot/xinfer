@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -28,61 +30,120 @@ def test_reference_is_default():
 
 def test_highest_priority_supported_backend_wins():
     reg = _registry()
-    reg.register("double", backend="fast", contract=TOL, platforms=("sm120",), priority=1)(lambda x: "fast")
-    reg.register("double", backend="thor", contract=TOL, platforms=("sm110",), priority=5)(lambda x: "thor")
+    reg.add("double", lambda x: "fast", backend="fast", contract=TOL, platforms=("sm120",), priority=1)
+    reg.add("double", lambda x: "thor", backend="thor", contract=TOL, platforms=("sm110",), priority=5)
     assert reg.build_table(_platform()).double(1) == "fast"
     assert reg.build_table(_platform("cuda-sm110", "sm110")).double(1) == "thor"
     assert reg.build_table(_platform("cpu", None, "cpu")).double(1) == 2
 
 
-def test_a_backend_implementer_fixes_its_registration_and_operators_override_the_contract():
+BACKEND = """
+from types import SimpleNamespace
+
+from xinfer.ops import register
+
+fast = SimpleNamespace(__name__="fast", __version__="2.0")  # an imported kernel library
+missing = None  # a kernel library that did not import
+
+
+@register("double", backend="cuda", requires=fast, platforms=("sm120",), priority=7, deterministic=False)
+def double(x):
+    return "fast"
+
+
+@register("double", backend="cuda", requires=missing)
+def double_missing(x):
+    return "missing"
+
+
+@register("double", backend="cuda", priority=1)
+def double_plain(x):
+    return "plain"
+
+
+@register("triple", backend="cuda", requires=fast)
+def triple(x):
+    return "fast triple"
+"""
+
+
+@pytest.fixture
+def cuda_ops(tmp_path, monkeypatch):
+    """A fresh process-wide registry that defines ``double``, and an importable backend module ``cuda_ops``."""
+    import importlib
+    import sys
+
     reg = _registry()
+    monkeypatch.setattr(importlib.import_module("xinfer.ops.registry"), "registry", reg)
+    (tmp_path / "cuda_ops.py").write_text(BACKEND)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    yield reg
+    sys.modules.pop("cuda_ops", None)
+
+
+def test_importing_a_backend_module_registers_its_implementations(cuda_ops):
+    import importlib
+
+    reg = cuda_ops
+    with pytest.raises(KeyError, match="triple"):  # an operator the registry does not define
+        importlib.import_module("cuda_ops")
     reg.define(OpSpec("triple", "triple(x)", lambda x: x * 3))
-    implements = reg.implementer("fast", platforms=("sm120",), version="fast 1.0", graph_safe=False)
-    implements("double")(lambda x: "fast double")
-    implements("triple", deterministic=False)(lambda x: "fast triple")
-    double, triple = (reg.implementations(op)[-1] for op in ("double", "triple"))
-    assert (double.backend, double.platforms, double.priority, double.version) == ("fast", ("sm120",), 10, "fast 1.0")
-    assert double.contract == Contract(numerics="tolerance", deterministic=True, graph_safe=False)
-    assert triple.contract == Contract(numerics="tolerance", deterministic=False, graph_safe=False)
-    assert reg.backend_ops("fast") == ["double", "triple"] and reg.backend_ops("slow") == []
+    importlib.import_module("cuda_ops")
+    assert [i.name for i in reg.implementations("double")] == ["reference", "cuda:fast", "cuda"]  # not "missing"
+    double = reg.implementations("double")[1]
+    assert (double.platforms, double.priority, double.version) == (("sm120",), 7, "fast 2.0")
+    assert double.contract == Contract(numerics="tolerance", deterministic=False)
+    assert reg.implementations("double")[2].platforms == ("cuda",)  # by default the backend's device type
+    assert reg.build_table(_platform()).double(1) == "fast"
+    assert reg.build_table(_platform("cuda-sm110", "sm110")).double(1) == "plain"
+    assert reg.build_table(_platform("cpu", None, "cpu")).double(1) == 2
+    assert reg.build_table(_platform(), backends={"double": "cuda"}).double(1) == "fast"  # the highest priority
+    assert reg.build_table(_platform(), backends={"double": "fast"}).double(1) == "fast"
+    with pytest.raises(RuntimeError, match="does not support"):
+        reg.build_table(_platform(), backends={"double": "cuda:missing"})
+    assert [row["library"] for row in reg.build_table(_platform()).report()] == ["fast", "fast"]
+    importlib.reload(importlib.import_module("cuda_ops"))  # importing again replaces the implementations
+    assert [i.name for i in reg.implementations("double")] == ["reference", "cuda:fast", "cuda"]
 
 
-def test_built_in_backends_and_entry_points_load_through_one_protocol(monkeypatch):
-    """Each plugin's ``register(registry)`` returns the operators it registered; a plugin that registered none is not
-    listed, and ``XINFER_<NAME>=0`` skips one without loading it."""
+def test_load_plugins_imports_the_built_in_modules_and_the_entry_points(cuda_ops, monkeypatch):
+    """``XINFER_<NAME>=0`` skips an entry point without importing it."""
+    import importlib
     import importlib.metadata
-    from types import SimpleNamespace
 
-    from xinfer.ops.backends import flash_attn, xcompute
-
-    def plugin(name, ops):
-        def register(registry):
-            for op in ops:
-                registry.implementer(name, platforms=("*",))(op)(lambda x: name)
-            return registry.backend_ops(name)
-        return register
-
+    reg = cuda_ops
+    reg.define(OpSpec("triple", "triple(x)", lambda x: x * 3))
+    monkeypatch.setattr(importlib.import_module("xinfer.ops.registry"), "BUILTIN_MODULES", ())
     loads = []
-    entries = [SimpleNamespace(name=name, load=lambda name=name, ops=ops: loads.append(name) or plugin(name, ops))
-               for name, ops in (("my-kernels", ["double"]), ("empty", []), ("skipped", ["double"]))]
+    entries = [SimpleNamespace(name=name, load=lambda name=name: loads.append(name) or importlib.import_module(name))
+               for name in ("cuda_ops", "skipped")]
     monkeypatch.setattr(importlib.metadata, "entry_points", lambda group: entries if group == "xinfer.ops" else [])
-    monkeypatch.setattr(xcompute, "register", plugin("xcompute", ["double"]))
-    monkeypatch.setattr(flash_attn, "register", plugin("flash_attn", []))
     monkeypatch.setenv("XINFER_SKIPPED", "0")
-    for name in ("XINFER_XCOMPUTE", "XINFER_FLASH_ATTN", "XINFER_MY_KERNELS", "XINFER_EMPTY"):
-        monkeypatch.delenv(name, raising=False)
-    reg = _registry()
-    assert reg.load_plugins() == ["xcompute", "my-kernels"]
-    assert loads == ["my-kernels", "empty"]  # "skipped" was not imported
+    monkeypatch.delenv("XINFER_CUDA_OPS", raising=False)
+    assert reg.load_plugins() == ["cuda:fast", "cuda"]
+    assert loads == ["cuda_ops"]  # "skipped" was not imported
     assert reg.load_plugins() == []  # once per registry
-    monkeypatch.setenv("XINFER_MY_KERNELS", "0")
-    assert _registry().load_plugins() == ["xcompute"]
+
+
+def test_the_process_wide_registry_loads_the_plugins_before_it_selects(cuda_ops, monkeypatch):
+    loaded = []
+    monkeypatch.setattr(cuda_ops, "load_plugins", lambda: loaded.append(True))
+    cuda_ops.build_table(_platform())
+    assert loaded == [True]
+    other = _registry()
+    monkeypatch.setattr(other, "load_plugins", lambda: loaded.append(False))
+    other.build_table(_platform())
+    assert loaded == [True]
+
+
+def test_an_implementation_takes_the_parameters_of_its_reference():
+    with pytest.raises(TypeError, match=r"fast implements 'double' with parameters \['y'\], the reference takes"):
+        _registry().add("double", lambda y: y, backend="fast", contract=TOL)
 
 
 def test_reference_only_and_pinned_backends():
     reg = _registry()
-    reg.register("double", backend="fast", contract=TOL, platforms=("sm120",), priority=1)(lambda x: "fast")
+    reg.add("double", lambda x: "fast", backend="fast", contract=TOL, platforms=("sm120",), priority=1)
     assert reg.build_table(_platform(), reference_only=True).double(1) == 2
     assert reg.build_table(_platform(), backends={"double": "fast"}).double(1) == "fast"
     with pytest.raises(RuntimeError, match="does not support"):
@@ -94,18 +155,18 @@ def test_reference_only_and_pinned_backends():
 def test_backends_must_declare_their_numerics():
     reg = _registry()
     with pytest.raises(ValueError, match="bitwise or tolerance"):
-        reg.register("double", backend="x", contract=Contract())
+        reg.add("double", lambda x: x, backend="x", contract=Contract())
     with pytest.raises(ValueError, match="numerics"):
         Contract(numerics="close enough")
-    reg.register("double", backend="x", contract=TOL)(lambda x: x)
+    reg.add("double", lambda x: x, backend="x", contract=TOL)
     with pytest.raises(ValueError, match="already registered"):
-        reg.register("double", backend="x", contract=TOL)(lambda x: x)
+        reg.add("double", lambda x: x, backend="x", contract=TOL)
 
 
 def test_report_lists_selection_and_contract():
     rows = _registry().build_table(_platform()).report()
     assert rows == [
-        dict(op="double", backend="reference", version=None, numerics="reference",
+        dict(op="double", backend="reference", library=None, version=None, numerics="reference",
              deterministic=True, graph_safe=True)
     ]
 
@@ -161,3 +222,14 @@ def test_slow_fallbacks_warn_on_cuda_only(caplog):
         assert not caplog.records
         assert ops.warn_slow_fallbacks("tiny", table, stage_ops, "cuda") == ["gemm_epilogue", "qkv_rope_kvcache"]
     assert "tiny: 2 operators have no fast kernel loaded" in caplog.text and "XINFER_XCOMPUTE_LIBRARY" in caplog.text
+
+
+def test_slow_fallbacks_fail_in_strict_mode(monkeypatch):
+    references = OpRegistry()
+    for name in ops.registry.names():
+        references.define(ops.registry.spec(name))
+    table = references.build_table(_platform())
+    monkeypatch.setenv("XINFER_OPS_STRICT", "1")
+    with pytest.raises(RuntimeError, match="XINFER_OPS_STRICT"):
+        ops.warn_slow_fallbacks("tiny", table, {"action": ("gemm_epilogue",)}, "cuda")
+    assert ops.warn_slow_fallbacks("tiny", table, {"action": ("gemm_epilogue",)}, "cpu") == []

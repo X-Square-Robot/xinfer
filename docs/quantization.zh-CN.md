@@ -5,7 +5,7 @@
 线性层的量化方法由 `QuantConfig` 决定（docs/design.md §12）。模型为每个线性层指定一个*组*（group）；配置把组映射到方法，组会继承其以点分隔的各级父组的设置。
 
 ```python
-from xinfer.quantization import QuantConfig
+from xinfer.models.layers.quantization import QuantConfig
 
 QuantConfig(groups={"vision.blocks": "mxfp8", "vision.merger": "mxfp8", "prefill": "mxfp8"})
 ```
@@ -60,7 +60,7 @@ GEMM 始终是输出 BF16 的 `nvfp4_gemm`。其余部分都在该输出上运�
 
 ## MXFP8 格式
 
-格式由 `xinfer/ops/mxfp8.py` 中的 torch 参考实现定义，它与 xcompute 保持一致：
+格式由 `xinfer/ops/reference/mxfp8.py` 中的 torch 参考实现定义，scale 布局和权重行顺序在 `xinfer/ops/layout/mxfp8.py` 中，与 xcompute 保持一致：
 - **元素**：E4M3。
 - **缩放因子**：每 32 列一个 E8M0 字节；`share_scale_128` 时一个缩放因子复制到 128 列。
 - **缩放值**：能把块的 amax 映射到 ±448 以内的最小的 2 的幂。
@@ -73,7 +73,7 @@ GEMM 始终是输出 BF16 的 `nvfp4_gemm`。其余部分都在该输出上运�
 
 ## NVFP4 格式
 
-格式由 `xinfer/ops/nvfp4.py` 中的 torch 参考实现定义，它遵循 embodied-serving `nvfp4_v2.patch` 中的 Wall-X NVFP4 kernel（`wall_x/infer/csrc/nvfp4/ops.cu`）及其下游的 GEMM：
+格式由 `xinfer/ops/reference/nvfp4.py` 中的 torch 参考实现定义，scale 布局在 `xinfer/ops/layout/nvfp4.py` 中，它遵循 embodied-serving `nvfp4_v2.patch` 中的 Wall-X NVFP4 kernel（`wall_x/infer/csrc/nvfp4/ops.cu`）及其下游的 GEMM：
 - **元素**：E2M1（0、0.5、1、1.5、2、3、4、6 及其负值），每字节两个，存为 uint8 `[M, K/2]`：第 `2j` 列在低半字节，第 `2j + 1` 列在高半字节，bit 3 为符号位。
 - **缩放因子**：每 16 列一个 FP8 E4M3 缩放因子，以 `float8_e4m3fn` 按 SWIZZLE_32_4_4 布局存储（行填充到 128，16 列的块填充到 4，填充值为零）。
 - **全局缩放因子**：`nvfp4_mse` 权重带有一个逐张量的 FP32 缩放因子 `g = amax / (448 · 6)`，按整个权重计算（以双精度计算，舍入到 FP32；全零权重为 1）。一个值等于 `e2m1 · scale · g`；激活和 `nvfp4` 权重的 `g = 1`。

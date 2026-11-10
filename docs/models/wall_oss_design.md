@@ -11,7 +11,7 @@ The reference is the eager `Qwen2_5_VLMoEForAction` flow path of Wall-X
 request processing, the embodied-serving Wall-X 4B service (es `9633ffd`).
 HarriX's bitwise port of that service (`qwen2_5`, `mxfp8-sm120`) was the
 second source. Files: `xinfer/models/wall_oss/` (`config.py`, `model.py`,
-`processing.py`, `geometry.py`) and the shared layers in `xinfer/layers/`.
+`processing.py`, `geometry.py`) and the shared layers in `xinfer/models/layers/`.
 
 ## Stage split
 
@@ -56,7 +56,7 @@ The reference composition (`numerics="reference"`) reproduces the Wall-X eager m
 ## Optimized composition
 
 `numerics="optimized"` (the default, `xinfer/models/wall_oss/optimized.py`) runs the reference composition's steps
-on operators of `xinfer/ops/fused.py`, each one xcompute call (xcompute `7336b0d`) where xcompute lists a kernel for
+on operators of `xinfer/ops/reference/fused.py`, each one xcompute call (xcompute `7336b0d`) where xcompute lists a kernel for
 the shape, else the operator's torch reference. All BF16, like the reference.
 
 | Step | Operator | Kernel at this model's shapes |
@@ -191,7 +191,7 @@ specializations and libm calls are part of the served numerics.
 The views are decoded and resized concurrently and the prompt is tokenized with
 the cached fixed pieces (`map_views` and `SegmentTokenizer` in
 `xinfer.models.processing`). The resized views cross to the engine as uint8. The vision stage packs them
-(`xinfer.layers.image_pack.ImagePack`): a float32 lookup table of each channel
+(`xinfer.models.layers.image_pack.ImagePack`): a float32 lookup table of each channel
 level, then the Qwen2.5-VL 14/2/2 patch layout with the image repeated over the
 two temporal slots. It only indexes and copies, so the rows are bitwise equal on
 the CPU and on the GPU, inside or outside a CUDA graph, and the request carries
