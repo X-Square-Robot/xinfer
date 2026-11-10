@@ -162,9 +162,7 @@ for _spec in (
     OpSpec("qkv_rope_kvcache",
            "qkv_rope_kvcache(x[M, K], weight[(H + 2KV)D, K], bias, cos[M, R/2], sin, k_cache[KV, rows, D], v_cache,"
            " start, H, KV, D) -> [M, HD]  # K/V written in place", fused.qkv_rope_kvcache),
-    OpSpec("rms_norm_cast", "rms_norm_cast(x[..., K], weight[K], eps) -> x.dtype  # x̂·w, one rounding",
-           fused.rms_norm_cast),
-    OpSpec("add_rms_norm", "add_rms_norm(x, residual, weight[K], eps) -> (residual + x, rms_norm_cast(sum))",
+    OpSpec("add_rms_norm", "add_rms_norm(x, residual, weight[K], eps) -> (residual + x, rms_norm(sum))",
            fused.add_rms_norm),
     OpSpec("flow_velocity_euler",
            "flow_velocity_euler(x[B, M, A] fp32, h[B, M, K] (normed), weight[A, K], dt, dof_mask=None,"

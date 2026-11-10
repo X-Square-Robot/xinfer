@@ -4,6 +4,8 @@ English | [简体中文](kernels.zh-CN.md)
 
 The default Wall-OSS BF16 composition uses xcompute's fused operators on CUDA. XInfer can run the same composition using PyTorch reference implementations when a compatible xcompute build is unavailable. Install the optional `flash-attn` package for vision and prompt attention.
 
+The built-in xcompute and flash-attn backends use the same [registration protocol](design.md#142-backend-registration-and-selection) as extensions in the `xinfer.ops` entry point group. For example, set `XINFER_FLASH_ATTN=0` to skip flash-attn at load time.
+
 ## GPU support
 
 The xcompute build must target the architecture of the serving GPU. Check `xcompute.build_target_archs()`. The [Wall-OSS performance measurements](performance.md) used an RTX 5090 and xcompute `7336b0d`.
@@ -48,7 +50,7 @@ usable build:
 `Policy` and `xinfer-serve` then log a warning when they load Wall-OSS on a GPU:
 
 ```
-wall_oss: 8 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Install
+wall_oss: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Install
 xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: docs/kernels.md
 ```
 

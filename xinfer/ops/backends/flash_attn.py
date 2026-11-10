@@ -29,8 +29,6 @@ from __future__ import annotations
 
 import torch
 
-from xinfer.ops.spec import Contract
-
 BACKEND = "flash_attn"
 ACTION_SPLITS = 4  # fixed split-KV count of action_attention
 
@@ -45,31 +43,25 @@ def available() -> bool:
     return True
 
 
-def register(registry) -> str | None:
-    """Register the flash-attn implementations; returns the flash-attn version, or None if unavailable.
+def register(registry) -> list[str]:
+    """Register the flash-attn implementations (the backend protocol of ``OpRegistry.load_plugins``).
 
     ``varlen_attention``, ``causal_attention``, ``action_attention``, ``prefix_attention`` and
-    ``kvcache_attention`` on CUDA platforms, priority 10, each with a tolerance, deterministic,
-    graph-safe contract.
+    ``kvcache_attention`` on CUDA platforms, priority 10, version ``"flash-attn <version>"``, each with a
+    tolerance, deterministic, graph-safe contract.
 
     Args:
         registry: the ``OpRegistry`` to register into.
 
     Returns:
-        ``"flash-attn <version>"``, or None if flash-attn is not importable.
+        The registered operator names; none when flash-attn is not importable.
     """
     if not available():
-        return None
+        return []
     import flash_attn
     import flash_attn_2_cuda
 
-    version = f"flash-attn {flash_attn.__version__}"
-    contract = Contract(numerics="tolerance", deterministic=True, graph_safe=True)
-
-    def implements(op):
-        """Registration decorator for ``op`` with this backend's platform, priority, version and contract."""
-        return registry.register(op, backend=BACKEND, platforms=("cuda",), priority=10, version=version,
-                                 contract=contract)
+    implements = registry.implementer(BACKEND, platforms=("cuda",), version=f"flash-attn {flash_attn.__version__}")
 
     segments = {}
 
@@ -229,4 +221,4 @@ def register(registry) -> str | None:
                                                  num_splits=ACTION_SPLITS)
         return out.reshape(b, n, heads, d)
 
-    return version
+    return registry.backend_ops(BACKEND)

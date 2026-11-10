@@ -28,12 +28,12 @@ DTYPE = torch.bfloat16
 FLOW_TIME_SCALE = 0.999
 
 OPTIMIZED_STAGE_OPS = {
-    "vision": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "rms_norm_cast", "add_rms_norm",
+    "vision": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "rms_norm", "add_rms_norm",
                "varlen_attention"),
-    "prefill": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "rms_norm_cast", "add_rms_norm",
+    "prefill": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "rms_norm", "add_rms_norm",
                 "causal_attention"),
     "action": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "prefix_kvcache_attention",
-               "rms_norm_cast", "add_rms_norm", "flow_velocity_euler", "linear", "silu"),
+               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "silu"),
 }
 
 
@@ -102,7 +102,7 @@ class OptimizedVision(nn.Module):
         x = x.reshape(n // unit, unit, -1)[window_index].reshape(n, -1)
         angles = angles.reshape(n // unit, unit, -1)[window_index].reshape(n, -1)
         cos, sin = angles.cos(), angles.sin()
-        normed = ops.rms_norm_cast(x, self.blocks[0].norm1, eps)
+        normed = ops.rms_norm(x, self.blocks[0].norm1, eps)
         branch = None
         for i, block in enumerate(self.blocks):
             if branch is not None:
@@ -160,7 +160,7 @@ class OptimizedPrefill(nn.Module):
         c, ops = self.config, self.ops
         heads, kv_heads, d, eps = c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.rms_norm_eps
         p = h.shape[1]
-        normed = ops.rms_norm_cast(h, self.layers[0].input_norm, eps)
+        normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
         last = len(self.layers) - 1
         for i, layer in enumerate(self.layers):
             keys, values = prompt_kv[i, 0, 0], prompt_kv[i, 1, 0]  # [KV, P, D]
@@ -253,7 +253,7 @@ class OptimizedAction(nn.Module):
         for step in range(steps):
             tau = torch.where(pinned, torch.ones_like(times[step]), times[step])
             h = self.action_head.embed(x, tau, dof).to(DTYPE)
-            normed = ops.rms_norm_cast(h, self.layers[0].input_norm, eps)
+            normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
             for i, layer in enumerate(self.layers):
                 keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
                 q = ops.qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin, keys[0], values[0], p, heads,

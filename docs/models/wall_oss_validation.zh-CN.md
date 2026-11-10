@@ -111,7 +111,7 @@ RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 290
 | `gemm_epilogue` | `x[768,2048] weight[2048,2048]` | 35 | 34.1 | 5.6 % | 29.3 | 86 % | 计算 |
 | `causal_attention` | `q[1,768,16,128] k[1,768,2,128]` | 35 | 29.8 | 4.9 % | 11.0 | 37 % | 计算 |
 | `add_rms_norm` | `x[1,768,2048] residual[1,768,2048]` | 70 | 4.0 | 1.3 % | 8.3 | 205 % | 访存（generic） |
-| `rms_norm_cast` | `x[1,768,2048] weight[2048]` | 1 | 3.0 | 0.0 % | 4.1 | 138 % | 访存（generic） |
+| `rms_norm` | `x[1,768,2048] weight[2048]` | 1 | 3.0 | 0.0 % | 4.1 | 138 % | 访存（generic） |
 | 算子外的活动 | | | | 0.2 % | | | |
 
 **Action**：graph 回放 7.51 ms；算子 kernel 7.30 ms。
@@ -148,7 +148,7 @@ RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 290
 | `tests/unit/test_cudagraph.py` | GPU | graph 键、回放 = eager、预热后未命中策略、LRU 和静态缓冲区增长；预热覆盖每个通道和批大小（包括混合长度的批）；某个结果在其通道正被捕获时被释放；`DeviceImage` 输入一直留在 host 内存中，直到设备图像线程在自己的 stream 上解码它们，任意长度的 JPEG 都回放同一个 graph |
 | `tests/unit/test_engine.py` | CPU | 调度器：组批、兼容性、准入、取消、失败；设备图像线程（另一个请求的解码被挂起时，不含设备图像的请求照常得到服务；准入顺序；解码失败只导致其所在请求失败；无 CUDA 设备） |
 | `tests/unit/test_attention_ops.py` | CPU；装有 flash-attn 的 GPU | attention 参考实现（因果、RTC 固定前缀）；flash-attn vs 参考实现、左填充的批 vs 单行、graph 捕获 |
-| `tests/unit/test_mxfp8.py` | CPU；设置了 `XINFER_XCOMPUTE_LIBRARY` 的 GPU | MXFP8 参考格式和融合参考实现；可融合的层形式（BF16 = eager 组合）；xcompute 算子 vs 参考实现、graph 捕获 |
+| `tests/unit/test_mxfp8.py` | CPU | MXFP8 参考格式和融合参考实现；可融合的层形式（BF16 = eager 组合） |
 | `tests/unit/test_shm.py` | CPU | 张量和 `DeviceImage` 数据通过共享内存从前端传入，图像尺寸记录在清单（manifest）中 |
 | `tests/unit/test_serve.py` | CPU | 引擎 + 2 个前端进程 + WebSocket 客户端：元数据、并发、错误、健康检查、干净关闭 |
 

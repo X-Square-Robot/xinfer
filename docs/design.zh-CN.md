@@ -56,9 +56,9 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 | §10 配置解析 | 部分实现 | 显式值 > 调优表 > 模型 / 平台规则 > 默认值，启动时打印每项来源（docs/configuration.md）；目前没有随包发布的调优表；`xinfer tune`、显存规划器参与推导、`Platform.derive` / `validate` 未实现 |
 | §11 模型接入 | 已实现 | 模型声明阶段、交接张量、能力、输入输出处理和形状桶。前端通过模型类的 `build_processors` 构建处理器，引擎预热时调用模型的 `pad` 钩子。 |
 | §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过 quick100 门禁。 |
-| §12 量化 | 部分实现 | 按模块组的 `QuantConfig`，BF16 与 MXFP8（xcompute，sm120）；量化预设由模型选项 `quantization` 指定，默认 BF16，不按（模型, 平台）解析；NVFP4（`nvfp4`、`nvfp4_mse`，即 Wall-X NVFP4 服务的两种配方）只有 torch 参考实现，没有设备后端，也没有模型预设使用；`xinfer eval quant` 未实现，精度门禁见 docs/precision.md |
+| §12 量化 | 部分实现 | 框架支持按模块组配置 `QuantConfig`。Wall-OSS 使用 BF16。MXFP8 和 NVFP4 具有 PyTorch 参考实现，详见[量化](quantization.zh-CN.md)。 |
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
-| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn；`xinfer.ops.conformance` 未实现 |
+| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn，与 `xinfer.ops` entry point 按同一协议加载（§14.2）；`xinfer.ops.conformance` 未实现 |
 | §15 协议与前端 | 部分实现 | WebSocket + msgpack，兼容 x2robot 客户端；`xinfer.Policy` 进程内 API；Client SDK 与兼容适配未实现 |
 | §16 可观测性与基准工具 | 部分实现 | 服务通过 [/metrics](metrics.zh-CN.md) 导出 Prometheus 指标。使用[压测工具](benchmark.zh-CN.md)测单请求延迟和闭环容量，或用 [xinfer-profile](profiling.zh-CN.md) 分析算子、排队及各阶段执行时间。 |
 | §17 测试 | 部分实现 | CPU 单元与契约测试；GPU 与资产测试需要本地资产，手动运行；CI（`.gitlab-ci.yml`）只跑 ruff 与 CPU 测试 |
@@ -479,7 +479,7 @@ Wall-OSS 使用 Qwen2.5-VL 视觉塔、prefill 专家和流匹配动作专家。
 
 ## 12. 量化
 
-- **`QuantConfig`**：方法，加上按模块的策略。例如 Wall-OSS 的 `mxfp8` 预设为 `{vision.blocks: mxfp8, vision.merger: mxfp8, prefill: mxfp8}`，其余模块（动作专家）为默认的 BF16。默认值按（模型, 平台）解析（§10.2），不写死在模型文件里；HarriX 的 Thor 配置 ViT 用 BF16 就是平台差异。
+- **`QuantConfig`** 配置各模块组使用的方法。Wall-OSS 当前只支持 BF16。参见[量化方法](quantization.zh-CN.md)。
 - **`QuantMethod` 接口**：
   - `create_weights`；
   - `process_weights_after_loading`：转换、打包、swizzle，必须在权重冻结之前完成；
@@ -536,7 +536,7 @@ class Platform:
 | 典型部署 | 机队，单卡多台 | 机队，单卡多台 |
 | 内存 | 32 GB 独立显存 | 统一内存：H2D 可以零拷贝或映射 |
 | CPU | 服务器 CPU（测试容器配额 24 核） | ARM，较弱：发射开销占比更高，机队下 Frontend 预处理也更容易成为瓶颈 |
-| MXFP8 GEMM | xcompute（TVM-FFI） | xcompute `mxfp8-thor` |
+| MXFP8 GEMM | PyTorch 参考实现 | PyTorch 参考实现 |
 | MPS | 支持（FleetServe split 布局使用）；v1 colocated 不依赖 | 待确认；v1 colocated 不依赖 |
 | 已知参考 | FleetServe、HarriX `mxfp8-sm120` | HarriX `mxfp8-thor`（ViT BF16、整调用图、RTC 关闭） |
 
@@ -570,7 +570,7 @@ XInfer 作为开源项目接入不同厂商的芯片，厂商包在树外维护�
 调用约定：
 
 - 只在当前 stream 上提交；不隐式同步；不在内部分配显存。
-- 需要 workspace 的算子在预热中完成首次分配。现在 xcompute MXFP8 按 stream 懒分配 workspace，在图捕获中会报错，这条约定由此而来。
+- 需要 workspace 的算子在预热期间完成首次分配，避免在 CUDA Graph 捕获期间分配内存。
 - 上述 `out`、workspace、当前 stream、无隐式同步与分配约定不因 TVM-FFI 或 `torch.library` 绑定而改变。
 
 验证要求：
@@ -580,10 +580,15 @@ XInfer 作为开源项目接入不同厂商的芯片，厂商包在树外维护�
 
 ### 14.2 后端注册与选择
 
+扩展通过 `xinfer.ops` 入口点导出 `register(registry) -> list[str]`。`OpRegistry.load_plugins()` 先加载内置的 xcompute 和 flash-attn，再加载入口点。注册函数返回本次注册的算子名，依赖不可用时返回空列表。
+
+后端调用 `registry.implementer(...)` 设置平台、版本、优先级和公共数值契约。下面展示 flash-attn 后端如何注册一个实现。
+
 ```python
-@ops.register("gemm_mxfp8", platform="cuda", arch=("sm120",), backend="xcompute",
-              graph_safe=True, deterministic=True)
-def _gemm_mxfp8_sm120(x, xs, w, ws, out, workspace): ...
+implements = registry.implementer("flash_attn", platforms=("cuda",), version=f"flash-attn {flash_attn.__version__}")
+
+@implements("causal_attention")
+def _causal(q, k, v, *, scale=None): ...
 ```
 
 - 在模型构建时选定实现，不在每次调用时分派。
