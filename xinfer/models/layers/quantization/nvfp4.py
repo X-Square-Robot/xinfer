@@ -33,8 +33,22 @@ from __future__ import annotations
 import torch
 
 from xinfer.ops import active_ops
-from xinfer.ops import nvfp4 as fmt
-from xinfer.quantization.base import METHODS, QuantMethod
+from xinfer.ops.layout import nvfp4 as fmt
+from xinfer.ops.reference.nvfp4 import E2M1_MAX, E4M3_MAX
+from xinfer.models.layers.quantization.base import METHODS, QuantMethod
+
+
+
+def global_scale(weight: torch.Tensor) -> float:
+    """Per-tensor scale of a weight with MSE block scales: ``amax / (448 · 6)`` rounded to FP32, 1.0 if all zero.
+
+    The quotient is taken in double precision and then rounded to FP32, as the Wall-X recipe computes it on the
+    host. Reads the amax back to the host.
+    """
+    amax = float(weight.detach().float().abs().amax())
+    if amax == 0.0:
+        return 1.0
+    return float(torch.tensor(amax / (E4M3_MAX * E2M1_MAX), dtype=torch.float32))
 
 
 class NVFP4(QuantMethod):
@@ -66,7 +80,7 @@ class NVFP4(QuantMethod):
 
         Registers non-persistent buffers ``weight_q`` (uint8 ``[out_features, in_features / 2]``) and
         ``weight_scales`` (swizzled ``float8_e4m3fn``), removes the ``weight`` parameter and sets
-        ``layer.weight_global_scale`` (1.0, or ``nvfp4.global_scale`` with MSE scales, which reads the weight's
+        ``layer.weight_global_scale`` (1.0, or ``global_scale`` with MSE scales, which reads the weight's
         amax back to the host). The bias stays BF16.
 
         Args:
@@ -80,7 +94,7 @@ class NVFP4(QuantMethod):
             raise ValueError(f"NVFP4 weights are quantized from BF16, got {weight.dtype}")
         if bias is not None and bias.dtype != torch.bfloat16:
             raise ValueError("NVFP4 linear bias must be BF16")
-        scale = fmt.global_scale(weight) if self.mse_weight_scales else 1.0
+        scale = global_scale(weight) if self.mse_weight_scales else 1.0
         q, scales = self._quantize(weight.contiguous(), global_scale=scale, mse=self.mse_weight_scales)
         del layer._parameters["weight"]
         layer.register_buffer("weight_q", q, persistent=False)

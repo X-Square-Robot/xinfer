@@ -57,7 +57,7 @@ def _bitwise(a, b):
 
 def test_inputs_and_response_match_reference_bitwise(corpus):
     """Model inputs, with the views packed as the vision stage packs them, and responses equal the service's."""
-    from xinfer.layers.image_pack import ImagePack
+    from xinfer.models.layers.image_pack import ImagePack
     from xinfer.models.wall_oss.image_processing import pixel_lookup_table
 
     prepare, finish, requests, ref = corpus

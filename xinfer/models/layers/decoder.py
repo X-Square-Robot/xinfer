@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from xinfer.layers.basic import GatedMLP, Linear, QKVLinear, RMSNorm
+from xinfer.models.layers.basic import GatedMLP, Linear, QKVLinear, RMSNorm
 from xinfer.ops import active_ops
 
 

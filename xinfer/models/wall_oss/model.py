@@ -28,11 +28,11 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from xinfer.layers.basic import Linear, RMSNorm
-from xinfer.layers.decoder import DecoderLayer
-from xinfer.layers.image_pack import ImagePack
-from xinfer.layers.rotary import MRope, inverse_frequencies, mrope_cos_sin
-from xinfer.layers.vision.qwen2_5_vit import VisionTower, VisionTowerConfig
+from xinfer.models.layers.basic import Linear, RMSNorm
+from xinfer.models.layers.decoder import DecoderLayer
+from xinfer.models.layers.image_pack import ImagePack
+from xinfer.models.layers.rotary import MRope, inverse_frequencies, mrope_cos_sin
+from xinfer.models.layers.vision.qwen2_5_vit import VisionTower, VisionTowerConfig
 from xinfer.loader import SafetensorsCheckpoint, Source, load_mapped
 from xinfer.models.interface import (
     Capabilities,

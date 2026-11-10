@@ -7,7 +7,7 @@ Models assign each linear layer a *group*; the config maps groups to
 methods, and a group inherits from its dot-separated parents.
 
 ```python
-from xinfer.quantization import QuantConfig
+from xinfer.models.layers.quantization import QuantConfig
 
 QuantConfig(groups={"vision.blocks": "mxfp8", "vision.merger": "mxfp8", "prefill": "mxfp8"})
 ```
@@ -79,7 +79,7 @@ down projection's input quantization, which is `GatedMLP(act_fused_into="down")`
 
 ## MXFP8 format
 
-The format is defined by the torch reference in `xinfer/ops/mxfp8.py`, which follows xcompute:
+The format is defined by the torch reference in `xinfer/ops/reference/mxfp8.py`, with the scale layout and weight row orders in `xinfer/ops/layout/mxfp8.py`, and follows xcompute:
 - **Elements**: E4M3.
 - **Scales**: one E8M0 byte per 32 columns, with `share_scale_128` replicating one scale over 128 columns.
 - **Scale value**: the smallest power of two that maps the block's amax into ±448.
@@ -92,7 +92,7 @@ The fused references follow the kernels' arithmetic where it is specified:
 
 ## NVFP4 format
 
-The format is defined by the torch reference in `xinfer/ops/nvfp4.py`, which follows the Wall-X NVFP4 kernels of
+The format is defined by the torch reference in `xinfer/ops/reference/nvfp4.py`, with the scale layout in `xinfer/ops/layout/nvfp4.py`, and follows the Wall-X NVFP4 kernels of
 the embodied-serving `nvfp4_v2.patch` (`wall_x/infer/csrc/nvfp4/ops.cu`) and the GEMMs they feed:
 - **Elements**: E2M1 (0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives), two per byte as uint8 `[M, K/2]`: column `2j` in the low nibble, `2j + 1` in the high nibble, bit 3 the sign.
 - **Scales**: one FP8 E4M3 scale per 16 columns, stored as `float8_e4m3fn` in the SWIZZLE_32_4_4 layout (rows padded to 128, 16-column blocks to 4, padding zero).

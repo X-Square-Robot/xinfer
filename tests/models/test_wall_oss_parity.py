@@ -162,15 +162,12 @@ def served_model(setup):
     from xinfer import ops
     from xinfer.models.wall_oss.model import WallOSS
     from xinfer.models.wall_oss.processing import ProcessingConfig
-    from xinfer.ops.backends import flash_attn
     from xinfer.platforms import resolve_platform
 
     platform = resolve_platform("cuda")
-    registry = ops.OpRegistry()
-    for name in ops.registry.names():
-        registry.define(ops.registry.spec(name))
-    flash_attn.register(registry)
-    table = registry.build_table(platform)
+    attention = ("varlen_attention", "causal_attention", "action_attention", "prefix_attention", "kvcache_attention")
+    table = ops.registry.build_table(platform, backends={name: "cuda:flash_attn" for name in attention},
+                                     reference_only=True)  # flash-attn attention, every other operator its reference
     with ops.use_ops(table):
         return WallOSS.from_checkpoint(CKPT, device=platform.device, numerics="reference",
                                        processing=ProcessingConfig(instruction_override=INSTRUCTION))

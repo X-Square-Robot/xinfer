@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from xinfer.layers.image_pack import ImageNormalize, ImagePack
+from xinfer.models.layers.image_pack import ImageNormalize, ImagePack
 
 SHAPES = ((56, 112, 3), (84, 28, 3), (28, 28, 3))
 

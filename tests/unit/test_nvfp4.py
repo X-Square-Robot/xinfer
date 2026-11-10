@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from xinfer import ops
-from xinfer.ops import mxfp8, nvfp4
+from xinfer.ops.reference import mxfp8, nvfp4
+from xinfer.models.layers.quantization.nvfp4 import global_scale
+from xinfer.ops.layout import nvfp4 as layout
 from xinfer.platforms import resolve_platform
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -13,7 +15,7 @@ E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 def _scales(s, rows, k):
     """Scale bytes per [row, 16-column block] from the swizzled tensor."""
-    off = nvfp4.scale_offsets(rows, k, s.device)[:, : k // 16]
+    off = layout.scale_offsets(rows, k, s.device)[:, : k // 16]
     return s.view(torch.uint8)[off.reshape(-1)].view(rows, k // 16)
 
 
@@ -35,11 +37,11 @@ def test_e2m1_rounds_to_nearest_even_and_saturates():
 
 
 def test_scale_layout_matches_the_swizzle_formula():
-    off = nvfp4.scale_offsets(256, 1280)
+    off = layout.scale_offsets(256, 1280)
     assert off.shape == (256, 80)
     assert off[0, 0] == 0 and off[0, 3] == 3 and off[0, 4] == 512 and off[1, 0] == 16 and off[32, 0] == 4
     assert off[128, 0] == 20 * 512 and len(set(off.reshape(-1).tolist())) == off.numel()
-    assert nvfp4.scale_elements(37, 48) == 128 * 4 and nvfp4.scale_elements(256, 1280) == 256 * 80
+    assert layout.scale_elements(37, 48) == 128 * 4 and layout.scale_elements(256, 1280) == 256 * 80
 
 
 def test_packing_scales_and_padding():
@@ -105,7 +107,7 @@ def test_mse_scales_match_a_scalar_transliteration():
     torch.manual_seed(1)
     w = (torch.randn(3, 64) * 0.05).bfloat16()
     w[2, 16:32] = 0  # all-zero block: every error is 0, the first candidate (code 1) wins
-    g = nvfp4.global_scale(w)
+    g = global_scale(w)
     q, s = nvfp4.quantize(w, global_scale=g, mse=True)
     got = _scales(s, 3, 64)
     blocks = w.float().numpy().reshape(3, 4, 16)
@@ -119,7 +121,7 @@ def test_mse_scales_match_a_scalar_transliteration():
 def test_mse_scales_never_reconstruct_worse_than_amax_scales():
     torch.manual_seed(2)
     w = (torch.randn(16, 256) * torch.logspace(-2, 1, 256)).bfloat16()
-    g = nvfp4.global_scale(w)
+    g = global_scale(w)
     mse = nvfp4.dequantize(*nvfp4.quantize(w, global_scale=g, mse=True)) * g
     amax = nvfp4.dequantize(*nvfp4.quantize(w, global_scale=g)) * g
     err = lambda back: ((back - w.float()) ** 2).view(16, 16, 16).sum(-1)  # noqa: E731
@@ -128,11 +130,11 @@ def test_mse_scales_never_reconstruct_worse_than_amax_scales():
 
 def test_global_scale():
     w = torch.zeros(4, 16, dtype=torch.bfloat16)
-    assert nvfp4.global_scale(w) == 1.0
+    assert global_scale(w) == 1.0
     w[1, 3] = -1344.0  # amax / 2688 = 0.5
-    assert nvfp4.global_scale(w) == 0.5
+    assert global_scale(w) == 0.5
     w[1, 3] = 1.0
-    assert nvfp4.global_scale(w) == float(np.float32(1.0 / 2688.0))
+    assert global_scale(w) == float(np.float32(1.0 / 2688.0))
 
 
 def test_rmsnorm_quantize_rounds_the_normalized_value_to_bf16():
@@ -194,8 +196,8 @@ def _load(module, gen):
 
 @pytest.mark.parametrize("method", ["nvfp4", "nvfp4_mse"])
 def test_linear_forms_compose_the_reference_operators(method):
-    from xinfer.layers.basic import Linear, RMSNorm
-    from xinfer.quantization import QuantConfig, process_weights, use_quant
+    from xinfer.models.layers.basic import Linear, RMSNorm
+    from xinfer.models.layers.quantization import QuantConfig, process_weights, use_quant
 
     with ops.use_ops(_table()), use_quant(QuantConfig(groups={"g": method})):
         layer, norm = Linear(128, 64, bias=True, group="g"), RMSNorm(128, 1e-6)
@@ -209,7 +211,7 @@ def test_linear_forms_compose_the_reference_operators(method):
     assert process_weights(layer) == {method: 1} and process_weights(down) == {method: 1}
     assert not hasattr(layer, "weight") and layer.weight_q.shape == (64, 64)
     mse = method == "nvfp4_mse"
-    g = nvfp4.global_scale(w) if mse else 1.0
+    g = global_scale(w) if mse else 1.0
     assert layer.weight_global_scale == g
     wq, ws = nvfp4.quantize(w, global_scale=g, mse=mse)
     assert torch.equal(layer.weight_q, wq) and torch.equal(layer.weight_scales.view(torch.uint8), ws.view(torch.uint8))
@@ -234,9 +236,9 @@ def test_linear_forms_compose_the_reference_operators(method):
 
 
 def test_qkv_and_gated_layers_run_the_plain_composition():
-    from xinfer.layers.basic import GatedMLP, QKVLinear, RMSNorm
-    from xinfer.layers.rotary import MRope
-    from xinfer.quantization import QuantConfig, process_weights, use_quant
+    from xinfer.models.layers.basic import GatedMLP, QKVLinear, RMSNorm
+    from xinfer.models.layers.rotary import MRope
+    from xinfer.models.layers.quantization import QuantConfig, process_weights, use_quant
 
     with ops.use_ops(_table()), use_quant(QuantConfig(groups={"g": "nvfp4", "e": "nvfp4_mse"})):
         norm = RMSNorm(128, 1e-6)
@@ -264,8 +266,8 @@ def test_qkv_and_gated_layers_run_the_plain_composition():
 
 
 def test_widths_must_be_multiples_of_16():
-    from xinfer.layers.basic import Linear
-    from xinfer.quantization import QuantConfig, use_quant
+    from xinfer.models.layers.basic import Linear
+    from xinfer.models.layers.quantization import QuantConfig, use_quant
 
     for method in ("nvfp4", "nvfp4_mse"):
         with ops.use_ops(_table()), use_quant(QuantConfig(groups={"g": method})):
@@ -312,7 +314,7 @@ def test_reference_quantizers_give_the_same_bits_on_cuda():
     torch.manual_seed(8)
     x = (torch.randn(300, 1280) * torch.logspace(-3, 3, 1280)).bfloat16()
     w = (torch.randn(64, 2048) * 0.02).bfloat16()
-    g = nvfp4.global_scale(w)
+    g = global_scale(w)
     for tensor, kwargs in ((x, {}), (w, dict(global_scale=g, mse=True))):
         (q, s), (rq, rs) = nvfp4.quantize(tensor.cuda(), **kwargs), nvfp4.quantize(tensor, **kwargs)
         assert torch.equal(q.cpu(), rq) and torch.equal(s.view(torch.uint8).cpu(), rs.view(torch.uint8))

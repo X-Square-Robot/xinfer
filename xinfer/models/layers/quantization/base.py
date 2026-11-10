@@ -98,7 +98,7 @@ class QuantMethod:
     into its activation quantization and the output transform into the GEMM
     epilogue, which skips intermediate roundings (see the mxfp8 method).
 
-    ``layer`` arguments are ``xinfer.layers.basic.Linear`` modules (``weight``, ``bias``, ``out_features``,
+    ``layer`` arguments are ``xinfer.models.layers.basic.Linear`` modules (``weight``, ``bias``, ``out_features``,
     ``layout``). Methods bind their operators from the active op table when constructed, so they must be
     created inside ``xinfer.ops.use_ops``.
 
@@ -250,7 +250,7 @@ def make_method(name: str, config: QuantConfig | None = None) -> QuantMethod:
         KeyError: ``name`` is not a known method.
     """
     if name not in METHODS and name in _MODULES:
-        importlib.import_module(f"xinfer.quantization.{_MODULES[name]}")
+        importlib.import_module(f"xinfer.models.layers.quantization.{_MODULES[name]}")
     if name not in METHODS:
         raise KeyError(f"unknown quantization method {name!r}; known: {sorted(METHODS.keys() | _MODULES.keys())}")
     options = dict((config.options if config else {}).get(name, {}))

@@ -7,7 +7,7 @@ after the checkpoint is loaded, ``process_weights(model)`` converts each
 layer's weights once (before they are shared or captured).
 """
 
-from xinfer.quantization.base import (
+from xinfer.models.layers.quantization.base import (
     METHODS,
     GatedLayout,
     QKVLayout,
