@@ -89,7 +89,6 @@ def test_add_rms_norm_is_the_rounded_sum_and_its_norm():
     x, residual, w = _randn(3, 16, generator=g), _randn(3, 16, generator=g), torch.rand(16, generator=g) + 0.5
     total, normed = fused.add_rms_norm(x, residual, w, 1e-6)
     assert torch.equal(total, residual + x) and torch.equal(normed, reference.rms_norm(residual + x, w, 1e-6))
-    assert torch.equal(fused.rms_norm_cast(x, w, 1e-6), reference.rms_norm(x, w, 1e-6))
 
 
 def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path):
@@ -98,13 +97,13 @@ def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path)
     import sys
     import types
 
-    from xinfer.ops.backends import xcompute_bf16
+    from xinfer.ops.backends import xcompute_unified
 
     path = tmp_path / "xcompute.so"
     path.write_bytes(b"")
     package = types.ModuleType("xcompute")
     package.KERNEL_LIB_PATH = str(path)
-    for name in xcompute_bf16.UNIFIED:
+    for name in xcompute_unified.UNIFIED:
         setattr(package, name, object())
     monkeypatch.setitem(sys.modules, "xcompute", package)
     monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
@@ -116,8 +115,8 @@ def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path)
         def has_function(self, name):
             return name in self.functions
 
-    assert xcompute_bf16._python_package(Library(xcompute_bf16.LIBRARY_ENTRIES)) is package
-    assert xcompute_bf16._python_package(Library(())) is None
+    assert xcompute_unified._python_package(Library(xcompute_unified.LIBRARY_ENTRIES)) is package
+    assert xcompute_unified._python_package(Library(())) is None
 
 
 def _fake_package(monkeypatch, tmp_path):
@@ -126,14 +125,14 @@ def _fake_package(monkeypatch, tmp_path):
     import sys
     import types
 
-    from xinfer.ops.backends import xcompute_bf16
+    from xinfer.ops.backends import xcompute_unified
 
     path = tmp_path / "xcompute.so"
     path.write_bytes(b"")
     package = types.ModuleType("xcompute")
     package.__spec__ = importlib.machinery.ModuleSpec("xcompute", None)
     package.KERNEL_LIB_PATH = str(path)
-    for name in xcompute_bf16.UNIFIED:
+    for name in xcompute_unified.UNIFIED:
         setattr(package, name, object())
     monkeypatch.setitem(sys.modules, "xcompute", package)
     monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
@@ -142,12 +141,14 @@ def _fake_package(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("archs,platforms", [("110,120", ("sm110", "sm120")), ("120", ("sm120",)), ("", None)])
 def test_xcompute_operators_register_on_the_architectures_the_build_targets(monkeypatch, tmp_path, archs, platforms):
-    from xinfer.ops.backends import xcompute_bf16
+    from xinfer.ops.backends import xcompute_unified
+    from xinfer.ops.registry import OpRegistry
 
     package = _fake_package(monkeypatch, tmp_path)
 
     class Library:
         path = package.KERNEL_LIB_PATH
+        sha256 = "0" * 64
 
         def has_function(self, name):
             return True
@@ -159,21 +160,16 @@ def test_xcompute_operators_register_on_the_architectures_the_build_targets(monk
         def call(self, name, *args):
             raise AssertionError("no kernel runs at registration")
 
-    class Registry:
-        def __init__(self):
-            self.platforms = {}
-
-        def register(self, op, *, platforms, **kwargs):
-            self.platforms[op] = platforms
-            return lambda function: function
-
-    registry = Registry()
-    names = xcompute_bf16.register(registry, Library(), "xcompute", "v")
+    registry = OpRegistry()
+    for name in ops.registry.names():
+        registry.define(ops.registry.spec(name))
+    xcompute_unified.register_unified(registry, Library())
+    names = registry.backend_ops("xcompute")
     if platforms is None:
-        assert names == [] and registry.platforms == {}
+        assert names == []
     else:
-        assert set(names) == set(registry.platforms) and set(names) == {*FUSED, "rms_norm"}
-        assert set(registry.platforms.values()) == {platforms}
+        assert set(names) == set(FUSED)
+        assert {registry.implementations(name)[-1].platforms for name in names} == {platforms}
 
 
 def test_the_xcompute_library_comes_from_the_installed_package(monkeypatch, tmp_path):
@@ -201,7 +197,7 @@ XCOMPUTE = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
 gpu = pytest.mark.skipif(not (XCOMPUTE and torch.cuda.is_available()
                               and torch.cuda.get_device_capability() == (12, 0)),
                          reason="xcompute + an SM120 GPU required")
-FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm_cast",
+FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm",
          "add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler")
 
 
@@ -213,10 +209,10 @@ def xc():
     registry = OpRegistry()
     for name in ops.registry.names():
         registry.define(ops.registry.spec(name))
-    library = xcompute.register(registry, XCOMPUTE)
-    if "gemm_epilogue" not in library.registered:
+    names = xcompute.register(registry)
+    if "gemm_epilogue" not in names:
         pytest.skip("needs a build of xcompute main and the xcompute Python package of the same build")
-    missing = set(FUSED) - set(library.registered)
+    missing = set(FUSED) - set(names)
     assert not missing, missing
     return registry.build_table(resolve_platform("cuda"))
 
@@ -252,7 +248,7 @@ def test_xcompute_matches_the_references_at_wall_oss_shapes(xc):
     r = lambda *s, scale=1.0, dtype=BF16: _randn(*s, scale=scale, dtype=dtype, device="cuda", generator=g)  # noqa: E731
     for m, k in ((2048, 1280), (768, 2048), (16, 1024)):
         x, residual, w = r(m, k), r(m, k), torch.rand(k, device="cuda") + 0.5
-        _check(xc, "rms_norm_cast", (x, w, 1e-6), relative=0.01)
+        _check(xc, "rms_norm", (x, w, 1e-6), relative=0.01)
         _check(xc, "add_rms_norm", (x, residual, w, 1e-6), relative=0.01)
     _check(xc, "gemm_glu_epilogue", (r(2048, 1280), r(6912, 1280, scale=1 / 36)), kwargs=dict(bias=r(6912)),
            relative=0.01)

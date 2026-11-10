@@ -7,36 +7,30 @@ import os
 import torch
 
 from xinfer.ops import fused
-from xinfer.ops.spec import Contract
+from xinfer.ops.backends.xcompute import BACKEND
 
 UNIFIED = ("gemm", "gemm_glu", "qkv_proj_rope", "prepack_weight", "selected_backend", "pack_rope_table", "AdaRms",
            "rmsnorm", "add_rmsnorm", "attention_kvcache", "attention_kvcache_backend", "denoise_output_euler")
 LIBRARY_ENTRIES = ("build_target_archs", "gemm_envelope_table")
 
 
-def register(registry, library, backend: str, version: str) -> list[str]:
-    """Register the operators the library and its Python package provide, on its architectures; returns their names.
+def register_unified(registry, library) -> None:
+    """Register Wall-OSS BF16 operators for the architectures targeted by the xcompute build.
 
     Args:
         registry: the ``OpRegistry``.
-        library: the loaded xcompute library (``xinfer.ops.backends.xcompute._Library``).
-        backend: backend name to register under.
-        version: version string of the implementations.
-
-    Returns:
-        The registered operator names; empty if the matching Python package is unavailable.
+        library: the loaded xcompute library. Its matching Python package must provide the entries in ``UNIFIED``.
     """
     xc = _python_package(library)
     if xc is None:
-        return []
+        return
     platforms = tuple(f"sm{arch}" for arch in str(library.function("build_target_archs")()).split(",")
                       if arch.isdigit())
     if not platforms:
-        return []
+        return
 
-    def kernel(op, numerics="tolerance", **kwargs):
-        return registry.register(op, backend=backend, platforms=platforms, priority=10, version=version,
-                                 contract=Contract(numerics=numerics, **kwargs))
+    kernel = registry.implementer(BACKEND, platforms=platforms,
+                                  version=f"unified xcompute.so sha256:{library.sha256[:12]}")
 
     cached = {}
 
@@ -95,8 +89,7 @@ def register(registry, library, backend: str, version: str) -> list[str]:
                                 kv_cache=(k_cache, v_cache, int(start)), backend="auto")
 
     @kernel("rms_norm")
-    @kernel("rms_norm_cast")
-    def _rms_norm_cast(x, weight, eps):
+    def _rms_norm(x, weight, eps):
         return xc.rmsnorm(x, weight, float(eps), True)
 
     @kernel("add_rms_norm")
@@ -129,9 +122,6 @@ def register(registry, library, backend: str, version: str) -> list[str]:
         return xc.denoise_output_euler(x, h, weight, dt=float(dt), dof_mask=dof_mask, padding_velocity=padding_velocity,
                                        pinned=None if pinned is None else pinned.to(torch.int32),
                                        pinned_values=pinned_values, out=torch.empty_like(x))
-
-    return ["rms_norm", "gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm_cast",
-            "add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler"]
 
 
 def _python_package(library):

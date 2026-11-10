@@ -1,6 +1,6 @@
 """MXFP8 reference: E4M3 elements with E8M0 block scales (OCP MX), torch only.
 
-Format, matching the xcompute kernels (``src/quantization/mxfp8_format_core.cuh``):
+Format used by the PyTorch reference operators:
 
 - elements are ``float8_e4m3fn``; scales are E8M0 bytes, one per 32 columns
   of K. With ``share_scale_128`` one scale covers 128 columns (the max over
@@ -13,13 +13,8 @@ Format, matching the xcompute kernels (``src/quantization/mxfp8_format_core.cuh`
 - scales are stored in the SWIZZLE_32_4_4 layout used by block-scaled GEMMs:
   rows padded to 128, 32-column blocks padded to 4.
 
-``quantize`` follows the kernel's arithmetic (except NaN inputs: the
-kernel's ``fminf(448, fmaxf(-448, v))`` drops the NaN and stores -448, while
-torch keeps it as an E4M3 NaN). The xcompute ``wallx_sm120`` kernel is built
-with fast-math and picks the neighbouring scale in under 1 % of blocks, so the
-two agree within one scale step there (docs/quantization.md). ``gemm`` dequantizes both operands and multiplies in
-FP32; tensor-core kernels accumulate in a different order, so backends match
-it within a tolerance.
+``quantize`` preserves NaN inputs as E4M3 NaNs. ``gemm`` dequantizes both operands
+and multiplies in FP32. Tensor-core kernels may accumulate in a different order.
 
 Fused forms (the Wall-X MXFP8 service recipe). Each skips a BF16 rounding
 that the unfused composition has:

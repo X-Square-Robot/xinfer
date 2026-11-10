@@ -90,32 +90,13 @@ GEMM 始终是输出 BF16 的 `nvfp4_gemm`。其余部分都在该输出上运�
 
 ## 后端
 
-没有后端时运行参考实现，基于 torch，速度较慢。NVFP4 只有 torch 参考实现：没有任何设备后端注册 `nvfp4_*` 算子。
-
-| 平台 | 后端 | 库 |
-|---|---|---|
-| RTX 5090 (sm120) | `xinfer.ops.backends.xcompute`，全部七个 MXFP8 算子（见下表） | 兼容 MXFP8 的 xcompute 构建（与 BF16 统一接口构建不同） |
-| Thor (sm110) | 尚未注册 | main 分支的 xcompute 有 SM110 MXFP8 kernel；待在 Thor 上验证 |
-
-| 算子 | xcompute 函数 | 相对参考的实测结果（RTX 5090） |
-|---|---|---|
-| `mxfp8_quantize` | `wallx_sm120_quantize_mxfp8` | 一致，只是 < 1 % 的块取了相邻的缩放值（fast-math `amax / 448`） |
-| `mxfp8_rmsnorm_quantize` | `wallx_sm120_rmsnorm_quant_mxfp8` | 在测试数据上逐位一致；契约允许罕见的一步差异（fast-math `rsqrtf`）；仅支持 BF16 norm 权重 |
-| `mxfp8_silu_mul_quantize` | `wallx_sm120_silu_mul_quant_mxfp8` | 在测试数据上逐位一致；契约同上（`__expf`） |
-| `mxfp8_gemm` | `wallx_sm120_mxfp8_gemm_bf16`（cuBLASLt） | 相差几个 BF16 ulp 以内 |
-| `mxfp8_gemm_rope` | `wallx_sm120_mxfp8_qkv_rope` 模式 0（CUTLASS） | ≥ 99.99 % 的元素逐位一致，其余相差 1 个 BF16 ulp |
-| `mxfp8_gemm_silu_mul` | `wallx_sm120_mxfp8_qkv_rope` 模式 1（CUTLASS） | 同上 |
-| `mxfp8_gemm_residual` | `wallx_sm120_oproj_resid_add_bf16`（CUTLASS） | 同上；无 bias |
-
-所有算子都带容差契约注册。
-- **cuBLASLt GEMM**：每个进程中，每种形状在第一次 eager 调用时自动调优一次。同一进程的所有通道（lane）共享调优结果，但不同进程可能选出不同的算法。引擎在捕获每个新的 graph 键之前先以 eager 方式运行一次，满足了该 kernel 先预热再捕获的要求。
-- **CUTLASS GEMM**：固定 128×128×128 tile，不使用 split-K，也没有 workspace。
+MXFP8 和 NVFP4 的框架算子使用 PyTorch 参考实现。内置的 xcompute 后端为 Wall-OSS 提供 BF16 算子。详见[kernel 指南](kernels.zh-CN.md)。
 
 ## 测试
 
 | 测试 | 检查内容 |
 |---|---|
-| `tests/unit/test_mxfp8.py` | 参考格式、误差界和融合参考实现（CPU）；可融合形式：BF16 与 eager 组合逐位一致，MXFP8 贴近 BF16（CPU）；xcompute 算子对比参考实现、graph 捕获（GPU，`XINFER_XCOMPUTE_LIBRARY`） |
+| `tests/unit/test_mxfp8.py` | 参考格式、误差界和融合参考实现（CPU）；可融合形式：BF16 与 eager 组合逐位一致，MXFP8 贴近 BF16（CPU） |
 | `tests/unit/test_nvfp4.py` | 参考格式对照手算的编码和缩放因子、MSE 缩放值搜索、融合参考实现、GEMM epilogue（CPU）；`nvfp4` 和 `nvfp4_mse` 层及其可融合形式（CPU）；参考 GEMM 对比 `torch._scaled_mm` NVFP4，即 Wall-X 服务在没有 CUTLASS kernel 的形状上所用的 GEMM（GPU，sm100 或更新） |
 
 量化改动的精度门禁是 quick100（[precision.md](precision.zh-CN.md)）。

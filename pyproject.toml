@@ -74,4 +74,3 @@ select = ["E", "F", "W"]
 [tool.ruff.lint.per-file-ignores]
 # Markdown tables in the module docstrings
 "xinfer/ops/backends/flash_attn.py" = ["E501"]
-"xinfer/ops/backends/xcompute.py" = ["E501"]
