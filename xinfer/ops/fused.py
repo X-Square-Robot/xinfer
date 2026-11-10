@@ -193,23 +193,9 @@ def qkv_rope_kvcache(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
                                  head_dim, 0.0)
 
 
-def rms_norm_cast(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMSNorm ``x̂ · w`` in FP32 and one rounding to ``x.dtype`` (xcompute ``rmsnorm``; ``reference.rms_norm``).
-
-    Args:
-        x: ``[..., K]`` BF16.
-        weight: ``[K]`` FP32 or BF16.
-        eps: Added to the mean square.
-
-    Returns:
-        ``[..., K]`` in ``x.dtype``.
-    """
-    return reference.rms_norm(x, weight, eps)
-
-
 def add_rms_norm(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
                  eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """``s = residual + x`` (one BF16 rounding), then ``rms_norm_cast(s)`` (xcompute ``add_rmsnorm``).
+    """``s = residual + x`` (one BF16 rounding), then ``reference.rms_norm(s)`` (xcompute ``add_rmsnorm``).
 
     Args:
         x: ``[..., K]`` BF16 branch output.

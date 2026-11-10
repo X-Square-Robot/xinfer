@@ -139,7 +139,7 @@ limit with the SM clock at 2617–2632 MHz (maximum 3090 MHz). Evidence archive:
 `xinfer-profiling-foundation-20261106.tar.gz` (sha256 `a2e7b27836e6b1410dade4835cd5904dcafaaab1ecb0f334589a4ee637f5779f`).
 
 - BF16, FP32: `torch.mm` of random 8192 × 8192 matrices (FP32 with TF32 off), 2N³ / time.
-- MXFP8: the registered `mxfp8_gemm` (xcompute `wallx_sm120`) on 8192³ operands with `fast_accum=False`, the
+- MXFP8: the xcompute `mxfp8_gemm` backend used for that measurement on 8192³ operands with `fast_accum=False`, the
   operator's default. The MXFP8 linear layers' `fast_accum="auto"` turns fast accumulation on for calls with at most
   16 rows or at least 8192 outputs, which can run faster than this peak.
 - NVFP4: `torch._scaled_mm` of NVFP4 operands with E4M3 scales per 16 elements, 8192³.

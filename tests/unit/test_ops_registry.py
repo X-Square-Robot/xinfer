@@ -35,6 +35,51 @@ def test_highest_priority_supported_backend_wins():
     assert reg.build_table(_platform("cpu", None, "cpu")).double(1) == 2
 
 
+def test_a_backend_implementer_fixes_its_registration_and_operators_override_the_contract():
+    reg = _registry()
+    reg.define(OpSpec("triple", "triple(x)", lambda x: x * 3))
+    implements = reg.implementer("fast", platforms=("sm120",), version="fast 1.0", graph_safe=False)
+    implements("double")(lambda x: "fast double")
+    implements("triple", deterministic=False)(lambda x: "fast triple")
+    double, triple = (reg.implementations(op)[-1] for op in ("double", "triple"))
+    assert (double.backend, double.platforms, double.priority, double.version) == ("fast", ("sm120",), 10, "fast 1.0")
+    assert double.contract == Contract(numerics="tolerance", deterministic=True, graph_safe=False)
+    assert triple.contract == Contract(numerics="tolerance", deterministic=False, graph_safe=False)
+    assert reg.backend_ops("fast") == ["double", "triple"] and reg.backend_ops("slow") == []
+
+
+def test_built_in_backends_and_entry_points_load_through_one_protocol(monkeypatch):
+    """Each plugin's ``register(registry)`` returns the operators it registered; a plugin that registered none is not
+    listed, and ``XINFER_<NAME>=0`` skips one without loading it."""
+    import importlib.metadata
+    from types import SimpleNamespace
+
+    from xinfer.ops.backends import flash_attn, xcompute
+
+    def plugin(name, ops):
+        def register(registry):
+            for op in ops:
+                registry.implementer(name, platforms=("*",))(op)(lambda x: name)
+            return registry.backend_ops(name)
+        return register
+
+    loads = []
+    entries = [SimpleNamespace(name=name, load=lambda name=name, ops=ops: loads.append(name) or plugin(name, ops))
+               for name, ops in (("my-kernels", ["double"]), ("empty", []), ("skipped", ["double"]))]
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda group: entries if group == "xinfer.ops" else [])
+    monkeypatch.setattr(xcompute, "register", plugin("xcompute", ["double"]))
+    monkeypatch.setattr(flash_attn, "register", plugin("flash_attn", []))
+    monkeypatch.setenv("XINFER_SKIPPED", "0")
+    for name in ("XINFER_XCOMPUTE", "XINFER_FLASH_ATTN", "XINFER_MY_KERNELS", "XINFER_EMPTY"):
+        monkeypatch.delenv(name, raising=False)
+    reg = _registry()
+    assert reg.load_plugins() == ["xcompute", "my-kernels"]
+    assert loads == ["my-kernels", "empty"]  # "skipped" was not imported
+    assert reg.load_plugins() == []  # once per registry
+    monkeypatch.setenv("XINFER_MY_KERNELS", "0")
+    assert _registry().load_plugins() == ["xcompute"]
+
+
 def test_reference_only_and_pinned_backends():
     reg = _registry()
     reg.register("double", backend="fast", contract=TOL, platforms=("sm120",), priority=1)(lambda x: "fast")

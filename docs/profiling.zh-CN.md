@@ -112,7 +112,7 @@ bound = roofline(op_cost(name, args, kwargs, outputs), PEAKS["NVIDIA GeForce RTX
 2026-11-06 在 driver 595.91.07、torch 2.9.1+cu130 下按稳态测得：每一项先连续负载约两秒，再取 20 次 CUDA event 计时的中位数。此时 BF16 GEMM 运行在 575 W 功耗上限，SM 时钟为 2617–2632 MHz（最高 3090 MHz）。证据包：`xinfer-profiling-foundation-20261106.tar.gz`（sha256 `a2e7b27836e6b1410dade4835cd5904dcafaaab1ecb0f334589a4ee637f5779f`）。
 
 - BF16、FP32：`torch.mm` 计算随机 8192 × 8192 矩阵（FP32 关闭 TF32），2N³ / 时间。
-- MXFP8：已注册的 `mxfp8_gemm`（xcompute `wallx_sm120`），8192³，`fast_accum=False`，即该算子的默认值。MXFP8 线性层的 `fast_accum="auto"` 对至多 16 行或至少 8192 个输出的调用开启快速累加，这些调用可以快于这个峰值。
+- MXFP8：该次测量使用的 xcompute `mxfp8_gemm` 后端，8192³，`fast_accum=False`，即该算子的默认值。MXFP8 线性层的 `fast_accum="auto"` 对至多 16 行或至少 8192 个输出的调用开启快速累加，这些调用可以快于这个峰值。
 - NVFP4：`torch._scaled_mm` 计算 NVFP4 操作数，每 16 个元素一个 E4M3 scale，8192³。
 - DRAM：1 GiB 的 `copy_`，读写字节数 / 时间。
 

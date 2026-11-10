@@ -56,9 +56,9 @@ The other sections describe the target design. The table below shows how far eac
 | §10 Configuration resolution | Partially implemented | Explicit value > tuning table > model / platform rules > default, with the source of each item printed at startup (docs/configuration.md); no tuning tables ship with the package yet; `xinfer tune`, memory-planner input to derivation, and `Platform.derive` / `validate` are not implemented |
 | §11 Model integration | Implemented | Models declare stages, handoff tensors, capabilities, input and output processing, and shape buckets. The frontend imports the model class's `build_processors`; the engine calls the model's `pad` hook for warmup. |
 | §11.4 Bundled model | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the quick100 gate. |
-| §12 Quantization | Partially implemented | Per-module-group `QuantConfig`, BF16 and MXFP8 (xcompute, sm120); the quantization preset is selected by the model option `quantization`, default BF16, not resolved per (model, platform); NVFP4 (`nvfp4`, `nvfp4_mse`, the two recipes of the Wall-X NVFP4 service) has only a torch reference implementation, with no device backend and no model preset using it; `xinfer eval quant` is not implemented; for the precision gate see docs/precision.md |
+| §12 Quantization | Partially implemented | The framework supports per-group `QuantConfig`. Wall-OSS runs in BF16. MXFP8 and NVFP4 have PyTorch reference operators. See [quantization](quantization.md). |
 | §13 Platform | Partially implemented | Only device capability descriptions and CUDA / CPU resolution (`xinfer/platforms/`); streams, events, copy primitives, `register_host` (`frontend/shm.py` currently calls `cudaHostRegister` directly), `classify_error`, `derive` / `validate` and plugin activation are not implemented; Thor (sm110) is unverified |
-| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI) and flash-attn; `xinfer.ops.conformance` is not implemented |
+| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI) and flash-attn, loaded with `xinfer.ops` entry points through one protocol (§14.2); `xinfer.ops.conformance` is not implemented |
 | §15 Protocol and frontend | Partially implemented | WebSocket + msgpack, compatible with the x2robot client; `xinfer.Policy` in-process API; Client SDK and compatibility adapters not implemented |
 | §16 Observability and benchmark tools | Partially implemented | The service exposes [Prometheus metrics](metrics.md). Use the [benchmarks](benchmark.md) for single-request latency and closed-loop capacity, and [xinfer-profile](profiling.md) to measure operator, queue and stage times. |
 | §17 Testing | Partially implemented | CPU unit and contract tests; GPU and asset tests need local assets and are run manually; CI (`.gitlab-ci.yml`) runs only ruff and CPU tests |
@@ -479,7 +479,7 @@ Wall-OSS uses a Qwen2.5-VL vision tower, a prefill expert and a flow-matching ac
 
 ## 12. Quantization
 
-- **`QuantConfig`**: a method plus per-module policies. For example, Wall-OSS's `mxfp8` preset is `{vision.blocks: mxfp8, vision.merger: mxfp8, prefill: mxfp8}`, and the remaining modules (the action expert) use the default BF16. Defaults are resolved per (model, platform) (§10.2), not hard-coded in model files; HarriX's Thor configuration running the ViT in BF16 is such a platform difference.
+- **`QuantConfig`** sets the method for each module group. Wall-OSS currently supports BF16 only. See [quantization methods](quantization.md).
 - **`QuantMethod` interface**:
   - `create_weights`;
   - `process_weights_after_loading`: conversion, packing and swizzling, which must finish before the weights are frozen;
@@ -536,7 +536,7 @@ A platform declares its capabilities at build time. The runtime derives the conf
 | Typical deployment | Fleet, multiple robots per GPU | Fleet, multiple robots per GPU |
 | Memory | 32 GB discrete GPU memory | Unified memory: H2D can be zero-copy or mapped |
 | CPU | Server CPU (24-core quota in the test container) | ARM, weaker: dispatch overhead is a larger share, and Frontend preprocessing is also more likely to become the bottleneck under fleet load |
-| MXFP8 GEMM | xcompute (TVM-FFI) | xcompute `mxfp8-thor` |
+| MXFP8 GEMM | PyTorch reference | PyTorch reference |
 | MPS | Supported (used by FleetServe's split layout); v1 colocated does not depend on it | To be confirmed; v1 colocated does not depend on it |
 | Known references | FleetServe, HarriX `mxfp8-sm120` | HarriX `mxfp8-thor` (ViT BF16, whole-call graph, RTC off) |
 
@@ -570,7 +570,7 @@ Determinism is declared, not required. An operator may give results that differ 
 Calling conventions:
 
 - Submit only on the current stream; no implicit synchronization; no internal memory allocation.
-- Operators that need a workspace make their first allocation during warmup. This convention exists because xcompute MXFP8 currently allocates its workspace lazily per stream, which fails during graph capture.
+- Operators that need workspace allocate it during warmup to avoid allocating memory during CUDA graph capture.
 - The conventions above on `out`, workspace, the current stream, and no implicit synchronization or allocation do not change with the TVM-FFI or `torch.library` binding.
 
 Validation requirements:
@@ -580,10 +580,15 @@ Validation requirements:
 
 ### 14.2 Backend registration and selection
 
+An extension exposes `register(registry) -> list[str]` through an entry point in the `xinfer.ops` group. `OpRegistry.load_plugins()` loads xcompute and flash-attn before loading the entry points. Each registration returns the operator names it added, or an empty list when its dependencies are unavailable.
+
+A backend uses `registry.implementer(...)` to set the platforms, version, priority and shared numerical contract for its operators. The flash-attn backend registers an implementation like this.
+
 ```python
-@ops.register("gemm_mxfp8", platform="cuda", arch=("sm120",), backend="xcompute",
-              graph_safe=True, deterministic=True)
-def _gemm_mxfp8_sm120(x, xs, w, ws, out, workspace): ...
+implements = registry.implementer("flash_attn", platforms=("cuda",), version=f"flash-attn {flash_attn.__version__}")
+
+@implements("causal_attention")
+def _causal(q, k, v, *, scale=None): ...
 ```
 
 - The implementation is selected at model build time, not dispatched on every call.

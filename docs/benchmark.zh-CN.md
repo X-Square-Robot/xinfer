@@ -16,7 +16,7 @@
 
 ```bash
 python benchmarks/request_latency.py --model wall_oss --checkpoint /path/to/5_25000 \
-  --model-options '{"quantization": "mxfp8"}' --requests-file flow.msgpack rtc.msgpack \
+  --model-options '{"quantization": "bf16"}' --requests-file flow.msgpack rtc.msgpack \
   --runs 50 --warmup-runs 5 --out artifacts/wall-oss-latency.json
 ```
 
