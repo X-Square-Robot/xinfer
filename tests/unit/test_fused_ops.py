@@ -7,7 +7,8 @@ import torch
 import torch.nn.functional as F
 
 from xinfer import ops
-from xinfer.ops import fused, reference
+from xinfer.ops import reference
+from xinfer.ops.reference import fused
 from xinfer.platforms import resolve_platform
 
 BF16 = torch.bfloat16
@@ -97,13 +98,13 @@ def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path)
     import sys
     import types
 
-    from xinfer.ops.backends import xcompute_unified
+    from xinfer.ops.backends import _xcompute as xcompute
 
     path = tmp_path / "xcompute.so"
     path.write_bytes(b"")
     package = types.ModuleType("xcompute")
     package.KERNEL_LIB_PATH = str(path)
-    for name in xcompute_unified.UNIFIED:
+    for name in xcompute.UNIFIED:
         setattr(package, name, object())
     monkeypatch.setitem(sys.modules, "xcompute", package)
     monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
@@ -115,8 +116,8 @@ def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path)
         def has_function(self, name):
             return name in self.functions
 
-    assert xcompute_unified._python_package(Library(xcompute_unified.LIBRARY_ENTRIES)) is package
-    assert xcompute_unified._python_package(Library(())) is None
+    assert xcompute._python_package(Library(xcompute.LIBRARY_ENTRIES)) is package
+    assert xcompute._python_package(Library(())) is None
 
 
 def _fake_package(monkeypatch, tmp_path):
@@ -125,71 +126,83 @@ def _fake_package(monkeypatch, tmp_path):
     import sys
     import types
 
-    from xinfer.ops.backends import xcompute_unified
+    from xinfer.ops.backends import _xcompute as xcompute
 
     path = tmp_path / "xcompute.so"
     path.write_bytes(b"")
     package = types.ModuleType("xcompute")
     package.__spec__ = importlib.machinery.ModuleSpec("xcompute", None)
     package.KERNEL_LIB_PATH = str(path)
-    for name in xcompute_unified.UNIFIED:
+    for name in xcompute.UNIFIED:
         setattr(package, name, object())
     monkeypatch.setitem(sys.modules, "xcompute", package)
     monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
     return package
 
 
-@pytest.mark.parametrize("archs,platforms", [("110,120", ("sm110", "sm120")), ("120", ("sm120",)), ("", None)])
-def test_xcompute_operators_register_on_the_architectures_the_build_targets(monkeypatch, tmp_path, archs, platforms):
-    from xinfer.ops.backends import xcompute_unified
-    from xinfer.ops.registry import OpRegistry
-
-    package = _fake_package(monkeypatch, tmp_path)
+@pytest.mark.parametrize("archs,platforms", [("110,120", ("sm110", "sm120")), ("120", ("sm120",)), ("", ())])
+def test_xcompute_runs_on_the_architectures_the_build_targets(archs, platforms):
+    from xinfer.ops.backends import _xcompute
 
     class Library:
-        path = package.KERNEL_LIB_PATH
-        sha256 = "0" * 64
-
-        def has_function(self, name):
-            return True
-
         def function(self, name):
             assert name == "build_target_archs"
             return lambda: archs
 
-        def call(self, name, *args):
-            raise AssertionError("no kernel runs at registration")
+    assert _xcompute.target_archs(Library()) == platforms
 
-    registry = OpRegistry()
-    for name in ops.registry.names():
-        registry.define(ops.registry.spec(name))
-    xcompute_unified.register_unified(registry, Library())
-    names = registry.backend_ops("xcompute")
-    if platforms is None:
-        assert names == []
-    else:
+
+def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(monkeypatch):
+    """With xcompute imported, every fused operator is registered on its build's architectures; without it, none."""
+    import importlib
+    import types
+
+    from xinfer.ops.backends import _xcompute
+    from xinfer.ops.registry import BUILTIN_MODULES, OpRegistry
+
+    registry_module = importlib.import_module("xinfer.ops.registry")  # ``xinfer.ops.registry`` is the instance
+
+    def registered(xcompute):
+        """A registry of every operator after importing the CUDA modules with ``_xcompute.XCOMPUTE = xcompute``."""
+        registry = OpRegistry()
+        for name in ops.registry.names():
+            registry.define(ops.registry.spec(name))
+        monkeypatch.setattr(registry_module, "registry", registry)
+        monkeypatch.setattr(_xcompute, "XCOMPUTE", xcompute)
+        monkeypatch.setattr(_xcompute, "xc", xcompute["requires"])
+        for module in BUILTIN_MODULES:
+            importlib.reload(importlib.import_module(module))
+        return registry
+
+    package = types.ModuleType("xcompute")
+    try:
+        registry = registered(dict(requires=package, platforms=("sm120",), version="sha256:0"))
+        names = registry.backend_ops("cuda:xcompute")
         assert set(names) == set(FUSED)
-        assert {registry.implementations(name)[-1].platforms for name in names} == {platforms}
+        assert {registry.implementations(name)[-1].platforms for name in names} == {("sm120",)}
+        assert registered(dict(requires=None, platforms=(), version=None)).backend_ops("cuda:xcompute") == []
+    finally:
+        monkeypatch.undo()
+        for module in BUILTIN_MODULES:  # register the modules as imported into the process-wide registry again
+            importlib.reload(importlib.import_module(module))
 
 
 def test_the_xcompute_library_comes_from_the_installed_package(monkeypatch, tmp_path):
-    from xinfer.ops.backends import xcompute
+    from xinfer.ops.backends import _xcompute
 
     package = _fake_package(monkeypatch, tmp_path)
-    assert xcompute._package_library() == package.KERNEL_LIB_PATH
-    monkeypatch.setattr(xcompute.importlib.util, "find_spec", lambda name: None)
-    assert xcompute._package_library() is None
+    assert _xcompute._package_library() == package.KERNEL_LIB_PATH
+    monkeypatch.setattr(_xcompute.importlib.util, "find_spec", lambda name: None)
+    assert _xcompute._package_library() is None
 
 
-def test_xinfer_xcompute_0_skips_the_xcompute_backend(monkeypatch):
-    from xinfer.ops.backends import xcompute
-    from xinfer.ops.registry import OpRegistry
+def test_xinfer_xcompute_0_skips_xcompute(monkeypatch):
+    from xinfer.ops.backends import _xcompute
 
     calls = []
-    monkeypatch.setattr(xcompute, "register", lambda registry: calls.append(registry))
+    monkeypatch.setattr(_xcompute, "_package_library", lambda: calls.append(True))
     monkeypatch.setenv("XINFER_XCOMPUTE", "0")
-    monkeypatch.setenv("XINFER_FLASH_ATTN", "0")
-    assert "xcompute" not in OpRegistry().load_plugins() and calls == []
+    assert _xcompute._import() is None and calls == []
 
 
 # --------------------------------------------------------------------------- xcompute (GPU, RTX 5090)
@@ -203,18 +216,12 @@ FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kv
 
 @pytest.fixture(scope="module")
 def xc():
-    from xinfer.ops.backends import xcompute
-    from xinfer.ops.registry import OpRegistry
-
-    registry = OpRegistry()
-    for name in ops.registry.names():
-        registry.define(ops.registry.spec(name))
-    names = xcompute.register(registry)
+    names = (ops.registry.load_plugins(), ops.registry.backend_ops("cuda:xcompute"))[1]
     if "gemm_epilogue" not in names:
         pytest.skip("needs a build of xcompute main and the xcompute Python package of the same build")
     missing = set(FUSED) - set(names)
     assert not missing, missing
-    return registry.build_table(resolve_platform("cuda"))
+    return ops.registry.build_table(resolve_platform("cuda"))
 
 
 def _check(table, name, args, *, atol=0.0, bitwise=False, equal=False, relative=None, kwargs=None):
@@ -228,7 +235,7 @@ def _check(table, name, args, *, atol=0.0, bitwise=False, equal=False, relative=
     got = getattr(table, name)(*clone(args), **kwargs)
     want = ops.registry.spec(name).reference(*clone(args), **kwargs)
     got, want = (tuple(x) if isinstance(x, tuple) else (x,) for x in (got, want))
-    assert table.selection(name).backend == "xcompute"
+    assert table.selection(name).library == "xcompute"
     assert table.selection(name).contract.numerics == ("bitwise" if bitwise else "tolerance")
     for a, b in zip(got, want):
         if bitwise or equal:
@@ -258,7 +265,7 @@ def test_xcompute_matches_the_references_at_wall_oss_shapes(xc):
         args = (r(m, k), r(2560, k, scale=k ** -0.5), r(2560), angles.cos(), angles.sin())
         got = xc.qkv_rope_kvcache(*args, caches[0][0], caches[0][1], 32, 16, 2, 128)
         want = ops.registry.spec("qkv_rope_kvcache").reference(*args, caches[1][0], caches[1][1], 32, 16, 2, 128)
-        assert xc.selection("qkv_rope_kvcache").backend == "xcompute"
+        assert xc.selection("qkv_rope_kvcache").library == "xcompute"
         for a, b in ((got, want), (caches[0], caches[1])):
             assert float((a.float() - b.float()).norm() / b.float().norm()) < 0.01
     p, m = 768, 16

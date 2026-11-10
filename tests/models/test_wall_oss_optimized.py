@@ -46,7 +46,7 @@ def setup():
     ops.registry.load_plugins()
     platform = resolve_platform("cuda")
     table = ops.registry.build_table(platform)
-    if table.selection("gemm_epilogue").backend != "xcompute":
+    if table.selection("gemm_epilogue").library != "xcompute":
         pytest.skip("needs the xcompute Python package with the unified entries")
     with ops.use_ops(table):  # exact prompts: the fixtures' K/V have the prompt's length
         model = WallOSS.from_checkpoint(CKPT, device=platform.device,
@@ -54,7 +54,7 @@ def setup():
     assert model.numerics == "optimized"
     xcompute_ops = {op for stage in OPTIMIZED_STAGE_OPS.values() for op in stage} - {
         "varlen_attention", "causal_attention", "linear", "silu"}
-    assert {op: table.selection(op).backend for op in xcompute_ops} == {op: "xcompute" for op in xcompute_ops}
+    assert {op: table.selection(op).library for op in xcompute_ops} == {op: "xcompute" for op in xcompute_ops}
     names = [r["name"] for r in json.loads((Path(BF16) / "bf16_reference.json").read_text())["requests"]]
     return dict(model=model, device=platform.device, prepare=model.input_processor(), names=names,
                 requests=pickle.load(open(Path(REF) / "requests.pkl", "rb")),

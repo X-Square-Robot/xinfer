@@ -2,21 +2,27 @@
 
 Layers call operators through the op table that is active while they are
 constructed (``use_ops``), so the backend for every operator is fixed at
-model build time. Backend packages register through the ``xinfer.ops`` entry
-point group (``register(registry)``).
+model build time. Backend modules register their implementations with
+``register`` when they are imported; packages outside XInfer name theirs in
+the ``xinfer.ops`` entry point group.
 """
 
 import logging
 
 import torch
 
-from xinfer.ops import fused, mxfp8, nvfp4, reference
+from xinfer.ops import reference
+from xinfer.ops.reference import fused, mxfp8, nvfp4
 from xinfer.ops.registry import (
     REFERENCE_BACKEND,
+    STRICT_ENV,
     Implementation,
     OpRegistry,
     OpTable,
     active_ops,
+    register,
+    registry,
+    strict,
     use_ops,
 )
 from xinfer.ops.spec import Contract, OpSpec
@@ -28,12 +34,11 @@ __all__ = [
     "OpSpec",
     "OpTable",
     "active_ops",
+    "register",
     "registry",
     "use_ops",
 ]
 logger = logging.getLogger(__name__)
-
-registry = OpRegistry()
 
 for _spec in (
     OpSpec("linear", "linear(x, weight, bias=None) -> Tensor", reference.linear),
@@ -114,7 +119,7 @@ for _spec in (
         "mxfp8_gemm(a_q, a_scales, w_q[N, K], w_scales, bias=None, *, fast_accum=False) -> bf16[M, N]",
         mxfp8.gemm,
     ),
-    # Fused forms (xinfer/ops/mxfp8.py): FP32 intermediates are not rounded to BF16.
+    # Fused forms (xinfer/ops/reference/mxfp8.py): FP32 intermediates are not rounded to BF16.
     OpSpec(
         "mxfp8_rmsnorm_quantize",
         "mxfp8_rmsnorm_quantize(x_bf16[M, K], weight[K], eps, *, share_scale_128=True) -> (e4m3, scales)",
@@ -168,7 +173,7 @@ for _spec in (
            "flow_velocity_euler(x[B, M, A] fp32, h[B, M, K] (normed), weight[A, K], dt, dof_mask=None,"
            " padding_velocity=None, pinned=None, pinned_values=None) -> fp32[B, M, A]  # flow velocity",
            fused.flow_velocity_euler),
-    # NVFP4 (xinfer/ops/nvfp4.py): packed E2M1 uint8 [M, K/2] with E4M3 scales per 16 columns.
+    # NVFP4 (xinfer/ops/reference/nvfp4.py): packed E2M1 uint8 [M, K/2] with E4M3 scales per 16 columns.
     OpSpec(
         "nvfp4_quantize",
         "nvfp4_quantize(x_bf16[M, K], *, global_scale=1.0, mse=False) -> (e2m1x2 uint8[M, K/2], e4m3 scales)",
@@ -197,8 +202,8 @@ del _spec
 def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[str]:
     """Warn when, on a CUDA device, operators a model calls have no backend kernel and run on a fused reference.
 
-    A fused operator's reference (``xinfer/ops/fused.py``) composes torch operations in place of a backend kernel,
-    so the model runs much slower on it. ``Policy`` and ``xinfer-serve`` call this once the model is built.
+    A fused operator's reference (``xinfer/ops/reference/fused.py``) composes torch operations in place of a backend
+    kernel, so the model runs much slower on it. ``Policy`` and ``xinfer-serve`` call this once the model is built.
 
     Args:
         model: the model name, for the message.
@@ -208,6 +213,9 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
 
     Returns:
         The operators on a fused reference, sorted (none on other devices).
+
+    Raises:
+        RuntimeError: there are such operators and ``XINFER_OPS_STRICT`` is set.
     """
     if torch.device(device).type != "cuda":
         return []
@@ -215,7 +223,10 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
                     if table.selection(name).backend == REFERENCE_BACKEND
                     and registry.spec(name).reference.__module__ == fused.__name__})
     if names:
-        logger.warning("%s: %d operators have no fast kernel loaded and fall back to slow torch code (%s). Install "
-                       "xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: docs/kernels.md",
-                       model, len(names), ", ".join(names))
+        message = (f"{model}: {len(names)} operators have no fast kernel loaded and fall back to slow torch code "
+                   f"({', '.join(names)}). Install xcompute built for this GPU, or set "
+                   "XINFER_XCOMPUTE_LIBRARY to such a build: docs/kernels.md")
+        if strict():
+            raise RuntimeError(f"{message} ({STRICT_ENV} is set)")
+        logger.warning("%s", message)
     return names
