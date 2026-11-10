@@ -39,6 +39,23 @@ def test_cli_parses_signed_stream_priorities():
     assert _per_stage(args.stream_priorities) == {"a": 0, "b": -1}
 
 
+def _dry_run(model_options):
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(ROOT), str(HERE)]))
+    return subprocess.run([sys.executable, "-m", "xinfer.entrypoints.serve", "--model", "echo_model:EchoModel",
+                           "--checkpoint", "unused", "--device", "cpu", "--model-options", model_options, "--dry-run"],
+                          capture_output=True, text=True, env=env, timeout=120)
+
+
+def test_image_preprocess_device_is_a_top_level_model_option():
+    """As for ``Policy``: read at the top level of the model options (``"gpu"`` needs device images, which the CPU
+    platform lacks), rejected in ``processing``."""
+    assert _dry_run('{"image_preprocess_device": "cpu"}').returncode == 0
+    for options, message in (('{"image_preprocess_device": "gpu"}', "cannot decode images on the device"),
+                             ('{"processing": {"image_preprocess_device": "cpu"}}', "top-level model option")):
+        result = _dry_run(options)
+        assert result.returncode != 0 and message in result.stdout + result.stderr, options
+
+
 def _free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -268,14 +285,58 @@ def test_health_endpoint(server):
         assert response.status == 200
 
 
+def test_metrics_endpoint_sums_the_engine_and_every_frontend(server):
+    import urllib.request
+
+    from prometheus_client.parser import text_string_to_metric_families
+
+    port, _, _ = server
+    with connect(f"ws://127.0.0.1:{port}", max_size=None) as websocket:
+        websocket.recv()
+        websocket.send(packb({"x": np.arange(4, dtype=np.float32)}))
+        assert unpackb(websocket.recv())["status"] == "ok"
+    time.sleep(1.0)  # the engine's sampled gauges are updated every 0.5 s
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=10) as response:
+        assert response.status == 200 and response.headers["Content-Type"].startswith("text/plain")
+        text = response.read().decode()
+    samples = {}
+    for family in text_string_to_metric_families(text):
+        for s in family.samples:
+            samples.setdefault(s.name, []).append((s.labels, s.value))
+    assert sum(v for labels, v in samples["xinfer_requests_total"] if labels["status"] == "ok") >= 1
+    assert samples["xinfer_request_duration_seconds_count"][0][1] >= 1
+    assert {labels["stage"] for labels, _ in samples["xinfer_stage_execution_seconds_count"]} == {"act"}
+    assert sum(v for labels, v in samples["xinfer_stage_dispatches_total"] if labels["stage"] == "act") >= 1
+    assert samples["xinfer_engine_healthy"] == [({}, 1.0)]
+    assert samples["xinfer_model_info"][0][0]["model"] == "echo_model:EchoModel"
+
+
+def test_metrics_can_be_disabled():
+    import urllib.error
+    import urllib.request
+
+    port, process, lines = _start("--disable-metrics")
+    try:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=10)
+        assert error.value.code == 404
+    finally:
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=30) == 0, "".join(lines[-20:])
+
+
 def test_shutdown_is_clean(server):
     port, process, lines = server
     shm_before = {p for p in os.listdir("/dev/shm") if p.startswith("xinfer-")}
     assert shm_before  # frontends own their buffers while running
+    metrics_dir = Path(next(line for line in lines if "recording Prometheus metrics in" in line).split(" in ")[1]
+                       .split(";")[0])
+    assert metrics_dir.is_dir()
     process.send_signal(signal.SIGTERM)
     assert process.wait(timeout=30) == 0, "".join(lines[-20:])
     time.sleep(0.5)
     assert not ({p for p in os.listdir("/dev/shm") if p.startswith("xinfer-")} & shm_before)
+    assert not metrics_dir.exists()  # the temporary metrics directory is removed
 
 
 def test_startup_resolves_and_records_the_configuration(server, resolved_path):

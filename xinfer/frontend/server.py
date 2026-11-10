@@ -51,8 +51,9 @@ def run_frontend(index: int, pipe, options: dict) -> None:
             ``server_timing``.
         pipe: this end of the pipe to the engine process's bridge thread.
         options: ``model``, ``checkpoint``, ``model_options``, ``host``, ``port``, ``buffers`` (ring
-            size), ``buffer_bytes`` (bytes per buffer), ``workers`` (processing threads), ``shm_prefix`` and
-            optionally ``env`` (sent in the metadata frame, default ``"x2robot"``).
+            size), ``buffer_bytes`` (bytes per buffer), ``workers`` (processing threads), ``shm_prefix``,
+            ``metrics`` (record ``FrontendMetrics`` and answer ``GET /metrics``) and optionally ``env`` (sent in the
+            metadata frame, default ``"x2robot"``).
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = ""  # frontends never touch the GPU
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # until the event loop runs; unwind to unlink the buffers
@@ -88,7 +89,9 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
     resolves the matching futures on the event loop. Input and output
     processing run on ``options["workers"]`` threads: their heavy parts (image
     decode and resize) release the GIL, so requests of different connections
-    are processed at the same time. ``GET /healthz`` and ``/ready`` on the same port return 200.
+    are processed at the same time. ``GET /healthz`` and ``/ready`` on the same port return 200; with
+    ``options["metrics"]``, ``GET /metrics`` returns every process's metrics (``xinfer.observability.metrics``) and
+    each answered request is recorded, else it returns 404.
 
     Args:
         index: frontend number.
@@ -101,6 +104,9 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
     """
     import websockets
 
+    from xinfer.observability import metrics as server_metrics
+
+    recorded = server_metrics.FrontendMetrics() if options.get("metrics") else None
     loop = asyncio.get_running_loop()
     # SIGTERM ends the loop. A handler raising SystemExit is lost when it runs inside a __del__.
     terminated = asyncio.Event()
@@ -147,6 +153,16 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
         """
         connection = (index, next(connections))
         prepare_connection = connect(prepare)
+        if recorded is not None:
+            recorded.connections.inc()
+        try:
+            await _answer(websocket, connection, prepare_connection)
+        finally:
+            if recorded is not None:
+                recorded.connections.dec()
+
+    async def _answer(websocket, connection, prepare_connection):
+        """Send the metadata frame, then answer the connection's requests until it closes (``handler``)."""
         await websocket.send(hello)
         async for message in websocket:
             received_at = time.perf_counter()
@@ -176,6 +192,8 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
                     infer_ms=(finished_at - received_at) * 1000, prepare_ms=(prepared_at - received_at) * 1000,
                     engine_ms=(engine_done_at - prepared_at) * 1000, output_ms=(finished_at - engine_done_at) * 1000,
                     frontend=index)
+                if recorded is not None:
+                    recorded.answered(OK, response["server_timing"])
                 await websocket.send(packb(response))
             except Exception as exc:  # noqa: BLE001 - the robot gets the error, the connection stays
                 if buffer is not None:
@@ -187,14 +205,24 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
                 reply = {"status": status, "error": error}
                 if getattr(exc, "error_info", None) is not None:  # a protocol error the robot acts on
                     reply.update(error=str(exc), error_info=exc.error_info)
+                if recorded is not None:
+                    recorded.answered(status)
                 await websocket.send(packb(reply))
 
-    def process_request(connection, request):
-        """Answer ``/healthz`` and ``/ready`` with 200; return None to continue the WebSocket handshake."""
+    async def process_request(connection, request):
+        """Answer ``/healthz``, ``/ready`` and ``/metrics``; return None to continue the WebSocket handshake."""
         # Plain HTTP health check on the serving port. Frontends start only
         # after the engine finished warmup, so an open port means ready.
         if request.path in ("/healthz", "/ready"):
             return connection.respond(HTTPStatus.OK, "ok\n")
+        if request.path.split("?")[0] == "/metrics":
+            if recorded is None:
+                return connection.respond(HTTPStatus.NOT_FOUND, "metrics are disabled\n")
+            body, content_type = await asyncio.to_thread(server_metrics.render)  # reads every process's files
+            response = connection.respond(HTTPStatus.OK, body.decode())
+            del response.headers["Content-Type"]
+            response.headers["Content-Type"] = content_type
+            return response
         return None
 
     server = await websockets.serve(handler, options["host"], options["port"], reuse_port=True,

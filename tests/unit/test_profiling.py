@@ -34,7 +34,7 @@ def events():
 
 
 def _registry():
-    """``mm`` with a fast default backend and a batch-invariant one, each logging its calls."""
+    """``mm`` with a backend that logs its calls."""
     reg, calls = OpRegistry(), []
     reg.define(OpSpec("mm", "mm(x, w, *, scale=1.0)", lambda x, w, *, scale=1.0: x @ w * scale))
 
@@ -43,39 +43,31 @@ def _registry():
         calls.append("fast")
         return x @ w * scale
 
-    @reg.register("mm", backend="stable", contract=Contract(numerics="tolerance", batch_invariant=True), priority=-2)
-    def stable(x, w, *, scale=1.0):
-        calls.append("stable")
-        return x @ w * scale
-
-    return reg, fast, stable, calls
+    return reg, fast, calls
 
 
 def test_plain_tables_bind_the_selected_functions_without_a_wrapper():
-    reg, fast, stable, _ = _registry()
-    table = reg.build_table(resolve_platform("cpu"))
-    assert table.mm is fast and table.batch_invariant_table().mm is stable
+    reg, fast, _ = _registry()
+    assert reg.build_table(resolve_platform("cpu")).mm is fast
     reference = ops.registry.build_table(resolve_platform("cpu"), reference_only=True)
-    for t in (reference, reference.batch_invariant_table()):
-        for name in ops.registry.names():
-            assert getattr(t, name) is ops.registry.spec(name).reference, name
+    for name in ops.registry.names():
+        assert getattr(reference, name) is ops.registry.spec(name).reference, name
 
 
 def test_profiled_tables_call_the_same_implementations_inside_spans(events):
-    reg, fast, stable, calls = _registry()
+    reg, fast, calls = _registry()
     table = reg.build_table(resolve_platform("cpu"))
     profiled = annotate.profiled_ops(table)
     x, w = torch.ones(2, 3), torch.ones(3, 4)
     assert torch.equal(profiled.mm(x, w, scale=2.0), torch.full((2, 4), 6.0))
-    assert torch.equal(profiled.batch_invariant_table().mm(x, w=w), torch.full((2, 4), 3.0))
-    assert calls == ["fast", "stable"]
+    assert torch.equal(profiled.mm(x, w=w), torch.full((2, 4), 3.0))
+    assert calls == ["fast", "fast"]
     assert events == [(None, "enter", "op::mm", {"x": "float32[2,3]", "w": "float32[3,4]", "scale": 2.0}),
                       (None, "exit", "op::mm"),
                       (None, "enter", "op::mm", {"x": "float32[2,3]", "w": "float32[3,4]"}),
                       (None, "exit", "op::mm")]
-    assert table.mm is fast and table.batch_invariant_table().mm is stable  # the plain table is unchanged
+    assert table.mm is fast  # the plain table is unchanged
     assert profiled.report() == table.report()
-    assert profiled.batch_invariant_table().selection("mm").backend == "stable"
     assert inspect.signature(profiled.mm) == inspect.signature(fast)
 
 

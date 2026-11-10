@@ -9,9 +9,10 @@ Operator profiling builds on these pieces:
 | Annotations | `xinfer.observability.annotate` | named host regions in torch profiler and Nsight Systems traces |
 | Profiled op tables | `annotate.profiled_ops` | a span around every operator call, with the call's shapes |
 | Operator cost | `xinfer.observability.op_cost` | FLOPs, bytes read and written, and compute pipe of one call |
-| Stage spans | `xinfer.engine` | a `stage::<stage>` span around every stage dispatch |
+| Engine spans | `xinfer.engine` | a `stage::<stage>` span around every stage dispatch, a `wait` span around its lane's waits, an `admit` span around each admission's upload |
 | Roofline bound | `xinfer.observability.roofline` | the lower bound of a call from its cost and the GPU's peaks |
 | Operator profile | `xinfer-profile ops`, `xinfer.observability.op_profile` | GPU time, cost and bound of every operator call shape of a model, per stage |
+| Load profile | `xinfer-profile load`, `xinfer.observability.load_profile` | each request's time in the engine under closed-loop robot load: admission, per stage queue, GPU wait and run, batch size |
 
 ## Annotations
 
@@ -35,8 +36,10 @@ with annotate.span("vision", batch_size=2):
   recorder, is added through `configure` without changing call sites.
 - Spans mark host code. A CUDA graph replay runs no host code: spans recorded during capture mark the capture, not
   the replays, so annotate eager runs.
-- The engine runs every stage dispatch inside `span("stage::<stage>", batch_size=B)`: the merge of the inputs, the stage
-  (or its graph replay) and the copies of its outputs. With annotation off this is the shared no-op context.
+- The engine runs every stage dispatch inside `span("stage::<stage>", batch_size=B, lane=i, requests="<id>,...")`: the
+  merge of the inputs, the stage (or its graph replay) and the copies of its outputs. Inside it, `span("wait")` covers
+  the lane's waits for the batch's inputs and upstream stages. Each admission's upload runs inside
+  `span("admit", request=<id>, robot=<robot>)`. With annotation off these are the shared no-op context.
 
 ## Profiled op tables
 
@@ -52,8 +55,7 @@ with ops.use_ops(profiled):
 - Every operator call of a model built under the profiled table runs inside `span("op::<operator>", **args)`, the
   arguments named by the implementation's parameters: tensors as `dtype[shape]`, host sequences as `[a,b,...]`,
   other values as they are; `None` is omitted.
-- The batch-invariant companion table (`batch_invariant_table()`) is wrapped too. Selections, contracts and the
-  selection report are those of the plain table.
+- Selections, contracts and the selection report are those of the plain table.
 - A model built under a plain table binds the selected implementations' function objects themselves, so profiling
   adds no wrapper and no overhead when it is off. `profiled_ops` uses `OpTable.wrapped(wrap)`, which copies a table
   with each callable replaced by `wrap(implementation)`.
@@ -182,3 +184,86 @@ without CUDA activity stops the command with that message.
   kernel times and do not include those gaps; the graph replay span is what serving sees.
 - Operators without an explicit formula have the generic data-movement cost (`generic`), so their bound is a memory
   bound.
+
+## Load profile (`xinfer-profile load`)
+
+```bash
+xinfer-profile load --model wall_oss --checkpoint /path/to/checkpoint --requests observation.msgpack \
+  --robots 8 --out artifacts/wall-oss-load
+```
+
+Where a request's time goes in the engine when several robots share it: what `xinfer-profile ops` does not see,
+since it runs one request at a time.
+
+1. **Engine.** The model and an `Engine` with `xinfer-serve`'s resolved defaults (lanes, batch sizes, CUDA
+   graphs), warmed up with the requests of `--requests` like `--warmup`.
+2. **Load.** `--robots` virtual robots (default 8) submit the prepared requests in turn, `--requests-per-robot` each
+   (default 80), at most one in flight: a robot sends its next request `--period-ms` (default 180) after the
+   previous one, or when the response arrives if that is later. The first `--warmup-requests` (default 20) of each
+   robot are left out of the statistics. With `--start spread` (default) robot `r` sends its first request `r / N`
+   of a period after the first robot, as independent robots would; with `--start together` all send it at once and
+   stay in step while the responses come within the period, the worst case for the queues. The times depend on
+   this arrival pattern: `benchmarks/robot_load.py` against `xinfer-serve` lies between the two.
+3. **Record.** A span sink (`load_profile.SpanRecorder`) keeps the engine's `admit`, `stage::` and `wait` spans:
+   host times and, on CUDA, timing events on the lane's stream at their ends, read after the load, so nothing
+   synchronizes while it runs. A dispatch's first event runs on its free lane at about the dispatch's host time,
+   which places the GPU times on the host clock.
+
+Segments per request (ms):
+
+| Segment | Time |
+|---|---|
+| `admit_ms` | submission to admission: waiting for a slot |
+| `inputs_ms` | the upload at admission |
+| `<stage>.delay_ms` | from the stage's inputs being ready (the upload's end for a first stage, else its upstream stages done on the GPU) to its start on the GPU |
+| `<stage>.run_ms` | the stage running on the GPU (host time on the CPU) |
+| `complete_ms` | the final stage done on the GPU until the result: the copy to the host and the completion thread |
+| `total_ms` | submission to the result |
+
+Along a chain of stages, as in every current model, these add up to `total_ms`, so the segments' excess in the tail
+adds up to the total's. `requests.csv` also has each stage's times that overlap the upstream run, for finding where
+a delay comes from:
+
+| Column | Time |
+|---|---|
+| `<stage>.queue_ms` | on the host, from the upload's or the upstream dispatches' end to the dispatch: waiting for a free lane |
+| `<stage>.wait_ms` | the lane waiting on the GPU for the inputs and upstream stages |
+
+With chained dispatch a request enters a stage's queue as soon as its upstream stages are dispatched, and a lane
+stays busy until its dispatch is done on the GPU. A stage's queue and wait times therefore run while its upstream
+stages run, and cost time only where they show up in `delay_ms`.
+
+| File | Contents |
+|---|---|
+| `requests.csv` | one row per request: robot, index, every segment, each stage's batch size, queue and wait times |
+| `summary.md`, `summary.json` | P50/P95/P99 of the segments that add up to `total_ms`, the requests per stage and batch size, the throughput, and for the requests at or above P95 and P99 of `total_ms` each segment's mean minus its mean over the median band (P45–P55) |
+| `meta.json` | the command, model options, the request file's sha256, the load settings, the resolved configuration, the operator selection and, on CUDA, the GPU, versions and source |
+
+- In process there are no frontend processes: requests are prepared once and their outputs are not processed, so
+  input and output processing, the network and the transfers between processes are not in the times. `--serve`
+  adds them (below).
+- With `DeviceImage` inputs the decoding on the device is in the first stage's delay.
+
+### Through `xinfer-serve` (`--serve`)
+
+With `--serve` the command starts `xinfer-serve` for the run (the same model, checkpoint and options, warmed up with
+`--requests`, plus `--serve-args`) with `--profile-dir <out>/engine`, and the robots become WebSocket clients sending
+the wire requests of `--requests` in turn, so every request goes through a frontend's input and output processing,
+the shared memory and the pipes as robots' requests do. `--profile-dir` makes the service's engine process record the
+same spans and write each request's engine side to `engine/engine-requests.json` when it stops.
+
+Each robot keeps one connection with one request in flight and connects after the previous robot, so each frontend
+numbers its connections in robot order; the engine knows a request by that connection, which joins each request's
+client time, `server_timing` and engine spans. Segments per request (ms):
+
+| Segment | Time |
+|---|---|
+| `network_ms` | the client's time minus `server_timing.infer_ms`: the network and the message encoding |
+| `prepare_ms`, `output_ms` | the frontend's input and output processing (`server_timing`) |
+| `handoff_ms` | `server_timing.engine_ms` minus the engine's span from admission to the final stage done: the shared-memory buffer, the pipes, waiting for a slot, the copy to the host and the completion |
+| `inputs_ms`, `<stage>.delay_ms`, `<stage>.run_ms` | as in process |
+| `total_ms` | sent to received, on the client |
+
+These add up to `total_ms` as in process; `requests.csv` also has the stages' queue and wait times.
+
+The command stops the service after the load; `serve.log` holds its log and resolved configuration.

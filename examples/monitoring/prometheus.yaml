@@ -1,0 +1,11 @@
+# Scrapes xinfer-serve's GET /metrics (docs/metrics.md). List one target per server (one server per GPU).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: xinfer
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - host.docker.internal:33985

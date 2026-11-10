@@ -21,7 +21,7 @@ The performance and validation guides document the conditions of each Wall-OSS m
 | Item | Decision |
 |---|---|
 | Project name | XInfer |
-| Repository | X-Square-Robot/xinfer on GitHub. External publication is subject to license and contribution-process approval. |
+| Repository | X-Square-Robot/x2infer on GitHub. |
 | Kernels | Stay in the existing xcompute repository, owned by the operator team; XInfer integrates through the xcompute binding in the ops layer |
 | Operator binding | xcompute uses TVM-FFI by default; where there is a concrete PyTorch compile or export need, `torch.library` adapters are added as needed and reuse the underlying implementation (§14.2) |
 | Deployment scenario | Each accelerator runs a model instance serving one or more robots. |
@@ -44,7 +44,7 @@ The other sections describe the target design. The table below shows how far eac
 | §4 Device boundary | Not implemented | `engine/` calls `torch.cuda` directly and branches on `Platform.is_cuda`; `test_layering.py` only checks that `platforms/interface.py` and `models/interface.py` do not import torch |
 | §5 Cancellation and per-request errors | Partially implemented | Cancelled requests that are not yet dispatched are dropped; dispatched ones run to completion and their results are discarded. An error during stage execution, during the upload at admission or while taking a batch fails only the affected requests and releases their slots. If the engine thread or the completion thread stops, `xinfer-serve` exits with status 1; recognizing sticky device errors (`Platform.classify_error`) and DRAINING are not implemented |
 | §6.3 Three scheduling rules | Implemented | A request enters the downstream queue as soon as its upstream is dispatched, and the downstream lane waits for the event on the GPU; zero-wait batching; the completion thread waits only for the final event (`xinfer/engine/core.py`) |
-| §6.4 Batch only batch-invariant stages | Implemented | Wall-OSS resolves allowed action batch sizes from its numerical composition and selected operator contracts. Vision and prefill use B1. |
+| §6.4 Batched precision | Implemented | The Wall-OSS reference action stage supports B1, B2, B4 and B8. The optimized composition, vision and prefill run at B1. |
 | §7.1 Admission | Partially implemented | `submit` returns a Future, which on rejection holds an `AdmitError` (`queue_full`, `per_robot_limit`, `stopped`); `admission_timeout` is not implemented |
 | §7.2–§7.4 Stage queues, batching, dispatch | Implemented | FIFO; the runtime derives the compatibility key from the inputs a stage actually reads; handoff tensors with different sequence lengths are left-padded and batched; batches are joined with torch concatenation, not through Platform copy primitives |
 | §7.5 Policy plugins | Not implemented | FIFO is built into the engine |
@@ -58,9 +58,9 @@ The other sections describe the target design. The table below shows how far eac
 | §11.4 Bundled model | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the quick100 gate. |
 | §12 Quantization | Partially implemented | Per-module-group `QuantConfig`, BF16 and MXFP8 (xcompute, sm120); the quantization preset is selected by the model option `quantization`, default BF16, not resolved per (model, platform); NVFP4 (`nvfp4`, `nvfp4_mse`, the two recipes of the Wall-X NVFP4 service) has only a torch reference implementation, with no device backend and no model preset using it; `xinfer eval quant` is not implemented; for the precision gate see docs/precision.md |
 | §13 Platform | Partially implemented | Only device capability descriptions and CUDA / CPU resolution (`xinfer/platforms/`); streams, events, copy primitives, `register_host` (`frontend/shm.py` currently calls `cudaHostRegister` directly), `classify_error`, `derive` / `validate` and plugin activation are not implemented; Thor (sm110) is unverified |
-| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI), flash-attn and batch-invariant Triton kernels; `xinfer.ops.conformance` is not implemented |
+| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI) and flash-attn; `xinfer.ops.conformance` is not implemented |
 | §15 Protocol and frontend | Partially implemented | WebSocket + msgpack, compatible with the x2robot client; `xinfer.Policy` in-process API; Client SDK and compatibility adapters not implemented |
-| §16 Observability and benchmark tools | Partially implemented | `server_timing` in responses; `benchmarks/request_latency.py` measures in-process single-request latency, and `benchmarks/robot_load.py` runs closed-loop load tests by the repository's conventions (Wall-OSS with RTC; request files without RTC through `--requests-file`), see docs/benchmark.md; the foundation of operator profiling (docs/profiling.md): `span` in `xinfer.observability.annotate` (kineto and NVTX sinks, chosen at startup), the `profiled_ops` op table, which puts a span around every operator call, the operator cost (`xinfer.observability.op_cost`: explicit formulas for the operators that do matrix products, each input and output moved once for the rest; `OpSpec` carries no cost), a `stage::` span around every stage dispatch in the engine, the roofline bound with a table of measured peaks, and `xinfer-profile ops`, which runs a model's requests under torch.profiler and writes per-stage operator tables with bounds; the `xinfer bench` / `tune` / `eval` commands are not implemented |
+| §16 Observability and benchmark tools | Partially implemented | The service exposes [Prometheus metrics](metrics.md). Use the [benchmarks](benchmark.md) for single-request latency and closed-loop capacity, and [xinfer-profile](profiling.md) to measure operator, queue and stage times. |
 | §17 Testing | Partially implemented | CPU unit and contract tests; GPU and asset tests need local assets and are run manually; CI (`.gitlab-ci.yml`) runs only ruff and CPU tests |
 | §18.1 Repository layout and command line | Differs from the plan | The repository is authoritative for directories; the service entry point is `xinfer-serve` (that is, `python -m xinfer.entrypoints.serve`) and the profiling entry point `xinfer-profile` (`ops`); the unified `xinfer` command is not implemented |
 
@@ -170,7 +170,7 @@ Two principles:
 | `observability/` | `ops/`, `platforms/` | `engine/`, `models/`, `layers/`, `frontend/`, `quantization/`, `loader/`, `config/` |
 | `entrypoints/` | Any package above | None (no other package depends on it) |
 
-The startup order is: build the model (operators are selected here) → `config.resolve` reads the built model's `capabilities()` and the platform capabilities → create the Engine. So properties derived from operators, such as batch invariance, reach the engine through the model interface, and the engine depends on neither ops nor config; the Frontend's shared memory and the Engine are connected by `entrypoints/serve.py`, so the engine does not depend on frontend.
+The startup order is: build the model (operators are selected here) → `config.resolve` reads the built model's `capabilities()` and the platform capabilities → create the Engine. So what the built model supports, such as its batch sizes, reaches the engine through the model interface, and the engine depends on neither ops nor config; the Frontend's shared memory and the Engine are connected by `entrypoints/serve.py`, so the engine does not depend on frontend.
 
 `test_layering.py` checks the package dependency directions in the table above, and that `platforms/interface.py` and `models/interface.py` do not import torch. The device boundary below is a target; it is neither implemented nor checked.
 
@@ -235,10 +235,7 @@ The first two concern "how stages are linked" and the last two "at what granular
 ### 6.4 Correctness contract: running alone and under full load
 
 - **Same kernels.** Both paths use the same set of stage graphs. Operators need not be deterministic (§14.1): results under full load must pass the model's precision gate as results run alone do, and where every operator of a stage is deterministic the two are bitwise equal.
-- **Only batch-invariant stages are batched.** The default path uses Bn>1 only for stages whose backend declares batch invariance and passes the "B1 and Bn bitwise equal" test; other stages use only B1 concurrency across lanes, which needs no batch invariance.
-- **Operator team deliverable.** For stages where batching pays off, batch-invariant kernels are an operator team deliverable.
-  - Current state: in XInfer, the action stage of Wall-OSS uses batch-invariant kernels and supports B1–B8; its vision and prefill stages support only B1.
-- **CI check**: the same input passes the precision gate under idle and full-load replay, and gives bitwise-equal outputs for stages whose operators are deterministic.
+- A model declares a stage's supported batch sizes after checking the batched results against its precision gate. Batching may change rounding. Wall-OSS supports action batching in the reference composition and uses B1 in the optimized composition.
 - **Scope.** Bitwise equality holds only within one platform and one set of operator implementations, not across chips; alignment across platforms and with the reference implementation uses tolerances, and each platform keeps its own golden outputs.
 
 ### 6.5 Risks to quantify in M0 / M1
@@ -375,7 +372,7 @@ Neither of them has **named profiles**:
 
 1. **Explicit values**: always take effect; a conflict with platform capabilities is an error, never silently rewritten.
 2. **Tuning table**: stores the measured best resource configuration, such as lane counts, per (model, platform, quantization). Generated by `xinfer tune`, shipped with the repository, and records the commit, date and measurement conditions.
-3. **Derivation rules**: derived from platform capabilities, model declarations (stage graph, batch invariance, shape buckets) and the memory planner. Shape-bucket granularity and the default `QuantConfig` are also resolved per (model, platform) at this level, not written in model files. Platform limits that caps cannot express come from `Platform.derive` and `Platform.validate` (§13.1), and are marked `platform:<name>` in the startup report; core rules contain no vendor special cases.
+3. **Derivation rules**: derived from platform capabilities, model declarations (stage graph, batch sizes, shape buckets) and the memory planner. Shape-bucket granularity and the default `QuantConfig` are also resolved per (model, platform) at this level, not written in model files. Platform limits that caps cannot express come from `Platform.derive` and `Platform.validate` (§13.1), and are marked `platform:<name>` in the startup report; core rules contain no vendor special cases.
 4. **Fixed defaults**: independent of load.
 
 There are no load-derived intent parameters (such as the number of robots served). The number of robots an instance serves changes all the time, while the engine adapts to arriving requests by itself: it batches only requests already queued, idle lanes use no compute, and CUDA graphs are captured for the keys that actually occur. So the in-flight request limit (the counterpart of vLLM's `max_num_seqs`, which is likewise a fixed default limit), the allowed batch sets per stage, the lane counts and the number of frontend processes all take limits or fixed values that suit any load (docs/configuration.md).
@@ -397,7 +394,7 @@ At startup the resolved values are printed and saved to disk, each with its sour
 max_running_requests  32         default
 lanes.vision          2          tuned:wall_oss/sm120-mxfp8@<commit>
 batch_sizes.vision    [1]        model:declares B1 only
-batch_sizes.action    [1,2,4,8]  model:batch-invariant, declared sizes
+batch_sizes.action    [1,2,4,8]  model:declared sizes
 cudagraphs            True       platform:supports graph capture
 frontends             2          default, ≤ cpus/2 = 12
 frontend_workers      4          default, frontends × workers ≤ cpus/2 = 12
@@ -436,7 +433,8 @@ class WallOSS(VLAModel):
             "prompt_kv": TensorSpec(batch_axis=2, seq_axis=4)}),  # the model declares the axes for the selected attention backend (§11.2)
     )
     def shape_buckets(self, cfg): ...          # planned: legal range, e.g. prompt width ≤ 200, step 16; the platform picks the actual buckets (§8.3)
-    def capabilities(self): ...                # RTC, batch sizes, batch invariance (derived from the selected operators)
+    pad_prompt = staticmethod(pad_prompt)      # pads a prepared prompt to a bucket width; the base class's pad() applies it
+    def capabilities(self): ...                # RTC, batch sizes, each stage's operators
     def stage_outputs(self, stage, b): ...     # shape and dtype of each stage's output buffers, allocated by the runtime
 
     def encode_images(self, b: StageBatch) -> None: ...   # writes b.out["image_embeds"]
@@ -538,7 +536,7 @@ A platform declares its capabilities at build time. The runtime derives the conf
 | Typical deployment | Fleet, multiple robots per GPU | Fleet, multiple robots per GPU |
 | Memory | 32 GB discrete GPU memory | Unified memory: H2D can be zero-copy or mapped |
 | CPU | Server CPU (24-core quota in the test container) | ARM, weaker: dispatch overhead is a larger share, and Frontend preprocessing is also more likely to become the bottleneck under fleet load |
-| MXFP8 GEMM | xcompute (TVM-FFI) | xcompute `mxfp8-thor` (`model/xcompute!58`) |
+| MXFP8 GEMM | xcompute (TVM-FFI) | xcompute `mxfp8-thor` |
 | MPS | Supported (used by FleetServe's split layout); v1 colocated does not depend on it | To be confirmed; v1 colocated does not depend on it |
 | Known references | FleetServe, HarriX `mxfp8-sm120` | HarriX `mxfp8-thor` (ViT BF16, whole-call graph, RTC off) |
 
@@ -565,7 +563,7 @@ Each operator defines:
 
 - **Signature**: outputs are written to an `out` provided by the caller; a workspace, if needed, is also provided by the caller.
 - **torch reference implementation**.
-- **Numerical contract**: bitwise equal to the reference or within a given tolerance; whether it is deterministic; whether it is batch-invariant.
+- **Numerical contract**: bitwise equal to the reference or within a given tolerance; whether it is deterministic.
 
 Determinism is declared, not required. An operator may give results that differ at rounding level between runs, for example stream-K GEMMs whose partial sums meet in a different order under concurrent load. What a model requires of its operators is that it passes its precision gate (docs/precision.md); for VLA models that is mainly the open-loop gate against recorded trajectories. Declaring `deterministic=False` tells tests and readers not to expect bitwise reproducibility.
 
@@ -577,14 +575,14 @@ Calling conventions:
 
 Validation requirements:
 
-- Every binding must be validated for numerical agreement with the reference implementation, for its declared determinism and batch invariance, and for its declared CUDA Graph capture and replay support; the binding method by itself guarantees none of these properties, nor any performance gain.
+- Every binding must be validated for numerical agreement with the reference implementation, for its declared determinism, and for its declared CUDA Graph capture and replay support; the binding method by itself guarantees none of these properties, nor any performance gain.
 - When a `torch.library` adapter is introduced, additionally validate the registration contract with `torch.library.opcheck`, and test the compile or export paths actually supported, covering input mutation and alias declarations, FakeTensor/shape inference and similar behavior. `opcheck` does not replace numerical agreement tests.
 
 ### 14.2 Backend registration and selection
 
 ```python
 @ops.register("gemm_mxfp8", platform="cuda", arch=("sm120",), backend="xcompute",
-              graph_safe=True, deterministic=True, batch_invariant=True)
+              graph_safe=True, deterministic=True)
 def _gemm_mxfp8_sm120(x, xs, w, ws, out, workspace): ...
 ```
 
@@ -605,7 +603,7 @@ def _gemm_mxfp8_sm120(x, xs, w, ws, out, workspace): ...
 | | XInfer repository (framework team) | xcompute repository (operator team) |
 |---|---|---|
 | Content | Operator signatures, reference implementations, conformance test suite, registration mechanism | High-performance implementations for each platform (CUDA/CuTe/Triton/HIP), with a wheel per platform |
-| Testing | Model-level alignment, runtime invariance | Runs `xinfer.ops.conformance` in CI (numerics, determinism, batch invariance, graph capture) and provides microbenchmarks |
+| Testing | Model-level alignment, runtime consistency | Runs `xinfer.ops.conformance` in CI (numerics, determinism, graph capture) and provides microbenchmarks |
 | Deliverables | The operator list and shapes for each model | A theoretical lower-bound (roofline) table for each implementation |
 | Versioning | Declares the compatible xcompute version range; checks the build fingerprint at startup | Semantic versioning; ABI changes bump the major version |
 
@@ -663,7 +661,7 @@ These tools decide whether others can reproduce "how many robots per GPU", and t
 | Operator conformance | Each backend implementation against the reference implementation; every binding follows the execution and validation contracts of §14.1 | xcompute repository CI (GPU) |
 | PyTorch operator adapters (when introduced) | `torch.library.opcheck`, the compile/export paths actually supported, and numerical agreement after adaptation (§14.1) | Main repository CI, on the devices declared as supported |
 | Model alignment | Frozen inputs, noise and reference outputs, compared with the original implementation | GPU, every MR (small sample) |
-| Runtime invariance | Chained vs non-chained, B1 vs Bn (when declared batch-invariant), idle vs full-load replay: outputs bitwise equal | GPU, nightly |
+| Runtime consistency | Chained vs non-chained, B1 vs Bn, idle vs full-load replay: outputs pass the precision gate, and are bitwise equal at B1 where the operators are deterministic | GPU, nightly |
 | Capacity regression | Thresholds maintained per (model, platform) | GPU, nightly or weekly |
 
 ---
@@ -774,7 +772,7 @@ XInfer/
 │   │   │   └── xcompute.py         # binds and registers xcompute implementations (currently via TVM-FFI)
 │   │   └── conformance/            # conformance test suite (also run in the xcompute repository CI)
 │   │       ├── cases.py            # per-operator shape and dtype cases, taken from the first models
-│   │       └── checks.py           # numerics, determinism, batch invariance, graph capture checks
+│   │       └── checks.py           # numerics, determinism, graph capture checks
 │   ├── observability/
 │   │   ├── timing.py               # per-request phase timing
 │   │   ├── metrics.py              # Prometheus
@@ -800,7 +798,7 @@ XInfer/
 │   ├── contract/                   # end-to-end with a fake model; test_layering.py checks dependency direction
 │   ├── plugin/                     # out-of-tree-style dummy platform package: discovery, activation and contract tests via entry points (§13.3)
 │   ├── models/                     # GPU: alignment with reference implementations (assets fetched externally per manifest)
-│   ├── invariance/                 # GPU: chained/non-chained, B1/Bn, idle/full load bitwise equal
+│   ├── consistency/                # GPU: chained/non-chained, B1/Bn, idle/full load within the precision gate
 │   └── fixtures/                   # small deterministic fixtures, noting the tests that use them
 ├── examples/                       # 5090 and Thor fleet deployment, offline Policy
 ├── tools/
@@ -903,7 +901,7 @@ What is migrated are the logical stages and the batching and ownership rules; th
 |---|---|---|
 | M-1 Review and repository setup | Main repository kc/XInfer created (private), xcompute confirmed as the operator repository; review of this document and of the operator contracts pending; CPU CI set up | Repository arrangement decided; review and acceptance conclusions recorded once the other items of this milestone are done |
 | M0 Data plane | Platform, operator backends, layers, Wall-OSS, single-lane dispatch and benchmarks | Wall-OSS meets its precision gate and records latency and graph dispatch costs on the target platform. |
-| M1 Fleet runtime | Multi-lane dispatch, zero-wait batching, frontend workers, slot lifecycle and configuration resolution | Measure fleet capacity, batch invariance and dispatch overhead under load. |
+| M1 Fleet runtime | Multi-lane dispatch, zero-wait batching, frontend workers, slot lifecycle and configuration resolution | Measure fleet capacity, batched precision and dispatch overhead under load. |
 | M2 Quantization and extension | NVFP4 and model extensions | Record numerical results for each model and quantization method. |
 | M3 Release | Docs, Client SDK, compatibility adapters, Router; license approval; GitHub release | External users can reproduce single-request latency and per-GPU capacity by following the docs |
 
@@ -915,7 +913,6 @@ What is migrated are the logical stages and the batching and ownership rules; th
 |---|---|---|
 | Chained dispatch lowers capacity near the critical load | The premise of the unified model | Measure on the colocated multi-lane path in M1; adjust the chaining condition if needed, keeping a single path |
 | Single-process dispatch becomes the bottleneck (Python overhead, GIL) | Fleet capacity | M1 measures dispatch-thread occupancy, lock waits and submission delay; first remove blocking and heavy CPU work from the hot path, and if needed evaluate moving the submission logic to a lower level. If the capacity bar is not met, keep optimizing and record the limits, without relying on the unimplemented split as a fallback; process splitting needs a separate review |
-| The first models' kernels are not batch-invariant | Limited batching gains | Listed as an operator team deliverable; use multi-lane B1 until then |
 | Thor's graphs, unified memory and CPU submission overhead differ from 5090 | Thor performance | Derive configuration from platform capabilities; separate M0 measurements on Thor. Thor is also deployed as a fleet, so M1 measures capacity and Frontend CPU usage on Thor separately. v1 does not depend on MPS, and confirming MPS support does not block this version |
 
 ---

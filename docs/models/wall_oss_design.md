@@ -45,9 +45,7 @@ The reference composition (`numerics="reference"`) reproduces the Wall-X eager m
 - LLM rotary tables: FP32 angles, cos/sin rounded to BF16; M-RoPE bands
   16/24/24. ViT rotary: FP32, not rounded.
 - The rotation itself (`rotary_embedding`) runs in FP32 and rounds once to
-  the activation dtype. With Triton installed it is one fused kernel whose
-  products and sum are separate `.rn` instructions, bitwise equal to the
-  torch composition.
+  the activation dtype.
 - Flow: `t = linspace(0, 1, N+1) · 0.999`, Euler `x ← x + Δt·v`, velocity
   prediction, per-token time (`τ = 1` for pinned RTC tokens), padding velocity
   for the uncommanded dims fixed at step 0, unnormalization with per-step
@@ -58,7 +56,7 @@ The reference composition (`numerics="reference"`) reproduces the Wall-X eager m
 ## Optimized composition
 
 `numerics="optimized"` (the default, `xinfer/models/wall_oss/optimized.py`) runs the reference composition's steps
-on operators of `xinfer/ops/fused.py`, each one xcompute call (xcompute `651195d`) where xcompute lists a kernel for
+on operators of `xinfer/ops/fused.py`, each one xcompute call (xcompute `7336b0d`) where xcompute lists a kernel for
 the shape, else the operator's torch reference. All BF16, like the reference.
 
 | Step | Operator | Kernel at this model's shapes |
@@ -95,18 +93,14 @@ Arithmetic that differs from the reference composition:
 ## Action-stage batching
 
 The reference composition's action stage takes 1, 2, 4 or 8 requests, with different prompt lengths
-and RTC delays, and gives each request the bits it gets alone (design §6.4); the optimized composition takes one:
+and RTC delays; the optimized composition takes one. A batched request gets its single-request result within
+rounding (design §6.4):
 
-- **Batch-invariant operators.** The action stack is built with the op
-  table's batch-invariant companion (`OpTable.batch_invariant_table()`):
-  - the Triton `linear` (the service's Stage-2 kernel: 16-row tiles, K split
-    fixed per weight shape) for expert 1 and the FP32 action head;
-  - the Triton `rms_norm`;
-  - flash-attn `action_attention`;
-  - elementwise references.
-
-  The ViT and the prompt keep the default selection (cuBLAS `linear`), since
-  they run one request at a time.
+- **Operators.** The action stack uses the default selection, as the other
+  stages do: cuBLAS `linear`, the xcompute `rms_norm` and flash-attn
+  `action_attention`. cuBLAS may choose another kernel for another row count,
+  so a batched request can differ from its single run at rounding level
+  (measured up to 3.4e-3, relative norm of the actions).
 - **Different prompt lengths.** `prompt_kv` declares its sequence axis.
   Batches left-pad it and pass `prompt_kv_lengths`; `action_attention` skips
   each row's padding (`cache_leftpad`), as the service did.
@@ -142,21 +136,19 @@ processor pads the prompt to a multiple of `ProcessingConfig.prompt_bucket`
   per dispatch (`left_align_prompts`, a gather over the prompt K/V), which
   makes it a plain left-padded row with `prompt_kv_lengths = P`: the layout the
   merge already produces for different lengths, which `action_attention` skips
-  with `cache_leftpad` and is batch-invariant over. The alternative, writing the
+  with `cache_leftpad`. The alternative, writing the
   action K/V right after each row's valid prompt as the Wall-X service's action
   pass does, would add a scatter per layer and step (360 per request) in place
   of the one gather; it would also change the attention operator.
-- **When.** Padding leaves the actions unchanged only if the action stage is
-  invariant to left padding, which its batch-invariant operators guarantee
-  (flash-attn with the Triton `linear`). The torch reference attention is not
-  (its softmax and products run over all columns), so `from_checkpoint`
-  rejects `prompt_bucket > 0` unless the action stage is batch-invariant; the
-  reference-operator model and the CPU run exact prompts (`prompt_bucket=0`).
+- **Rounding.** flash-attn's action attention skips the left padding, so a
+  padded request alone gets its exact prompt's actions. The torch reference
+  attention runs its softmax and products over all columns, and a batch
+  changes the GEMM row counts: both can change the bits at rounding level.
 
-Measured on an RTX 5090 (validation): padded and exact prompts give the same
-bits, for the prefill K/V of the valid tokens and for the actions (eager, graphs
-and batched with other buckets), with MXFP8 and with BF16 on the default
-backends, over 28 prompt lengths from 706 to 756 tokens.
+Measured on an RTX 5090 with the default backends (validation): the padded
+prompts of 12 requests with random arm poses give their exact prompts' actions
+bit for bit alone (eager and graphs), and within 5.9e-3 (relative norm) batched
+with requests of other buckets.
 
 ## Attention
 
