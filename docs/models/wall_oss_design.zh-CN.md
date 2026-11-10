@@ -37,7 +37,7 @@
 
 | 步骤 | 算子 | 本模型形状下的 kernel |
 |---|---|---|
-| ViT 和语言模型的残差加法 + RMSNorm | `add_rms_norm`（第一个归一化用 `rms_norm_cast`） | xcompute `add_rmsnorm` / `rmsnorm` |
+| ViT 和语言模型的残差加法 + RMSNorm | `add_rms_norm`（第一个归一化用 `rms_norm`） | xcompute `add_rmsnorm` / `rmsnorm` |
 | ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` | `qkv_proj_rope` → cuBLASLt 加一个 RoPE kernel |
 | ViT 注意力（窗口、全注意力块） | `varlen_attention` | flash-attention 2 |
 | ViT 投影、MLP down、merger（+ bias；merger fc1 + GELU） | `gemm_epilogue` | `gemm` → cuBLASLt |

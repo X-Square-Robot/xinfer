@@ -4,6 +4,8 @@
 
 Wall-OSS 默认的 BF16 组合在 CUDA 上使用 xcompute 融合算子。没有兼容的 xcompute 构建时，XInfer 用 PyTorch 参考实现运行同一组合。安装可选的 `flash-attn` 包可启用视觉和 prompt 注意力的优化实现。
 
+内置的 xcompute 和 flash-attn 后端与通过 `xinfer.ops` 入口点加载的扩展使用相同的[注册协议](design.zh-CN.md#142-后端注册与选择)。例如，设置 `XINFER_FLASH_ATTN=0` 会在加载时跳过 flash-attn。
+
 ## GPU 支持
 
 xcompute 构建必须支持服务所用 GPU 的架构。可通过 `xcompute.build_target_archs()` 检查。[Wall-OSS 性能测量](performance.zh-CN.md)使用 RTX 5090 和 xcompute `7336b0d`。
@@ -42,7 +44,7 @@ xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue':
 此时 `Policy` 和 `xinfer-serve` 在 GPU 上加载 Wall-OSS 时会记录一条警告：
 
 ```
-wall_oss: 8 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Install
+wall_oss: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Install
 xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: docs/kernels.md
 ```
 

@@ -149,7 +149,7 @@ movement only. A memory-bound call above 100 % read data still in L2.
 | `gemm_epilogue` | `x[768,2048] weight[2048,2048]` | 35 | 34.1 | 5.6 % | 29.3 | 86 % | compute |
 | `causal_attention` | `q[1,768,16,128] k[1,768,2,128]` | 35 | 29.8 | 4.9 % | 11.0 | 37 % | compute |
 | `add_rms_norm` | `x[1,768,2048] residual[1,768,2048]` | 70 | 4.0 | 1.3 % | 8.3 | 205 % | memory (generic) |
-| `rms_norm_cast` | `x[1,768,2048] weight[2048]` | 1 | 3.0 | 0.0 % | 4.1 | 138 % | memory (generic) |
+| `rms_norm` | `x[1,768,2048] weight[2048]` | 1 | 3.0 | 0.0 % | 4.1 | 138 % | memory (generic) |
 | activity outside operators | | | | 0.2 % | | | |
 
 **Action**: graph replay 7.51 ms; operator kernels 7.30 ms.
@@ -189,7 +189,7 @@ movement only. A memory-bound call above 100 % read data still in L2.
 | `tests/unit/test_cudagraph.py` | GPU | graph keys, replay = eager, after-warmup miss policies, LRU and static buffer growth; warmup covers every lane and batch size (also batches of mixed lengths); a result freed while its lane is being captured; `DeviceImage` inputs stay in host memory until the device-image thread decodes them on its own stream, and JPEGs of any length replay one graph |
 | `tests/unit/test_engine.py` | CPU | scheduler: batching, compatibility, admission, cancellation, failures; the device-image thread (a request without device images served while another's decoding is held, admission order, a failing decode fails only its request, no CUDA device) |
 | `tests/unit/test_attention_ops.py` | CPU; GPU with flash-attn | attention references (causal, RTC pinned prefix); flash-attn vs references, left-padded batches vs single rows, graph capture |
-| `tests/unit/test_mxfp8.py` | CPU; GPU with `XINFER_XCOMPUTE_LIBRARY` | MXFP8 reference format and fused references; fusable layer forms (BF16 = eager composition); xcompute operators vs references, graph capture |
+| `tests/unit/test_mxfp8.py` | CPU | MXFP8 reference format and fused references; fusable layer forms (BF16 = eager composition) |
 | `tests/unit/test_shm.py` | CPU | tensors and `DeviceImage` data cross from a frontend through shared memory, with the image sizes in the manifest |
 | `tests/unit/test_serve.py` | CPU | engine + 2 frontend processes + WebSocket clients: metadata, concurrency, errors, health, clean shutdown |
 

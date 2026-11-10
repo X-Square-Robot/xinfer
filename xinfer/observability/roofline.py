@@ -6,9 +6,8 @@ state: each entry after about two seconds of continuous load, the median of 20 r
 GEMM then ran at the 575 W power limit with the SM clock at 2617-2632 MHz (3090 MHz maximum). Methods:
 
 - ``bf16``, ``fp32``: ``torch.mm`` of random 8192 x 8192 matrices (FP32: TF32 off), 2N³ / time;
-- ``mxfp8``: the registered ``mxfp8_gemm`` (xcompute ``wallx_sm120``) on 8192³ operands with ``fast_accum=False``, the
-  operator's default. The MXFP8 linear layers' ``fast_accum="auto"`` turns fast accumulation on for calls with at
-  most 16 rows or at least 8192 outputs, which can run faster than this peak;
+- ``mxfp8``: the hardware peak was measured with a legacy xcompute MXFP8 GEMM on 8192³ operands with
+  ``fast_accum=False``. The current built-in MXFP8 backend uses PyTorch reference operators;
 - ``nvfp4``: ``torch._scaled_mm`` of NVFP4 operands with E4M3 scales per 16 elements, 8192³;
 - ``dram``: ``copy_`` of 1 GiB, bytes read and written / time.
 

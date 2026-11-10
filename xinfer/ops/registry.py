@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 
@@ -237,23 +238,55 @@ class OpRegistry:
 
         return decorate
 
+    def implementer(self, backend: str, *, platforms: tuple[str, ...], version: str | None = None,
+                    priority: int = 10, **contract) -> Callable[..., Callable[[Callable], Callable]]:
+        """The registration decorator of one backend: ``implementer(...)(op, **contract_overrides)``.
+
+        Fixes the backend's name, platforms, priority, version and contract fields (``numerics`` defaults to
+        ``"tolerance"``); an operator may override contract fields, for example ``deterministic=False``.
+
+        Args:
+            backend: backend name.
+            platforms: platform names, device types or arch names its implementations support.
+            version: backend version string for the selection report.
+            priority: selection rank of its implementations.
+            **contract: ``Contract`` fields shared by its implementations.
+
+        Returns:
+            ``implements(op, **contract_overrides)``, a decorator as ``register`` returns.
+        """
+        shared = {"numerics": "tolerance", **contract}
+
+        def implements(op: str, **overrides) -> Callable[[Callable], Callable]:
+            return self.register(op, backend=backend, contract=Contract(**{**shared, **overrides}),
+                                 platforms=platforms, priority=priority, version=version)
+
+        return implements
+
     def implementations(self, op: str) -> tuple[Implementation, ...]:
         """All implementations of ``op`` in registration order, the reference first."""
         return tuple(self._impls[op])
 
+    def backend_ops(self, backend: str) -> list[str]:
+        """Names of the operators ``backend`` implements, sorted."""
+        return [op for op in self.names() if any(i.backend == backend for i in self._impls[op])]
+
     # -- plugins ------------------------------------------------------------
     def load_plugins(self) -> list[str]:
-        """Register built-in backends that are configured, then every ``xinfer.ops`` entry point.
+        """Register the built-in backends, then every ``xinfer.ops`` entry point, through one protocol.
 
-        Built-in: xcompute when ``XINFER_XCOMPUTE_LIBRARY`` points at a library or the ``xcompute`` package is
-        installed (``XINFER_XCOMPUTE=0`` skips it);
-        flash-attn when the package imports (``XINFER_FLASH_ATTN=0`` skips it).
+        A backend is a module (or entry point) with a ``register(registry)`` function that registers what the
+        environment provides and returns the operator names it registered (empty when its library is missing).
+        Built-in: ``xcompute`` (``XINFER_XCOMPUTE_LIBRARY`` or the installed ``xcompute`` package) and ``flash_attn``
+        (the ``flash_attn`` package). ``XINFER_<NAME>=0`` skips the backend or entry point ``<name>`` (upper case,
+        characters other than letters, digits and ``_`` as ``_``; for example ``XINFER_FLASH_ATTN=0``).
 
         Runs once per registry; later calls do nothing. Errors raised by a backend's ``register`` (for
         example a missing ``XINFER_XCOMPUTE_LIBRARY`` file) propagate.
 
         Returns:
-            Names of the backends and entry points registered by this call (empty after the first call).
+            Names of the backends and entry points that registered operators in this call (empty after the first
+            call).
         """
         if self._plugins_loaded:
             return []
@@ -263,15 +296,12 @@ class OpRegistry:
 
         from xinfer.ops.backends import flash_attn, xcompute
 
+        plugins = [(module.BACKEND, lambda module=module: module.register) for module in (xcompute, flash_attn)]
+        plugins += [(entry_point.name, entry_point.load) for entry_point in entry_points(group=PLUGIN_GROUP)]
         loaded = []
-        if os.environ.get("XINFER_XCOMPUTE", "1") != "0" and xcompute.register(self) is not None:
-            loaded.append(xcompute.BACKEND)
-        if os.environ.get("XINFER_FLASH_ATTN", "1") != "0" and flash_attn.register(self) is not None:
-            loaded.append(flash_attn.BACKEND)
-        for entry_point in entry_points(group=PLUGIN_GROUP):
-            register = entry_point.load()
-            register(self)
-            loaded.append(entry_point.name)
+        for name, load in plugins:
+            if os.environ.get("XINFER_" + re.sub(r"\W", "_", name.upper()), "1") != "0" and load()(self):
+                loaded.append(name)
         return loaded
 
     # -- selection ----------------------------------------------------------
