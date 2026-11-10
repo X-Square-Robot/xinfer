@@ -66,7 +66,7 @@ def register(registry) -> list[str]:
     Returns:
         The registered operator names; none without a library.
     """
-    from xinfer.ops.backends.xcompute_bf16 import register_unified
+    from xinfer.ops.backends.xcompute_unified import register_unified
 
     path = os.environ.get(ENV) or _package_library()
     if not path:
