@@ -201,8 +201,11 @@ def test_injected_noise_is_deterministic(composition):
 
 
 def test_the_optimized_composition_is_the_default_and_takes_one_request_per_action_batch(tiny_optimized):
+    from xinfer.models.wall_oss.optimized import OPTIMIZED_STAGE_OPS
+
     assert tiny_optimized.numerics == "optimized"
     assert tiny_optimized.capabilities().batch_sizes["action"] == (1,)
+    assert tiny_optimized.capabilities().stage_ops == OPTIMIZED_STAGE_OPS  # what the startup check reads
 
 
 @pytest.mark.parametrize(("delay", "rtc_rows"), [(0, 0), (3, 15)])
@@ -214,14 +217,6 @@ def test_optimized_composition_tracks_the_reference(tiny, tiny_optimized, delay,
     b = Engine(tiny_optimized, platform).run(request)["predict_action"]
     assert torch.isfinite(b).all()
     assert float((a - b).norm() / a.norm()) < 0.05
-
-
-def test_prompt_padding_needs_a_batch_invariant_action_stage(tiny):
-    from xinfer.models.wall_oss.model import WallOSS
-
-    assert not tiny.capabilities().batch_invariant["action"]  # torch reference operators on the CPU
-    with ops.use_ops(ops.registry.build_table(resolve_platform("cpu"))), pytest.raises(ValueError, match="bucket"):
-        WallOSS.from_checkpoint(tiny.root, device="cpu", numerics="reference")  # prompt_bucket defaults to 16
 
 
 def test_pad_prompt_keeps_the_valid_tokens_and_the_action_tokens(tiny):
@@ -262,7 +257,7 @@ def test_left_align_prompts_moves_the_valid_tokens_last():
 
 
 def test_padded_prompt_gives_the_actions_of_the_exact_prompt(composition):
-    """CPU check of the layout: the reference operators are not invariant to padding, so the bits may differ."""
+    """CPU check of the layout: padding changes the reference operators' rounding, so the bits may differ."""
     from xinfer.models.wall_oss.processing import pad_prompt
 
     request = _request(composition, delay=3, rtc_rows=15)

@@ -23,9 +23,10 @@ FORBIDDEN = {
 }
 # Interfaces that must stay free of torch, so that other runtimes can implement them.
 TORCH_FREE = ("platforms/interface.py", "models/interface.py")
-# The engine may use the model interface, never a concrete model, and the profiling spans, which import no other
-# XInfer package.
-ENGINE_ALLOWED = {"models": {"xinfer.models.interface"}, "observability": {"xinfer.observability.annotate"}}
+# The engine may use the model interface, never a concrete model, and the profiling spans and the request statistics,
+# which import no other XInfer package.
+ENGINE_ALLOWED = {"models": {"xinfer.models.interface"},
+                  "observability": {"xinfer.observability.annotate", "xinfer.observability.stats"}}
 
 
 def _imports(path: Path):
@@ -50,8 +51,9 @@ def test_dependency_direction():
                     violations.append(f"{path.relative_to(ROOT)} imports {name}")
                 if package == "engine" and parts[1] in ENGINE_ALLOWED and name not in ENGINE_ALLOWED[parts[1]]:
                     violations.append(f"{path.relative_to(ROOT)} imports {name}")
-    violations += [f"observability/annotate.py imports {name}" for name in _imports(ROOT / "observability/annotate.py")
-                   if name.split(".")[0] == "xinfer"]
+    for module in ("annotate", "stats"):
+        violations += [f"observability/{module}.py imports {name}"
+                       for name in _imports(ROOT / f"observability/{module}.py") if name.split(".")[0] == "xinfer"]
     assert not violations, "\n".join(violations)
 
 

@@ -244,31 +244,27 @@ class HandoffSpec:
 class Capabilities:
     """What a built model supports; checked when a service is built.
 
-    ``xinfer.config.resolve`` turns ``batch_sizes`` and ``batch_invariant``
-    into the ``batch_sizes.<stage>`` settings, and the engine applies the same
-    invariance gate. Both call ``VLAModel.capabilities()`` once at startup.
+    ``xinfer.config.resolve`` turns ``batch_sizes`` into the ``batch_sizes.<stage>``
+    settings; it and the engine call ``VLAModel.capabilities()`` once at startup.
 
     Attributes:
-        batch_sizes: per stage, the batch sizes its method accepts. Size 1 is always allowed; a stage
-            missing from the mapping is treated as B1 only.
+        batch_sizes: per stage, the batch sizes its method accepts; the stage batches up to the largest by
+            default. Size 1 is always allowed; a stage missing from the mapping is treated as B1 only. A model
+            declares sizes above 1 only for a stage whose batched results pass its precision gate.
         num_steps: denoising steps of the action stage, as declared by the model (the v1 runtime
             does not read it).
         rtc: whether the model accepts real-time-chunking requests.
         rtc_delay_range: inclusive range of accepted RTC inference delays, when ``rtc`` is True.
-        batch_invariant: per stage, whether its selected operators make every batch row bitwise equal to
-            the same request run alone. Missing stages count as not invariant; such stages run at batch
-            size 1 unless ``allow_non_invariant_batching`` and an explicit ``max_batch`` are set.
+        stage_ops: per stage, the operators its method calls. ``Policy`` and ``xinfer-serve`` warn at startup
+            when one of them has no backend kernel loaded and runs on a fused operator's torch reference.
     """
 
-    # Batch sizes each stage accepts. Batching beyond 1 additionally requires
-    # batch-invariant operators in that stage (docs/design.md §6.4).
     batch_sizes: Mapping[str, tuple[int, ...]]
     num_steps: int
     rtc: bool = False
     rtc_delay_range: tuple[int, int] | None = None  # inclusive, when rtc is True
-    # Stages whose selected operators guarantee that each row of a batch equals
-    # the same row computed alone. Only these batch by default.
-    batch_invariant: Mapping[str, bool] = field(default_factory=dict)
+    # Operators each stage calls, for the startup check of slow fallbacks.
+    stage_ops: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -495,6 +491,10 @@ class VLAModel:
         handoffs: tensors passed between stages, with their batch layout.
         batch_axes: batch axis of prepared inputs and final-stage outputs by name (default 0); handoff
             tensors use their ``TensorSpec`` instead.
+        pad_prompt: ``pad_prompt(tensors, width)``: the prepared tensors with the prompt padded (or truncated)
+            to ``width`` tokens; the default ``pad`` applies it to the ``prompt`` dimension.
+        checkpoint, processing: set by ``from_checkpoint``; the default ``input_processor`` and
+            ``output_processor`` pass them to ``build_processors``.
     """
 
     stage_graph: ClassVar[StageGraph]
@@ -502,6 +502,8 @@ class VLAModel:
     # Batch axis of prepared inputs and final outputs when requests are
     # batched (default 0); handoff tensors use their TensorSpec.
     batch_axes: ClassVar[Mapping[str, int]] = {}
+    # Pads the prepared prompt tensors to a bucket width (the default ``pad``).
+    pad_prompt: ClassVar[Callable[[Mapping[str, Any], int], dict[str, Any]] | None] = None
 
     @classmethod
     def from_checkpoint(cls, path: str, *, device: str, ops, **options) -> VLAModel:
@@ -524,9 +526,8 @@ class VLAModel:
     def capabilities(self) -> Capabilities:
         """Defaults: every stage takes one request at a time.
 
-        Override to declare batch sizes, batch invariance (derived from the
-        selected operators' contracts) and RTC support. Called at startup by
-        the resolver, the engine and ``Policy``.
+        Override to declare batch sizes, the operators each stage calls and RTC
+        support. Called at startup by the resolver, the engine and ``Policy``.
 
         Returns:
             The model's ``Capabilities``; the default has B1 only for every stage and ``num_steps=0``.
@@ -567,17 +568,17 @@ class VLAModel:
         """Return the InputProcessor for in-process use (``Policy``).
 
         Returns:
-            A processor equivalent to the first element of ``build_processors``.
+            The first element of ``build_processors(self.checkpoint, processing=self.processing)``.
         """
-        raise NotImplementedError
+        return self.build_processors(self.checkpoint, processing=self.processing)[0]
 
     def output_processor(self) -> OutputProcessor:
         """Return the OutputProcessor for in-process use (``Policy``).
 
         Returns:
-            A processor equivalent to the second element of ``build_processors``.
+            The second element of ``build_processors(self.checkpoint, processing=self.processing)``.
         """
-        raise NotImplementedError
+        return self.build_processors(self.checkpoint, processing=self.processing)[1]
 
     def shape_buckets(self) -> Mapping[str, BucketSpec]:
         """Policies shared with input processing, keyed by variable dimension (for example ``prompt``).
@@ -599,9 +600,12 @@ class VLAModel:
         """Resize one declared dimension for warmup, preserving model-specific masks and positions.
 
         Smaller widths may truncate valid input for warmup only. Outputs are discarded; metadata and
-        unrelated inputs should be shared with ``prepared``.
+        unrelated inputs should be shared with ``prepared``. The default pads the ``prompt`` dimension with
+        ``pad_prompt``.
         """
-        raise NotImplementedError(f"padding is not implemented for {dimension!r}")
+        if dimension != "prompt" or self.pad_prompt is None:
+            raise NotImplementedError(f"padding is not implemented for {dimension!r}")
+        return PreparedRequest(self.pad_prompt(prepared.tensors, width), prepared.meta)
 
     def stage_outputs(self, stage: str, batch: StageBatch) -> dict[str, OutputSpec]:
         """Output buffers ``stage`` needs for ``batch`` (``batch.out`` is empty).

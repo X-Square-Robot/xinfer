@@ -118,28 +118,28 @@ registers the `nvfp4_*` operators.
 
 | Platform | Backend | Library |
 |---|---|---|
-| RTX 5090 (sm120) | `xinfer.ops.backends.xcompute`, all seven MXFP8 operators (table below) | xcompute `0.1.0+wallx2` (model/xcompute MR !72), set `XINFER_XCOMPUTE_LIBRARY=/path/to/xcompute.so` |
+| RTX 5090 (sm120) | `xinfer.ops.backends.xcompute`, all seven MXFP8 operators (table below) | a compatible MXFP8 build of xcompute (separate from the BF16 unified build) |
 | Thor (sm110) | not registered yet | main-branch xcompute has SM110 MXFP8 kernels; to be validated on Thor |
 
-| Operator | xcompute function | Measured vs reference (RTX 5090) | Batch invariant |
-|---|---|---|---|
-| `mxfp8_quantize` | `wallx_sm120_quantize_mxfp8` | equal except a neighbouring scale in < 1 % of blocks (fast-math `amax / 448`) | yes |
-| `mxfp8_rmsnorm_quantize` | `wallx_sm120_rmsnorm_quant_mxfp8` | bitwise on the test data; contract allows rare one-step differences (fast-math `rsqrtf`); BF16 norm weight only | yes |
-| `mxfp8_silu_mul_quantize` | `wallx_sm120_silu_mul_quant_mxfp8` | bitwise on the test data; same contract (`__expf`) | yes |
-| `mxfp8_gemm` | `wallx_sm120_mxfp8_gemm_bf16` (cuBLASLt) | within a few BF16 ulps | no (algorithm chosen per shape) |
-| `mxfp8_gemm_rope` | `wallx_sm120_mxfp8_qkv_rope` mode 0 (CUTLASS) | ≥ 99.99 % of elements bitwise, others 1 BF16 ulp | yes (tested: rows equal across M) |
-| `mxfp8_gemm_silu_mul` | `wallx_sm120_mxfp8_qkv_rope` mode 1 (CUTLASS) | same | yes (tested) |
-| `mxfp8_gemm_residual` | `wallx_sm120_oproj_resid_add_bf16` (CUTLASS) | same; no bias | yes (tested) |
+| Operator | xcompute function | Measured vs reference (RTX 5090) |
+|---|---|---|
+| `mxfp8_quantize` | `wallx_sm120_quantize_mxfp8` | equal except a neighbouring scale in < 1 % of blocks (fast-math `amax / 448`) |
+| `mxfp8_rmsnorm_quantize` | `wallx_sm120_rmsnorm_quant_mxfp8` | bitwise on the test data; contract allows rare one-step differences (fast-math `rsqrtf`); BF16 norm weight only |
+| `mxfp8_silu_mul_quantize` | `wallx_sm120_silu_mul_quant_mxfp8` | bitwise on the test data; same contract (`__expf`) |
+| `mxfp8_gemm` | `wallx_sm120_mxfp8_gemm_bf16` (cuBLASLt) | within a few BF16 ulps |
+| `mxfp8_gemm_rope` | `wallx_sm120_mxfp8_qkv_rope` mode 0 (CUTLASS) | ≥ 99.99 % of elements bitwise, others 1 BF16 ulp |
+| `mxfp8_gemm_silu_mul` | `wallx_sm120_mxfp8_qkv_rope` mode 1 (CUTLASS) | same |
+| `mxfp8_gemm_residual` | `wallx_sm120_oproj_resid_add_bf16` (CUTLASS) | same; no bias |
 
 All are registered with tolerance contracts.
 - **cuBLASLt GEMM**: autotunes each shape once per process on its first eager call. All lanes of a process share the result, but different processes may pick different algorithms. Engines run every new graph key eagerly before capturing it, which satisfies the kernel's warm-before-capture requirement.
-- **CUTLASS GEMMs**: fixed 128×128×128 tiles, no split-K and no workspace. Each output row depends only on its own input row.
+- **CUTLASS GEMMs**: fixed 128×128×128 tiles, no split-K and no workspace.
 
 ## Tests
 
 | Test | Checks |
 |---|---|
-| `tests/unit/test_mxfp8.py` | reference format, error bounds and fused references (CPU); fusable forms: BF16 equals the eager composition bitwise, MXFP8 tracks BF16 (CPU); xcompute operators vs the references, CUTLASS row invariance, graph capture (GPU, `XINFER_XCOMPUTE_LIBRARY`) |
+| `tests/unit/test_mxfp8.py` | reference format, error bounds and fused references (CPU); fusable forms: BF16 equals the eager composition bitwise, MXFP8 tracks BF16 (CPU); xcompute operators vs the references, graph capture (GPU, `XINFER_XCOMPUTE_LIBRARY`) |
 | `tests/unit/test_nvfp4.py` | reference format against hand-computed codes and scales, MSE scale search, fused references, GEMM epilogues (CPU); `nvfp4` and `nvfp4_mse` layers and their fusable forms (CPU); reference GEMM vs `torch._scaled_mm` NVFP4, the GEMM the Wall-X service ran for the shapes without a CUTLASS kernel (GPU, sm100 or newer) |
 
 The precision gate for quantization changes is quick100 ([precision.md](precision.md)).

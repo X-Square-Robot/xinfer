@@ -373,24 +373,6 @@ def test_xcompute_cutlass_gemms_match_reference(xc, rows):
 
 @gpu
 @pytest.mark.gpu
-def test_xcompute_cutlass_gemms_are_row_invariant(xc):
-    """Each output row depends only on its input row (fixed tiles, no split-K): batch invariant."""
-    w = _expert0_weights(1)
-    x = torch.randn(756, 2048, device="cuda").bfloat16()
-    angles = torch.rand(756, 64, device="cuda") * 100
-    residual = torch.randn(756, 2048, device="cuda").bfloat16()
-    norm_w = torch.ones(2048, device="cuda").bfloat16()
-    full = _expert0_gemms(xc, w, xc.mxfp8_rmsnorm_quantize(x, norm_w, 1e-6), angles, residual)
-    for sl in (slice(0, 1), slice(5, 21), slice(100, 357), slice(700, 756)):
-        part = _expert0_gemms(xc, w, xc.mxfp8_rmsnorm_quantize(x[sl].contiguous(), norm_w, 1e-6), angles[sl],
-                              residual[sl].contiguous())
-        for key in full:
-            assert torch.equal(part[key], full[key][sl]), (key, sl)
-    assert all(xc.selection(f"mxfp8_gemm_{k}").contract.batch_invariant for k in ("rope", "silu_mul", "residual"))
-
-
-@gpu
-@pytest.mark.gpu
 def test_xcompute_fused_ops_capture_in_cuda_graphs(xc):
     w = _expert0_weights(2)
     x = torch.randn(64, 2048, device="cuda").bfloat16()

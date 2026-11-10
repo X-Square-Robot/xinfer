@@ -22,7 +22,7 @@ XInfer 通过一个对接 embodied-serving 测试框架（harness）的适配器
 | `tools/precision/quick100_b1_score.py` | 用 harness 自身的函数为保存的 harness 运行结果计算 B1 场景的分数 |
 
 适配器对每个请求组执行以下操作：
-- 对传输格式（wire）的观测运行 XInfer 的输入处理，使用该请求保存的 FP32 噪声（prompt 与服务时一样填充到 `processing.prompt_bucket`，默认 16 token）；在 `processing.image_preprocess_device="gpu"` 时，它与引擎一样在 vision 阶段之前于 GPU 上解码并 resize 各视图（`xinfer.engine.device_images`）；
+- 对传输格式（wire）的观测运行 XInfer 的输入处理，使用该请求保存的 FP32 噪声（prompt 与服务时一样填充到 `processing.prompt_bucket`，默认 16 token）；在 `image_preprocess_device="gpu"`（其配置的顶层键）时，它与引擎一样在 vision 阶段之前于 GPU 上解码并 resize 各视图（`xinfer.engine.device_images`）；
 - 逐请求运行 vision 和 prefill；
 - 对整个组调用一次 action 阶段（B1 或该场景的 BN）。不同的 prompt 长度（例如 760 和 761 token）与引擎一样以左填充方式合并（`xinfer.engine.batching`）。optimized 组合每次 action 调用只接受一个请求：遇到组批的请求组时适配器报错，harness 在 B1 之后停止，用 `quick100_b1_score.py` 计算该运行的分数；
 - 报告该次调用实际的批和延迟。
@@ -51,15 +51,15 @@ python /path/to/xinfer/tools/precision/quick100_b1_score.py . $ASSETS $ASSETS/re
 
 ## Wall-OSS quick100 门禁
 
-结果（2026-11-07，RTX 5090，torch 2.10.0+cu130）：`numerics="optimized"`，使用默认后端（xcompute `651195d`、flash-attn），B1：
+结果（2026-11-08，RTX 5090，torch 2.10.0+cu130）：`numerics="optimized"`，使用默认后端（xcompute `0c48a46`、flash-attn），B1：
 
 | 场景 | 相对 BF16 的 GT-MSE | episode 95 % CI | 相对旧服务（target） |
 |---|---|---|---|
-| quick100 B1，延迟 5（100 个窗口） | **−6.09 %：PASS** | [−12.07, +0.32] | +0.57 % |
+| quick100 B1，延迟 5（100 个窗口） | **−6.58 %：PASS** | [−12.48, −0.34] | +0.05 % |
 
 - 按同样方式计算：旧的 MXFP8 服务为 −6.62 %，XInfer 参考组合（使用 eager 模型的 kernel）为 −6.28 %（torch 2.9.1），optimized 组合在 torch 2.9.1 下为 −6.25 %（CI [−12.17, −0.25]；其动作与 2.10 下的并非逐位一致，因为 torch 算子的舍入不同）。
 - **原始 BF16 并不是服务的语义。** 服务和 XInfer 在每一步都切断 RTC 固定动作 token 对去噪 token 的注意力，而原始 eager 模型在第 0 步允许其注意（docs/models/wall_oss_design.md）。与原始 BF16 的差距主要来自这一差异。
 - 组批场景需要每次调用接受多个请求的 action 阶段；optimized 组合只接受一个。
 - GPU 测试把每个阶段与 eager BF16 模型比较，并逐位检查 graph；输出质量只由本门禁判断。
 
-证据：`xinfer-wall-oss-optimized-20261107.tar.gz` 中的运行 `q100-wos210-run`（torch 2.10）和 `q100-wos-run`（2.9.1）（哈希见 docs/models/wall_oss_validation.md）。
+证据：`xinfer-xcompute-prepack-20261108.tar.gz` 中的运行 `gates/q100-run`；之前的运行 `q100-wos210-run`（torch 2.10）和 `q100-wos-run`（2.9.1）在 `xinfer-wall-oss-optimized-20261107.tar.gz` 中（哈希见 docs/models/wall_oss_validation.zh-CN.md）。

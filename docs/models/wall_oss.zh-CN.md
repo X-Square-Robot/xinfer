@@ -14,12 +14,12 @@ Wall-OSS 是这一架构的开源名称（[X-Square-Robot/wall-x](https://github
 |---|---|
 | 模型数值 | 两种组合，BF16。`numerics="optimized"`（默认）：ViT、expert 0 和动作专家跑在 xcompute 的算子上（残差加法融合进 RMSNorm、带 bias 和 RoPE 并写入 K/V 缓存的 QKV、GEMM 尾处理里的 SiLU-mul 和 GELU、action 阶段的 small-M GEMM、缓存注意力和读出-Euler 尾部）（[设计](wall_oss_design.zh-CN.md#optimized-组合)）；从相同输入出发，各阶段与 Wall-X eager 模型相差在 2.8 % 以内（[验证](wall_oss_validation.zh-CN.md#optimized-组合)）。`numerics="reference"`：使用参考（torch）算子时，prefill 和 action 阶段与 Wall-X eager BF16 模型逐位一致，ViT 仅因 attention kernel 不同而有差异（[验证](wall_oss_validation.zh-CN.md#参考算子模型)） |
 | 输入/输出处理 | 在 embodied-serving Wall-X 4B 服务的 42 个请求参考抓包上与其逐位一致；可选在 GPU 上解码和缩放各视角图像（`image_preprocess_device="gpu"`，非逐位一致；见[下文](#部署选项processingconfig)） |
-| 执行 | 共置（colocated）的 `Engine`（[docs/engine.md](../engine.zh-CN.md)）：每阶段多个通道（lane）、链式派发、CUDA graph（与 eager 逐位一致）。optimized 组合每次派发一个请求；参考组合在负载下 action 阶段跨不同 prompt 长度和 RTC 延迟以 B1–B8 组批，使用批次不变 kernel（与单请求逐位一致） |
+| 执行 | 共置（colocated）的 `Engine`（[docs/engine.md](../engine.zh-CN.md)）：每阶段多个通道（lane）、链式派发、CUDA graph（与 eager 逐位一致）。optimized 组合每次派发一个请求；参考组合在负载下 action 阶段跨不同 prompt 长度和 RTC 延迟以 B1–B8 组批，每个请求与其单独运行相差在舍入级以内（[验证](wall_oss_validation.zh-CN.md)） |
 | 服务 | `xinfer.entrypoints.serve`，基于 WebSocket + msgpack，兼容 x2robot 桌面客户端（[服务](../serving.zh-CN.md)） |
 | 精度 | 仅 BF16 |
 | Attention | 安装 flash-attn 时，ViT 和 prompt 的 attention 使用 flash-attn 后端；action 的 attention 使用 xcompute 的 `attention_kvcache`（optimized 组合）或 flash-attn（参考组合） |
-| 精度门禁 | embodied-serving quick100 B1（门禁）：optimized 组合相对原始 BF16 的 GT-MSE 为 −6.09 %，PASS（≤ +1 %）；其组批场景需要组批的 action 阶段，未运行（[精度](../precision.zh-CN.md#wall-oss-quick100-门禁)） |
-| 速度 | RTX 5090，optimized 组合：阶段 graph vision 15.6、prefill 22.3、action 7.5 ms（768 token 的桶、5 步，共 45.5 ms）；`Policy.infer` 48.7 ms（P50）。参考组合：50.9 ms 和 54.1 ms（[验证](wall_oss_validation.zh-CN.md#延迟)）。视图在设备上处理时的单请求时延和单卡机器人数见[性能](../performance.zh-CN.md) |
+| 精度门禁 | embodied-serving quick100 B1（门禁）：optimized 组合相对原始 BF16 的 GT-MSE 为 −6.58 %，PASS（≤ +1 %）；其组批场景需要组批的 action 阶段，未运行（[精度](../precision.zh-CN.md#wall-oss-quick100-门禁)） |
+| 速度 | RTX 5090，optimized 组合：阶段 graph vision 15.6、prefill 21.3、action 7.3 ms（768 token 的桶、5 步，共 44.2 ms）；`Policy.infer` 47.3 ms（P50）。参考组合：50.9 ms 和 54.1 ms（[验证](wall_oss_validation.zh-CN.md#延迟)）。视图在设备上处理时的单请求时延和单卡机器人数见[性能](../performance.zh-CN.md) |
 | 尚未支持 | optimized 组合 action 阶段的组批、静态 prompt 的 KV 复用（实测收益约 0.2 ms，不计划实现）、MXFP8、NVFP4、Thor |
 
 ## 环境要求
@@ -28,7 +28,7 @@ Wall-OSS 是这一架构的开源名称（[X-Square-Robot/wall-x](https://github
 - `pip install -e '.[models]'`（tokenizers、OpenCV、PyYAML）以及 `numba`。旋转换算在 numba 下运行，以便与参考服务逐位一致（见[设计](wall_oss_design.zh-CN.md#处理)）。
 - 一块 CUDA GPU，BF16 权重需要约 10 GB 空闲显存（测试可在 CPU 上运行）。
 - 使用 `image_preprocess_device="gpu"` 时：`pip install -e '.[gpu-image]'`（torchvision ≥ 0.19）。
-- optimized 组合（默认）：RTX 5090（SM120）；`XINFER_XCOMPUTE_LIBRARY` 指向由 xcompute `651195d`（`feat/gemm-family-unify`）构建的 `xcompute.so`，且同一构建的 Python 包可导入。缺少这些时它运行在 torch 参考实现上（很慢）。
+- optimized 组合（默认）：可导入一个针对该 GPU 架构编译的 xcompute 构建的 Python 包，安装与检查方法见 [kernel](../kernels.zh-CN.md)。本文的数据在 RTX 5090（SM120）上测得。缺少时它运行在 torch 参考实现上（很慢）。
 
 ## 运行
 
@@ -56,8 +56,9 @@ response = policy.infer(request)   # request: the desktop robot msgpack dict
 | `embodiment`、`frequency_hz`、`action_space` | `X2 ex001_desktop`、32、`Rel EEF` | 参考部署的 system prompt |
 | `num_steps` / `allow_client_num_steps` | 5 / true | RTC 请求可以发送 `num_flow_steps` |
 | `rtc_wire_delay_range` | (3, 8) | 对原始 `inference_delay` 做准入 |
-| `image_preprocess_device` | `"cpu"`；在 `Policy` 中由其 `image_preprocess_device` 参数设置（CUDA 上为 `"gpu"`） | `"gpu"`：前端发送 JPEG 字节和原始帧及其目标尺寸，引擎在第一个阶段之前用 nvJPEG 解码 JPEG，并在设备上缩放各视角图像（bicubic，与 OpenCV INTER_CUBIC 相同）。可省去前端的解码和缩放时间；视角图像以及由此得到的动作与 CPU 路径不逐位一致（[配置](../configuration.zh-CN.md#在-gpu-上做图像预处理)） |
-| `prompt_bucket` | 16 | prompt 在末尾（action token 之前）填充到该 token 数的整数倍，因此 CUDA graph 以桶（bucket）为键；参考组合中动作与精确 prompt 的结果逐位一致（[设计](wall_oss_design.zh-CN.md#prompt-桶)），这要求 action 阶段使用批次不变算子（默认后端；使用参考算子，即 `--reference-ops` 或 CPU 时，需设为 0）；optimized 组合在 action 注意力中掩码填充，不同宽度之间不逐位一致 |
+| `prompt_bucket` | 16 | prompt 在末尾（action token 之前）填充到该 token 数的整数倍，因此 CUDA graph 以桶（bucket）为键；两种组合都对填充做掩码，填充最多在舍入级改变动作（[设计](wall_oss_design.zh-CN.md#prompt-桶)） |
+
+`image_preprocess_device` 是顶层模型选项（不放在 `processing` 中）：`xinfer serve` 下为 `"cpu"`；`Policy` 下取平台默认值（CUDA 上为 `"gpu"`）。`"gpu"`：前端发送 JPEG 字节和原始帧及其目标尺寸，引擎在第一个阶段之前用 nvJPEG 解码 JPEG，并在设备上缩放各视角图像（bicubic，与 OpenCV INTER_CUBIC 相同）。可省去前端的解码和缩放时间；视角图像以及由此得到的动作与 CPU 路径不逐位一致（[配置](../configuration.zh-CN.md#在-gpu-上做图像预处理)）
 
 初始 flow 噪声由输入处理器在 CPU 上逐请求采样（`ProcessingConfig.noise_seed` 可将其固定）；测试会替换准备好的 `noise` 张量。
 

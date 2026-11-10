@@ -1,11 +1,12 @@
-"""``Policy``'s ``image_preprocess_device`` argument and its platform default."""
+"""The ``image_preprocess_device`` model option: ``Policy``'s platform default, ``xinfer serve``'s ``"cpu"``."""
 
+import copy
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from xinfer.config import ConfigError, resolve_image_preprocess_device
+from xinfer.config import ConfigError, apply_image_preprocess_device
 from xinfer.platforms.detect import _cpu_platform
 
 
@@ -14,18 +15,44 @@ def _platform(device_images):
     return replace(platform, name="test", capabilities=replace(platform.capabilities, device_images=device_images))
 
 
-@pytest.mark.parametrize(("device_images", "explicit", "expected"), [
-    (True, None, "gpu"), (False, None, "cpu"), (True, "cpu", "cpu"), (False, "cpu", "cpu"), (True, "gpu", "gpu"),
+def _device(device_images, explicit, default=None):
+    """The resolved device: ``"gpu"`` when ``apply_image_preprocess_device`` sets the processing field."""
+    options = apply_image_preprocess_device({"image_preprocess_device": explicit}, _platform(device_images), default)
+    return options.get("processing", {}).get("image_preprocess_device", "cpu")
+
+
+@pytest.mark.parametrize(("device_images", "explicit", "default", "expected"), [
+    (True, None, None, "gpu"), (False, None, None, "cpu"),  # Policy: the platform's
+    (True, None, "cpu", "cpu"),  # xinfer serve
+    (True, "cpu", None, "cpu"), (False, "cpu", None, "cpu"), (True, "gpu", "cpu", "gpu"),
 ])
-def test_the_default_follows_the_platform_and_explicit_values_are_kept(device_images, explicit, expected):
-    assert resolve_image_preprocess_device(_platform(device_images), explicit) == expected
+def test_the_default_comes_from_the_entry_point_or_the_platform_and_explicit_values_are_kept(
+        device_images, explicit, default, expected):
+    assert _device(device_images, explicit, default) == expected
 
 
 @pytest.mark.parametrize(("explicit", "message"), [("gpu", "cannot decode images on the device"),
                                                    ("cuda", "must be")])
 def test_unsupported_values_are_rejected(explicit, message):
     with pytest.raises(ConfigError, match=message):
-        resolve_image_preprocess_device(_platform(False), explicit)
+        _device(False, explicit)
+
+
+@pytest.mark.parametrize(("options", "expected"), [
+    ({"quantization": "mxfp8", "image_preprocess_device": "gpu", "processing": {"noise_seed": 1}},
+     {"quantization": "mxfp8", "processing": {"noise_seed": 1, "image_preprocess_device": "gpu"}}),
+    ({"quantization": "mxfp8", "image_preprocess_device": "cpu"}, {"quantization": "mxfp8"}),
+    ({"processing": {"noise_seed": 1}}, {"processing": {"noise_seed": 1}}),  # xinfer serve's default: "cpu"
+])
+def test_the_top_level_option_reaches_the_processors(options, expected):
+    before = copy.deepcopy(options)
+    assert apply_image_preprocess_device(options, _platform(True), default="cpu") == expected
+    assert options == before
+
+
+def test_the_option_is_not_a_processing_field():
+    with pytest.raises(ConfigError, match="top-level model option"):
+        apply_image_preprocess_device({"processing": {"image_preprocess_device": "gpu"}}, _platform(True), "cpu")
 
 
 def test_the_cpu_platform_has_no_device_images():
@@ -66,8 +93,8 @@ def test_policy_sets_the_processing_field_only_for_the_device_path(policy):
     assert policy(device_images=False) is None
 
 
-def test_policy_takes_the_switch_only_as_its_argument(policy):
-    with pytest.raises(ConfigError, match="Policy argument"):
+def test_policy_takes_the_switch_only_at_the_top_level(policy):
+    with pytest.raises(ConfigError, match="top-level model option"):
         policy(processing={"image_preprocess_device": "cpu"})
     with pytest.raises(ConfigError, match="cannot decode images"):
         policy(device_images=False, image_preprocess_device="gpu")

@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from xinfer import ops
-from xinfer.config import ConfigError, ExplicitSettings, resolve, resolve_image_preprocess_device
+from xinfer.config import ExplicitSettings, apply_image_preprocess_device, resolve
 from xinfer.engine.core import Engine
 from xinfer.engine.cudagraph import CUDAGraphConfig
 from xinfer.models.interface import PreparedRequest, connect
@@ -71,14 +71,14 @@ class Policy:
                 use -1 for the final stage on CUDA and 0 otherwise. Nonzero priorities require platform support.
             image_preprocess_device: where the views are decoded and resized: ``"gpu"`` by the engine on the
                 device, ``"cpu"`` in the calling thread, or ``None`` for the platform's default (``"gpu"`` on a
-                CUDA device with torchvision; ``xinfer.config.resolve_image_preprocess_device``). Sets the model's
-                ``processing.image_preprocess_device``.
+                CUDA device with torchvision; ``xinfer.config.apply_image_preprocess_device``). A model option
+                of the top level, as in ``xinfer serve --model-options``, not a ``processing`` field.
             **model_options: passed to ``from_checkpoint``. A string ``quantization`` (default ``"bf16"``)
                 also selects the tuned table. ``processing``, if given, is a dict.
 
         Raises:
             ConfigError: CUDA graphs requested on a platform without capture; ``image_preprocess_device`` set in
-                ``processing`` (it is this argument), or ``"gpu"`` on a platform without device images.
+                ``processing``, or ``"gpu"`` on a platform without device images.
             KeyError: unknown model name.
             RuntimeError: a CUDA device was requested but CUDA is not available.
             ValueError: unsupported device type.
@@ -89,16 +89,14 @@ class Policy:
             self.platform, backends=op_backends, reference_only=reference_ops
         )
         model_cls = get_model_class(model)
-        processing = model_options.get("processing") or {}
-        if "image_preprocess_device" in processing:
-            raise ConfigError("image_preprocess_device is a Policy argument, not a processing field")
-        if resolve_image_preprocess_device(self.platform, image_preprocess_device) == "gpu":  # "cpu": the default
-            model_options["processing"] = {**processing, "image_preprocess_device": "gpu"}
+        model_options = apply_image_preprocess_device(
+            {**model_options, "image_preprocess_device": image_preprocess_device}, self.platform)
         with ops.use_ops(self.op_table):
             self.model = model_cls.from_checkpoint(
                 checkpoint, device=self.platform.device, ops=self.op_table, **model_options
             )
         self.capabilities = self.model.capabilities()
+        ops.warn_slow_fallbacks(model, self.op_table, self.capabilities.stage_ops, self.platform.device)
         self.io_schema = self.model.io_schema()
         self._prepare = connect(self.model.input_processor())
         self._finish = self.model.output_processor()

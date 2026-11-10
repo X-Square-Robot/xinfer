@@ -83,11 +83,14 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(prog="xinfer serve", description=__doc__)
     p.add_argument("--model", required=True)
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--model-options", default="{}", help="JSON options for the model and its processors")
+    p.add_argument("--model-options", default="{}",
+                   help="JSON options for the model and its processors, e.g. image_preprocess_device (default cpu)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=33985)
     p.add_argument("--device", default=None)
     p.add_argument("--frontends", type=int, default=None, help="frontend processes (default 2)")
+    p.add_argument("--disable-metrics", action="store_true",
+                   help="do not record Prometheus metrics; GET /metrics answers 404 (docs/metrics.md)")
     p.add_argument("--frontend-workers", type=int, default=None, help="processing threads per frontend (default 4)")
     p.add_argument("--shm-buffers", type=int, default=None, help="shared-memory buffers per frontend")
     p.add_argument("--shm-buffer-mib", type=int, default=32)
@@ -96,7 +99,6 @@ def parse_args(argv=None):
                    help="CUDA stream priority per stage, e.g. action=0; lower is higher; "
                         "default -1 for the final stage on CUDA, else 0")
     p.add_argument("--max-batch", default=None, help="per stage, e.g. action=4")
-    p.add_argument("--allow-non-invariant-batching", action="store_true")
     p.add_argument("--max-running-requests", type=int, default=None,
                    help="requests admitted and running in the engine (default 32)")
     p.add_argument("--max-queued-requests", type=int, default=None)
@@ -106,6 +108,9 @@ def parse_args(argv=None):
     p.add_argument("--tuned", default="auto", help="'auto' (bundled table), 'none', or a tuned-table JSON path")
     p.add_argument("--resolved-config", default=None, help="write the resolved settings and sources to this JSON")
     p.add_argument("--dry-run", action="store_true", help="load the model, print the resolved configuration, exit")
+    p.add_argument("--profile-dir", default=None,
+                   help="record the engine's spans and write each request's engine segments here at shutdown "
+                        "(xinfer-profile load --serve; docs/profiling.md)")
     p.add_argument("--reference-ops", action="store_true")
     p.add_argument("--op-backends", default=None,
                    help="pin backends per operator, e.g. varlen_attention=flash_attn; pins win over --reference-ops")
@@ -114,6 +119,45 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+
+def _start_metrics(args, model, platform, quantization):
+    """Record Prometheus metrics from this process and the frontends started after it (docs/metrics.md).
+
+    The processes write into ``PROMETHEUS_MULTIPROC_DIR`` when it is set, else into a new temporary directory
+    removed at exit.
+
+    Returns:
+        ``(EngineMetrics, directory, temporary)``, or ``(None, None, False)`` without ``prometheus_client``.
+    """
+    import tempfile
+
+    import xinfer
+    from xinfer.observability import metrics
+
+    if not metrics.available():
+        logger.warning("prometheus_client is not installed, so GET /metrics is disabled (pip install -e '.[serve]')")
+        return None, None, False
+    given = os.environ.get(metrics.ENV)
+    directory = given or tempfile.mkdtemp(prefix="xinfer-metrics-")
+    metrics.enable(directory)
+    logger.info("recording Prometheus metrics in %s; GET /metrics on the serving port", directory)
+    info = dict(model=args.model, quantization=quantization if isinstance(quantization, str) else "custom",
+                numerics=str(getattr(model, "numerics", "")), platform=platform.name, version=xinfer.__version__)
+    return metrics.EngineMetrics(info), directory, not given
+
+
+def _stop_metrics(directory, temporary: bool, pids) -> None:
+    """Remove the temporary metrics directory, or drop the live gauges of ``pids`` from a given one."""
+    import shutil
+
+    from xinfer.observability import metrics
+
+    if temporary:
+        shutil.rmtree(directory, ignore_errors=True)
+        return
+    for pid in pids:
+        metrics.mark_dead(pid)
+
 def main(argv=None) -> None:
     """Run the server: the engine process (main thread) and its frontend processes.
 
@@ -121,7 +165,8 @@ def main(argv=None) -> None:
 
     1. Parse the flags and configure logging; set ``OMP_NUM_THREADS``, ``MKL_NUM_THREADS`` and
        ``NUMBA_NUM_THREADS`` to 1 unless already set, and use one torch CPU thread.
-    2. Resolve the platform, load operator plugins, select the operators and load the model with
+    2. Resolve the platform and the ``image_preprocess_device`` model option (default ``"cpu"``,
+       ``apply_image_preprocess_device``), load operator plugins, select the operators and load the model with
        ``from_checkpoint``.
     3. Resolve the settings (flags as ``ExplicitSettings``, ``--tuned``), log
        them and write ``--resolved-config`` when given; with ``--dry-run`` print them and return.
@@ -129,12 +174,14 @@ def main(argv=None) -> None:
        this process and warm up with them (``Engine.warmup``: their CUDA graphs on every lane and at every allowed
        batch size), then finish the warmup. Each frontend later runs these requests through the model's InputProcessor
        and, with the engine's outputs for them, its OutputProcessor before it reports ready (``run_frontend``).
-    5. Spawn the frontend processes (``run_frontend``), each with a pipe and its own shared-memory ring,
-       and start one bridge thread per pipe; when every frontend reports that it listens, print
-       ``XINFER READY <host>:<port> frontends=<N>``.
+    5. Unless ``--disable-metrics``, start recording Prometheus metrics (``_start_metrics``): the engine's requests
+       from now on, after the warmup, through its ``stats_sink``, and the frontends'. Spawn the frontend processes
+       (``run_frontend``), each with a pipe and its own shared-memory ring, and start one bridge thread per pipe;
+       when every frontend reports that it listens, print ``XINFER READY <host>:<port> frontends=<N>``.
     6. Wait for SIGINT/SIGTERM, the exit of any frontend, or an engine that can no longer serve
-       (``Engine.health``, checked every 0.5 s); then terminate and join the frontends, shut the engine down,
-       unregister and unmap the shared memory, and leave with ``os._exit`` (status 0 after a signal, 1 when a
+       (``Engine.health``, checked every 0.5 s, when the engine's sampled metrics are updated too); then terminate
+       and join the frontends, shut the engine down, unregister and unmap the shared memory, remove the temporary
+       metrics directory, and leave with ``os._exit`` (status 0 after a signal, 1 when a
        frontend died or the engine stopped), skipping interpreter finalization so CUDA objects are not
        destroyed after the CUDA context.
 
@@ -152,7 +199,7 @@ def main(argv=None) -> None:
     import torch
 
     from xinfer import ops
-    from xinfer.config import ExplicitSettings, load_tuned, resolve
+    from xinfer.config import ExplicitSettings, apply_image_preprocess_device, load_tuned, resolve
     from xinfer.engine import Engine
     from xinfer.engine import AdmitError
     from xinfer.frontend.protocol import ADMIT_STATUS, INTERNAL_ERROR, OK, read_requests
@@ -163,8 +210,10 @@ def main(argv=None) -> None:
     from xinfer.platforms import resolve_platform
 
     torch.set_num_threads(1)
-    model_options = json.loads(args.model_options)
     platform = resolve_platform(args.device)
+    # The views are decoded and resized in the frontends unless the model options say "gpu" (bitwise as the
+    # reference services).
+    model_options = apply_image_preprocess_device(json.loads(args.model_options), platform, default="cpu")
     ops.registry.load_plugins()
     table = ops.registry.build_table(platform, backends=_op_backends(args.op_backends),
                                      reference_only=args.reference_ops)
@@ -177,8 +226,7 @@ def main(argv=None) -> None:
         stream_priorities=_per_stage(args.stream_priorities),
         max_running_requests=args.max_running_requests, max_queued_requests=args.max_queued_requests,
         per_robot_inflight=args.per_robot_inflight, cudagraphs=False if args.enforce_eager else None,
-        allow_non_invariant_batching=args.allow_non_invariant_batching, frontends=args.frontends,
-        frontend_workers=args.frontend_workers, shm_buffers=args.shm_buffers)
+        frontends=args.frontends, frontend_workers=args.frontend_workers, shm_buffers=args.shm_buffers)
     quantization = model_options.get("quantization", "bf16")
     tuned = {"auto": True, "none": None}[args.tuned] if args.tuned in ("auto", "none") else load_tuned(args.tuned)
     resolved = resolve(model, platform, model_name=args.model,
@@ -186,6 +234,7 @@ def main(argv=None) -> None:
                        explicit=explicit, tuned=tuned)
     logger.info("model loaded in %.1fs on %s; ops %s", time.perf_counter() - started, platform.name,
                 {r["op"]: r["backend"] for r in table.report()})
+    ops.warn_slow_fallbacks(args.model, table, model.capabilities().stage_ops, platform.device)
     logger.info("resolved configuration:\n%s", resolved.report())
     if args.resolved_config:
         resolved.write(args.resolved_config, model=args.model, platform=platform.name, ops=table.report(),
@@ -201,6 +250,18 @@ def main(argv=None) -> None:
         outputs = engine.warmup([prepare(request) for request in raw])
         warmup = [(request, {k: np.asarray(v) for k, v in out.items()}) for request, out in zip(raw, outputs)]
         logger.info("warmup done: %s", engine.cudagraph_stats())
+    engine_metrics, metrics_dir, metrics_temporary = None, None, False
+    if not args.disable_metrics:
+        engine_metrics, metrics_dir, metrics_temporary = _start_metrics(args, model, platform, quantization)
+        if engine_metrics is not None:  # after the warmup: its requests, dispatches and captures are not counted
+            engine.stats_sink = engine_metrics.record
+            engine_metrics.sample(engine)
+    recorder = None
+    if args.profile_dir:
+        from xinfer.observability import annotate, load_profile
+
+        recorder = load_profile.SpanRecorder(platform.is_cuda)
+        annotate.configure(recorder)
 
     mp_context = mp.get_context("spawn")
     options = dict(model=args.model, checkpoint=args.checkpoint, model_options=model_options, host=args.host,
@@ -208,6 +269,7 @@ def main(argv=None) -> None:
                    workers=resolved.value("frontend_workers"),
                    shm_prefix=f"xinfer-{uuid.uuid4().hex[:8]}")
     options["warmup"] = warmup  # the frontends run these requests through their processors before serving
+    options["metrics"] = engine_metrics is not None
     reader = ShmReader(register_cuda=platform.is_cuda)
     reader_lock = threading.Lock()
     ready = threading.Semaphore(0)
@@ -282,6 +344,8 @@ def main(argv=None) -> None:
     reason = None
     while not stop.is_set() and all(p.is_alive() for p in processes):
         reason = engine.health()
+        if engine_metrics is not None:
+            engine_metrics.sample(engine)
         if reason is not None:
             logger.error("engine cannot serve (%s); exiting", reason)
             break
@@ -291,8 +355,13 @@ def main(argv=None) -> None:
     for process in processes:
         process.join(timeout=10)
     engine.shutdown()
+    if recorder is not None:
+        logger.info("engine requests written to %s", load_profile.write_engine_requests(recorder, engine.stages,
+                                                                                       args.profile_dir))
     with reader_lock:
         reader.close()
+    if metrics_dir is not None:
+        _stop_metrics(metrics_dir, metrics_temporary, [process.pid for process in processes] + [os.getpid()])
     logger.info("stopped; dispatches %s", dict(engine.stats))
     logging.shutdown()
     sys.stdout.flush()

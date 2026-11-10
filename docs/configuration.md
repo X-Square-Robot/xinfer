@@ -13,9 +13,9 @@ So each setting is a fixed choice or an upper bound that suits any load. It is
 resolved once at startup and reported with its source. Precedence, highest
 first:
 
-1. **explicit**: a flag or argument the operator set. It is checked against the platform and the model and never rewritten. A conflict is an error: a batch size the model does not declare, batching a stage whose operators are not batch-invariant without `--allow-non-invariant-batching`, CUDA graphs on a platform without capture (API only), or an unknown stage.
+1. **explicit**: a flag or argument the operator set. It is checked against the platform and the model and never rewritten. A conflict is an error: a batch size the model does not declare, CUDA graphs on a platform without capture (API only), or an unknown stage.
 2. **tuned table**: measured values for (model, architecture, quantization), from `xinfer/tuned/<model>/<arch>-<quantization>.json` or `--tuned <path>`. Each table records the commit, date, method and evidence; the source reads `tuned:<table>@<commit>`. Tables can set `lanes`. No table ships at present: a table is added only when a measured value differs from the default.
-3. **model / platform rules**: what the model declares (batch sizes, batch invariance with the selected operators) and what the platform supports (graph capture, CPU quota); sources `model:<rule>` and `platform:<rule>`.
+3. **model / platform rules**: what the model declares (batch sizes) and what the platform supports (graph capture, CPU quota); sources `model:<rule>` and `platform:<rule>`.
 4. **default**: a fixed value.
 
 Code: `xinfer/config/` (`resolve.py`, `tuned.py`).
@@ -29,7 +29,7 @@ Code: `xinfer/config/` (`resolve.py`, `tuned.py`).
 | `max_queued_requests` | 256 | submitted requests waiting for admission |
 | `lanes.<stage>` | tuned value, else 2 | a lane is a stream with its own graph pool; a second lane lets two requests run the stage at once |
 | `stream_priorities.<stage>` | −1 for the final stage on CUDA (Wall-OSS: `action`), else 0 | CUDA stream priority of the stage's lanes, lower is higher (`--stream-priorities action=0`, `Policy(stream_priorities={...})`) |
-| `batch_sizes.<stage>` | every size the model declares, if the stage is batch-invariant with the selected operators; else `[1]` | a larger allowed size never delays a request, because batches form only from queued requests |
+| `batch_sizes.<stage>` | every size the model declares | a larger allowed size never delays a request, because batches form only from queued requests; a model declares sizes above 1 only for a stage whose batched results pass its precision gate |
 | `cudagraphs` | on where the platform supports capture | |
 | `frontends` | 2, at most half the CPUs of the container quota | each frontend adds a bridge thread in the engine process |
 | `frontend_workers` | 4, with `frontends × frontend_workers` at most half the CPUs of the quota | processing threads per frontend; requests of different connections are processed at the same time |
@@ -41,6 +41,8 @@ removing it. Unknown stages, non-integers, values the device cannot
 represent, and nonzero values on a platform without stream priorities are
 errors (`--dry-run` resolves the values without creating lanes, so it does not
 check the device range).
+
+The MXFP8 measurements below are historical results from an earlier Wall-OSS configuration. The current [Wall-OSS composition](models/wall_oss.md) supports BF16.
 
 Why these values:
 - **Lanes 2.** On Wall-OSS MXFP8 (RTX 5090), two action lanes gave 7 robots of capacity against 5 with one (batched action stage), and 2/2/2 beat 1/1/1 without batching (31.2 vs 27.2 req/s saturated); three or more lanes were not measured. Evidence: `xinfer-action-batching-20261101.tar.gz` and `xinfer-flash-attn-20261101.tar.gz` (hashes in docs/models/wall_oss_validation.md).
@@ -66,7 +68,7 @@ Wall-OSS uses `BucketSpec` in `xinfer/models/interface.py`. The startup report s
 | Positive `prompt_bucket` | Round up to that granularity, capped at the model's prompt limit |
 | `prompt_bucket=0` | Exact valid length, without bucket padding |
 
-Wall-OSS checks for batch-invariant action operators when it loads. With these operators, prompt padding preserves its output bit for bit.
+Wall-OSS masks padded positions during action attention. Changing the prompt width can change floating-point rounding.
 
 The engine expands `meta["prompt_len_range"]` in `xinfer/engine/cudagraph.py`
 and calls the model's `pad` hook. It warms the reachable widths from largest to smallest. Logs report the widths and per-stage graph counts.
@@ -75,13 +77,17 @@ the configured post-warmup graph-miss behavior.
 
 ## Image preprocessing on the GPU
 
-A processing option of every bundled model, `processing.image_preprocess_device`, set per entry point:
+`image_preprocess_device`, an option of every bundled model, sits at the top level of the model options in every
+entry point, so one set of options serves both (`benchmarks/performance.py` passes the same to each):
 
-- `xinfer serve`: `--model-options '{"processing": {"image_preprocess_device": "gpu"}}'`; the default is `"cpu"`.
-- `Policy(..., image_preprocess_device=...)`, an argument of its own (not in `processing`): `None`, the default,
-  takes the platform's: `"gpu"` where the views can be decoded and resized on the device (a CUDA device with
-  torchvision, the platform capability `device_images`), else `"cpu"`. `"gpu"` on a platform without it raises
-  `ConfigError`.
+- `xinfer serve` (and `xinfer-profile`): `--model-options '{"image_preprocess_device": "gpu"}'`; the default is
+  `"cpu"`.
+- `Policy(..., image_preprocess_device=...)`: `None`, the default, takes the platform's: `"gpu"` where the views can be
+  decoded and resized on the device (a CUDA device with torchvision, the platform capability `device_images`), else
+  `"cpu"`.
+
+It is not a `processing` field: there it raises `ConfigError`, as does `"gpu"` on a platform without device images.
+The entry point resolves it (`xinfer.config.apply_image_preprocess_device`) and hands it to the model's processors.
 
 | Value | Where the views are decoded and resized | Numerics |
 |---|---|---|
@@ -121,7 +127,6 @@ lanes.action                  2          default
 stream_priorities.vision      0          default
 stream_priorities.prefill     0          default
 stream_priorities.action      -1         default:final stage
-allow_non_invariant_batching  False      default
 batch_sizes.vision            [1]        model:declares B1 only
 batch_sizes.prefill           [1]        model:declares B1 only
 batch_sizes.action            [1]        model:declares B1 only
@@ -132,8 +137,7 @@ shm_buffers                   16         default:one per running request
 ```
 
 The reference composition (`--model-options '{"numerics": "reference"}'`) declares action batches
-`[1, 2, 4, 8]`, which resolve to all four with batch-invariant operators and to `[1]` with `--reference-ops`
-(`model:not batch-invariant`).
+`[1, 2, 4, 8]` (`model:declared sizes`).
 
 ## Measured with the defaults
 

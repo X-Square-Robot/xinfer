@@ -27,13 +27,13 @@
 - BF16 权重和激活；语言模型的 RMSNorm 权重以及 action head、时间嵌入和 ODE 状态为 FP32（与 Wall-X 的加载方式相同）。
 - RMSNorm 在 FP32 下归一化和缩放，只舍入一次。
 - LLM 旋转表：FP32 角度，cos/sin 舍入到 BF16；M-RoPE 频带 16/24/24。ViT 旋转表：FP32，不舍入。
-- 旋转本身（`rotary_embedding`）在 FP32 下计算，并一次性舍入到激活 dtype。安装 Triton 时它是一个融合 kernel，其乘法和加法是分开的 `.rn` 指令，与 torch 组合实现逐位一致。
+- 旋转本身（`rotary_embedding`）在 FP32 下计算，并一次性舍入到激活 dtype。
 - Flow：`t = linspace(0, 1, N+1) · 0.999`，Euler `x ← x + Δt·v`，速度预测，逐 token 时间（固定（pinned）的 RTC token 取 `τ = 1`），未下发指令的维度的填充速度在第 0 步固定，用按步的 `[16, 26]` 统计量反归一化。
 - ViT MLP 保留 checkpoint 的 128 对齐宽度（3456），使 GEMM 形状与来源一致。
 
 ## Optimized 组合
 
-`numerics="optimized"`（默认，`xinfer/models/wall_oss/optimized.py`）在 `xinfer/ops/fused.py` 的算子上运行参考组合的步骤：xcompute 为该形状列出 kernel 时，每个算子是一次 xcompute 调用（xcompute `651195d`），否则用算子的 torch 参考实现。与参考组合一样全部为 BF16。
+`numerics="optimized"`（默认，`xinfer/models/wall_oss/optimized.py`）在 `xinfer/ops/fused.py` 的算子上运行参考组合的步骤：xcompute 为该形状列出 kernel 时，每个算子是一次 xcompute 调用（xcompute `7336b0d`），否则用算子的 torch 参考实现。与参考组合一样全部为 BF16。
 
 | 步骤 | 算子 | 本模型形状下的 kernel |
 |---|---|---|
@@ -61,15 +61,9 @@
 
 ## Action 阶段组批
 
-参考组合的 action 阶段接受 1、2、4 或 8 个请求，各请求的 prompt 长度和 RTC 延迟可以不同，并使每个请求得到与单独运行时相同的比特（设计 §6.4）；optimized 组合只接受一个：
+参考组合的 action 阶段接受 1、2、4 或 8 个请求，各请求的 prompt 长度和 RTC 延迟可以不同；optimized 组合只接受一个。组批的请求与其单独运行的结果相差在舍入级以内（设计 §6.4）：
 
-- **批次不变算子。** action 栈使用算子表的批次不变配套表（`OpTable.batch_invariant_table()`）构建：
-  - Triton `linear`（服务的 Stage-2 kernel：16 行 tile，K 切分按权重形状固定），用于 expert 1 和 FP32 action head；
-  - Triton `rms_norm`；
-  - flash-attn `action_attention`；
-  - 逐元素参考实现。
-
-  ViT 和 prompt 保持默认选择（cuBLAS `linear`），因为它们一次只运行一个请求。
+- **算子。** action 栈与其他阶段一样使用默认选择：cuBLAS `linear`、xcompute `rms_norm` 和 flash-attn `action_attention`。cuBLAS 可能为不同行数选择不同的 kernel，因此组批的请求可能与其单独运行有舍入级差异（实测最大 3.4e-3，动作的相对范数）。
 - **不同 prompt 长度。** `prompt_kv` 声明了其序列轴。组批时对它做左填充并传入 `prompt_kv_lengths`；`action_attention` 跳过每行的填充（`cache_leftpad`），与服务的做法相同。
 - **填充过的 prompt** 把有效 token 放在前面（见下一节）；action 阶段在 attention 之前把每行的填充移入左填充。
 - **引擎行为。** action 通道空闲时，引擎把当时排队的请求组成一批（零等待组批）。因此在负载下 action 阶段无需任何设置即会以 B2–B8 运行；`--max-batch action=N` 可限制批大小。
@@ -80,10 +74,10 @@
 
 - **位置。** 填充 token（`<|endoftext|>`，M-RoPE 位置为 0）放在 prompt 末尾、action token 之前（`processing.pad_prompt`）。`prompt_len` 变为填充后的长度 `W`，作为 prefill graph 的键；`prompt_valid`（`[1]` int32）保存有效 token 数 `P`；`action_position_base` 仍是未填充 prompt 末尾的位置。
 - **Prefill。** 在因果 attention 下，没有任何有效 token 会 attend 到其后的填充 token，而 norm 和投影对每个 token 的行独立计算，因此前 `P` 列的 K/V 与未填充时的 prefill 相同。MXFP8 CUTLASS GEMM 保证这一点（固定 tile、无 split-K）。对于 cuBLAS（BF16），这是实测结果而非保证：它的 kernel 选择可能取决于行数。flash-attn 的因果调用（`num_splits=1`）对有效行在两种长度下访问相同的 key 块。
-- **Action 阶段。** `prompt_kv` 到达时宽度为 `W`，前 `P` 列有效，并在引擎合并时左填充到批内最宽的行（`prompt_kv_lengths = W`）。`denoise` 每次派发时把每行循环右移 `W − P` 一次（`left_align_prompts`，对 prompt K/V 做一次 gather），使其变成 `prompt_kv_lengths = P` 的普通左填充行：这正是合并对不同长度本来就会产生的布局，`action_attention` 用 `cache_leftpad` 跳过填充，并且对它批次不变。另一种做法是像 Wall-X 服务的 action 计算那样，把 action K/V 紧接在每行的有效 prompt 之后写入，这会以每层每步一次 scatter（每个请求 360 次）取代这一次 gather；还会改变 attention 算子。
-- **适用条件。** 只有当 action 阶段对左填充不变时，填充才不会改变动作，这由其批次不变算子保证（flash-attn 配合 Triton `linear`）。torch 参考 attention 不满足这一点（其 softmax 和乘积覆盖所有列），因此除非 action 阶段批次不变，`from_checkpoint` 会拒绝 `prompt_bucket > 0`；参考算子模型和 CPU 运行精确 prompt（`prompt_bucket=0`）。
+- **Action 阶段。** `prompt_kv` 到达时宽度为 `W`，前 `P` 列有效，并在引擎合并时左填充到批内最宽的行（`prompt_kv_lengths = W`）。`denoise` 每次派发时把每行循环右移 `W − P` 一次（`left_align_prompts`，对 prompt K/V 做一次 gather），使其变成 `prompt_kv_lengths = P` 的普通左填充行：这正是合并对不同长度本来就会产生的布局，`action_attention` 用 `cache_leftpad` 跳过填充。另一种做法是像 Wall-X 服务的 action 计算那样，把 action K/V 紧接在每行的有效 prompt 之后写入，这会以每层每步一次 scatter（每个请求 360 次）取代这一次 gather；还会改变 attention 算子。
+- **舍入。** flash-attn 的 action attention 跳过左填充，因此填充后的请求单独运行时得到其精确 prompt 的动作。torch 参考 attention 的 softmax 和乘积覆盖所有列，组批又会改变 GEMM 的行数：两者都可能在舍入级改变比特。
 
-在 RTX 5090 上实测（见验证）：在默认后端下，无论 MXFP8 还是 BF16，在 706 到 756 个 token 的 28 种 prompt 长度上，填充 prompt 与精确 prompt 给出相同的比特，包括有效 token 的 prefill K/V 以及动作（eager、graph 以及与其他桶一起组批）。
+在 RTX 5090 上以默认后端实测（见验证）：12 个随机机械臂姿态请求的填充 prompt，单独运行时（eager 和 graph）与其精确 prompt 的动作逐位一致，与其他桶的请求一起组批时相差在 5.9e-3 以内（相对范数）。
 
 ## Attention
 

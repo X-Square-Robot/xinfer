@@ -143,7 +143,8 @@ CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "Wall-OSS" --mode
 ```
 
 - **Single request:** `request_latency.py` on the model's request set (50 runs after 5 warmup runs), with the views
-  decoded and resized on the device (`image_preprocess_device="gpu"`, `Policy`'s default).
+  decoded and resized on the device (`image_preprocess_device="gpu"`, `Policy`'s default). An
+  `image_preprocess_device` in `--model-options` applies to this part and to the load.
 - **Load:** for each robot count, in increasing order, a newly started `xinfer-serve` with the default settings and
   the model's warmup files, then `robot_load.py` with the repository convention (80 requests per robot, the first 20
   dropped, 8 rounds with random start phases). A model with real-time chunking gets the synthetic desktop observations with RTC (the default

@@ -22,7 +22,7 @@
 
 - **快速。** 单请求时延低，每个加速器能服务更多机器人。异步阶段发射、设备事件以及（在支持的平台上）图回放降低了主机开销。阶段队列和零等待组批把排队中的兼容请求合并执行，共享权重，并让不同阶段的工作相互重叠。
 - **稳定。** 时延可预测，服务在机队负载下持续运行：服务前先预热，有准入限制，并对逐请求的故障进行隔离。
-- **准确。** 输出忠实于原始模型。默认情况下，组批不会改变单个请求的结果，量化预设均通过各模型的[精度门禁](docs/precision.zh-CN.md)。
+- **准确。** 输出忠实于原始模型。不同批大小可能带来浮点舍入差异。模型输出的验证方法见[精度门禁](docs/precision.zh-CN.md)。
 - **可扩展。** 可复用的层和阶段接口简化了模型接入。平台适配器和算子适配器把模型代码接到新芯片和优化过的 kernel 上。
 
 ## 快速开始
@@ -82,7 +82,7 @@ finally:
 
 每个加速器运行各自的引擎（Engine）和权重。
 
-优化的 CUDA 执行路径使用 Triton 和可选的 FlashAttention 后端。MXFP8 还需要兼容的 **xcompute** 构建；见[量化与 kernel 配置](docs/quantization.zh-CN.md#后端)。Ascend 通过 `torch_npu` 走 BF16 参考算子路径。
+优化的 CUDA 执行路径使用 **xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 通过 `torch_npu` 走 BF16 参考算子路径。
 
 ## 工作原理
 
@@ -110,9 +110,11 @@ finally:
 | 部署服务 | [服务](docs/serving.zh-CN.md) |
 | 了解调度与 CUDA graph | [引擎](docs/engine.zh-CN.md) |
 | 配置部署 | [配置](docs/configuration.zh-CN.md) |
-| 选择数值格式与 kernel | [量化](docs/quantization.zh-CN.md) |
+| 编译并启用优化 kernel | [Kernel](docs/kernels.zh-CN.md) |
+| 选择数值格式 | [量化](docs/quantization.zh-CN.md) |
 | 验证模型输出 | [精度](docs/precision.zh-CN.md) |
 | 分析算子性能 | [性能剖析](docs/profiling.zh-CN.md) |
+| 用 Prometheus 和 Grafana 监控服务 | [指标](docs/metrics.zh-CN.md) |
 | 扩展框架 | [模型接口](xinfer/models/interface.py) · [架构与设计](docs/design.zh-CN.md) |
 
 ## 参与贡献
@@ -121,4 +123,4 @@ finally:
 
 ---
 
-XInfer 目前处于非公开开发阶段，许可与公开发布尚待确定。
+此发行版尚未附带许可证。

@@ -147,10 +147,10 @@ def test_result_freed_during_a_capture():
 
 
 class BatchedToy(Toy):
-    """Toy whose second stage batches B1/B2/B4; it works row by row, so it is batch-invariant."""
+    """Toy whose second stage batches B1/B2/B4; it works row by row."""
 
     def capabilities(self):
-        return Capabilities(batch_sizes={"a": (1,), "b": (1, 2, 4)}, num_steps=0, batch_invariant={"b": True})
+        return Capabilities(batch_sizes={"a": (1,), "b": (1, 2, 4)}, num_steps=0)
 
 
 def _row_request(seed, steps=200):
@@ -193,7 +193,7 @@ class RaggedToy(VLAModel):
     handoffs = (HandoffSpec("a", "b", {"kv": TensorSpec(batch_axis=0, seq_axis=1)}),)
 
     def capabilities(self):
-        return Capabilities(batch_sizes={"a": (1,), "b": (1, 2, 4)}, num_steps=0, batch_invariant={"b": True})
+        return Capabilities(batch_sizes={"a": (1,), "b": (1, 2, 4)}, num_steps=0)
 
     def stage_outputs(self, stage, batch):
         if stage == "a":

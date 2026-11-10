@@ -21,7 +21,7 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 | 事项 | 决定 |
 |---|---|
 | 项目名 | XInfer |
-| 仓库 | GitHub 上的 X-Square-Robot/xinfer。对外发布须完成许可证与贡献流程审批。 |
+| 仓库 | GitHub 上的 X-Square-Robot/x2infer。 |
 | kernel | 沿用现有 xcompute 仓库，由算子组负责；XInfer 通过 ops 层的 xcompute 绑定接入 |
 | 算子绑定 | xcompute 默认使用 TVM-FFI；有明确的 PyTorch 编译、导出需求时，按需增加 `torch.library` 适配并复用底层实现（§14.2） |
 | 部署场景 | 每个加速器运行一个模型实例，为一台或多台机器人提供服务。 |
@@ -44,7 +44,7 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 | §4 设备边界 | 未实现 | `engine/` 直接调用 `torch.cuda`，并按 `Platform.is_cuda` 分支；`test_layering.py` 只检查 `platforms/interface.py`、`models/interface.py` 不 import torch |
 | §5 取消与单请求错误 | 部分实现 | 未发射的取消请求直接丢弃，已发射的跑完后丢弃结果；阶段执行、接纳时的上传或取批时出错，只让相应的请求失败，并释放其 slot。引擎线程或完成线程停止时 `xinfer-serve` 以状态 1 退出；设备粘滞错误的识别（`Platform.classify_error`）与 DRAINING 未实现 |
 | §6.3 三条调度规则 | 已实现 | 上游发射后请求即进入下游队列，下游 lane 在 GPU 上等待事件；零等待组批；完成线程只等最终事件（`xinfer/engine/core.py`） |
-| §6.4 只对批次不变的阶段组批 | 已实现 | Wall-OSS 根据数值组合和所选算子的契约确定 action 阶段允许的批大小。Vision 和 prefill 使用 B1。 |
+| §6.4 组批精度 | 已实现 | Wall-OSS 参考组合允许 action 阶段使用 B1、B2、B4 和 B8。优化组合、vision 和 prefill 只使用 B1。 |
 | §7.1 接纳 | 部分实现 | `submit` 返回 Future，拒绝时为 `AdmitError`（`queue_full`、`per_robot_limit`、`stopped`）；`admission_timeout` 未实现 |
 | §7.2–§7.4 阶段队列、组批、发射 | 已实现 | FIFO；兼容键由运行时按阶段实际读取的输入推导；序列长度不同的交接张量左填充后组批；合批用 torch 拼接，不经 Platform 拷贝原语 |
 | §7.5 策略插件 | 未实现 | FIFO 写在引擎内 |
@@ -58,9 +58,9 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 | §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过 quick100 门禁。 |
 | §12 量化 | 部分实现 | 按模块组的 `QuantConfig`，BF16 与 MXFP8（xcompute，sm120）；量化预设由模型选项 `quantization` 指定，默认 BF16，不按（模型, 平台）解析；NVFP4（`nvfp4`、`nvfp4_mse`，即 Wall-X NVFP4 服务的两种配方）只有 torch 参考实现，没有设备后端，也没有模型预设使用；`xinfer eval quant` 未实现，精度门禁见 docs/precision.md |
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
-| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）、flash-attn、批次不变 Triton kernel；`xinfer.ops.conformance` 未实现 |
+| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn；`xinfer.ops.conformance` 未实现 |
 | §15 协议与前端 | 部分实现 | WebSocket + msgpack，兼容 x2robot 客户端；`xinfer.Policy` 进程内 API；Client SDK 与兼容适配未实现 |
-| §16 可观测性与基准工具 | 部分实现 | 响应中的 `server_timing`；`benchmarks/request_latency.py` 测进程内单请求延迟，`benchmarks/robot_load.py` 按仓库口径闭环压测（Wall-OSS 带 RTC；不带 RTC 的请求文件用 `--requests-file`），见 docs/benchmark.md；算子级 profiling 的基础（docs/profiling.md）：`xinfer.observability.annotate` 的 `span`（kineto、NVTX 两种 sink，启动时选定）、给每个算子调用加 span 的 `profiled_ops` 算子表和算子代价（`xinfer.observability.op_cost`：做矩阵乘的算子有显式公式，其余算子按输入输出各搬运一次计；`OpSpec` 不带代价）、引擎在每次阶段发射外加的 `stage::` span、带实测峰值表的 roofline 下限，以及 `xinfer-profile ops`：在 torch.profiler 下运行模型的请求，按阶段输出带下限的算子表；`xinfer bench` / `tune` / `eval` 命令未实现 |
+| §16 可观测性与基准工具 | 部分实现 | 服务通过 [/metrics](metrics.zh-CN.md) 导出 Prometheus 指标。使用[压测工具](benchmark.zh-CN.md)测单请求延迟和闭环容量，或用 [xinfer-profile](profiling.zh-CN.md) 分析算子、排队及各阶段执行时间。 |
 | §17 测试 | 部分实现 | CPU 单元与契约测试；GPU 与资产测试需要本地资产，手动运行；CI（`.gitlab-ci.yml`）只跑 ruff 与 CPU 测试 |
 | §18.1 仓库结构与命令行 | 与规划不同 | 目录以仓库为准；服务入口为 `xinfer-serve`（即 `python -m xinfer.entrypoints.serve`），profiling 入口为 `xinfer-profile`（`ops`）；统一的 `xinfer` 命令未实现 |
 
@@ -170,7 +170,7 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 | `observability/` | `ops/`、`platforms/` | `engine/`、`models/`、`layers/`、`frontend/`、`quantization/`、`loader/`、`config/` |
 | `entrypoints/` | 以上任何包 | 无（其他包都不依赖它） |
 
-启动顺序是：构建模型（算子在此时选定）→ `config.resolve` 读取已构建模型的 `capabilities()` 与平台能力 → 创建 Engine。所以批次不变性这类由算子推出的属性经模型接口交给 engine，engine 不依赖 ops，也不依赖 config；Frontend 的共享内存与 Engine 之间由 `entrypoints/serve.py` 衔接，engine 不依赖 frontend。
+启动顺序是：构建模型（算子在此时选定）→ `config.resolve` 读取已构建模型的 `capabilities()` 与平台能力 → 创建 Engine。所以已构建模型支持的能力（例如批大小）经模型接口交给 engine，engine 不依赖 ops，也不依赖 config；Frontend 的共享内存与 Engine 之间由 `entrypoints/serve.py` 衔接，engine 不依赖 frontend。
 
 `test_layering.py` 检查上表中包之间的依赖方向，以及 `platforms/interface.py`、`models/interface.py` 不 import torch。下面的设备边界是目标，尚未实现，也未检查。
 
@@ -235,10 +235,7 @@ Engine Scheduler: 接纳（分配请求 slot）→ H2D（uint8 图像、token、
 ### 6.4 正确性契约：单独运行与满载运行
 
 - **同一套 kernel。** 两条路径使用同一批阶段图。算子不要求确定性（§14.1）：满载下的结果要像单独运行的结果一样通过该模型的精度门禁；某个阶段的算子都是确定性时，两者逐位相同。
-- **只有批次不变的阶段才组批。** 后端声明并通过"B1 与 Bn 逐位一致"测试的阶段，默认路径才使用 Bn>1；其余阶段只用多 lane 的 B1 并发，这种并发不需要批次不变。
-- **算子组的交付项。** 在组批有收益的阶段，批次不变的 kernel 列为算子组交付项。
-  - 现状：XInfer 中 Wall-OSS 的 action 阶段使用批次不变 kernel，支持 B1–B8；其 vision 与 prefill 阶段只支持 B1。
-- **CI 检查**：同一输入在空载和满载回放下都通过精度门禁；算子都是确定性的阶段，输出逐位相同。
+- 模型通过精度门禁后，才为该阶段声明大于 1 的批大小。组批可能改变浮点舍入。Wall-OSS 参考组合支持 action 组批，优化组合保持 B1。
 - **适用范围。** 逐位相同只在同一平台和同一组算子实现内成立，不跨芯片；跨平台与参考实现的对齐用容差，每个平台保存自己的 golden。
 
 ### 6.5 M0 / M1 需要量化的风险
@@ -375,7 +372,7 @@ v1 只实现 `colocated`。Vision、Prefill、Action 共享一个 Engine 进程�
 
 1. **显式值**：总是生效；与平台能力冲突时直接报错，不静默改写。
 2. **调优表**：按（模型, 平台, 量化）存放实测最优的 lane 数等资源配置。由 `xinfer tune` 生成，随仓库发布，记录提交、日期和测量口径。
-3. **推导规则**：根据平台能力、模型声明（阶段图、批次不变性、形状桶）和显存规划器推导。形状桶粒度和默认 `QuantConfig` 同样按（模型, 平台）在这一层解出，不写在模型文件里。caps 表达不了的平台限制由 `Platform.derive` 与 `Platform.validate` 提供（§13.1），结果在启动报告中标为 `platform:<name>`；核心规则里不写厂商特例。
+3. **推导规则**：根据平台能力、模型声明（阶段图、批大小、形状桶）和显存规划器推导。形状桶粒度和默认 `QuantConfig` 同样按（模型, 平台）在这一层解出，不写在模型文件里。caps 表达不了的平台限制由 `Platform.derive` 与 `Platform.validate` 提供（§13.1），结果在启动报告中标为 `platform:<name>`；核心规则里不写厂商特例。
 4. **固定默认值**：与负载无关。
 
 不设按负载推导的意图参数（如服务的机器人数）。实例服务的机器人数随时变化，而引擎本身随到达的请求自适应：只把已在队列中的请求组批，空闲的 lane 不占算力，CUDA graph 按实际出现的键捕获。因此在途请求上限（对应 vLLM 的 `max_num_seqs`，它同样是固定的默认上限）、各阶段允许的 batch 集合、lane 数和 frontend 进程数，都取对各种负载都合适的上限或固定值（docs/configuration.md）。
@@ -397,7 +394,7 @@ xinfer serve --model wall_oss --checkpoint CKPT --lanes vision=1    # 显式覆�
 max_running_requests  32         default
 lanes.vision          2          tuned:wall_oss/sm120-mxfp8@<commit>
 batch_sizes.vision    [1]        model:declares B1 only
-batch_sizes.action    [1,2,4,8]  model:batch-invariant, declared sizes
+batch_sizes.action    [1,2,4,8]  model:declared sizes
 cudagraphs            True       platform:supports graph capture
 frontends             2          default, ≤ cpus/2 = 12
 frontend_workers      4          default, frontends × workers ≤ cpus/2 = 12
@@ -436,7 +433,8 @@ class WallOSS(VLAModel):
             "prompt_kv": TensorSpec(batch_axis=2, seq_axis=4)}),  # 模型按所选 attention 后端声明轴（§11.2）
     )
     def shape_buckets(self, cfg): ...          # 计划：合法范围，如 prompt 宽度 ≤ 200、步长 16；实际桶由平台选（§8.3）
-    def capabilities(self): ...                # RTC、batch 大小、批次不变性（由所选算子推出）
+    pad_prompt = staticmethod(pad_prompt)      # 把准备好的 prompt 填充到桶宽度；基类的 pad() 调用它
+    def capabilities(self): ...                # RTC、batch 大小、各阶段调用的算子
     def stage_outputs(self, stage, b): ...     # 各阶段输出缓冲的形状与 dtype，由运行时分配
 
     def encode_images(self, b: StageBatch) -> None: ...   # 写 b.out["image_embeds"]
@@ -538,7 +536,7 @@ class Platform:
 | 典型部署 | 机队，单卡多台 | 机队，单卡多台 |
 | 内存 | 32 GB 独立显存 | 统一内存：H2D 可以零拷贝或映射 |
 | CPU | 服务器 CPU（测试容器配额 24 核） | ARM，较弱：发射开销占比更高，机队下 Frontend 预处理也更容易成为瓶颈 |
-| MXFP8 GEMM | xcompute（TVM-FFI） | xcompute `mxfp8-thor`（`model/xcompute!58`） |
+| MXFP8 GEMM | xcompute（TVM-FFI） | xcompute `mxfp8-thor` |
 | MPS | 支持（FleetServe split 布局使用）；v1 colocated 不依赖 | 待确认；v1 colocated 不依赖 |
 | 已知参考 | FleetServe、HarriX `mxfp8-sm120` | HarriX `mxfp8-thor`（ViT BF16、整调用图、RTC 关闭） |
 
@@ -565,7 +563,7 @@ XInfer 作为开源项目接入不同厂商的芯片，厂商包在树外维护�
 
 - **签名**：输出写入调用方提供的 `out`；需要 workspace 时由调用方提供。
 - **torch 参考实现**。
-- **数值契约**：与参考逐位一致还是给定容差；是否确定性；是否批次不变。
+- **数值契约**：与参考逐位一致还是给定容差；是否确定性。
 
 确定性只需声明，不作要求。算子在多次运行之间可以有舍入量级的差异，例如 stream-K GEMM 在并发负载下部分和以不同的顺序相加。模型对算子的要求是能通过该模型的精度门禁（docs/precision.zh-CN.md）；对 VLA 模型来说主要是对照录制轨迹的开环门禁。声明 `deterministic=False` 是告诉测试和读者不要期待逐位可复现。
 
@@ -577,14 +575,14 @@ XInfer 作为开源项目接入不同厂商的芯片，厂商包在树外维护�
 
 验证要求：
 
-- 每种绑定均需验证与参考实现的数值一致性、所声明的确定性和批次不变性，以及所声明的 CUDA Graph 捕获与重放能力；绑定方式本身不保证这些性质或性能收益。
+- 每种绑定均需验证与参考实现的数值一致性、所声明的确定性，以及所声明的 CUDA Graph 捕获与重放能力；绑定方式本身不保证这些性质或性能收益。
 - 引入 `torch.library` 适配时，额外使用 `torch.library.opcheck` 验证注册契约，并测试实际支持的编译或导出路径，覆盖输入修改与别名声明、FakeTensor／形状推导等行为。`opcheck` 不替代数值一致性测试。
 
 ### 14.2 后端注册与选择
 
 ```python
 @ops.register("gemm_mxfp8", platform="cuda", arch=("sm120",), backend="xcompute",
-              graph_safe=True, deterministic=True, batch_invariant=True)
+              graph_safe=True, deterministic=True)
 def _gemm_mxfp8_sm120(x, xs, w, ws, out, workspace): ...
 ```
 
@@ -605,7 +603,7 @@ def _gemm_mxfp8_sm120(x, xs, w, ws, out, workspace): ...
 | | XInfer 仓库（框架组） | xcompute 仓库（算子组） |
 |---|---|---|
 | 内容 | 算子签名、参考实现、一致性测试套件、注册机制 | 各平台高性能实现（CUDA/CuTe/Triton/HIP），按平台出 wheel |
-| 测试 | 模型级对齐、运行时不变性 | 在 CI 中运行 `xinfer.ops.conformance`（数值、确定性、批次不变、图捕获），并给出 microbenchmark |
+| 测试 | 模型级对齐、运行时一致性 | 在 CI 中运行 `xinfer.ops.conformance`（数值、确定性、图捕获），并给出 microbenchmark |
 | 交付 | 每个模型的算子清单与形状 | 每个实现附理论下限表（roofline） |
 | 版本 | 声明兼容的 xcompute 版本范围；启动时校验构建指纹 | 语义化版本；ABI 变化要升主版本 |
 
@@ -663,14 +661,14 @@ def _gemm_mxfp8_sm120(x, xs, w, ws, out, workspace): ...
 | 算子一致性 | 每个后端实现对照参考实现；各绑定遵守 §14.1 的执行与验证契约 | xcompute 仓库 CI（GPU） |
 | PyTorch 算子适配（引入时） | `torch.library.opcheck`、实际支持的编译／导出路径，以及适配后的数值一致性（§14.1） | 主仓库 CI，按声明支持的设备执行 |
 | 模型对齐 | 冻结输入、噪声和参考输出，与原始实现对比 | GPU，每个 MR（小样本） |
-| 运行时不变性 | 链式 vs 非链式、B1 vs Bn（声明批次不变时）、空载 vs 满载回放：输出逐位相同 | GPU，夜间 |
+| 运行时一致性 | 链式 vs 非链式、B1 vs Bn、空载 vs 满载回放：输出通过精度门禁；算子确定时 B1 输出逐位相同 | GPU，夜间 |
 | 容量回归 | 按（模型, 平台）维护阈值 | GPU，夜间或每周 |
 
 ---
 
 ## 18. 仓库与开发流程
 
-- XInfer 通过 §14 中的算子契约、绑定和一致性检查接入 xcompute。对外发布须完成许可证与贡献流程审批。
+- XInfer 通过 §14 中的算子契约、绑定和一致性检查接入 xcompute。
 - **沿用 embodied-serving 的规范**：
   - MR 描述必须写明问题、改动、验证和限制；
   - 实验原始数据不进 Git；
@@ -774,7 +772,7 @@ XInfer/
 │   │   │   └── xcompute.py         # 绑定并注册 xcompute 实现（现用 TVM-FFI）
 │   │   └── conformance/            # 一致性测试套件（xcompute 仓库 CI 也运行）
 │   │       ├── cases.py            # 各算子的形状与 dtype 用例，取自首批模型
-│   │       └── checks.py           # 数值、确定性、批次不变、图捕获检查
+│   │       └── checks.py           # 数值、确定性、图捕获检查
 │   ├── observability/
 │   │   ├── timing.py               # 每请求分段计时
 │   │   ├── metrics.py              # Prometheus
@@ -800,7 +798,7 @@ XInfer/
 │   ├── contract/                   # 假模型端到端；test_layering.py 检查依赖方向
 │   ├── plugin/                     # 树外风格的 dummy 平台包：经入口点完成发现、激活与契约测试（§13.3）
 │   ├── models/                     # GPU：与参考实现对齐（资产按 manifest 从外部拉取）
-│   ├── invariance/                 # GPU：链式/非链式、B1/Bn、空载/满载 逐位相同
+│   ├── consistency/                # GPU：链式/非链式、B1/Bn、空载/满载 都通过精度门禁
 │   └── fixtures/                   # 小型确定性 fixture，注明使用它的测试
 ├── examples/                       # 5090 与 Thor 机队部署、离线 Policy
 ├── tools/
@@ -903,7 +901,7 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 |---|---|---|
 | M-1 评审与建仓 | 主仓库 kc/XInfer 已创建（私有），算子仓库确定为 xcompute；本文档评审及算子契约待完成；CPU CI 已接入 | 仓库安排已确定；本里程碑其余事项完成后记录评审与验收结论 |
 | M0 数据面 | 平台、算子后端、模型层、Wall-OSS、单通道发射和基准测试 | Wall-OSS 通过精度门禁，并记录目标平台的时延与图发射开销。 |
-| M1 机队运行时 | 多通道发射、零等待组批、前端工作进程、slot 生命周期与配置解析 | 测量负载下的机队容量、批次不变性和发射开销。 |
+| M1 机队运行时 | 多通道发射、零等待组批、前端工作进程、slot 生命周期与配置解析 | 测量负载下的机队容量、组批精度和发射开销。 |
 | M2 量化与扩展 | NVFP4 与模型扩展 | 记录各模型及量化方法的数值结果。 |
 | M3 发布 | 文档、Client SDK、兼容适配、Router；许可审批；GitHub 发布 | 外部用户按文档能复现单请求延迟与单卡容量 |
 
@@ -915,7 +913,6 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 |---|---|---|
 | 链式发射在临界负载附近降低容量 | 统一模型的前提 | M1 在 colocated 多 lane 路径测量；必要时调整链式发射条件，保持单一路径 |
 | 单进程发射成为瓶颈（Python 开销、GIL） | 机队容量 | M1 测发射线程占用、锁等待与提交延迟；优先消除热路径阻塞和 CPU 重活，必要时评估下沉提交逻辑。未达容量门槛则继续优化并记录限制，不以尚未实现的 split 作为兜底；拆进程需另行评审 |
-| 首批模型的 kernel 不批次不变 | 组批收益受限 | 列为算子组交付项；在此之前用多 lane B1 |
 | Thor 的图、统一内存与 CPU 提交开销和 5090 不同 | Thor 性能 | 按平台能力推导配置；Thor 单独做 M0 测量。Thor 也按机队部署，M1 在 Thor 上单独测容量和 Frontend 的 CPU 占用。v1 不依赖 MPS，MPS 能力确认不阻塞本版 |
 
 ---

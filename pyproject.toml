@@ -24,7 +24,7 @@ models = [
     "numba>=0.60",
     "pillow>=10",
 ]
-# processing.image_preprocess_device = "gpu": JPEG decoding with nvJPEG (batched CUDA decode_jpeg).
+# image_preprocess_device = "gpu": JPEG decoding with nvJPEG (batched CUDA decode_jpeg).
 gpu-image = [
     "torchvision>=0.19",
 ]
@@ -32,10 +32,12 @@ serve = [
     "websockets>=12",
     "msgpack>=1.0",
     "msgpack-numpy>=0.4.8",
+    "prometheus_client>=0.20",
 ]
 test = [
     "pytest>=7",
     "websockets>=12",
+    "prometheus_client>=0.20",
     "msgpack>=1.0",
     "msgpack-numpy>=0.4.8",
     "tokenizers>=0.19",
