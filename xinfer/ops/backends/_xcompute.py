@@ -74,7 +74,8 @@ def _import():
         logger.info("xcompute is not available: set %s or install the xcompute package", ENV)
         return None
     library = _Library(path)
-    package, archs = _python_package(library), target_archs(library)
+    package = _python_package(library)
+    archs = target_archs(library) if package is not None else ()
     if package is None or not archs:
         logger.info("xcompute is not available: %s has no Python package of its build with the unified entries, or "
                     "targets no architecture", library.path)

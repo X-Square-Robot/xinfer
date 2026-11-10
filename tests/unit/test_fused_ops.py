@@ -120,6 +120,34 @@ def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path)
     assert xcompute._python_package(Library(())) is None
 
 
+def test_legacy_xcompute_library_falls_back_during_table_build(tmp_path):
+    """Build the first table in a fresh process with an xcompute library missing build_target_archs."""
+    import subprocess
+    import sys
+    import textwrap
+
+    path = tmp_path / "xcompute.so"
+    path.touch()
+    script = textwrap.dedent("""
+        import sys
+        from unittest.mock import Mock
+
+        from xinfer import ops
+        from xinfer.platforms import resolve_platform
+
+        library = Mock()
+        library.get_function.side_effect = {"gemm_envelope_table": lambda: ()}.__getitem__
+        sys.modules["tvm_ffi"] = Mock(load_module=Mock(return_value=library))
+        sys.modules["xcompute"] = Mock(KERNEL_LIB_PATH=sys.argv[1])
+
+        table = ops.registry.build_table(resolve_platform("cpu"))
+        assert table.selection("gemm_epilogue").backend == "reference"
+        assert ops.registry.backend_ops("cuda:xcompute") == []
+    """)
+    env = dict(os.environ, XINFER_XCOMPUTE="1", XINFER_XCOMPUTE_LIBRARY=str(path), XINFER_FLASH_ATTN="0")
+    subprocess.run([sys.executable, "-c", script, str(path)], env=env, check=True)
+
+
 def _fake_package(monkeypatch, tmp_path):
     """A stand-in ``xcompute`` package whose library is ``tmp_path/xcompute.so``, importable as ``xcompute``."""
     import importlib.machinery
