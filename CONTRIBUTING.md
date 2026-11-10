@@ -1,6 +1,6 @@
 # Contributing to XInfer
 
-XInfer is in private development. Read [docs/design.md](docs/design.md),
+Read [docs/design.md](docs/design.md),
 including its implementation-status section, before proposing implementation
 changes.
 
@@ -17,13 +17,13 @@ The GitHub distribution ships only Wall-OSS. When syncing from upstream, import 
 - Add maintained code when it has an implementation or validation purpose;
   avoid placeholder modules that imply unsupported functionality.
 
-## Merge requests
+## Pull requests
 
-- **One concern per merge request.** Keep refactoring, renaming and
-  formatting-only changes in their own merge request and say "no functional
+- **One concern per pull request.** Keep refactoring, renaming and
+  formatting-only changes in their own pull request and say "no functional
   change" in its title. Do not include unrelated edits.
 - **Size.** Aim for about 400 changed lines, not counting tests and fixtures.
-  Split anything above about 1000 lines into stacked merge requests, or agree
+  Split anything above about 1000 lines into stacked pull requests, or agree
   on the design in an issue first.
 - **Description.** Use the default template: problem, changes, validation,
   limitations and references. List the checks actually run with their results,
@@ -31,13 +31,11 @@ The GitHub distribution ships only Wall-OSS. When syncing from upstream, import 
   measurements, comparisons with earlier revisions and where the evidence is
   stored belong here, not in the repository.
 - **Commits.** Imperative subject without issue numbers; the body explains why.
-  Squash fix-up commits before review. Put `Closes #N` only in the
-  description's references: GitLab closes the issue when the merge commit,
-  which carries the description, lands.
+  Squash fix-up commits before review. Use `Closes #N` in the pull request description to link the issue.
 - **Review.** Merge only with CI passing and the branch up to date with `main`.
-  Keep a merge request in draft until its validation is complete. Answer every
+  Keep a pull request in draft until its validation is complete. Answer every
   review comment with a change or an explanation.
-- **AI assistance.** Agent-written merge requests follow the same rules. The
+- **AI assistance.** Agent-written pull requests follow the same rules. The
   responsible person reviews every changed line, and the description says
   which parts an agent wrote.
 
@@ -64,11 +62,11 @@ The GitHub distribution ships only Wall-OSS. When syncing from upstream, import 
 
 ## Validation
 
-GitLab CI (`.gitlab-ci.yml`) runs on every merge request and on `main`:
+Run the repository checks locally before submitting changes:
 `ruff check .` (settings in `pyproject.toml`), the CPU test suite,
 `tools/check_repo.py` (the repository content rules below) and
 `tools/docs_i18n.py check` (the documentation languages, below). GPU and asset
-tests skip in CI; run them on a GPU machine and report them in the merge
+tests skip in CI; run them on a GPU machine and report them in the pull
 request. Do not report planned checks as passing. Each implementation change
 should document runnable checks appropriate to the functionality it adds.
 
@@ -77,9 +75,9 @@ As the implementation becomes available, validation should cover:
 - CPU contracts for admission, stage progression, cancellation, resource
   ownership, configuration, and dependency direction.
 - Backend conformance against reference operators, including graph capture and
-  the declared determinism and batch invariance.
+  the declared determinism.
 - Model alignment with fixed inputs, initial noise, and reference outputs.
-- Same-configuration output invariance across supported runtime paths.
+- Same-configuration outputs across supported runtime paths (batched or not) within the precision gate.
 - Repeated latency and fleet-capacity measurements for each supported platform.
 
 Performance reports must identify the source revision, hardware/software
@@ -98,11 +96,11 @@ and evidence references instead of raw experiment archives.
 Documentation describes the current state: usage, design and validated
 results, each result with its configuration and its evidence archive (name and
 sha256). It has no experiment logs, history pages or comparisons with earlier
-revisions; update it in the same merge request as any user-visible change.
+revisions; update it in the same pull request as any user-visible change.
 
 Every documentation page (`README.md`, `docs/**/*.md`) exists as an English page
 `X.md` and a Simplified Chinese page `X.zh-CN.md`, which link to each other in
-their first lines. A merge request that changes a page changes both, with the
+their first lines. A pull request that changes a page changes both, with the
 same headings, tables and code (comments, diagrams and other `text` blocks are
 translated), and links in a Chinese page lead to Chinese pages. Write a Chinese
 page with the English link targets, then run `python tools/docs_i18n.py links`

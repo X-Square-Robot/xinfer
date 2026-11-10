@@ -29,9 +29,8 @@ for robots, from onboard inference to shared fleet serving.
 - **Stable.** Predictable latency and a service that keeps running under fleet
   load, with warmup before serving, admission limits, and per-request failure
   isolation.
-- **Accurate.** Outputs follow the original model. By default, batching does
-  not change a request's result, and quantized presets pass each model's
-  [precision gate](docs/precision.md).
+- **Accurate.** Outputs follow the original model. Batch size can affect floating-point rounding. The
+  [precision guide](docs/precision.md) describes the Wall-OSS gate and its results.
 - **Extensible.** Reusable layers and stage interfaces
   simplify model integration. Platform and operator adapters connect model
   code to new chips and optimized kernels.
@@ -44,9 +43,12 @@ Use Python 3.10+ and a PyTorch build matched to your accelerator. These examples
 python -m pip install -e ".[models,serve]"
 ```
 
-Bring a checkpoint and its tokenizer, configuration, and normalization assets
-in a supported format, for example [Wall-OSS](docs/models/wall_oss.md#requirements).
-The examples below use Wall-OSS with the default BF16 precision.
+The default Wall-OSS BF16 path uses **xcompute**. Install a build for your CUDA GPU and
+check the selected backends in the [kernel guide](docs/kernels.md). If the build is unavailable,
+XInfer uses the slower PyTorch reference implementations.
+
+The examples use BF16 and require the [supported Wall-OSS checkpoint layout](docs/models/wall_oss.md#requirements), including its tokenizer and normalization files.
+The publicly released Wall-OSS-0.5 and WALL-OSS-FLOW checkpoints use a different layout and do not load directly.
 
 ### Serve a model
 
@@ -105,9 +107,8 @@ Each configuration's single-request latency and robots per GPU: [performance](do
 
 Each accelerator runs its own Engine and weights.
 
-Optimized CUDA execution uses Triton and optional FlashAttention backends.
-MXFP8 additionally uses a compatible **xcompute** build; see
-[quantization and kernel setup](docs/quantization.md#backends).
+Optimized CUDA execution uses an **xcompute** build and the optional FlashAttention
+backend; see [kernels](docs/kernels.md).
 Ascend uses the BF16 reference-operator path through `torch_npu`.
 
 ## How it works
@@ -145,9 +146,11 @@ definitions. Model-specific results and numerical checks are recorded in the
 | Deploy a service | [Serving](docs/serving.md) |
 | Understand scheduling and CUDA graphs | [Engine](docs/engine.md) |
 | Configure a deployment | [Configuration](docs/configuration.md) |
-| Select numerical formats and kernels | [Quantization](docs/quantization.md) |
+| Build and enable the optimized kernels | [Kernels](docs/kernels.md) |
+| Select numerical formats | [Quantization](docs/quantization.md) |
 | Validate model outputs | [Precision](docs/precision.md) |
 | Profile operators | [Profiling](docs/profiling.md) |
+| Monitor a service with Prometheus and Grafana | [Metrics](docs/metrics.md) |
 | Extend the framework | [Model interface](xinfer/models/interface.py) · [Architecture and design](docs/design.md) |
 
 ## Contributing
@@ -157,4 +160,4 @@ performance evidence requirements.
 
 ---
 
-XInfer is in private development. Licensing and public release are pending.
+This distribution does not currently include a license.

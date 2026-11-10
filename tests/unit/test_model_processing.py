@@ -151,6 +151,8 @@ def test_text_range_keeps_separators_and_caps_truncated_prompts():
 
 
 class Bucketed(VLAModel):
+    pad_prompt = staticmethod(lambda tensors, width: dict(tensors, width=width))  # the default pad uses it
+
     def __init__(self, spec, variants=None):
         self.spec, self.variants = spec, variants
 
@@ -160,9 +162,21 @@ class Bucketed(VLAModel):
     def warmup_requests(self, prepared):
         return self.variants or [prepared]
 
-    def pad(self, prepared, dimension, width):
-        assert dimension == "prompt"
-        return PreparedRequest(dict(prepared.tensors, width=width), prepared.meta)
+    @classmethod
+    def build_processors(cls, checkpoint, processing=None, **_ignored):
+        return ("input", checkpoint, processing), ("output", checkpoint, processing), {}
+
+
+def test_model_defaults_build_the_processors_and_pad_only_the_prompt():
+    model = Bucketed(BucketSpec(8))
+    model.checkpoint, model.processing = "checkpoint", {"prompt_bucket": 8}
+    assert model.input_processor() == ("input", "checkpoint", {"prompt_bucket": 8})
+    assert model.output_processor() == ("output", "checkpoint", {"prompt_bucket": 8})
+    prepared = PreparedRequest({"width": 50}, {"robot": "a"})
+    padded = model.pad(prepared, "prompt", 16)
+    assert padded.tensors == {"width": 16} and padded.meta is prepared.meta
+    with pytest.raises(NotImplementedError):
+        model.pad(prepared, "history", 4)
 
 
 def test_warmup_preserves_unbucketed_requests_and_expands_each_models_variant():

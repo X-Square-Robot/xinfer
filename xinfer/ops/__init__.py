@@ -6,8 +6,13 @@ model build time. Backend packages register through the ``xinfer.ops`` entry
 point group (``register(registry)``).
 """
 
+import logging
+
+import torch
+
 from xinfer.ops import fused, mxfp8, nvfp4, reference
 from xinfer.ops.registry import (
+    REFERENCE_BACKEND,
     Implementation,
     OpRegistry,
     OpTable,
@@ -15,10 +20,6 @@ from xinfer.ops.registry import (
     use_ops,
 )
 from xinfer.ops.spec import Contract, OpSpec
-
-# Elementwise references: each output element depends on its own inputs only, so
-# rows never interact and any batching gives the same bits.
-_ELEMENTWISE = Contract(batch_invariant=True)
 
 __all__ = [
     "Contract",
@@ -30,19 +31,22 @@ __all__ = [
     "registry",
     "use_ops",
 ]
+logger = logging.getLogger(__name__)
 
 registry = OpRegistry()
 
 for _spec in (
     OpSpec("linear", "linear(x, weight, bias=None) -> Tensor", reference.linear),
     OpSpec("rms_norm", "rms_norm(x, weight, eps) -> Tensor", reference.rms_norm),
-    OpSpec("silu_and_mul", "silu_and_mul(gate, up) -> Tensor", reference.silu_and_mul, _ELEMENTWISE),
-    OpSpec("silu", "silu(x) -> Tensor", reference.silu, _ELEMENTWISE),
-    OpSpec("gelu", "gelu(x) -> Tensor  # exact erf", reference.gelu, _ELEMENTWISE),
-    OpSpec("gelu_tanh", "gelu_tanh(x) -> Tensor  # tanh approximation", reference.gelu_tanh, _ELEMENTWISE),
-    OpSpec("gelu_tanh_and_mul", "gelu_tanh_and_mul(gate, up) -> Tensor", reference.gelu_tanh_and_mul, _ELEMENTWISE),
+    OpSpec("silu_and_mul", "silu_and_mul(gate, up) -> Tensor", reference.silu_and_mul),
+    OpSpec("silu", "silu(x) -> Tensor", reference.silu),
+    OpSpec("gelu", "gelu(x) -> Tensor  # exact erf", reference.gelu),
+    OpSpec("gelu_tanh", "gelu_tanh(x) -> Tensor  # tanh approximation", reference.gelu_tanh),
+    OpSpec("gelu_tanh_and_mul",
+           "gelu_tanh_and_mul(gate, up) -> Tensor",
+           reference.gelu_tanh_and_mul),
     OpSpec("gated_residual", "gated_residual(x, y, gate) -> x + y * gate  # product rounded first",
-           reference.gated_residual, _ELEMENTWISE),
+           reference.gated_residual),
     OpSpec("layer_norm", "layer_norm(x, weight, bias, eps) -> fp32 Tensor  # in FP32", reference.layer_norm),
     OpSpec("ada_rms_norm", "ada_rms_norm(x[B, L, K], scale[B, 1, K], shift[B, 1, K], eps) -> Tensor"
            "  # x·rsqrt(mean(x²)+eps)·(1+scale)+shift in FP32, x.dtype out", reference.ada_rms_norm),
@@ -55,13 +59,13 @@ for _spec in (
            "  # zero initial state, q/k L2-normalized, FP32 chunks of 64",
            reference.chunk_gated_delta_rule),
     OpSpec("gated_rms_norm", "gated_rms_norm(x[..., D], gate[..., D], weight[D], eps) -> rms_norm(x)·weight·silu(gate)",
-           reference.gated_rms_norm, _ELEMENTWISE),
+           reference.gated_rms_norm),
     OpSpec("rotary_embedding",
            "rotary_embedding(x[..., H, D], cos[..., 1, D] fp32, sin) -> Tensor  # in FP32, x.dtype out",
-           reference.rotary_embedding, _ELEMENTWISE),
+           reference.rotary_embedding),
     OpSpec("rotary_embedding_rounded",
            "rotary_embedding_rounded(x[..., H, D], cos[..., 1, D], sin) -> Tensor  # in x.dtype, products rounded",
-           reference.rotary_embedding_rounded, _ELEMENTWISE),
+           reference.rotary_embedding_rounded),
     OpSpec(
         "causal_attention",
         "causal_attention(q[B, L, H, D], k[B, L, KV, D], v, *, scale=None) -> [B, L, H, D]",
@@ -190,3 +194,30 @@ for _spec in (
 ):
     registry.define(_spec)
 del _spec
+
+
+def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[str]:
+    """Warn when, on a CUDA device, operators a model calls have no backend kernel and run on a fused reference.
+
+    A fused operator's reference (``xinfer/ops/fused.py``) composes torch operations in place of a backend kernel,
+    so the model runs much slower on it. ``Policy`` and ``xinfer-serve`` call this once the model is built.
+
+    Args:
+        model: the model name, for the message.
+        table: the op table the model was built with.
+        stage_ops: ``{stage: operator names}``, the model's ``Capabilities.stage_ops``.
+        device: the model's device.
+
+    Returns:
+        The operators on a fused reference, sorted (none on other devices).
+    """
+    if torch.device(device).type != "cuda":
+        return []
+    names = sorted({name for names in stage_ops.values() for name in names
+                    if table.selection(name).backend == REFERENCE_BACKEND
+                    and registry.spec(name).reference.__module__ == fused.__name__})
+    if names:
+        logger.warning("%s: %d operators have no fast kernel loaded and fall back to slow torch code (%s). Install "
+                       "xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: docs/kernels.md",
+                       model, len(names), ", ".join(names))
+    return names

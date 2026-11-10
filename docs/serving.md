@@ -41,7 +41,7 @@ the device-image thread in [Device images](engine.md#device-images).
 - **Engine process.** Loads the model, runs the engine (see
   [engine.md](engine.md)), maps the buffers and registers them as pinned host
   memory, so uploads read them directly. With
-  `processing.image_preprocess_device="gpu"` the frontends only read the JPEG
+  `image_preprocess_device="gpu"` the frontends only read the JPEG
   headers; the JPEG bytes and raw frames of the `DeviceImage` values cross in
   the buffers, with their sizes in the manifest, and the engine decodes the
   JPEGs from there ([configuration](configuration.md#image-preprocessing-on-the-gpu)).
@@ -72,6 +72,7 @@ the device-image thread in [Device images](engine.md#device-images).
 
   Count every response whose `status` is not `"ok"` as failed.
 - `GET /healthz` (or `/ready`) on the same port returns 200.
+- `GET /metrics` on the same port returns the Prometheus metrics of the engine and every frontend ([metrics](metrics.md)).
 
 ## Run
 
@@ -85,10 +86,12 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/5_2500
 |---|---|
 | `--model-options` | JSON passed to `from_checkpoint` and `build_processors` (Wall-OSS: `processing` = `ProcessingConfig` fields) |
 | `--frontends`, `--frontend-workers`, `--shm-buffers`, `--shm-buffer-mib` | frontend processes (default 2), processing threads each (default 4) and shared-memory buffers each; buffer size |
-| `--lanes`, `--max-batch`, `--allow-non-invariant-batching`, `--max-running-requests`, `--max-queued-requests`, `--per-robot-inflight` | engine settings ([engine.md](engine.md)); checked, never rewritten |
+| `--lanes`, `--max-batch`, `--max-running-requests`, `--max-queued-requests`, `--per-robot-inflight` | engine settings ([engine.md](engine.md)); checked, never rewritten |
 | `--enforce-eager` | run every stage eagerly, without CUDA graphs (default: CUDA graphs where the platform supports capture); `--warmup` request files (JSON or msgpack, each one request or a list): their graphs, at every shape bucket the model derives from them (one flow and one RTC request cover Wall-OSS), are captured on every lane and allowed batch size, and every frontend runs them through the model's processors, before serving |
 | `--tuned` | tuned-table selection: `auto`, `none` or a path |
 | `--resolved-config`, `--dry-run` | write the resolved settings with their sources; print them and exit |
+| `--profile-dir` | record the engine's spans and write each request's engine segments to this directory at shutdown; for profiling runs (`xinfer-profile load --serve`, [profiling](profiling.md#through-xinfer-serve---serve)), the records grow with the requests |
+| `--disable-metrics` | record no Prometheus metrics; `GET /metrics` answers 404 ([metrics](metrics.md)) |
 | `--reference-ops`, `--op-backends` | use only torch reference operators; pin a backend per operator (`op=backend,...`), pins win over `--reference-ops` |
 
 SIGINT/SIGTERM stops the frontends, releases graphs and pinned buffers, and

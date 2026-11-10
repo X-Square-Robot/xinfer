@@ -61,7 +61,7 @@ def test_report_lists_selection_and_contract():
     rows = _registry().build_table(_platform()).report()
     assert rows == [
         dict(op="double", backend="reference", version=None, numerics="reference",
-             deterministic=True, batch_invariant=False, graph_safe=True)
+             deterministic=True, graph_safe=True)
     ]
 
 
@@ -104,26 +104,15 @@ def test_varlen_attention_isolates_segments():
     torch.testing.assert_close(ops.reference.varlen_attention(q, k2, v, cu_seqlens, scale=0.3)[:3], out[:3])
 
 
-def test_batch_invariant_companion_table():
-    from xinfer.ops import Contract, OpRegistry, OpSpec
-    from xinfer.platforms import resolve_platform
-
-    reg = OpRegistry()
-    reg.define(OpSpec("mm", "mm(x) -> Tensor", lambda x: x))
-    reg.define(OpSpec("act", "act(x) -> Tensor", lambda x: x, Contract(batch_invariant=True)))
-
-    @reg.register("mm", backend="fast", contract=Contract(numerics="tolerance"), priority=5)
-    def fast(x):
-        return x
-
-    @reg.register("mm", backend="stable", contract=Contract(numerics="tolerance", batch_invariant=True), priority=-2)
-    def stable(x):
-        return x
-
-    table = reg.build_table(resolve_platform("cpu"))
-    assert table.selection("mm").backend == "fast"
-    inv = table.batch_invariant_table()
-    assert inv.selection("mm").backend == "stable" and inv.selection("act").backend == "reference"
-    assert inv.batch_invariant_table() is inv
-    pinned = reg.build_table(resolve_platform("cpu"), backends={"mm": "fast"})
-    assert pinned.batch_invariant_table().selection("mm").backend == "fast"  # explicit pins are honored
+def test_slow_fallbacks_warn_on_cuda_only(caplog):
+    references = OpRegistry()  # the operators without backends, whatever the process has loaded
+    for name in ops.registry.names():
+        references.define(ops.registry.spec(name))
+    table = references.build_table(_platform())  # every operator on its reference
+    # linear and silu have plain references; gemm_epilogue and qkv_rope_kvcache stand in for backend kernels
+    stage_ops = {"prefill": ("gemm_epilogue", "linear"), "action": ("gemm_epilogue", "qkv_rope_kvcache", "silu")}
+    with caplog.at_level("WARNING", logger="xinfer.ops"):
+        assert ops.warn_slow_fallbacks("tiny", table, stage_ops, "cpu") == []
+        assert not caplog.records
+        assert ops.warn_slow_fallbacks("tiny", table, stage_ops, "cuda") == ["gemm_epilogue", "qkv_rope_kvcache"]
+    assert "tiny: 2 operators have no fast kernel loaded" in caplog.text and "XINFER_XCOMPUTE_LIBRARY" in caplog.text

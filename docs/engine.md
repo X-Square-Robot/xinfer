@@ -36,7 +36,10 @@ returning from it does not mean GPU execution has completed.
 If waiting on a final-stage event raises, that batch's requests fail and the
 completion thread goes on. `Engine.health()` returns why the engine can no
 longer serve (its engine or completion thread has stopped), else None;
-`xinfer-serve` polls it ([serving](serving.md)).
+`xinfer-serve` polls it ([serving](serving.md)). With `Engine.stats_sink` set,
+the completion thread reports each completed request's admission wait and
+stage waits and executions to it as `RequestStats`
+([metrics](metrics.md#collection)).
 
 ## Scheduling rules
 
@@ -48,11 +51,11 @@ longer serve (its engine or completion thread has stopped), else None;
 2. **Zero-wait batching.** A dispatch takes the compatible requests already
    queued, up to the stage limit, choosing the largest allowed batch size and
    never padding rows. Compatible means equal shapes (except the batch axis)
-   and equal host values for every input the stage reads. A stage batches only
-   if the model declares it batch-invariant (`Capabilities.batch_invariant`,
-   derived from its operators' contracts) or `allow_non_invariant_batching`
-   is set. The first dispatch of each stage runs alone because it learns which
-   inputs the stage reads.
+   and equal host values for every input the stage reads. A stage batches up to
+   the largest size the model declares in `Capabilities.batch_sizes`; a model
+   declares sizes above 1 only for a stage whose batched results pass its
+   precision gate. The first dispatch of each stage runs alone because it
+   learns which inputs the stage reads.
    - **Different lengths.** A handoff tensor whose `TensorSpec` declares a
      `seq_axis` (Wall-OSS: the prompt K/V) may differ in length between batched
      requests. The batch left-pads every row to the longest, and the stage
@@ -91,7 +94,7 @@ that event.
 A prepared input may be a `DeviceImage` (`xinfer.models.interface`) instead
 of a tensor: a camera view as it arrived, JPEG bytes or an RGB frame, with
 its size after each resize step and each step's `interpolate` mode. The input
-processors send them with `processing.image_preprocess_device="gpu"` (every bundled model; [configuration](configuration.md#image-preprocessing-on-the-gpu)).
+processors send them with `image_preprocess_device="gpu"` (every bundled model; [configuration](configuration.md#image-preprocessing-on-the-gpu)).
 Before the request's first stage, outside the CUDA graphs, the engine turns
 each one into the `[h, w, 3]` uint8 view that the stages read under the same
 name, as with CPU preprocessing. The views have the CPU path's shapes, so the
@@ -171,12 +174,11 @@ variant), which `xinfer-serve` passes to the frontends for their own warmup
 |---|---|---|
 | `lanes` | 1 per stage | lanes (stream + graph pool) per stage, e.g. `{"prefill": 2, "action": 2}` |
 | `stream_priorities` | 0 per stage | CUDA stream priority of every lane of a stage; lower integers have higher priority |
-| `max_batch` | 1 per stage | batch limit per stage; capped by `Capabilities.batch_sizes` and the invariance gate |
+| `max_batch` | 1 per stage | batch limit per stage; capped by `Capabilities.batch_sizes` |
 | `max_running_requests` | 8 | admitted requests in flight |
 | `max_queued_requests` | 256 | submitted requests waiting for admission (`AdmitError("queue_full")` beyond) |
 | `per_robot_inflight` | 1 | unfinished requests per robot id (`AdmitError("per_robot_limit")`) |
 | `cudagraphs` | `None` | `CUDAGraphConfig()` replays CUDA graphs (see `xinfer.engine.cudagraph`) |
-| `allow_non_invariant_batching` | false | batch stages whose operators are not batch-invariant (changes numerics) |
 
 A lane's stream priority is fixed when the lane is created; the upload and
 copy streams keep priority 0. Priorities change only the order in which the GPU
@@ -189,16 +191,13 @@ platform rules and fixed defaults that do not depend on the load
 
 ## Guarantees and tests
 
-- With batch-invariant operators a request gets the same bits alone and in any
-  batch: `test_wall_oss_parity.py::test_action_batches_equal_single_requests`
-  batches Wall-OSS action stages B2..B8 with different prompt lengths and RTC
-  delays and compares each request with its single run.
+- `test_wall_oss_parity.py::test_action_batches_match_single_requests` compares action batches B2–B8 against requests run alone across different prompt lengths and RTC delays. The outputs agree within rounding.
 - Results of a request are independent of concurrency when batch size is 1:
   `tests/models/test_wall_oss_parity.py` runs 21 concurrent requests on 2 lanes
   per stage with graphs and compares them bitwise with the same requests run
   alone.
 - `tests/unit/test_engine.py` covers concurrent submission, batching and row
-  splitting, compatibility keys, the invariance gate, admission limits and
+  splitting, compatibility keys, admission limits and
   backpressure, cancellation and per-request failures.
 - `tests/unit/test_cudagraph.py::test_result_freed_during_a_capture` frees a
   result on another thread while its lane is being captured.

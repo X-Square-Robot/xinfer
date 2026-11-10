@@ -99,7 +99,7 @@ CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "Wall-OSS" --mode
   --warmup flow.msgpack rtc.msgpack --robots 3 4 5 --out artifacts/perf-wall-oss
 ```
 
-- **单请求：** 对模型的请求集运行 `request_latency.py`（5 次预热后 50 次），视图在设备上解码和 resize（`image_preprocess_device="gpu"`，即 `Policy` 的默认值）。
+- **单请求：** 对模型的请求集运行 `request_latency.py`（5 次预热后 50 次），视图在设备上解码和 resize（`image_preprocess_device="gpu"`，即 `Policy` 的默认值）。`--model-options` 中的 `image_preprocess_device` 同时作用于这一部分和负载部分。
 - **压测：** 按机器人数从小到大，每个数都新启动一个使用默认设置和模型预热文件的 `xinfer-serve`，然后按仓库口径运行 `robot_load.py`（每台机器人 80 个请求，丢弃前 20 个，8 轮，起步相位随机）。支持实时分块的模型使用带 RTC 的合成桌面观测（默认负载）；不支持的模型使用其请求集（`--load-requests`）。脚本在第一个未通过的机器人数后停止。
 - **容量：** 任何一轮都没有错误或缺失行、各轮服务端 P50 的中位数（8 轮各自 P50 的中位数）低于 150 ms，且所有更小的已测机器人数也都通过的最大机器人数。表中给出该机器人数各轮 P50 和 P95 的中位数；`row.json` 另外记录最差的一轮。饱和吞吐是测得的最高完成速率。
 - **输出：** `row.json` 记录全部数字、配置、环境以及每个机器人数前后的机器负载；表格行打印到标准输出。

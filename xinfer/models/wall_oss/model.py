@@ -49,7 +49,8 @@ from xinfer.models.processing import view_inputs
 from xinfer.models.wall_oss.config import WallOSSConfig
 from xinfer.models.wall_oss.optimized import (OPTIMIZED_STAGE_OPS, OptimizedAction, OptimizedPrefill,
                                               OptimizedVision, compact_rope, optimized_weight_mapping)
-from xinfer.ops import active_ops, use_ops
+from xinfer.models.wall_oss.processing import pad_prompt
+from xinfer.ops import active_ops
 
 DTYPE = torch.bfloat16
 
@@ -167,12 +168,11 @@ class WallOSS(VLAModel, nn.Module):
             batch axis 2, ragged sequence axis 4).
         batch_axes: ``position_ids`` batches along axis 1; other prepared inputs along axis 0.
         stage_ops: Operators each stage calls in the reference composition (``OPTIMIZED_STAGE_OPS`` for the
-            optimized one); ``capabilities`` derives batch invariance from them.
+            optimized one); ``capabilities`` reports them for the startup check of slow fallbacks.
         vision: The Qwen2.5-VL ``VisionTower`` (``OptimizedVision`` for the optimized composition).
         embed_tokens: Token embedding table ``[embedding_rows, hidden_size]`` BF16.
         prefill_layers: Expert-0 ``DecoderLayer`` stack (group ``"prefill"``; reference composition).
-        action_layers: Expert-1 ``DecoderLayer`` stack (group ``"action_expert"``), built with the
-            batch-invariant op table (reference composition).
+        action_layers: Expert-1 ``DecoderLayer`` stack (group ``"action_expert"``; reference composition).
         action_norm: Final expert-1 RMSNorm (FP32 weight; reference composition).
         prefill_stack: ``OptimizedPrefill`` (optimized composition).
         action: ``OptimizedAction`` (optimized composition).
@@ -196,7 +196,8 @@ class WallOSS(VLAModel, nn.Module):
         HandoffSpec("prefill", "action", {"prompt_kv": TensorSpec(batch_axis=2, seq_axis=4)}),
     )
     batch_axes = {"position_ids": 1}
-    # Operators each stage calls; batch invariance of a stage follows from them.
+    pad_prompt = staticmethod(pad_prompt)
+    # Operators each stage calls in the reference composition.
     stage_ops = {
         "vision": ("linear", "rms_norm", "silu_and_mul", "gelu", "rotary_embedding", "varlen_attention"),
         "prefill": ("linear", "rms_norm", "silu_and_mul", "rotary_embedding", "causal_attention"),
@@ -222,9 +223,7 @@ class WallOSS(VLAModel, nn.Module):
         # not config.json's vocab_size); taken from the checkpoint.
         self.embed_tokens = nn.Parameter(torch.empty(embedding_rows, config.hidden_size, device="meta"),
                                          requires_grad=False)
-        table = active_ops()
         self.register_buffer("inv_freq", inverse_frequencies(config.head_dim, config.rope_theta), persistent=False)
-        self._op_table = table
         self.register_buffer("action_min", torch.empty(0), persistent=False)
         self.register_buffer("action_delta", torch.empty(0), persistent=False)
         if numerics == "optimized":
@@ -232,12 +231,8 @@ class WallOSS(VLAModel, nn.Module):
             self.prefill_stack = OptimizedPrefill(config)
             self.action_head = ActionHead(self.action_dim, config.experts[1].hidden_size)
             self.action = OptimizedAction(config, self.action_head)
-            self._stage_tables = {"vision": table, "prefill": table, "action": table}
             return
         self.vision = VisionTower(vision_config(config))
-        # The action stage batches requests: its layers bind the batch-invariant
-        # operator selection, so a request gets the same bits alone or in a batch.
-        invariant = table.batch_invariant_table()
         self.rope = MRope(config.mrope_section)
 
         def stack(expert, group):
@@ -248,12 +243,10 @@ class WallOSS(VLAModel, nn.Module):
             )
 
         self.prefill_layers = stack(config.experts[0], "prefill")
-        with use_ops(invariant):
-            self.action_rope = MRope(config.mrope_section)
-            self.action_layers = stack(config.experts[1], "action_expert")
-            self.action_norm = RMSNorm(config.experts[1].hidden_size, config.rms_norm_eps)
-            self.action_head = ActionHead(self.action_dim, config.experts[1].hidden_size)
-        self._stage_tables = {"vision": table, "prefill": table, "action": invariant}
+        self.action_rope = MRope(config.mrope_section)
+        self.action_layers = stack(config.experts[1], "action_expert")
+        self.action_norm = RMSNorm(config.experts[1].hidden_size, config.rms_norm_eps)
+        self.action_head = ActionHead(self.action_dim, config.experts[1].hidden_size)
 
     # ------------------------------------------------------------------ load
     @classmethod
@@ -277,10 +270,8 @@ class WallOSS(VLAModel, nn.Module):
             The model on ``device`` in eval mode, with ``load_report`` set.
 
         Raises:
-            ValueError: Another quantization or an unknown ``numerics``, an action normalizer that is not
-                ``[action_horizon, action_dim]``, or, in the reference composition, ``processing.prompt_bucket``
-                set while its action stage is not batch-invariant with the selected operators (padding would then
-                change the actions).
+            ValueError: Another quantization or an unknown ``numerics``, or an action normalizer that is not
+                ``[action_horizon, action_dim]``.
         """
         if quantization not in (None, "bf16"):
             raise ValueError(f"Wall-OSS runs in BF16; quantization {quantization!r} is not supported")
@@ -288,12 +279,6 @@ class WallOSS(VLAModel, nn.Module):
         checkpoint = SafetensorsCheckpoint(path)
         rows = checkpoint.shape("model.embed_tokens.weight")[0]
         model = cls(config, Path(path), embedding_rows=rows, processing=processing, numerics=numerics)
-        from xinfer.models.wall_oss.processing import processing_config
-
-        if (numerics == "reference" and processing_config(processing).prompt_bucket
-                and not model.capabilities().batch_invariant["action"]):
-            raise ValueError("padded prompts give the same actions only with batch-invariant action-stage operators;"
-                             " set processing.prompt_bucket to 0 with the selected operators")
         mapping = (optimized_weight_mapping if numerics == "optimized" else weight_mapping)(model)
         model.load_report = load_mapped(model, mapping, checkpoint, device=device)
         stats = torch.load(Path(path) / "normalizer_action.pth", map_location="cpu", weights_only=True)
@@ -310,13 +295,10 @@ class WallOSS(VLAModel, nn.Module):
         Returns:
             ``Capabilities`` with batch sizes ``vision`` (1,), ``prefill`` (1,) and ``action`` (1, 2, 4, 8) in the
             reference composition, (1,) in the optimized one; ``num_steps=5``; RTC with delays
-            ``1 .. config.rtc_max_delay``; and per-stage ``batch_invariant``, true when every operator the stage
-            selects has a batch-invariant contract.
+            ``1 .. config.rtc_max_delay``; and ``stage_ops``.
         """
         optimized = self.numerics == "optimized"
         stage_ops = OPTIMIZED_STAGE_OPS if optimized else self.stage_ops
-        invariant = {stage: all(self._stage_tables[stage].selection(op).contract.batch_invariant for op in names)
-                     for stage, names in stage_ops.items()}
         return Capabilities(
             # Vision and prefill are written for one request (packed image rows,
             # per-request prompt length); the reference action stage takes batches of
@@ -325,7 +307,7 @@ class WallOSS(VLAModel, nn.Module):
             num_steps=5,
             rtc=True,
             rtc_delay_range=(1, self.config.rtc_max_delay),
-            batch_invariant=invariant,
+            stage_ops=stage_ops,
         )
 
     def io_schema(self) -> IOSchema:
@@ -367,31 +349,10 @@ class WallOSS(VLAModel, nn.Module):
         return (WallOSSInputProcessor(checkpoint, config, processing), WallOSSOutputProcessor(config),
                 wire_metadata(config))
 
-    def input_processor(self):
-        """Return a new ``WallOSSInputProcessor`` for this checkpoint and processing config."""
-        from xinfer.models.wall_oss.processing import WallOSSInputProcessor
-
-        return WallOSSInputProcessor(self.checkpoint, self.config, self.processing)
-
-    def output_processor(self):
-        """Return a new ``WallOSSOutputProcessor`` for this model configuration."""
-        from xinfer.models.wall_oss.processing import WallOSSOutputProcessor
-
-        return WallOSSOutputProcessor(self.config)
-
     def shape_buckets(self):
         from xinfer.models.wall_oss.processing import processing_config
 
         return {"prompt": processing_config(self.processing).bucket_spec()}
-
-    def pad(self, prepared, dimension, width):
-        """Pad between prompt and action tokens, retaining the valid length and action positions."""
-        from xinfer.models.interface import PreparedRequest
-        from xinfer.models.wall_oss.processing import pad_prompt
-
-        if dimension != "prompt":
-            raise KeyError(dimension)
-        return PreparedRequest(pad_prompt(prepared.tensors, width), prepared.meta)
 
     # ----------------------------------------------------------------- stages
     def stage_outputs(self, stage, batch):

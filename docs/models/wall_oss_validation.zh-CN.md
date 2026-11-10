@@ -4,7 +4,7 @@
 
 导航：[用法](wall_oss.zh-CN.md) · [设计](wall_oss_design.zh-CN.md)
 
-当前状态在 RTX 5090（功耗上限 575 W，flash-attn 2.8.3.post1，`xcompute.so` sha256 `dbfb9da7…d0dc`）上使用内部 checkpoint `5_25000`（`model.safetensors` sha256 `37a4b2ea…f3024`，`config.json` `95e34cbd…0cd6`）验证。eager BF16 参考、与它的对照以及 optimized 组合的结果来自 torch 2.10.0+cu130，其余结果来自 torch 2.9.1+cu130；在 torch 2.10.0+cu130 下，默认后端上的参考组合给出与 2.9.1 逐位一致的动作（18 个请求，单独运行与组批；`xinfer-torch210-v3-20261107.tar.gz`）。每项结果都注明其证据包（见文末表格）。
+当前状态在 RTX 5090（功耗上限 575 W，flash-attn 2.8.3.post1，`xcompute.so` sha256 `dbfb9da7…d0dc`）上使用内部 checkpoint `5_25000`（`model.safetensors` sha256 `37a4b2ea…f3024`，`config.json` `95e34cbd…0cd6`）验证。eager BF16 参考、与它的对照以及 optimized 组合的结果来自 torch 2.10.0+cu130，其余结果来自 torch 2.9.1+cu130，但默认后端上参考组合的组批、填充和延迟结果来自 torch 2.10.0+cu130，其 action 阶段在 cuBLAS 上运行（`xinfer-remove-batch-invariant-20261109.tar.gz`）。每项结果都注明其证据包（见文末表格）。
 
 ## 摘要
 
@@ -13,16 +13,15 @@
 | 输入/输出处理 vs 服务 | CPU | 全部 42 个抓包请求逐位一致 |
 | prefill 和 action 阶段 vs eager BF16 模型 | 参考组合，参考算子 | 逐位一致（[下文](#参考算子模型)） |
 | 各阶段 vs eager BF16 模型（从其输入出发） | optimized 组合，7 个请求 | vision 1.5–2.7 %、prefill K/V 1.5–1.6 %、action 0.14–0.23 %（相对范数）；7 个请求的完整链路都比 MXFP8 服务更接近 eager BF16 模型（[下文](#optimized-组合)） |
-| 精度门禁：quick100 B1（[精度](../precision.zh-CN.md#wall-oss-quick100-门禁)） | optimized 组合 | **PASS**：相对原始 BF16 的 GT-MSE 为 −6.09 %，episode CI [−12.07, +0.32]（门限 ≤ +1 %） |
-| 融合旋转 vs torch 组合 | Triton（参考组合） | 逐位一致；编译出的 kernel 中没有 `FFMA` |
+| 精度门禁：quick100 B1（[精度](../precision.zh-CN.md#wall-oss-quick100-门禁)） | optimized 组合 | **PASS**：相对原始 BF16 的 GT-MSE 为 −6.58 %，episode CI [−12.48, −0.34]（门限 ≤ +1 %） |
 | CUDA graph 回放 vs eager | optimized 组合；使用 flash-attn 的参考组合；7 个请求（flow，RTC 延迟 3–8） | 逐位一致 |
 | 每阶段 2 个通道上的并发请求 vs 单独运行 | 参考组合，参考算子，7 个请求提交 3 次 | 逐位一致 |
-| 组批的 action 阶段（B2–B8，不同 prompt 长度和 RTC 延迟）vs 单请求 | 参考组合，默认后端，16 个请求、4 种 prompt 长度，提交两次 | 逐位一致 |
-| 填充到 16 token 桶的 prompt vs 精确 prompt（[设计](wall_oss_design.zh-CN.md#prompt-桶)） | 参考组合，默认后端；60 个请求，4 个桶中的 28 种 prompt 长度 | 逐位一致；optimized 组合在舍入范围内一致（极小 checkpoint） |
+| 组批的 action 阶段（B2–B8，不同 prompt 长度和 RTC 延迟）vs 单请求 | 参考组合，默认后端，16 个请求、4 种 prompt 长度，提交两次 | 相差在 3.4e-3 以内（动作的相对范数；测试上限 0.05） |
+| 填充到 16 token 桶的 prompt vs 精确 prompt（[设计](wall_oss_design.zh-CN.md#prompt-桶)） | 参考组合，默认后端；12 个随机机械臂姿态的请求，多个桶 | 单独运行（eager 和 graph）逐位一致；与其他桶一起组批时相差在 5.9e-3 以内；optimized 组合在舍入范围内一致（极小 checkpoint） |
 | 在 GPU 上解码和缩放的视角图像（`image_preprocess_device="gpu"`）vs CPU 视角图像 | 抓包中的视角图像，按 dummy 客户端的发送方式 | 原始前视帧（仅缩放）：平均 0.002、最大 1 级；均匀噪声的腕部 JPEG：平均 5.5、最大 55 级 |
 | 与 x2robot 客户端的传输兼容性 | 网络服务 | 所有压测运行均无错误，包括 RTC 反馈 |
 
-“默认后端”为 xcompute（optimized 组合）、flash-attn（attention）和 Triton（参考组合 action 阶段的批次不变 `linear`、`rms_norm`、`rotary_embedding`）。
+“默认后端”为 flash-attn（attention）和 cuBLAS（参考组合的 GEMM），参考组合的其他算子走 torch 参考实现；optimized 组合运行在 xcompute 上。
 
 ## 参考
 
@@ -67,14 +66,14 @@
 
 ### 延迟
 
-RTX 5090（空闲卡，torch 2.10.0+cu130，xcompute `651195d`），x2robot dummy 客户端的请求（原始 1280×720 前视帧、两张 640×480 JPEG 腕部视角；prompt 桶 768，5 步）。阶段 graph：每个阶段捕获为一个 CUDA graph，回放 50 次的 P50。`Policy.infer`：服务抓包 `ref-v1` 的前 6 个请求（视角为原始数组；3 个 flow，3 个延迟为 3、5、8 的 RTC），预热 3 遍后 60 次调用（10 遍）的 P50，视角图像在 GPU 上解码和缩放（默认；在 CPU 上：48.5 和 53.8 ms）。
+RTX 5090（空闲卡，torch 2.10.0+cu130，xcompute `0c48a46`），x2robot dummy 客户端的请求（原始 1280×720 前视帧、两张 640×480 JPEG 腕部视角；prompt 桶 768，5 步）。阶段 graph：每个阶段捕获为一个 CUDA graph，回放 50 次的 P50。`Policy.infer`：服务抓包 `ref-v1` 的前 6 个请求（视角为原始数组；3 个 flow，3 个延迟为 3、5、8 的 RTC），预热 3 遍后 60 次调用（10 遍）的 P50，视角图像在 GPU 上解码和缩放（默认）。
 
 | 组合 | vision | prefill | action | 各阶段合计 | `Policy.infer` |
 |---|---|---|---|---|---|
-| optimized | 15.6 ms | 22.3 ms | 7.5 ms | 45.5 ms | 48.7 ms |
-| reference（默认后端） | 15.4 ms | 24.1 ms | 11.4 ms | 50.9 ms | 54.1 ms |
+| optimized | 15.6 ms | 21.3 ms | 7.3 ms | 44.2 ms | 47.3 ms |
+| reference（默认后端；2026-11-09） | 15.7 ms | 24.5 ms | 13.4 ms | 53.5 ms | 58.3 ms |
 
-optimized 组合各阶段的 kernel 时间（nsys）：vision 15.6 ms，其中 13.1 ms 是 cuBLASLt 上的 BF16 GEMM，0.6 ms 是注意力；action 阶段 7.8 ms，其中 2.6 ms 是走 xcompute 通用路径的 360 个 gate/up 和 QKV GEMM（一个 SM80 WMMA kernel，每次 7.2 µs），1.6 ms 是 360 个 small-M 输出投影和 down 投影，2.0 ms 是注意力，0.3 ms 是融合的归一化。参考组合中，action 阶段的 740 个批次不变 GEMM 耗时 4.6 ms。
+optimized 组合各阶段的 kernel 时间（nsys）：vision 15.6 ms，其中 13.1 ms 是 cuBLASLt 上的 BF16 GEMM，0.6 ms 是注意力；action 阶段 7.8 ms，其中 2.6 ms 是走 xcompute 通用路径的 360 个 gate/up 和 QKV GEMM（一个 SM80 WMMA kernel，每次 7.2 µs），1.6 ms 是 360 个 small-M 输出投影和 down 投影，2.0 ms 是注意力，0.3 ms 是融合的归一化。
 
 ### 逐算子耗时与下限
 
@@ -84,55 +83,55 @@ optimized 组合各阶段的 kernel 时间（nsys）：vision 15.6 ms，其中 1
 xinfer-profile ops --model wall_oss --checkpoint <checkpoint> --requests <requests.msgpack> --out <directory>
 ```
 
-RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 2902 MHz，最高 3090 MHz），torch 2.10.0+cu130（CUDA 13.0），XInfer `20358f4`，xcompute `651195d`。请求：[参考算子模型](#参考算子模型)检查的 7 个请求（服务抓包 `ref-v1`：3 个 flow，4 个延迟 3–8 的 RTC），合成一个请求文件（sha256 `0eb0db3e…`），prompt 桶 768。峰值：`PEAKS` 表（[性能剖析](../profiling.zh-CN.md#roofline-下限)：BF16 220.1 TFLOP/s，DRAM 1522 GB/s）。证据包：`xinfer-fa2-causal-20261108-r3.tar.gz`（sha256 `4e520a26c98b8e5b6434593db6b95f231202b36a55a2e7b2d5803d185b6307eb`）。
+RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 2902 MHz，最高 3090 MHz），torch 2.10.0+cu130（CUDA 13.0），XInfer `5b142b0`，xcompute `0c48a46`。请求：[参考算子模型](#参考算子模型)检查的 7 个请求（服务抓包 `ref-v1`：3 个 flow，4 个延迟 3–8 的 RTC），合成一个请求文件（sha256 `0eb0db3e…`），prompt 桶 768。峰值：`PEAKS` 表（[性能剖析](../profiling.zh-CN.md#roofline-下限)：BF16 220.1 TFLOP/s，DRAM 1522 GB/s）。证据包：`xinfer-xcompute-prepack-20261108.tar.gz`（sha256 `5b6701637a9064bb04213ea0cc0a078054d25a844aed8b1ebd3b9394e76fe9d8`）。
 
 均为每请求的值。每个请求先运行两次预热，然后全部在剖析器下以 eager 模式运行：算子时间是这次运行的 kernel 时间，按算子调用归属；graph 回放时间是相同请求回放其 CUDA graph（即服务路径）时该阶段的 GPU 区间。占比是占该阶段 eager GPU 时间的比例；下限是单次调用的 roofline 下限，效率为下限 / 时间；`generic` 标记只按数据搬运计代价的算子。访存受限的调用效率超过 100 % 时，其数据仍在 L2 中。
 
-**Vision**：graph 回放 16.34 ms；算子 kernel 16.03 ms。
+**Vision**：graph 回放 16.50 ms；算子 kernel 15.99 ms。
 
 | 算子 | 调用形状 | 调用次数 | µs/次 | 占比 | 下限 µs | 效率 | 限制项 |
 |---|---|---|---|---|---|---|---|
-| `gemm_glu_epilogue` | `x[2112,1280] weight[6912,1280]` | 32 | 219.9 | 43.8 % | 169.8 | 77 % | 计算 |
+| `gemm_glu_epilogue` | `x[2112,1280] weight[6912,1280]` | 32 | 220.1 | 43.9 % | 169.8 | 77 % | 计算 |
 | `qkv_rope_epilogue` | `x[2112,1280] weight[3840,1280]` | 32 | 121.1 | 24.1 % | 94.3 | 78 % | 计算 |
-| `gemm_epilogue` | `x[2112,3456] weight[1280,3456]` | 32 | 85.8 | 17.1 % | 84.9 | 99 % | 计算 |
+| `gemm_epilogue` | `x[2112,3456] weight[1280,3456]` | 32 | 85.9 | 17.1 % | 84.9 | 99 % | 计算 |
 | `gemm_epilogue` | `x[2112,1280] weight[1280,1280]` | 32 | 34.0 | 6.8 % | 31.4 | 92 % | 计算 |
 | `varlen_attention` | `q[2112,16,80] k[2112,16,80]`，36 段 | 28 | 13.7 | 2.4 % | 14.2 | 104 % | 访存 |
 | `add_rms_norm` | `x[2112,1280] residual[2112,1280]` | 64 | 5.5 | 2.2 % | 14.2 | 257 % | 访存（generic） |
-| `varlen_attention` | `q[2112,16,80] k[2112,16,80]`，3 段 | 4 | 61.8 | 1.5 % | 35.2 | 57 % | 计算 |
-| `gemm_epilogue` | `x[528,5120] weight[5120,5120]` | 1 | 191.5 | 1.2 % | 125.8 | 66 % | 计算 |
+| `varlen_attention` | `q[2112,16,80] k[2112,16,80]`，3 段 | 4 | 61.7 | 1.5 % | 35.2 | 57 % | 计算 |
+| `gemm_epilogue` | `x[528,5120] weight[5120,5120]` | 1 | 154.7 | 1.0 % | 125.8 | 81 % | 计算 |
 | 其余：3 个其他调用形状和算子外的活动 | | | | 1.0 % | | | |
 
-**Prefill**：graph 回放 22.30 ms；算子 kernel 22.69 ms。
+**Prefill**：graph 回放 20.92 ms；算子 kernel 21.37 ms。
 
 | 算子 | 调用形状 | 调用次数 | µs/次 | 占比 | 下限 µs | 效率 | 限制项 |
 |---|---|---|---|---|---|---|---|
-| `gemm_glu_epilogue` | `x[768,2048] weight[22016,2048]` | 35 | 316.9 | 48.8 % | 314.7 | 99 % | 计算 |
-| `gemm_epilogue` | `x[768,11008] weight[2048,11008]` | 35 | 182.0 | 28.0 % | 157.3 | 86 % | 计算 |
-| `qkv_rope_kvcache` | `x[768,2048] weight[2560,2048]` | 36 | 60.8 | 9.6 % | 36.6 | 60 % | 计算 |
-| `gemm_epilogue` | `x[768,2048] weight[2048,2048]` | 35 | 49.4 | 7.6 % | 29.3 | 59 % | 计算 |
-| `causal_attention` | `q[1,768,16,128] k[1,768,2,128]` | 35 | 29.6 | 4.6 % | 11.0 | 37 % | 计算 |
-| `add_rms_norm` | `x[1,768,2048] residual[1,768,2048]` | 70 | 4.0 | 1.2 % | 8.3 | 208 % | 访存（generic） |
-| `rms_norm_cast` | `x[1,768,2048] weight[2048]` | 1 | 3.0 | 0.0 % | 4.1 | 140 % | 访存（generic） |
+| `gemm_glu_epilogue` | `x[768,2048] weight[22016,2048]` | 35 | 316.9 | 51.8 % | 314.7 | 99 % | 计算 |
+| `gemm_epilogue` | `x[768,11008] weight[2048,11008]` | 35 | 158.8 | 25.9 % | 157.3 | 99 % | 计算 |
+| `qkv_rope_kvcache` | `x[768,2048] weight[2560,2048]` | 36 | 61.0 | 10.2 % | 36.6 | 60 % | 计算 |
+| `gemm_epilogue` | `x[768,2048] weight[2048,2048]` | 35 | 34.1 | 5.6 % | 29.3 | 86 % | 计算 |
+| `causal_attention` | `q[1,768,16,128] k[1,768,2,128]` | 35 | 29.8 | 4.9 % | 11.0 | 37 % | 计算 |
+| `add_rms_norm` | `x[1,768,2048] residual[1,768,2048]` | 70 | 4.0 | 1.3 % | 8.3 | 205 % | 访存（generic） |
+| `rms_norm_cast` | `x[1,768,2048] weight[2048]` | 1 | 3.0 | 0.0 % | 4.1 | 138 % | 访存（generic） |
 | 算子外的活动 | | | | 0.2 % | | | |
 
-**Action**：graph 回放 7.78 ms；算子 kernel 7.57 ms。
+**Action**：graph 回放 7.51 ms；算子 kernel 7.30 ms。
 
 | 算子 | 调用形状 | 调用次数 | µs/次 | 占比 | 下限 µs | 效率 | 限制项 |
 |---|---|---|---|---|---|---|---|
-| `qkv_rope_kvcache` | `x[16,1024] weight[2560,1024]` | 180 | 12.9 | 30.1 % | 3.5 | 27 % | 访存 |
-| `gemm_epilogue` | `x[16,2048] weight[1024,2048]` | 360 | 4.7 | 21.8 % | 2.8 | 60 % | 访存 |
-| `gemm_glu_epilogue` | `x[16,1024] weight[4096,1024]` | 180 | 8.7 | 20.4 % | 5.6 | 64 % | 访存 |
-| `prefix_kvcache_attention` | `q[1,16,16,128] k_cache[1,784,2,128]` | 180 | 7.8 | 18.3 % | 0.6 | 8 % | 访存 |
-| `add_rms_norm` | `x[1,16,1024] residual[1,16,1024]` | 360 | 1.2 | 5.4 % | 0.1 | 8 % | 访存（generic） |
-| `linear` | `x[1,16,2048] weight[1024,2048]` | 5 | 17.6 | 1.1 % | 5.6 | 32 % | 访存 |
-| `linear` | `x[1,16,1024] weight[1024,1024]` | 5 | 9.4 | 0.6 % | 2.8 | 30 % | 访存 |
+| `qkv_rope_kvcache` | `x[16,1024] weight[2560,1024]` | 180 | 12.8 | 31.0 % | 3.5 | 28 % | 访存 |
+| `gemm_epilogue` | `x[16,2048] weight[1024,2048]` | 360 | 4.7 | 22.6 % | 2.8 | 60 % | 访存 |
+| `prefix_kvcache_attention` | `q[1,16,16,128] k_cache[1,784,2,128]` | 180 | 7.9 | 19.1 % | 0.6 | 8 % | 访存 |
+| `gemm_glu_epilogue` | `x[16,1024] weight[4096,1024]` | 180 | 7.3 | 17.6 % | 5.6 | 77 % | 访存 |
+| `add_rms_norm` | `x[1,16,1024] residual[1,16,1024]` | 360 | 1.2 | 5.6 % | 0.1 | 8 % | 访存（generic） |
+| `linear` | `x[1,16,2048] weight[1024,2048]` | 5 | 16.8 | 1.1 % | 5.6 | 33 % | 访存 |
+| `linear` | `x[1,16,1024] weight[1024,1024]` | 5 | 9.2 | 0.6 % | 2.8 | 31 % | 访存 |
 | `linear` | `x[1,16,52] weight[1024,52]` | 5 | 2.9 | 0.2 % | 0.2 | 6 % | 访存 |
 | 其余：10 个其他调用形状和算子外的活动 | | | | 2.1 % | | | |
 
 **时间花在哪里：**
-- **Vision**（16.3 ms）：带 epilogue 的 GEMM 占该阶段的 93 %，达到其下限的 66–99 %；窗口注意力和全局注意力共占 4 %。
-- **Prefill**（22.3 ms）：GEMM 达到 59–99 %；因果注意力达到其下限的 37 %，占该阶段的 5 %。
-- **Action**（7.8 ms）：16 行时所有算子都受访存限制；带 cache 写入的 QKV 投影只达到其下限的 27 %，cache 注意力为 8 %，两者合计占该阶段的 48 %。
+- **Vision**（16.5 ms）：带 epilogue 的 GEMM 占该阶段的 93 %，达到其下限的 77–99 %；窗口注意力和全局注意力共占 4 %。
+- **Prefill**（20.9 ms）：GEMM 达到 60–99 %；因果注意力达到其下限的 37 %，占该阶段的 5 %。
+- **Action**（7.5 ms）：16 行时所有算子都受访存限制；带 cache 写入的 QKV 投影只达到其下限的 28 %，cache 注意力为 8 %，两者合计占该阶段的 50 %。
 
 ## 测试
 
@@ -143,14 +142,13 @@ RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 290
 | `tests/models/test_wall_oss_processing.py` | checkpoint、服务抓包 | 处理一致性，逐位一致；分桶的 prompt = 精确 prompt 加填充 |
 | `tests/unit/test_image_pack.py` | CPU；GPU | 视角图像归一化（逐通道和共享查找表）以及 vision 阶段的打包与 NumPy 计算结果一致；在 CUDA 上以及用新像素做 CUDA graph 回放时同样一致 |
 | `tests/unit/test_model_processing.py` | CPU | 视角图像按相机顺序并发处理，错误会传到调用方；`SegmentTokenizer` 在一个小型字节级 BPE 上与 tokenizer 一致；JPEG 帧头（baseline、progressive）以及把视角图像带到引擎的 `DeviceImage` 值 |
-| `tests/models/test_wall_oss_parity.py` | GPU、checkpoint、两个参考 | 参考组合：prefill 和 action 阶段逐位一致；链路比 MXFP8 更接近；CUDA graph 与 eager 逐位一致；多通道并发请求与单请求一致；按服务配置（flash-attn、批次不变的 action 阶段、prompt 桶）：比 MXFP8 更接近，组批的 action 阶段与单请求一致，填充的 prompt 与精确 prompt 一致，预热覆盖所有姿态 |
+| `tests/models/test_wall_oss_parity.py` | GPU、checkpoint、两个参考 | 参考组合：prefill 和 action 阶段逐位一致；链路比 MXFP8 更接近；CUDA graph 与 eager 逐位一致；多通道并发请求与单请求一致；按服务配置（flash-attn、prompt 桶）：比 MXFP8 更接近，组批的 action 阶段与单请求相差在 0.05 以内，填充的 prompt 与精确 prompt 相差在 0.05 以内（相对范数），预热覆盖所有姿态 |
 | `tests/models/test_wall_oss_optimized.py` | GPU、xcompute、checkpoint、两个参考 | optimized 组合：从 eager BF16 模型的输入出发，各阶段相差在 5 % 以内；链路比 MXFP8 更接近；graph 回放与 eager 一致 |
 | `tests/unit/test_fused_ops.py` | CPU；带 xcompute 的 GPU | 融合算子的参考实现对照未融合的 torch；xcompute 的 kernel 在本模型形状下对照参考实现（归一化、写入 K/V 的带 bias GQA QKV、带 bias 的 ViT GLU、带 prompt 填充和 RTC 列的缓存注意力） |
 | `tests/unit/test_cudagraph.py` | GPU | graph 键、回放 = eager、预热后未命中策略、LRU 和静态缓冲区增长；预热覆盖每个通道和批大小（包括混合长度的批）；某个结果在其通道正被捕获时被释放；`DeviceImage` 输入一直留在 host 内存中，直到设备图像线程在自己的 stream 上解码它们，任意长度的 JPEG 都回放同一个 graph |
-| `tests/unit/test_engine.py` | CPU | 调度器：组批、兼容性、不变性门控、准入、取消、失败；设备图像线程（另一个请求的解码被挂起时，不含设备图像的请求照常得到服务；准入顺序；解码失败只导致其所在请求失败；无 CUDA 设备） |
-| `tests/unit/test_attention_ops.py` | CPU；装有 flash-attn 的 GPU | attention 参考实现（因果、RTC 固定前缀）；flash-attn vs 参考实现、批/行不变性、graph 捕获 |
-| `tests/unit/test_batch_invariant.py` | 装有 Triton 的 GPU | 批次不变 linear / RMSNorm vs 参考实现、行不变性、graph 捕获；融合旋转与参考实现逐位一致，其 SASS 中没有 FFMA |
-| `tests/unit/test_mxfp8.py` | CPU；设置了 `XINFER_XCOMPUTE_LIBRARY` 的 GPU | MXFP8 参考格式和融合参考实现；可融合的层形式（BF16 = eager 组合）；xcompute 算子 vs 参考实现、CUTLASS 行不变性、graph 捕获 |
+| `tests/unit/test_engine.py` | CPU | 调度器：组批、兼容性、准入、取消、失败；设备图像线程（另一个请求的解码被挂起时，不含设备图像的请求照常得到服务；准入顺序；解码失败只导致其所在请求失败；无 CUDA 设备） |
+| `tests/unit/test_attention_ops.py` | CPU；装有 flash-attn 的 GPU | attention 参考实现（因果、RTC 固定前缀）；flash-attn vs 参考实现、左填充的批 vs 单行、graph 捕获 |
+| `tests/unit/test_mxfp8.py` | CPU；设置了 `XINFER_XCOMPUTE_LIBRARY` 的 GPU | MXFP8 参考格式和融合参考实现；可融合的层形式（BF16 = eager 组合）；xcompute 算子 vs 参考实现、graph 捕获 |
 | `tests/unit/test_shm.py` | CPU | 张量和 `DeviceImage` 数据通过共享内存从前端传入，图像尺寸记录在清单（manifest）中 |
 | `tests/unit/test_serve.py` | CPU | 引擎 + 2 个前端进程 + WebSocket 客户端：元数据、并发、错误、健康检查、干净关闭 |
 
@@ -164,8 +162,10 @@ RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 290
 
 | 证据包（sha256） | 本页中的结果 |
 |---|---|
-| `xinfer-per-op-tables-20261107.tar.gz`（`1409a222310efad9328ef3c50ec5feacb805e9731c37a117225fc511a98e55ad`） | 逐算子表 |
-| `xinfer-wall-oss-optimized-20261107.tar.gz`（`aebb58f9ffd571d4947a6953cb2a534c2c58776d5ca5060064c125b6122a7a38`） | optimized 组合：阶段误差、延迟和 kernel 剖析、quick100 B1、GPU 测试 |
+| `xinfer-remove-batch-invariant-20261109.tar.gz`（`f2e3863b4fa2b89aebf09b48336a5882a80195d6a3ad3d952e09c752b088924c`） | 默认后端上 action 阶段使用 cuBLAS 的参考组合：组批和填充的请求、阶段与 `Policy.infer` 延迟、测试 |
+| `xinfer-xcompute-main-20261109.tar.gz`（`a15e9f7632b36be4c2f0b86dc9aa05a0314012865387796c614f63192ab40ee4`） | xcompute `7336b0d`：optimized 组合在 18 个请求上的动作（单请求和并发）与 `0c48a46` 上的逐位一致，因此 `0c48a46` 上的结果对它同样成立；GPU 测试 |
+| `xinfer-xcompute-prepack-20261108.tar.gz`（`5b6701637a9064bb04213ea0cc0a078054d25a844aed8b1ebd3b9394e76fe9d8`） | optimized 组合在 xcompute `0c48a46` 上打包 GEMM 权重的结果：逐算子表、时延、quick100 B1、动作与 `651195d` 上的对比 |
+| `xinfer-wall-oss-optimized-20261107.tar.gz`（`aebb58f9ffd571d4947a6953cb2a534c2c58776d5ca5060064c125b6122a7a38`） | optimized 组合在 `651195d` 上的结果：阶段误差、kernel 剖析、quick100 B1、GPU 测试 |
 | `xinfer-torch210-v3-20261107.tar.gz`（`79579b493a0b1c89bfaeaf8985d4f6e737d4b1104afea58783a8c6fc71f242a0`） | 同一棵树上 torch 2.10.0+cu130 与 2.9.1+cu130 的对比：重新生成的 eager BF16 参考及其差异、GPU 测试套件、18 个请求的动作、单请求时延、一次 8 台压测 |
 | `xinfer-gpu-image-preprocess-v3-20261106.tar.gz`（`85d80bc1c7db8b3ec1ad98c983d435c8e470a4a80e43e4d700a8722bf6e94852`） | 使用 `DeviceImage` 输入的 `image_preprocess_device="gpu"`：42 个请求的动作和视角图像与下一个证据包中所测代码的结果逐位一致，默认路径与 main 逐位一致，每个模型一次压测，GPU 测试套件 |
 | `xinfer-gpu-image-preprocess-v2-20261105.tar.gz`（`9ec8364a0d1eb0e7673e5c96c104bf88cb26cfe31f9f98df8ba331b43bebae67`） | `image_preprocess_device="gpu"`：视角图像 vs CPU 路径 |

@@ -28,12 +28,12 @@ completion thread:
 
 `_select_batch` 把选中的请求从阶段队列中移除。`_execute_stage_batch` 提交异步 CUDA 工作并记录其事件；它返回并不代表 GPU 已执行完成。
 
-如果等待最终阶段事件时抛出异常，该批请求失败，完成线程继续运行。`Engine.health()` 返回引擎无法继续服务的原因（引擎线程或完成线程已停止），否则返回 None；`xinfer-serve` 会轮询它（[服务](serving.zh-CN.md)）。
+如果等待最终阶段事件时抛出异常，该批请求失败，完成线程继续运行。`Engine.health()` 返回引擎无法继续服务的原因（引擎线程或完成线程已停止），否则返回 None；`xinfer-serve` 会轮询它（[服务](serving.zh-CN.md)）。设置了 `Engine.stats_sink` 时，完成线程把每个完成请求的准入等待以及各阶段的等待和执行时间作为 `RequestStats` 报告给它（[指标](metrics.zh-CN.md#采集方式)）。
 
 ## 调度规则
 
 1. **链式分发（dispatch）。** 请求的上游阶段一经*分发*，请求就进入该阶段的队列；通道（lane）在 GPU 上等待上游的事件。通道空闲时，请求无需主机往返即可跑完所有阶段，这就是单请求路径。有负载时队列被填满，各阶段形成流水线。
-2. **零等待组批。** 一次分发取队列中已有的兼容请求，不超过该阶段的上限，选用允许的最大批大小，且从不填充空行。兼容指该阶段读取的每个输入形状相同（批维除外）且主机端取值相同。只有当模型声明该阶段批次不变（`Capabilities.batch_invariant`，由其算子的契约推导）或设置了 `allow_non_invariant_batching` 时，该阶段才会组批。每个阶段的第一次分发单独运行，因为要借此得知该阶段读取哪些输入。
+2. **零等待组批。** 一次分发取队列中已有的兼容请求，不超过该阶段的上限，选用允许的最大批大小，且从不填充空行。兼容指该阶段读取的每个输入形状相同（批维除外）且主机端取值相同。阶段最多按模型在 `Capabilities.batch_sizes` 中声明的最大批大小组批；模型只为组批结果能通过其精度门禁的阶段声明大于 1 的批大小。每个阶段的第一次分发单独运行，因为要借此得知该阶段读取哪些输入。
    - **不同长度。** 若交接张量的 `TensorSpec` 声明了 `seq_axis`（Wall-OSS：prompt 的 K/V），同批请求之间该张量的长度可以不同。组批时每一行左填充到最长者的长度，阶段会收到 `<name>_lengths`（`int32 [B]`，B1 时也有）。见 `xinfer/engine/batching.py`。在 CUDA 上，长度从锁页（pinned）内存异步上传：通道可能已经在等待上游事件，阻塞式上传会卡住发起提交的线程。
    - **延迟合并。** 输入在阶段读取时才合并。阶段不读取的输入，或无法共享的输入（形状或主机端取值不同），不会合并进批。
    - **计数器。** `stats["dispatch_<stage>_b<N>"]` 按批大小统计分发次数，`stats["padded_dispatch_<stage>"]` 统计对不同长度做过填充的批数。
@@ -47,7 +47,7 @@ completion thread:
 
 ## 设备图像
 
-准备好的输入可以是 `DeviceImage`（`xinfer.models.interface`）而非张量：即到达时原样的相机视图（JPEG 字节或 RGB 帧），附带每个 resize 步骤之后的尺寸以及每一步的 `interpolate` 模式。输入处理器在 `processing.image_preprocess_device="gpu"` 时发送这种输入（每个内置模型；[配置](configuration.zh-CN.md#在-gpu-上做图像预处理)）。在请求的第一个阶段之前、CUDA graph 之外，引擎把其中每一个转成 `[h, w, 3]` uint8 视图，各阶段以同一名称读取它，与 CPU 预处理时相同。这些视图与 CPU 路径的形状相同，因此 graph 及其键不变，变长的 JPEG 字节也不会成为 graph 的键。
+准备好的输入可以是 `DeviceImage`（`xinfer.models.interface`）而非张量：即到达时原样的相机视图（JPEG 字节或 RGB 帧），附带每个 resize 步骤之后的尺寸以及每一步的 `interpolate` 模式。输入处理器在 `image_preprocess_device="gpu"` 时发送这种输入（每个内置模型；[配置](configuration.zh-CN.md#在-gpu-上做图像预处理)）。在请求的第一个阶段之前、CUDA graph 之外，引擎把其中每一个转成 `[h, w, 3]` uint8 视图，各阶段以同一名称读取它，与 CPU 预处理时相同。这些视图与 CPU 路径的形状相同，因此 graph 及其键不变，变长的 JPEG 字节也不会成为 graph 的键。
 
 准入时，请求的张量照常上传，其 `DeviceImage` 值留在主机内存中。带设备图像的请求随后进入**设备图像线程**，而不是其起始阶段的队列。该线程按准入顺序处理：让自己的 CUDA stream 等待该请求的上传，用一次批量的 torchvision `decode_jpeg` 调用解码该请求的全部 JPEG，上传其帧，以 FP32 resize 各视图（四舍五入到 uint8），然后记录一个事件，该事件即成为请求的 `inputs_ready` 事件。随后引擎线程把请求放入其起始阶段的队列，这些阶段的通道在 GPU 上等待该事件：引擎线程从不等待解码，一个请求的解码与它之前各请求的阶段重叠执行。不带设备图像的请求不经过该线程。视图归请求所有，直到请求在最终阶段之后完成，因此不会有阶段读到已释放的内存。如果解码抛出异常，只有该请求失败（其张量保留到该线程的事件之后）；`shutdown` 会排空并停止该线程。预热请求走同一条路径。
 
@@ -69,12 +69,11 @@ completion thread:
 |---|---|---|
 | `lanes` | 每阶段 1 个 | 每个阶段的通道数（stream + graph 池），例如 `{"prefill": 2, "action": 2}` |
 | `stream_priorities` | 每阶段 0 | 一个阶段所有通道的 CUDA stream 优先级；整数越小优先级越高 |
-| `max_batch` | 每阶段 1 | 每个阶段的批上限；受 `Capabilities.batch_sizes` 和批次不变性门槛限制 |
+| `max_batch` | 每阶段 1 | 每个阶段的批上限；受 `Capabilities.batch_sizes` 限制 |
 | `max_running_requests` | 8 | 在途的已准入请求数 |
 | `max_queued_requests` | 256 | 已提交、等待准入的请求数（超出则 `AdmitError("queue_full")`） |
 | `per_robot_inflight` | 1 | 每个机器人 id 未完成的请求数（`AdmitError("per_robot_limit")`） |
 | `cudagraphs` | `None` | 设为 `CUDAGraphConfig()` 时回放 CUDA graph（见 `xinfer.engine.cudagraph`） |
-| `allow_non_invariant_batching` | false | 对算子非批次不变的阶段也组批（会改变数值） |
 
 通道的 stream 优先级在创建通道时确定；上传 stream 和拷贝 stream 保持优先级 0。优先级只改变 GPU 执行就绪工作的顺序：准入、组批和事件等待都不变，graph 仍在同一个通道 stream 上捕获和回放。
 
@@ -82,9 +81,9 @@ completion thread:
 
 ## 保证与测试
 
-- 使用批次不变的算子时，请求单独运行与在任意批中运行的结果逐位一致：`test_wall_oss_parity.py::test_action_batches_equal_single_requests` 以不同 prompt 长度和 RTC 延迟对 Wall-OSS action 阶段做 B2..B8 组批，并把每个请求与其单独运行的结果比较。
+- `test_wall_oss_parity.py::test_action_batches_match_single_requests` 对不同 prompt 长度和 RTC 延迟比较 B2–B8 组批与单请求动作，检查两者的差异是否在舍入范围内。
 - 批大小为 1 时，请求的结果与并发无关：`tests/models/test_wall_oss_parity.py` 在每阶段 2 个通道、启用 graph 的情况下运行 21 个并发请求，并与相同请求单独运行的结果逐位比较。
-- `tests/unit/test_engine.py` 覆盖并发提交、组批与按行拆分、兼容性键、批次不变性门槛、准入上限与背压、取消以及逐请求失败。
+- `tests/unit/test_engine.py` 覆盖并发提交、组批与按行拆分、兼容性键、准入上限与背压、取消以及逐请求失败。
 - `tests/unit/test_cudagraph.py::test_result_freed_during_a_capture` 在通道正在捕获时于另一个线程释放一个结果。
 - `tests/unit/test_host_copy.py` 用一个 GPU 闸门挡住失败分发的部分拷贝，并检查在此期间其通道和槽位不会被复用。
 - `tests/unit/test_batching_async.py` 让上游生产者保持未完成，并检查合并不等长的批不会阻塞发起提交的线程。

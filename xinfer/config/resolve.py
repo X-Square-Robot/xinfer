@@ -10,7 +10,7 @@ resolved once at startup and recorded with its source:
 |---|---|
 | ``explicit`` | set by the operator; checked against the platform and model, never rewritten |
 | ``tuned:<table>@<commit>`` | measured best value for (model, architecture, quantization) |
-| ``model:<rule>`` | follows from the model's declarations (batch sizes, batch invariance) |
+| ``model:<rule>`` | follows from the model's declarations (batch sizes) |
 | ``platform:<rule>`` | follows from the platform (graph capture, CPU quota) |
 | ``default`` | a fixed default |
 
@@ -71,8 +71,6 @@ class ExplicitSettings:
         max_queued_requests: submitted requests waiting for admission.
         per_robot_inflight: unfinished requests per robot.
         cudagraphs: ``True`` requires a platform with graph capture; ``False`` runs every stage eagerly.
-        allow_non_invariant_batching: allow batching stages whose operators are not batch-invariant (this
-            changes numerics); ``False`` means not set.
         frontends: frontend processes.
         frontend_workers: processing threads per frontend.
         shm_buffers: shared-memory buffers per frontend.
@@ -85,7 +83,6 @@ class ExplicitSettings:
     max_queued_requests: int | None = None
     per_robot_inflight: int | None = None
     cudagraphs: bool | None = None
-    allow_non_invariant_batching: bool = False
     frontends: int | None = None
     frontend_workers: int | None = None
     shm_buffers: int | None = None
@@ -102,7 +99,7 @@ class ResolvedConfig:
 
     Attributes:
         settings: setting name to ``Setting``. Names: ``per_robot_inflight``, ``max_running_requests``,
-            ``max_queued_requests``, ``lanes.<stage>``, ``allow_non_invariant_batching``, ``batch_sizes.<stage>``
+            ``max_queued_requests``, ``lanes.<stage>``, ``batch_sizes.<stage>``
             (list of allowed batch sizes), ``stream_priorities.<stage>``, ``cudagraphs``, ``frontends``,
             ``frontend_workers``, ``shm_buffers`` and declared ``shape_buckets.<dimension>`` policies.
         stages: the model's stage names in execution order.
@@ -126,8 +123,7 @@ class ResolvedConfig:
 
         Returns:
             An ``EngineConfig`` with lanes per stage, ``max_batch`` per stage set to the largest resolved
-            batch size, the request limits, the graph policy (``None`` for eager execution) and
-            ``allow_non_invariant_batching``.
+            batch size, the request limits and the graph policy (``None`` for eager execution).
         """
         value = self.value
         return EngineConfig(
@@ -138,7 +134,6 @@ class ResolvedConfig:
             max_queued_requests=value("max_queued_requests"),
             per_robot_inflight=value("per_robot_inflight"),
             cudagraphs=(cudagraph_config or CUDAGraphConfig()) if value("cudagraphs") else None,
-            allow_non_invariant_batching=value("allow_non_invariant_batching"),
         )
 
     def rows(self) -> list[dict]:
@@ -201,24 +196,46 @@ def _positive(name: str, value: int) -> int:
     return value
 
 
-def resolve_image_preprocess_device(platform, explicit: str | None) -> str:
-    """Where ``Policy`` has the camera views decoded and resized (``processing.image_preprocess_device``).
+def apply_image_preprocess_device(model_options: Mapping[str, Any], platform,
+                                  default: str | None = None) -> dict[str, Any]:
+    """Resolve the ``image_preprocess_device`` model option and hand it to the model's processors.
+
+    The option, where the camera views are decoded and resized, sits at the top level of the model options of every
+    entry point (``Policy(..., image_preprocess_device=...)``, ``xinfer serve --model-options
+    '{"image_preprocess_device": ...}'``), not in ``processing``. The processors read it as
+    ``processing.image_preprocess_device``, set here when it resolves to ``"gpu"`` (``"cpu"`` is their default).
 
     Args:
+        model_options: the entry point's model options; ``processing``, if given, is a dict.
         platform: the resolved ``Platform``.
-        explicit: ``"cpu"``, ``"gpu"``, or ``None`` for the platform's default: ``"gpu"`` where the views can be
-            decoded and resized on the device (``device_images``: a CUDA device with torchvision), else ``"cpu"``.
+        default: the entry point's default when the option is unset (``xinfer serve``: ``"cpu"``), or ``None`` for
+            the platform's (``Policy``): ``"gpu"`` where the views can be decoded and resized on the device
+            (``device_images``: a CUDA device with torchvision), else ``"cpu"``.
+
+    Returns:
+        A copy of ``model_options`` without ``image_preprocess_device``, for ``from_checkpoint`` and
+        ``build_processors``.
 
     Raises:
-        ConfigError: another value, or ``"gpu"`` on a platform without device images.
+        ConfigError: ``processing`` sets it; a value other than ``"cpu"`` and ``"gpu"``; ``"gpu"`` on a platform
+            without device images.
     """
-    if explicit is None:
-        return "gpu" if platform.capabilities.device_images else "cpu"
-    if explicit not in ("cpu", "gpu"):
-        raise ConfigError(f'image_preprocess_device must be "cpu" or "gpu", got {explicit!r}')
-    if explicit == "gpu" and not platform.capabilities.device_images:
+    options = dict(model_options)
+    device = options.pop("image_preprocess_device", None)
+    processing = options.get("processing") or {}
+    if "image_preprocess_device" in processing:
+        raise ConfigError("image_preprocess_device is a top-level model option, not a processing field")
+    if device is None:
+        device = default
+    if device is None:
+        device = "gpu" if platform.capabilities.device_images else "cpu"
+    elif device not in ("cpu", "gpu"):
+        raise ConfigError(f'image_preprocess_device must be "cpu" or "gpu", got {device!r}')
+    elif device == "gpu" and not platform.capabilities.device_images:
         raise ConfigError(f"platform {platform.name} cannot decode images on the device (needs CUDA and torchvision)")
-    return explicit
+    if device == "gpu":
+        options["processing"] = {**processing, "image_preprocess_device": "gpu"}
+    return options
 
 
 def resolve(model, platform, *, model_name: str, quantization: str | None = None,
@@ -236,8 +253,7 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
     - ``stream_priorities.<stage>``: explicit, else -1 for a final stage (one without consumers) on a platform with
       stream priorities, else 0; nonzero requires platform support.
     - ``batch_sizes.<stage>`` (allowed batch sizes, 1 always included): with an explicit ``max_batch``, the
-      declared sizes up to it; else ``[1]`` when the model declares B1 only or the stage is not
-      batch-invariant (``allow_non_invariant_batching`` only permits explicit limits); else every declared size.
+      declared sizes up to it; else every declared size.
     - ``cudagraphs``: explicit, else whether the platform supports graph capture.
     - ``frontends``: explicit, else 2, at most half the CPU quota.
     - ``frontend_workers``: explicit, else 4, with ``frontends × frontend_workers`` at most half the CPU quota.
@@ -246,7 +262,7 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
 
     Args:
         model: the loaded model; its ``stage_graph`` gives the stages and its ``capabilities()`` the
-            batch sizes and batch invariance.
+            batch sizes.
         platform: the resolved platform; ``capabilities.arch`` selects the tuned table and ``capabilities.cudagraphs``
             gates CUDA graphs.
         model_name: registry name of the model, which names the tuned table directory.
@@ -261,8 +277,7 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
 
     Raises:
         ConfigError: an explicit value is below 1, names an unknown stage, asks for a batch size above the
-            model's largest, batches a non-invariant stage without ``allow_non_invariant_batching``, or enables
-            CUDA graphs on a platform without capture.
+            model's largest, or enables CUDA graphs on a platform without capture.
         ValueError: the bundled tuned table is malformed.
     """
     explicit = explicit or ExplicitSettings()
@@ -311,25 +326,17 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
             raise ConfigError(f"platform {platform.name} does not support nonzero stream priorities")
         out[f"stream_priorities.{stage}"] = Setting(priority, "explicit")
 
-    out["allow_non_invariant_batching"] = Setting(bool(explicit.allow_non_invariant_batching),
-                                                  "explicit" if explicit.allow_non_invariant_batching else "default")
     for stage in stages:
         allowed = sorted(set(capabilities.batch_sizes.get(stage, (1,))) | {1})
-        invariant = bool(capabilities.batch_invariant.get(stage, False))
         if stage in explicit.max_batch:
             limit = _positive(f"max_batch.{stage}", explicit.max_batch[stage])
             if limit > allowed[-1]:
                 raise ConfigError(f"stage {stage} supports batch sizes {allowed}, not {limit}")
-            if limit > 1 and not invariant and not explicit.allow_non_invariant_batching:
-                raise ConfigError(f"stage {stage} is not batch-invariant with the selected operators; batching it "
-                                  f"changes results unless allow_non_invariant_batching is set")
             out[f"batch_sizes.{stage}"] = Setting([b for b in allowed if b <= limit], "explicit")
         elif allowed == [1]:
             out[f"batch_sizes.{stage}"] = Setting([1], "model:declares B1 only")
-        elif not invariant:
-            out[f"batch_sizes.{stage}"] = Setting([1], "model:not batch-invariant")
         else:
-            out[f"batch_sizes.{stage}"] = Setting(allowed, "model:batch-invariant, declared sizes")
+            out[f"batch_sizes.{stage}"] = Setting(allowed, "model:declared sizes")
 
     if explicit.cudagraphs is not None:
         if explicit.cudagraphs and not platform.capabilities.cudagraphs:

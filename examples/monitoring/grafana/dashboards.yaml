@@ -1,0 +1,7 @@
+# Grafana provisioning: load the dashboards mounted at /var/lib/grafana/dashboards (xinfer.json).
+apiVersion: 1
+providers:
+  - name: xinfer
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

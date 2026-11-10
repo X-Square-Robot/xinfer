@@ -9,9 +9,9 @@
 
 因此每项设置都是适用于任何负载的固定选择或上限。它在启动时解析一次，并连同其来源一起报告。优先级从高到低：
 
-1. **显式（explicit）**：运维人员设置的命令行参数或函数参数。它会对照平台和模型进行检查，但从不被改写。冲突即报错：模型未声明的批大小、未加 `--allow-non-invariant-batching` 却对算子非批次不变的阶段组批、在不支持捕获的平台上启用 CUDA graph（仅限 API），或未知的阶段。
+1. **显式（explicit）**：运维人员设置的命令行参数或函数参数。它会对照平台和模型进行检查，但从不被改写。冲突即报错：模型未声明的批大小、在不支持捕获的平台上启用 CUDA graph（仅限 API），或未知的阶段。
 2. **调优表（tuned table）**：针对（模型、架构、量化）组合的实测值，来自 `xinfer/tuned/<model>/<arch>-<quantization>.json` 或 `--tuned <path>`。每张表记录提交、日期、方法和证据；来源显示为 `tuned:<table>@<commit>`。表可以设置 `lanes`。目前没有随附任何表：只有当实测值与默认值不同时才添加表。
-3. **模型 / 平台规则**：模型声明的内容（批大小、所选算子下的批次不变性）和平台支持的能力（graph 捕获、CPU 配额）；来源为 `model:<rule>` 和 `platform:<rule>`。
+3. **模型 / 平台规则**：模型声明的内容（批大小）和平台支持的能力（graph 捕获、CPU 配额）；来源为 `model:<rule>` 和 `platform:<rule>`。
 4. **默认（default）**：固定值。
 
 代码：`xinfer/config/`（`resolve.py`、`tuned.py`）。
@@ -25,13 +25,15 @@
 | `max_queued_requests` | 256 | 已提交、等待准入的请求数 |
 | `lanes.<stage>` | 调优值，否则为 2 | 一个通道是一条带有自己 graph 池的 stream；第二个通道让两个请求可以同时运行该阶段 |
 | `stream_priorities.<stage>` | CUDA 上最终阶段为 −1（Wall-OSS：`action`），其他为 0 | 该阶段各通道的 CUDA stream 优先级，越小越高（`--stream-priorities action=0`、`Policy(stream_priorities={...})`） |
-| `batch_sizes.<stage>` | 若该阶段在所选算子下批次不变，则为模型声明的所有大小；否则为 `[1]` | 允许更大的批大小从不会延迟请求，因为批只由已排队的请求组成 |
+| `batch_sizes.<stage>` | 模型声明的所有大小 | 允许更大的批大小从不会延迟请求，因为批只由已排队的请求组成；模型只为组批结果能通过其精度门禁的阶段声明大于 1 的批大小 |
 | `cudagraphs` | 平台支持捕获时开启 | |
 | `frontends` | 2，最多为容器配额 CPU 数的一半 | 每个前端会在引擎进程中增加一个桥接线程 |
 | `frontend_workers` | 4，且 `frontends × frontend_workers` 不超过配额 CPU 数的一半 | 每个前端的处理线程数；不同连接的请求同时处理 |
 | `shm_buffers` | 每个前端 `ceil(max_running_requests / frontends)` 个 | 每个运行中的请求一个缓冲区；缓冲区全部被租用的前端会等待。默认：2 × 16 个 `--shm-buffer-mib`（32 MiB）缓冲区，锁页 |
 
 stream 优先级只是对就绪 GPU 工作的提示：它不会抢占正在运行的 kernel，也不会绕过事件等待，因此它只是把延迟在阶段之间转移，而不是消除延迟。未知阶段、非整数、设备无法表示的值，以及在不支持 stream 优先级的平台上设置非零值，都会报错（`--dry-run` 解析这些值时不创建通道，因此不检查设备支持的范围）。
+
+下述 MXFP8 数据是早期 Wall-OSS 配置的历史测量；当前 [Wall-OSS 组合](models/wall_oss.zh-CN.md)支持 BF16。
 
 为什么取这些值：
 - **通道数 2。** 在 Wall-OSS MXFP8（RTX 5090）上，两个 action 通道的容量为 7 台，一个通道为 5 台（action 阶段组批）；不组批时 2/2/2 优于 1/1/1（饱和时 31.2 对 27.2 req/s）；三个及以上通道未测量。证据：`xinfer-action-batching-20261101.tar.gz` 和 `xinfer-flash-attn-20261101.tar.gz`（哈希见 docs/models/wall_oss_validation.md）。
@@ -56,16 +58,18 @@ Wall-OSS 使用 `xinfer/models/interface.py` 中的 `BucketSpec`。启动报告�
 | 正数 `prompt_bucket` | 向上取整到该粒度，上限为模型的 prompt 长度上限 |
 | `prompt_bucket=0` | 精确的有效长度，不做桶填充 |
 
-Wall-OSS 加载时会检查 action 算子的批次不变性。这些算子保证 prompt 填充前后的输出逐位一致。
+Wall-OSS 在 action 注意力中对填充位置使用掩码。改变 prompt 宽度可能导致浮点舍入差异。
 
 引擎在 `xinfer/engine/cudagraph.py` 中展开 `meta["prompt_len_range"]` 并调用模型的 `pad` 钩子，按从大到小的顺序预热可达宽度。日志报告各宽度和每个阶段的 graph 数量。精确长度策略只预热所提供的 prompt 宽度，其他长度按配置的预热后 graph 未命中策略处理。
 
 ## 在 GPU 上做图像预处理
 
-这是每个内置模型的处理选项 `processing.image_preprocess_device`，按入口分别设置：
+`image_preprocess_device` 是每个内置模型都有的选项，在所有入口中都放在模型选项的顶层，因此同一份选项可同时用于各个入口（`benchmarks/performance.py` 把同一份选项传给两者）：
 
-- `xinfer serve`：`--model-options '{"processing": {"image_preprocess_device": "gpu"}}'`；默认值为 `"cpu"`。
-- `Policy(..., image_preprocess_device=...)`，是 `Policy` 自己的参数（不放在 `processing` 中）：默认值 `None` 取平台的默认：能在设备上解码和 resize 视图时（有 torchvision 的 CUDA 设备，即平台能力 `device_images`）为 `"gpu"`，否则为 `"cpu"`。在不具备该能力的平台上指定 `"gpu"` 会抛出 `ConfigError`。
+- `xinfer serve`（以及 `xinfer-profile`）：`--model-options '{"image_preprocess_device": "gpu"}'`；默认值为 `"cpu"`。
+- `Policy(..., image_preprocess_device=...)`：默认值 `None` 取平台的默认：能在设备上解码和 resize 视图时（有 torchvision 的 CUDA 设备，即平台能力 `device_images`）为 `"gpu"`，否则为 `"cpu"`。
+
+它不是 `processing` 的字段：写在 `processing` 中会抛出 `ConfigError`；在不具备设备图像能力的平台上指定 `"gpu"` 也会抛出。入口解析该选项（`xinfer.config.apply_image_preprocess_device`）并交给模型的处理器。
 
 | 取值 | 视图在哪里解码和 resize | 数值 |
 |---|---|---|
@@ -103,7 +107,6 @@ lanes.action                  2          default
 stream_priorities.vision      0          default
 stream_priorities.prefill     0          default
 stream_priorities.action      -1         default:final stage
-allow_non_invariant_batching  False      default
 batch_sizes.vision            [1]        model:declares B1 only
 batch_sizes.prefill           [1]        model:declares B1 only
 batch_sizes.action            [1]        model:declares B1 only
@@ -113,7 +116,7 @@ frontend_workers              4          default, frontends × workers ≤ cpus/
 shm_buffers                   16         default:one per running request
 ```
 
-参考组合（`--model-options '{"numerics": "reference"}'`）声明 action 批次 `[1, 2, 4, 8]`：使用批次不变的算子时四种都可用，使用 `--reference-ops` 时解析为 `[1]`（`model:not batch-invariant`）。
+参考组合（`--model-options '{"numerics": "reference"}'`）声明 action 批次 `[1, 2, 4, 8]`（`model:declared sizes`）。
 
 ## 默认设置下的实测结果
 

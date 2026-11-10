@@ -17,14 +17,10 @@ For ``action_attention`` the service made two ``num_splits=1`` calls (all
 keys, and ``P + pinned`` keys for the pinned rows) with only 16 CTAs on the
 Wall-X shapes, which is slower than the torch reference. The per-row form
 with a fixed split count is about 4x faster (22 vs 92 µs per call at B1).
-Left-padded prompts (``prompt_lengths``) use ``cache_leftpad``. A row's
-split-KV boundaries follow its own key range, so a row gives the same bits
-alone, in any batch, and behind any amount of left padding (tested).
+Left-padded prompts (``prompt_lengths``) use ``cache_leftpad``.
 
 Contracts against the torch references: tolerance (different accumulation
-order), deterministic, batch invariant (every sequence, batch row and query
-row is computed independently; ``action_attention`` splits a row's K/V only
-at boundaries set by that row), graph safe. ``varlen_attention``
+order), deterministic, graph safe. ``varlen_attention``
 takes ``cu_seqlens`` as a host sequence; its device copy is created on the
 first (eager) call for each layout and reused, also inside captured graphs.
 """
@@ -36,7 +32,7 @@ import torch
 from xinfer.ops.spec import Contract
 
 BACKEND = "flash_attn"
-ACTION_SPLITS = 4  # fixed split-KV count of action_attention (a constant keeps it batch invariant)
+ACTION_SPLITS = 4  # fixed split-KV count of action_attention
 
 
 def available() -> bool:
@@ -53,7 +49,7 @@ def register(registry) -> str | None:
     """Register the flash-attn implementations; returns the flash-attn version, or None if unavailable.
 
     ``varlen_attention``, ``causal_attention``, ``action_attention``, ``prefix_attention`` and
-    ``kvcache_attention`` on CUDA platforms, priority 10, each with a tolerance, deterministic, batch-invariant,
+    ``kvcache_attention`` on CUDA platforms, priority 10, each with a tolerance, deterministic,
     graph-safe contract.
 
     Args:
@@ -68,7 +64,7 @@ def register(registry) -> str | None:
     import flash_attn_2_cuda
 
     version = f"flash-attn {flash_attn.__version__}"
-    contract = Contract(numerics="tolerance", deterministic=True, batch_invariant=True, graph_safe=True)
+    contract = Contract(numerics="tolerance", deterministic=True, graph_safe=True)
 
     def implements(op):
         """Registration decorator for ``op`` with this backend's platform, priority, version and contract."""

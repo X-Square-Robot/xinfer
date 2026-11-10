@@ -23,12 +23,12 @@ yet.
 |---|---|
 | Model numerics | Two compositions, BF16. `numerics="optimized"` (the default): the ViT, expert 0 and the action expert on xcompute's operators (residual adds fused into the RMSNorms, QKV with bias and RoPE writing the K/V cache, SiLU-mul and GELU in the GEMM epilogues, small-M GEMMs, cache attention and the readout-Euler tail in the action stage) ([design](wall_oss_design.md#optimized-composition)); each stage is within 2.8 % of the Wall-X eager model from the same inputs ([validation](wall_oss_validation.md#optimized-composition)). `numerics="reference"`: with reference (torch) operators the prefill and action stages are bitwise equal to the Wall-X eager BF16 model and the ViT differs only through the attention kernel ([validation](wall_oss_validation.md#reference-operator-model)) |
 | Input/output processing | Bitwise equal to the embodied-serving Wall-X 4B service on its 42-request reference capture; optionally the views are decoded and resized on the GPU (`image_preprocess_device="gpu"`, not bitwise equal; [below](#deployment-options-processingconfig)) |
-| Execution | Colocated `Engine` ([docs/engine.md](../engine.md)): lanes per stage, chained dispatch, CUDA graphs (bitwise equal to eager). The optimized composition runs one request per dispatch; the reference composition batches the action stage B1–B8 under load, across prompt lengths and RTC delays, with batch-invariant kernels (bitwise equal to single requests) |
+| Execution | Colocated `Engine` ([docs/engine.md](../engine.md)): lanes per stage, chained dispatch, CUDA graphs (bitwise equal to eager). The optimized composition runs one request per dispatch; the reference composition batches the action stage B1–B8 under load, across prompt lengths and RTC delays, each request within rounding of its single run ([validation](wall_oss_validation.md)) |
 | Serving | `xinfer.entrypoints.serve` over WebSocket + msgpack, compatible with the x2robot desktop client ([serving](../serving.md)) |
 | Precision | BF16 only |
 | Attention | flash-attn backend for the ViT and prompt attention when installed; the action attention on xcompute's `attention_kvcache` (optimized composition) or flash-attn (reference composition) |
-| Precision gate | embodied-serving quick100 B1, the gate: the optimized composition −6.09 % GT-MSE vs the original BF16, PASS (≤ +1 %); its batch scenarios need a batched action stage and are not run ([precision](../precision.md#wall-oss-quick100-gate)) |
-| Speed | RTX 5090, optimized composition: stage graphs vision 15.6, prefill 22.3, action 7.5 ms (45.5 ms at the 768-token bucket, 5 steps); `Policy.infer` 48.7 ms (P50). Reference composition: 50.9 ms and 54.1 ms ([validation](wall_oss_validation.md#latency)). Single request with the views on the device and robots per GPU: [performance](../performance.md) |
+| Precision gate | embodied-serving quick100 B1, the gate: the optimized composition −6.58 % GT-MSE vs the original BF16, PASS (≤ +1 %); its batch scenarios need a batched action stage and are not run ([precision](../precision.md#wall-oss-quick100-gate)) |
+| Speed | RTX 5090, optimized composition: stage graphs vision 15.6, prefill 21.3, action 7.3 ms (44.2 ms at the 768-token bucket, 5 steps); `Policy.infer` 47.3 ms (P50). Reference composition: 50.9 ms and 54.1 ms ([validation](wall_oss_validation.md#latency)). Single request with the views on the device and robots per GPU: [performance](../performance.md) |
 | Not yet | batching in the optimized action stage, static-prompt KV reuse (measured gain about 0.2 ms, not planned), MXFP8, NVFP4, Thor |
 
 ## Requirements
@@ -40,9 +40,9 @@ yet.
   service (see [design](wall_oss_design.md#processing)).
 - A CUDA GPU with about 10 GB free for BF16 weights (CPU works for tests).
 - For `image_preprocess_device="gpu"`: `pip install -e '.[gpu-image]'` (torchvision ≥ 0.19).
-- Optimized composition (the default): an RTX 5090 (SM120); `XINFER_XCOMPUTE_LIBRARY` pointing to an
-  `xcompute.so` built from xcompute `651195d` (`feat/gemm-family-unify`) and that build's Python package
-  importable. Without them it runs on the torch references (slowly).
+- Optimized composition (the default): the Python package of an xcompute build for the GPU's architecture
+  importable. See [kernels](../kernels.md) for setup and checks. The reported measurements use an RTX 5090 (SM120).
+  Without it the composition runs on the torch references (slowly).
 
 ## Run
 
@@ -76,8 +76,9 @@ The reference composition: pass `numerics="reference"` (serving: `--model-option
 | `embodiment`, `frequency_hz`, `action_space` | `X2 ex001_desktop`, 32, `Rel EEF` | system prompt of the reference deployment |
 | `num_steps` / `allow_client_num_steps` | 5 / true | RTC requests may send `num_flow_steps` |
 | `rtc_wire_delay_range` | (3, 8) | admission on the raw `inference_delay` |
-| `image_preprocess_device` | `"cpu"`; under `Policy`, its `image_preprocess_device` argument (`"gpu"` on CUDA) | `"gpu"`: the frontend sends the JPEG bytes and raw frames with their target sizes, and the engine decodes the JPEGs with nvJPEG and resizes the views on the device (bicubic like OpenCV INTER_CUBIC) before the first stage. Saves the frontend's decode and resize time; the views, and so the actions, are not bitwise equal to the CPU path ([configuration](../configuration.md#image-preprocessing-on-the-gpu)) |
-| `prompt_bucket` | 16 | prompts are padded at their end, before the action tokens, to a multiple of this many tokens, so CUDA graphs are keyed by the bucket; in the reference composition the actions are bitwise equal to the exact prompt's ([design](wall_oss_design.md#prompt-buckets)), which needs batch-invariant action-stage operators (the default backends; with reference operators, `--reference-ops` or the CPU, set it to 0); the optimized composition masks the padding in its action attention, not bitwise across widths |
+| `prompt_bucket` | 16 | prompts are padded at their end, before the action tokens, to a multiple of this many tokens, so CUDA graphs are keyed by the bucket; both compositions mask the padding, which changes the actions at rounding level at most ([design](wall_oss_design.md#prompt-buckets)) |
+
+`image_preprocess_device`, a top-level model option (not in `processing`): `"cpu"` under `xinfer serve`; under `Policy` the platform's (`"gpu"` on CUDA). `"gpu"`: the frontend sends the JPEG bytes and raw frames with their target sizes, and the engine decodes the JPEGs with nvJPEG and resizes the views on the device (bicubic like OpenCV INTER_CUBIC) before the first stage. Saves the frontend's decode and resize time; the views, and so the actions, are not bitwise equal to the CPU path ([configuration](../configuration.md#image-preprocessing-on-the-gpu))
 
 Initial flow noise is drawn per request on the CPU by the input processor
 (`ProcessingConfig.noise_seed` fixes it); tests replace the prepared `noise`

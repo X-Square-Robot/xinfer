@@ -2,12 +2,13 @@
 
 Runs on the visible GPU (select it with ``CUDA_VISIBLE_DEVICES``), with nothing else on it:
 
-1. ``request_latency.py`` on the configuration's request set, with the views decoded and resized on the device
-   (``Policy``'s ``image_preprocess_device="gpu"``);
-2. for each robot count, in increasing order, a newly started ``xinfer-serve`` with the configuration's model options
-   and warmup files, then ``robot_load.py`` with the repository convention (80 requests per robot, the first 20
-   dropped, 8 rounds, each with random robot start phases): synthetic desktop observations with RTC, or
-   ``--load-requests`` without RTC. It stops after the first count that fails.
+1. ``request_latency.py`` on the configuration's request set, with its model options; ``Policy`` decodes and resizes
+   the views on the device unless they set ``image_preprocess_device``;
+2. for each robot count, in increasing order, a newly started ``xinfer-serve`` with the same model options (the views
+   processed in the frontends unless they set ``image_preprocess_device``) and the warmup files, then
+   ``robot_load.py`` with the repository convention (80 requests per robot, the first 20 dropped, 8 rounds, each with
+   random robot start phases): synthetic desktop observations with RTC, or ``--load-requests`` without RTC. It stops
+   after the first count that fails.
 
 A count passes when no round has an error or missing row and the median over its rounds of the ``server_infer_ms``
 P50 is below 150 ms; the capacity is the largest count that passes with every smaller measured count passing too.
@@ -141,10 +142,9 @@ def main(argv=None) -> int:
     args.out.mkdir(parents=True)
     result = {"name": args.name, "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "environment": environment(), "latency": {}, "load": {}}
-    options = {**json.loads(args.model_options), "image_preprocess_device": "gpu"}
     target = args.out / "latency.json"
     subprocess.run([sys.executable, str(HERE / "request_latency.py"), "--model", args.model, "--checkpoint",
-                    args.checkpoint, "--model-options", json.dumps(options), "--requests-file", *args.latency_requests,
+                    args.checkpoint, "--model-options", args.model_options, "--requests-file", *args.latency_requests,
                     "--out", str(target)], check=True)
     latency = json.loads(target.read_text())
     result["latency"] = {k: latency[k] for k in ("total_ms", "prepare_ms", "engine_ms", "output_ms",
