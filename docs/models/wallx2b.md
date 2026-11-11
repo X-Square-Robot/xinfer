@@ -4,6 +4,8 @@ English | [简体中文](wallx2b.zh-CN.md)
 
 Use the model ID `wallx2b` to serve a BF16 Wall-X 2B checkpoint on a CUDA GPU. The model takes three camera views, the state of a desktop dual-arm robot and a task instruction. Each call predicts 16 steps for both arms. Real-time chunking (RTC) can pin part of the previous action so consecutive predictions overlap.
 
+See the [validation results](wallx2b_validation.md) for latency, single-GPU capacity and open-loop accuracy on the RTX 5090.
+
 ## Checkpoint requirements
 
 Provide a compatible checkpoint directory obtained separately. This repository ships the inference code. Start with the following files from the same training export:

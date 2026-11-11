@@ -12,7 +12,7 @@ Existing code and records this design draws on:
 - the pipeline-overlap-vla study;
 - current main source of vLLM and SGLang.
 
-The performance and validation guides document the conditions of each Wall-OSS measurement.
+The [performance table](performance.md) lists measurement conditions for Wall-OSS and Wall-X 2B and links to their validation results.
 
 ---
 
