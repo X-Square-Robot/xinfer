@@ -11,49 +11,20 @@ from __future__ import annotations
 
 import torch
 
+from xinfer.ops.layout import _swizzle_32_4_4
+
 BLOCK = 32
 SHARED_BLOCK = 128
 
 
 def scale_elements(rows: int, k: int, *, block: int = BLOCK) -> int:
-    """Bytes of a SWIZZLE_32_4_4 scale tensor for a logical [rows, k] matrix.
-
-    Args:
-        rows: logical rows ``M`` (padded to a multiple of 128).
-        k: logical columns ``K`` (``ceil(K / block)`` scale blocks, padded to a multiple of 4).
-        block: columns per scale (32 for MXFP8, 16 for NVFP4).
-
-    Returns:
-        The number of scale bytes, including padding.
-    """
-    padded_rows = (rows + 127) // 128 * 128
-    blocks = (k + block - 1) // block
-    return padded_rows * ((blocks + 3) // 4 * 4)
+    """Bytes of swizzled E8M0 scales for a logical ``[rows, k]`` matrix, including padding."""
+    return _swizzle_32_4_4.scale_elements(rows, k, block=block)
 
 
 def scale_offsets(rows: int, k: int, device=None, *, block: int = BLOCK) -> torch.Tensor:
-    """Physical offset of scale[row, block] for row < rows, block < padded block count.
-
-    SWIZZLE_32_4_4: each 128-row x 4-block tile occupies 512 consecutive bytes, tiles in row-tile-major
-    order; within a tile, ``r = row % 128`` and ``b = block % 4`` sit at ``(r % 32) * 16 + (r // 32) * 4 + b``.
-
-    Args:
-        rows: logical rows ``M``.
-        k: logical columns ``K``.
-        device: device of the returned tensor.
-        block: columns per scale (32 for MXFP8, 16 for NVFP4).
-
-    Returns:
-        int64 ``[rows, padded block count]`` offsets into the flat scale tensor.
-    """
-    blocks = (k + block - 1) // block
-    columns = (blocks + 3) // 4 * 4
-    col_groups = columns // 4
-    row = torch.arange(rows, device=device, dtype=torch.int64)[:, None]
-    block = torch.arange(columns, device=device, dtype=torch.int64)[None, :]
-    in_block = row & 127
-    tile = (row // 128) * col_groups + block // 4
-    return tile * 512 + (in_block & 31) * 16 + (in_block // 32) * 4 + (block & 3)
+    """int64 ``[rows, padded block count]`` offsets of the E8M0 scales, one per ``block`` columns."""
+    return _swizzle_32_4_4.scale_offsets(rows, k, device, block=block)
 
 
 def rope_pair_permutation(q_dim: int, k_dim: int, head_dim: int, n: int) -> torch.Tensor:
