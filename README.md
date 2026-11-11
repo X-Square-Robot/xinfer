@@ -96,8 +96,9 @@ and action representations are documented in each model guide.
 | Model | Model ID | Precision | Real-time chunking | Guide |
 |---|---|---|---|---|
 | Wall-OSS · internal checkpoints | `wall_oss` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wall_oss.md) |
+| Wall-X 2B | `wallx2b` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
 
-Each configuration's single-request latency and robots per GPU: [performance](docs/performance.md).
+Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. Published Wall-OSS latency and capacity measurements are in the [performance table](docs/performance.md).
 
 | Hardware | Device | Runtime |
 |---|---|---|

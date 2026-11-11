@@ -2,9 +2,7 @@
 
 English | [简体中文](performance.zh-CN.md)
 
-The current single-request latency and single-GPU capacity of each serving configuration, measured with
-`benchmarks/performance.py` in one protocol ([benchmark](benchmark.md#performance-table)). Each model's validation
-page has the per-stage breakdown and the precision results.
+The table reports Wall-OSS single-request latency and single-GPU capacity measured with `benchmarks/performance.py` under the [benchmark protocol](benchmark.md#performance-table). See [Wall-OSS validation](models/wall_oss_validation.md) for stage timings and precision results.
 
 | # | Model | Precision, composition | GPU | Single request P50 | Robots per GPU | Server P50 at capacity | Server P95 at capacity | Saturation | Precision gate |
 |---|---|---|---|---|---|---|---|---|---|
