@@ -8,7 +8,7 @@ The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the xcomp
 
 ## GPU support
 
-The xcompute build must target the architecture of the serving GPU. Check `xcompute.build_target_archs()`. The [Wall-OSS performance measurements](performance.md) used an RTX 5090 and xcompute `7336b0d`.
+The xcompute build must target the architecture of the serving GPU. Check `xcompute.build_target_archs()`. The [Wall-OSS and Wall-X 2B benchmarks](performance.md) used an RTX 5090 and xcompute `7336b0d`.
 
 ## Install and select a build
 

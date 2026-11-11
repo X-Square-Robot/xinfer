@@ -8,7 +8,7 @@ Wall-OSS 和 Wall-X 2B 默认的 BF16 组合在 CUDA 上使用 xcompute 融合�
 
 ## GPU 支持
 
-xcompute 构建必须支持服务所用 GPU 的架构。可通过 `xcompute.build_target_archs()` 检查。[Wall-OSS 性能测量](performance.zh-CN.md)使用 RTX 5090 和 xcompute `7336b0d`。
+xcompute 构建必须支持服务所用 GPU 的架构。可通过 `xcompute.build_target_archs()` 检查。[Wall-OSS 和 Wall-X 2B 的性能测试](performance.zh-CN.md)均使用 RTX 5090 和 xcompute `7336b0d`。
 
 ## 安装与选择构建
 
