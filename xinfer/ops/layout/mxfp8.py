@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from xinfer.ops.layout import swizzle_32_4_4
+from xinfer.ops.layout import _swizzle_32_4_4
 
 BLOCK = 32
 SHARED_BLOCK = 128
@@ -19,12 +19,12 @@ SHARED_BLOCK = 128
 
 def scale_elements(rows: int, k: int, *, block: int = BLOCK) -> int:
     """Bytes of swizzled E8M0 scales for a logical ``[rows, k]`` matrix, including padding."""
-    return swizzle_32_4_4.scale_elements(rows, k, block=block)
+    return _swizzle_32_4_4.scale_elements(rows, k, block=block)
 
 
 def scale_offsets(rows: int, k: int, device=None, *, block: int = BLOCK) -> torch.Tensor:
     """int64 ``[rows, padded block count]`` offsets of the E8M0 scales, one per ``block`` columns."""
-    return swizzle_32_4_4.scale_offsets(rows, k, device, block=block)
+    return _swizzle_32_4_4.scale_offsets(rows, k, device, block=block)
 
 
 def rope_pair_permutation(q_dim: int, k_dim: int, head_dim: int, n: int) -> torch.Tensor:
