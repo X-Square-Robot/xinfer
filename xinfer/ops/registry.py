@@ -30,7 +30,7 @@ REFERENCE_BACKEND = "reference"
 PLUGIN_GROUP = "xinfer.ops"
 # Built-in backend modules, loaded like ``xinfer.ops`` entry points but without relying on installed package metadata.
 BUILTIN_MODULES = ("xinfer.ops.backends.cuda.attn", "xinfer.ops.backends.cuda.gemm", "xinfer.ops.backends.cuda.norm",
-                   "xinfer.ops.backends.cuda.flow")
+                   "xinfer.ops.backends.cuda.flow", "xinfer.ops.backends.cuda.position")
 STRICT_ENV = "XINFER_OPS_STRICT"
 
 
@@ -340,7 +340,7 @@ class OpRegistry:
         """Import the built-in backend modules, then every module of the ``xinfer.ops`` entry point group.
 
         Importing a backend module registers its implementations (``register``) into the process-wide ``registry``.
-        Built-in: ``xinfer/ops/backends/cuda/`` (``attn``, ``gemm``, ``norm``, ``flow``), on xcompute
+        Built-in: ``xinfer/ops/backends/cuda/`` (``attn``, ``gemm``, ``norm``, ``flow``, ``position``), on xcompute
         (``XINFER_XCOMPUTE_LIBRARY`` or the installed ``xcompute`` package) and flash-attn (the ``flash_attn``
         package) when they import; ``XINFER_XCOMPUTE=0`` and ``XINFER_FLASH_ATTN=0`` leave them out.
         ``XINFER_<NAME>=0`` skips the entry point ``<name>`` without importing it (upper case, characters other than

@@ -33,20 +33,22 @@
 python -m pip install -e ".[models,serve]"
 ```
 
-请准备兼容的 checkpoint 及其 tokenizer、配置和归一化文件，并将示例中的 MODEL_ID 替换为已注册的模型 ID。
+Wall-X 2B 默认的 BF16 优化路径使用 **xcompute**。在支持的 GPU 上安装与其架构匹配的构建后，按 [kernel 指南](docs/kernels.zh-CN.md)检查各算子的后端。缺少兼容构建时使用较慢的 PyTorch 实现。
+
+以下示例使用 BF16，需要[兼容的 Wall-X 2B checkpoint](docs/models/wallx2b.zh-CN.md#checkpoint-要求)，包括 tokenizer 和归一化文件。
 
 ### 启动模型服务
 
 ```bash
 xinfer-serve \
-  --model MODEL_ID \
+  --model wallx2b \
   --checkpoint /path/to/checkpoint \
   --device cuda \
   --warmup observation.msgpack \
   --port 33985
 ```
 
-`observation.msgpack` 是一个符合[请求格式](docs/serving.zh-CN.md#协议)的代表性请求。预热在服务开始接受连接之前运行。如有 RTC 流量，请在 `--warmup` 中同时提供一个普通请求和一个 RTC 请求。
+`observation.msgpack` 是一个符合[请求格式](docs/models/wallx2b.zh-CN.md#请求与响应)的代表性请求。预热在服务开始接受连接之前运行。如有 RTC 流量，请在 `--warmup` 中同时提供一个普通请求和一个 RTC 请求。
 
 通过 WebSocket + msgpack 连接 `ws://127.0.0.1:33985`。协议、健康检查端点和部署选项见[服务指南](docs/serving.zh-CN.md)。
 
@@ -59,7 +61,7 @@ from xinfer import Policy
 from xinfer.frontend.protocol import unpackb
 
 observation = unpackb(Path("observation.msgpack").read_bytes())
-policy = Policy("MODEL_ID", "/path/to/checkpoint", device="cuda")
+policy = Policy("wallx2b", "/path/to/checkpoint", device="cuda")
 
 try:
     policy.warmup([observation])
@@ -72,7 +74,11 @@ finally:
 
 ## 模型与硬件
 
-各配置的单请求时延和单卡机器人数：[性能](docs/performance.zh-CN.md)。
+| 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
+|---|---|---|---|---|
+| Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
+
+Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。
 
 | 硬件 | 设备 | 运行时 |
 |---|---|---|

@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from xinfer.models.layers.basic import _meta_param
+from xinfer.models.layers.basic import ParamGroup
 from xinfer.models.layers.rotary import inverse_frequencies, mrope_cos_sin, vision_rotary_angles
 from xinfer.loader import Source
 from xinfer.ops import active_ops
@@ -35,15 +35,6 @@ OPTIMIZED_STAGE_OPS = {
     "action": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "prefix_kvcache_attention",
                "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "silu"),
 }
-
-
-class ParamGroup(nn.Module):
-    """A named group of meta parameters ``{name: shape}``."""
-
-    def __init__(self, **shapes):
-        super().__init__()
-        for name, shape in shapes.items():
-            setattr(self, name, _meta_param(*shape))
 
 
 def compact_rope(inv_freq: torch.Tensor, positions: torch.Tensor, section) -> tuple[torch.Tensor, torch.Tensor]:

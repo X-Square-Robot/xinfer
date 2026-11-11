@@ -1,4 +1,4 @@
-"""Fused Wall-OSS operators against unfused torch (CPU) and xcompute kernels (GPU)."""
+"""Fused Wall-OSS and Wall-X 2B operators against unfused torch (CPU) and xcompute kernels (GPU)."""
 
 import os
 
@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from xinfer import ops
+from xinfer.models.wallx.optimized import column_ranges, q_k_v_gate
 from xinfer.ops import reference
 from xinfer.ops.reference import fused
 from xinfer.platforms import resolve_platform
@@ -40,6 +41,22 @@ def test_gemm_glu_epilogue_is_ada_rms_norm_then_silu_mul():
     y = normed @ w.t()
     torch.testing.assert_close(fused.gemm_glu_epilogue(x, w, modulation=table, row_class=rows, eps=1e-6),
                                F.silu(y[:, :8]) * y[:, 8:])
+
+
+def test_transposed_gemm_weight_on_an_xcompute_build_without_kn(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from xinfer.ops.backends.cuda import gemm
+
+    prepack = Mock(side_effect=ValueError("prepack_weight: layout= only takes 'nk_k64blk' (a BF16 gemm weight)"))
+    monkeypatch.setattr(gemm, "xc", SimpleNamespace(prepack_weight=prepack))
+    monkeypatch.setattr(gemm, "_supports_kn", True)
+    for n in (4, 6):
+        weight = torch.arange(3 * n).reshape(3, n).t()
+        dense = gemm._kn(weight)
+        assert dense.is_contiguous() and torch.equal(dense, weight)
+    assert prepack.call_count == 1
 
 
 def test_qkv_rope_epilogue_rotates_q_and_k_halves():
@@ -170,6 +187,7 @@ def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(
         monkeypatch.setattr(registry_module, "registry", registry)
         monkeypatch.setattr(_xcompute, "XCOMPUTE", xcompute)
         monkeypatch.setattr(_xcompute, "xc", xcompute["requires"])
+        monkeypatch.setattr(_xcompute, "library", None)
         for module in BUILTIN_MODULES:
             importlib.reload(importlib.import_module(module))
         return registry
@@ -180,6 +198,10 @@ def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(
         names = registry.backend_ops("cuda:xcompute")
         assert set(names) == set(FUSED)
         assert {registry.implementations(name)[-1].platforms for name in names} == {("sm120",)}
+        # A build may have the base GEMM kernels and only some of the 2B kernels.
+        package.denoise_input_embed = object()
+        enabled = registered(dict(requires=package, platforms=("sm120",), version="sha256:0"))
+        assert set(enabled.backend_ops("cuda:xcompute")) == set(FUSED) | {"flow_input_embed"}
         assert registered(dict(requires=None, platforms=(), version=None)).backend_ops("cuda:xcompute") == []
     finally:
         monkeypatch.undo()
@@ -291,3 +313,200 @@ def test_xcompute_gemm_packs_a_weight_only_a_packed_layout_lists(xc):
     assert xcompute.selected_backend("gemm_glu", x, w, activation="silu") == "generic"
     assert xcompute.selected_backend("gemm_glu", x, packed, activation="silu") != "generic"
     assert torch.equal(xc.gemm_glu_epilogue(x, w), xcompute.gemm_glu(x, packed, activation="silu"))
+
+
+def test_add_zero_centered_norm_returns_the_sum_and_its_norm():
+    g = torch.Generator().manual_seed(3)
+    x, residual, w = _randn(4, 8, generator=g), _randn(4, 8, generator=g), _randn(8, generator=g)
+    total, normed = fused.add_zero_centered_rms_norm(x, residual, w, 1e-6)
+    assert torch.equal(total, residual + x)
+    assert torch.equal(normed, reference.rms_norm(total, 1 + w.float(), 1e-6))
+
+
+def test_gated_delta_net_is_the_reference_mixer():
+    from xinfer.models.layers.qwen3_5 import GatedDeltaNet
+
+    g = torch.Generator().manual_seed(5)
+    torch.manual_seed(5)
+    with ops.use_ops(ops.registry.build_table(resolve_platform("cpu"))):
+        mixer = GatedDeltaNet(16, 2, 4, 8, 8, 4, 1e-6).to_empty(device="cpu")
+    for param in mixer.parameters():
+        param.data.copy_(torch.randn(param.shape, generator=g) * 0.3)
+    mixer.A_log.data, mixer.norm_weight.data = mixer.A_log.data.abs(), mixer.norm_weight.data + 1
+    x = torch.randn(1, 70, 16, generator=g)
+    expected = mixer(x, torch.ones(1, 70, 1))
+    zba = torch.cat((mixer.in_z(x), mixer.in_b(x), mixer.in_a(x)), -1)
+    out = fused.gated_delta_net(mixer.in_qkv(x), zba, mixer.conv_weight[:, 0], mixer.A_log, mixer.dt_bias,
+                                mixer.norm_weight, 2, 4, 8, 8, 1e-6)
+    torch.testing.assert_close(mixer.out_proj(out), expected)
+
+
+def test_vision_tables_follow_the_layout_of_the_reference_tower():
+    from types import SimpleNamespace
+
+    from xinfer.models.layers.rotary import vision_rotary_angles
+    from xinfer.models.layers.vision.qwen3_5_vit import vision_layout
+
+    g = torch.Generator().manual_seed(0)
+    grids = [(1, 4, 6), (2, 6, 4)]
+    layout = vision_layout(grids, SimpleNamespace(spatial_merge_size=2, grid_side=5))
+    inv_freq = 1.0 / 10000 ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8)
+    assert torch.equal(fused.rot_pos(inv_freq, grids, 2), vision_rotary_angles(inv_freq, layout["positions"]))
+    table = torch.randn(25, 8, generator=g)
+    corners = table[layout["pos_index"]] * layout["pos_weight"][:, :, None]
+    expected = corners[0] + corners[1] + corners[2] + corners[3]
+    torch.testing.assert_close(fused.pos_embed_interp(table, grids, 2), expected)
+
+
+def test_rope_full_rotates_the_half_split_pairs():
+    g = torch.Generator().manual_seed(1)
+    n, heads, d = 5, 2, 8
+    q, k = torch.randn(1, n, heads, d, generator=g), torch.randn(1, n, 1, d, generator=g)
+    angles = torch.randn(n, d // 2, generator=g)
+    cos, sin = angles.cos(), angles.sin()
+    q_out, k_out = fused.rope_full(q, k, cos[None], sin[None], d)
+    full = (torch.cat((cos, cos), -1)[None, :, None], torch.cat((sin, sin), -1)[None, :, None])
+    torch.testing.assert_close(q_out, reference.apply_rotary(q, *full))
+    torch.testing.assert_close(k_out, reference.apply_rotary(k, *full))
+    q_part, _ = fused.rope_full(q, k, cos[None, :, :2], sin[None, :, :2], 4)
+    assert torch.equal(q_part[..., 4:], q[..., 4:])
+    partial = (torch.cat((cos[:, :2],) * 2, -1)[None, :, None], torch.cat((sin[:, :2],) * 2, -1)[None, :, None])
+    torch.testing.assert_close(q_part[..., :4], reference.apply_rotary(q[..., :4], *partial))
+
+
+def test_qkv_norm_split_norms_q_and_k_and_copies_v_and_the_gate():
+    g = torch.Generator().manual_seed(2)
+    heads, kv, d = 2, 1, 8
+    packed = _randn(1, 3, 2 * heads * d + 2 * kv * d, generator=g)
+    q_weight, k_weight = _randn(d, scale=0.1, generator=g), _randn(d, scale=0.1, generator=g)
+    q, k, v, gate = fused.qkv_norm_split(packed, q_weight, k_weight, heads, kv, d, 1e-6)
+    query = packed[..., :2 * heads * d].reshape(1, 3, heads, 2, d)
+    torch.testing.assert_close(q, fused.zero_centered_rms_norm(query[..., 0, :], q_weight, 1e-6), atol=0.02, rtol=0)
+    key = packed[..., 2 * heads * d:(2 * heads + kv) * d].reshape(1, 3, kv, d)
+    torch.testing.assert_close(k, fused.zero_centered_rms_norm(key, k_weight, 1e-6), atol=0.02, rtol=0)
+    assert torch.equal(v, packed[..., (2 * heads + kv) * d:].reshape(1, 3, kv, d))
+    assert torch.equal(gate, query[..., 1, :].reshape(1, 3, heads * d))
+
+
+def test_gated_kvcache_attention_with_column_ranges_is_the_masked_attention():
+    """Keys [0, prefix) and the new rows, a mask turned into per-column row ranges, the output gate."""
+    g = torch.Generator().manual_seed(3)
+    m, prefix, length = 6, 5, 12  # rows 5..10 hold the new keys, row 11 is unused
+    q = torch.randn(1, m, 4, 8, generator=g).bfloat16()
+    k, v = torch.randn(1, length, 2, 8, generator=g).bfloat16(), torch.randn(1, length, 2, 8, generator=g).bfloat16()
+    gate = torch.randn(1, m, 32, generator=g).bfloat16()
+    visible = torch.zeros(m, length, dtype=torch.bool)
+    visible[:, :prefix] = True
+    visible[2:, prefix:prefix + m] = torch.tril(torch.ones(m, m, dtype=torch.bool))[2:]
+    visible[:2, prefix:prefix + 2] = True  # the first two rows see each other only
+    out = fused.gated_kvcache_attention(q, k, v, torch.tensor([prefix]), prefix, gate,
+                                          flash_mask=column_ranges(visible[None, None]))
+    o = reference.attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mask=visible[None, None])
+    assert torch.equal(out, o.transpose(1, 2).reshape(1, m, -1) * torch.sigmoid(gate))
+
+
+def test_flow_input_embed_without_heads_is_one_fp32_projection():
+    g = torch.Generator().manual_seed(8)
+    z, dof, w = torch.randn(1, 5, 4, generator=g), torch.ones(1, 5, 4), torch.randn(16, 8, generator=g)
+    torch.testing.assert_close(fused.flow_input_embed(z, w[None], extra=dof),
+                               (torch.cat((z, dof), -1) @ w.t()).bfloat16())
+
+
+def test_modulated_norms_take_the_pinned_modulation_for_the_first_rows():
+    g = torch.Generator().manual_seed(10)
+    x, branch = torch.randn(1, 5, 16, generator=g).bfloat16(), torch.randn(1, 5, 16, generator=g).bfloat16()
+    mod, pinned = torch.randn(1, 48, generator=g) * 0.3, torch.randn(1, 48, generator=g) * 0.3
+    rows = torch.tensor([2], dtype=torch.int32)
+    normed, gate = fused.modulated_rms_norm(x, mod, 1e-6, pinned, rows)
+    for r, m in ((0, pinned), (1, pinned), (2, mod), (4, mod)):
+        assert torch.equal(normed[:, r], reference.ada_rms_norm(x[:, r:r + 1], m[:, None, :16], m[:, None, 16:32],
+                                                                1e-6)[:, 0])
+        assert torch.equal(gate[:, r], m[:, 32:].bfloat16())
+    branch_gate = torch.randn(1, 1, 16, generator=g).bfloat16()
+    normed, gate, total = fused.gated_residual_modulated_rms_norm(x, branch, branch_gate, mod, 1e-6)
+    assert torch.equal(total, x + branch * branch_gate) and gate.shape == (1, 1, 16)
+    assert torch.equal(normed, fused.modulated_rms_norm(total, mod, 1e-6)[0])
+
+
+def test_identity_layer_norms_are_two_gated_residual_norms_in_place():
+    g = torch.Generator().manual_seed(11)
+    residual, branch = torch.randn(1, 5, 16, generator=g).bfloat16(), torch.randn(1, 5, 16, generator=g).bfloat16()
+    branch_gate = torch.randn(1, 1, 16, generator=g).bfloat16()
+    first, second = torch.randn(1, 48, generator=g) * 0.3, torch.randn(1, 48, generator=g) * 0.3
+    n1, g1, s1 = fused.gated_residual_modulated_rms_norm(residual, branch, branch_gate, first, 1e-6)
+    n2, g2, s2 = fused.gated_residual_modulated_rms_norm(s1, n1, g1, second, 1e-6)
+    gate = fused.identity_layer_norms_(residual, branch, branch_gate, first, second, 1e-6)
+    assert torch.equal(gate, g2) and torch.equal(residual, s2) and torch.equal(branch, n2)
+
+
+def test_qkv_norm_rope_kvcache_is_the_gemm_then_the_split_norms_and_rope():
+    g = torch.Generator().manual_seed(12)
+    m, k, heads, kv, d, start = 4, 32, 2, 1, 16, 3
+    x = torch.randn(m, k, generator=g).bfloat16()
+    q_gate, wk, wv = (torch.randn(n, k, generator=g).bfloat16() * 0.2 for n in (2 * heads * d, kv * d, kv * d))
+    qn, kn = (torch.randn(d, generator=g) * 0.1).bfloat16(), (torch.randn(d, generator=g) * 0.1).bfloat16()
+    angles = torch.rand(m, 4, generator=g)
+    caches = torch.zeros(2, kv, start + m, d, dtype=torch.bfloat16)
+    out = fused.qkv_norm_rope_kvcache(x, q_k_v_gate(q_gate, wk, wv, heads), qn, kn, angles.cos(), angles.sin(),
+                                      caches[0], caches[1], start, heads, kv, d, 1e-6)
+    packed = reference.linear(x, torch.cat((q_gate, wk, wv)))[None]
+    q, key, value, gate = fused.qkv_norm_split(packed, qn, kn, heads, kv, d, 1e-6)
+    q, key = fused.rope_full(q, key, angles.cos()[None], angles.sin()[None], 8)
+    torch.testing.assert_close(out.float(), torch.cat((q.reshape(m, -1), gate.reshape(m, -1)), 1).float(),
+                               atol=0.05, rtol=0.05)
+    torch.testing.assert_close(caches[0, :, start:].float(), key[0].transpose(0, 1).float(), atol=0.05, rtol=0.05)
+    assert torch.equal(caches[1, :, start:], value[0].transpose(0, 1)) and not caches[:, :, :start].any()
+
+
+@gpu
+@pytest.mark.gpu
+def test_xcompute_matches_the_references_at_wallx2b_shapes(xc):
+    """Wall-X 2B: attention heads 8/2/256 (no gated kernel is listed: ungated attention_kvcache and the gate, and the
+    reference for the causal prompt attention), action width 1024, 16 action rows, 26 action values."""
+    required = ("gated_causal_attention", "gated_kvcache_attention", "modulated_rms_norm",
+                "gated_residual_modulated_rms_norm", "identity_layer_norms_", "qkv_norm_rope_kvcache",
+                "flow_input_embed")
+    missing = [name for name in required if xc.selection(name).library != "xcompute"]
+    if missing:
+        pytest.skip(f"installed xcompute build lacks Wall-X 2B kernels: {', '.join(missing)}")
+    g = torch.Generator().manual_seed(16)
+    r = lambda *s, scale=1.0, dtype=BF16: _randn(*s, scale=scale, dtype=dtype, device="cuda", generator=g)  # noqa: E731
+    p, m, a = 430, 16, 1024
+    _check(xc, "gated_causal_attention", (r(p, 8, 256), r(p, 2, 256), r(p, 2, 256), r(p, 2048)), equal=True)
+    visible = torch.ones(m, p + m, dtype=torch.bool, device="cuda")
+    visible[:3, p + 3:] = False  # RTC: the pinned rows do not see the others
+    _check(xc, "gated_kvcache_attention", (r(1, m, 8, 256), r(1, p + m, 2, 256), r(1, p + m, 2, 256),
+                                           torch.tensor([p], dtype=torch.int32, device="cuda"), p, r(1, m, 2048)),
+           kwargs=dict(flash_mask=column_ranges(visible[None, None])), relative=0.01)
+    h = r(1, m, a)
+    w_t = r(a, 2048, scale=1 / 45).t().contiguous()  # the output and down projections: stored [K, N]
+    _check(xc, "gemm_epilogue", (r(m, 2048), w_t.t()), relative=0.01)
+    _check(xc, "gemm_glu_epilogue", (h[0], r(4096, a, scale=1 / 32)), relative=0.01)
+    mod, pinned = r(1, 3 * a, scale=0.3, dtype=torch.float32), r(1, 3 * a, scale=0.3, dtype=torch.float32)
+    rows = torch.tensor([3], dtype=torch.int32, device="cuda")
+    pins = dict(pinned_modulation=pinned, pinned_rows=rows)
+    _check(xc, "modulated_rms_norm", (h, mod, 1e-6), kwargs=pins, relative=0.01)
+    _check(xc, "gated_residual_modulated_rms_norm", (h, r(1, m, a), r(1, m, a), mod, 1e-6), kwargs=pins,
+           relative=0.01)
+    residual, branch, gate = r(1, m, a), r(1, m, a), r(1, m, a)
+    got = (residual.clone(), branch.clone())
+    want = (residual.clone(), branch.clone())
+    double = dict(pinned_input_modulation=pinned, pinned_post_modulation=mod, pinned_rows=rows)
+    got_gate = xc.identity_layer_norms_(*got, gate, mod, pinned, 1e-6, **double)
+    want_gate = ops.registry.spec("identity_layer_norms_").reference(*want, gate, mod, pinned, 1e-6, **double)
+    assert xc.selection("identity_layer_norms_").library == "xcompute"
+    for x, y in zip((*got, got_gate), (*want, want_gate)):
+        assert float((x.float() - y.float()).norm() / y.float().norm()) < 0.01
+    angles = torch.rand(m, 32, device="cuda") * 20
+    caches = [torch.zeros(2, 2, p + m, 256, dtype=BF16, device="cuda") for _ in range(2)]
+    args = (h[0], r(5120, a, scale=1 / 32), r(256, scale=0.1), r(256, scale=0.1), angles.cos(), angles.sin())
+    got = xc.qkv_norm_rope_kvcache(*args, caches[0][0], caches[0][1], p, 8, 2, 256, 1e-6)
+    want = ops.registry.spec("qkv_norm_rope_kvcache").reference(*args, caches[1][0], caches[1][1], p, 8, 2, 256, 1e-6)
+    for x, y in ((got, want), (caches[0], caches[1])):
+        assert float((x.float() - y.float()).norm() / y.float().norm()) < 0.01
+    z, dof = r(1, m, 26, dtype=torch.float32), (torch.rand(1, m, 26, generator=g) > 0.2).float().cuda()
+    _check(xc, "flow_input_embed", (z, r(1, a, 52, scale=0.1, dtype=torch.float32)), kwargs=dict(extra=dof),
+           relative=1e-4)
+    _check(xc, "flow_velocity_euler", (z, h, r(26, a, scale=1 / 32, dtype=torch.float32), 0.1, dof,
+                                       r(1, m, 26, dtype=torch.float32), rows, r(1, m, 26, dtype=torch.float32)),
+           relative=1e-4)

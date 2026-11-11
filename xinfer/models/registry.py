@@ -13,6 +13,7 @@ PLUGIN_GROUP = "xinfer.models"
 
 _BUILTIN = {
     "wall_oss": "xinfer.models.wall_oss.model:WallOSS",
+    "wallx2b": "xinfer.models.wallx2b.model:Wallx2b",
 }
 
 

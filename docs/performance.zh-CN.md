@@ -2,7 +2,7 @@
 
 [English](performance.md) | 简体中文
 
-各服务配置当前的单请求时延和单卡容量，均用 `benchmarks/performance.py` 按同一口径测得（[基准测试](benchmark.zh-CN.md#性能表)）。各阶段的拆分和精度结果见每个模型的验证页。
+表中是 Wall-OSS 在单个 GPU 上的单请求时延和服务容量，使用 `benchmarks/performance.py` 按[性能表测试口径](benchmark.zh-CN.md#性能表)测得。分阶段时延和精度结果见 [Wall-OSS 验证](models/wall_oss_validation.zh-CN.md)。
 
 | # | 模型 | 精度、组合 | GPU | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 饱和吞吐 | 精度门禁 |
 |---|---|---|---|---|---|---|---|---|---|
