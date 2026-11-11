@@ -43,6 +43,7 @@ class _Library:
 
         self.path = str(Path(path).resolve(strict=True))
         self.sha256 = hashlib.sha256(Path(self.path).read_bytes()).hexdigest()
+        self._tvm_ffi = tvm_ffi
         self._module = tvm_ffi.load_module(self.path)
         self._fns = {}
 
@@ -60,9 +61,14 @@ class _Library:
             self._fns[name] = self._module.get_function(name)
         return self._fns[name]
 
+    def call(self, name, *args):
+        """Call a library function on the current torch stream."""
+        with self._tvm_ffi.use_torch_stream():
+            return self.function(name)(*args)
+
 
 def _import():
-    """``(package, archs, version)`` of the usable xcompute build, or None (the reason is logged).
+    """``(package, library, archs, version)`` of the usable xcompute build, or None (the reason is logged).
 
     Raises:
         FileNotFoundError: ``$XINFER_XCOMPUTE_LIBRARY`` does not exist.
@@ -79,7 +85,7 @@ def _import():
         logger.info("xcompute is not available: %s has no Python package of its build with the unified entries, or "
                     "targets no architecture", library.path)
         return None
-    return package, archs, f"unified xcompute.so sha256:{library.sha256[:12]}"
+    return package, library, archs, f"unified xcompute.so sha256:{library.sha256[:12]}"
 
 
 def _package_library() -> str | None:
@@ -117,6 +123,13 @@ def target_archs(library) -> tuple[str, ...]:
     return tuple(f"sm{arch}" for arch in str(library.function("build_target_archs")()).split(",") if arch.isdigit())
 
 
-xc, archs, version = _import() or (None, (), None)
+xc, library, archs, version = _import() or (None, None, (), None)
 # ``register`` arguments of every operator that calls xcompute
 XCOMPUTE = dict(requires=xc, platforms=archs, version=version)
+
+
+def xcompute_with(*entries, functions=()):
+    """Register a kernel only when this xcompute build exports the additional entries it uses."""
+    available = (xc is not None and all(hasattr(xc, name) for name in entries)
+                 and (not functions or library is not None and all(library.has_function(name) for name in functions)))
+    return dict(XCOMPUTE, requires=xc if available else None)

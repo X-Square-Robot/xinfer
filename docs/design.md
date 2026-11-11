@@ -25,7 +25,7 @@ The performance and validation guides document the conditions of each Wall-OSS m
 | Kernels | Stay in the existing xcompute repository, owned by the operator team; XInfer integrates through the xcompute binding in the ops layer |
 | Operator binding | xcompute uses TVM-FFI by default; where there is a concrete PyTorch compile or export need, `torch.library` adapters are added as needed and reuse the underlying implementation (§14.2) |
 | Deployment scenario | Each accelerator runs a model instance serving one or more robots. |
-| Bundled model | Wall-OSS |
+| Bundled models | Wall-OSS and Wall-X 2B |
 | First hardware | RTX 5090 (sm120), Jetson Thor (sm110) |
 | GPU process layout | Default `colocated`: one Engine per GPU, with Vision / Prefill / Action in one process; v1 implements only this layout, `split` is not implemented for now |
 | Stage and deployment boundary | Logical stages are separate from the process mapping; StageGraph declares computation and dependencies, and the runtime decides which process a stage runs in (§9.3) |
@@ -55,7 +55,7 @@ The other sections describe the target design. The table below shows how far eac
 | §9.2 Frontend processes | Implemented | 2 processes by default, SO_REUSEPORT, 4 processing threads per process; shared memory plus pipe notification (not ZMQ); does not initialize CUDA, but imports torch. In-process calls are provided by `Policy` |
 | §10 Configuration resolution | Partially implemented | Explicit value > tuning table > model / platform rules > default, with the source of each item printed at startup (docs/configuration.md); no tuning tables ship with the package yet; `xinfer tune`, memory-planner input to derivation, and `Platform.derive` / `validate` are not implemented |
 | §11 Model integration | Implemented | Models declare stages, handoff tensors, capabilities, input and output processing, and shape buckets. The frontend imports the model class's `build_processors`; the engine calls the model's `pad` hook for warmup. |
-| §11.4 Bundled model | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the quick100 gate. |
+| §11.4 Bundled models | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the quick100 gate. Wall-X 2B uses a Qwen3.5 backbone and supports RTC on the desktop dual-arm robot. |
 | §12 Quantization | Partially implemented | The framework supports per-group `QuantConfig`. Wall-OSS runs in BF16. MXFP8 and NVFP4 have PyTorch reference operators. See [quantization](quantization.md). |
 | §13 Platform | Partially implemented | Only device capability descriptions and CUDA / CPU resolution (`xinfer/platforms/`); streams, events, copy primitives, `register_host` (`frontend/shm.py` currently calls `cudaHostRegister` directly), `classify_error`, `derive` / `validate` and plugin activation are not implemented; Thor (sm110) is unverified |
 | §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI) and flash-attn, registered by the `cuda` backend modules and loaded with the `xinfer.ops` entry points (§14.2); `xinfer.ops.conformance` is not implemented |
@@ -471,9 +471,11 @@ The Frontend imports only processing, never model code; only the Engine imports 
 | Sampler | flow-matching Euler; RTC (frozen prefix) | — |
 | Preprocessing | Multi-camera images, normalizers, prompt templates | — |
 
-### 11.4 Bundled model
+### 11.4 Bundled models
 
 Wall-OSS uses a Qwen2.5-VL vision tower, a prefill expert and a flow-matching action expert. See the [Wall-OSS design](models/wall_oss_design.md) for tensor layouts, execution stages and numerical configurations.
+
+Wall-X 2B pairs a Qwen3.5 vision encoder and hybrid language backbone with a flow-matching action expert. For the checkpoint layout, desktop dual-arm protocol and serving command, see the [Wall-X 2B guide](models/wallx2b.md).
 
 ---
 

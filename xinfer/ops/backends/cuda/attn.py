@@ -24,8 +24,18 @@ order), deterministic, graph safe. ``varlen_attention``
 takes ``cu_seqlens`` as a host sequence; its device copy is created on the
 first (eager) call for each layout and reused, also inside captured graphs.
 
-xcompute (``_xcompute``): ``prefix_kvcache_attention`` on the cache shapes and options its kernel
-supports (``attention_kvcache_backend``); it runs other calls on the reference itself.
+xcompute (``_xcompute``), each on the shapes and options its kernel lists (asked once per shape on the first, eager
+call); the other calls run on the reference:
+
+| operator | xcompute entry | other calls |
+|---|---|---|
+| ``prefix_kvcache_attention`` | ``attention_kvcache`` | reference |
+| ``segment_attention`` | ``attention_varlen`` (segment layout on the host) | reference |
+| ``gated_causal_attention`` | ``attention_varlen`` with the gate | reference |
+| ``gated_kvcache_attention`` | ``attention_kvcache`` with the gate | ``attention_kvcache``, then ``sigmoid_gate_mul_inplace`` |
+| ``gated_delta_net`` | ``gated_delta_rule_prefill`` | one sequence with heads of 128 only (ValueError) |
+
+Contracts against the torch references: tolerance.
 """
 
 from __future__ import annotations
@@ -34,7 +44,8 @@ import os
 
 import torch
 
-from xinfer.ops.backends._xcompute import XCOMPUTE, xc
+from xinfer.ops import reference
+from xinfer.ops.backends._xcompute import XCOMPUTE, xc, xcompute_with
 from xinfer.ops.reference import fused
 from xinfer.ops.registry import register
 
@@ -213,34 +224,80 @@ def action_attention(q, k, v, k_prompt, v_prompt, num_pinned, prompt_lengths=Non
     return out.reshape(b, n, heads, d)
 
 
-def _kvcache_options(prefix_len, new_pos, flash_mask, scale) -> dict:
-    return dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
+_listed = {}  # (entry, shapes, options) -> whether the entry's kernel list takes the call
 
 
-_listed = {}  # (q shape, cache shape, new_pos, has mask) -> whether the attention kernel takes them
+def _takes(entry, probe, key, *args, **kwargs) -> bool:
+    """Whether ``probe(*args, **kwargs)``, an xcompute ``*_backend`` query, finds a kernel (it raises ValueError
+    otherwise).
 
-
-def _kvcache_listed(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale) -> bool:
-    """Whether the attention kernel supports these cache shapes and options (it raises ValueError otherwise).
-
-    Asked once per key, on its first (eager) call: the engine runs every new graph key before capturing it.
+    Asked once per ``(entry, key)``, on its first (eager) call: the engine runs every new graph key before capturing it.
     """
-    key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
-    if key not in _listed:
+    if (entry, key) not in _listed:
         try:
-            xc.attention_kvcache_backend(q, k_cache, v_cache,
-                                         **_kvcache_options(prefix_len, new_pos, flash_mask, scale))
-            _listed[key] = True
+            probe(*args, **kwargs)
+            _listed[entry, key] = True
         except ValueError:
-            _listed[key] = False
-    return _listed[key]
+            _listed[entry, key] = False
+    return _listed[entry, key]
 
 
 @register("prefix_kvcache_attention", backend="cuda", **XCOMPUTE)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
-    if not _kvcache_listed(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):
+    options = dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
+    key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
+    if not _takes("kvcache", xc.attention_kvcache_backend, key, q, k_cache, v_cache, **options):
         return fused.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask,
                                               scale=scale)
     b, m = q.shape[:2]
-    out = xc.attention_kvcache(q, k_cache, v_cache, **_kvcache_options(prefix_len, new_pos, flash_mask, scale))
-    return out.reshape(b, m, -1)
+    return xc.attention_kvcache(q, k_cache, v_cache, **options).reshape(b, m, -1)
+
+
+_segment_layouts = {}  # (segment bounds, heads, head_dim) -> whether attention_varlen's kernel list takes the layout
+
+
+@register("segment_attention", backend="cuda", **xcompute_with("attention_varlen", "attention_varlen_backend"))
+def segment_attention(q, k, v, cu_seqlens, *, scale=None):
+    bounds = tuple(cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else cu_seqlens)
+    cu = torch.tensor(bounds, dtype=torch.int32)  # on the host: the backend plans its work per segment layout
+    longest = max(end - start for start, end in zip(bounds[:-1], bounds[1:]))
+    key = (bounds, *q.shape[1:])
+    if key not in _segment_layouts:
+        try:
+            xc.attention_varlen_backend(q, k, v, cu_seqlens=cu, max_seqlen=longest)
+            _segment_layouts[key] = True
+        except ValueError:
+            _segment_layouts[key] = False
+    if not _segment_layouts[key]:
+        return reference.varlen_attention(q, k, v, bounds, scale=scale)
+    return xc.attention_varlen(q, k, v, cu_seqlens=cu, max_seqlen=longest, softmax_scale=scale).view(q.shape)
+
+
+@register("gated_causal_attention", backend="cuda", **xcompute_with("attention_varlen", "attention_varlen_backend"))
+def gated_causal_attention(q, k, v, gate, *, scale=None):
+    options = dict(seg_len=q.shape[0], causal=True, out_gate=gate, gate_act="sigmoid")
+    if not _takes("varlen", xc.attention_varlen_backend, (q.shape, k.shape), q, k, v, **options):
+        return fused.gated_causal_attention(q, k, v, gate, scale=scale)  # no kernel listed for these heads
+    return xc.attention_varlen(q, k, v, softmax_scale=scale, pdl=False, **options)
+
+
+@register("gated_kvcache_attention", backend="cuda", **xcompute_with("sigmoid_gate_mul_inplace"))
+def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
+    options = dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
+    key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
+    if _takes("kvcache_gated", xc.attention_kvcache_backend, key, q, k_cache, v_cache, out_gate=gate,
+              gate_act="sigmoid", **options):
+        return xc.attention_kvcache(q, k_cache, v_cache, out_gate=gate, gate_act="sigmoid", **options)
+    o = xc.attention_kvcache(q, k_cache, v_cache, **options)  # no gated kernel for these heads
+    return xc.sigmoid_gate_mul_inplace(o.reshape(gate.shape), gate, round_sigmoid=True)
+
+
+@register("gated_delta_net", backend="cuda", **xcompute_with("gated_delta_rule_prefill"))
+def gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim,
+                    head_v_dim, eps):
+    b, n, _ = qkv.shape
+    if b != 1 or head_k_dim != 128 or head_v_dim != 128 or zba.shape[-1] != num_v_heads * (head_v_dim + 2):
+        raise ValueError("xcompute gated_delta_rule_prefill takes one sequence with heads of 128")
+    out = xc.gated_delta_rule_prefill(qkv.reshape(n, -1), zba.reshape(n, -1), conv_weight, A_log, dt_bias,
+                                      norm_weight, num_k_heads=num_k_heads, eps=float(eps))
+    return out.view(1, n, -1)

@@ -77,8 +77,9 @@ finally:
 | 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
 |---|---|---|---|---|
 | Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
+| Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
-各配置的单请求时延和单卡机器人数：[性能](docs/performance.zh-CN.md)。
+Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。Wall-OSS 的单请求时延和单卡机器人数见[性能表](docs/performance.zh-CN.md)。
 
 | 硬件 | 设备 | 运行时 |
 |---|---|---|

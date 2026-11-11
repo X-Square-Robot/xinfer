@@ -4,7 +4,7 @@ Read [docs/design.md](docs/design.md),
 including its implementation-status section, before proposing implementation
 changes.
 
-The GitHub distribution ships only Wall-OSS. When syncing from upstream, import reviewed changes for the framework and this model.
+The GitHub distribution ships Wall-OSS and Wall-X 2B. When syncing from upstream, import reviewed changes for the framework and these models.
 
 ## Scope and architecture
 

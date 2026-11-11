@@ -2,7 +2,7 @@
 
 English | [简体中文](kernels.zh-CN.md)
 
-The default Wall-OSS BF16 composition uses xcompute's fused operators on CUDA. XInfer can run the same composition using PyTorch reference implementations when a compatible xcompute build is unavailable. Install the optional `flash-attn` package for vision and prompt attention.
+The default BF16 compositions for Wall-OSS and Wall-X 2B use xcompute's fused operators on CUDA. XInfer can run the same composition using PyTorch reference implementations when a compatible xcompute build is unavailable. Install the optional `flash-attn` package for vision and prompt attention.
 
 The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the xcompute and flash-attn libraries and load the same way as extensions in the `xinfer.ops` entry point group ([registration](design.md#142-backend-registration-and-selection)). Operators whose library does not import run on their torch references, and a warning lists the slow ones; `XINFER_OPS_STRICT=1` makes that warning an error. For example, set `XINFER_FLASH_ATTN=0` to skip flash-attn at load time.
 
@@ -12,7 +12,7 @@ The xcompute build must target the architecture of the serving GPU. Check `xcomp
 
 ## Install and select a build
 
-Install a matching xcompute Python package and shared library from your provider. Neither is bundled with XInfer. For BF16, use a build with the unified GEMM, attention and norm entries. For weight packing, use a build that provides `prepack_weight(layout="kn")`. If using a CUDA 13 source build, install the `apache-tvm-ffi` Python package in the same environment and compile for the deployment GPU.
+Install a matching xcompute Python package and shared library from your provider. Neither is bundled with XInfer. For BF16, use a build with the unified GEMM, attention and norm entries. A build that supports `prepack_weight(layout="kn")` uses transposed weights without copying. Older builds copy these weights to a contiguous tensor. Wall-X 2B selects its additional CUDA operators individually when the build provides their entry points. If using a CUDA 13 source build, install the `apache-tvm-ffi` Python package in the same environment and compile for the deployment GPU.
 
 ## Run
 
