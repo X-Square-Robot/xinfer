@@ -42,7 +42,7 @@ Single-robot latency over the network, including the frontend, is
 
 `robot_load.py` loads a running WebSocket + msgpack service with
 virtual robots and reports latency per round. It needs only the client
-libraries (OpenCV for the synthetic Wall-OSS observations), not XInfer itself:
+libraries, including OpenCV for the synthetic observations:
 
 ```bash
 python -m pip install numpy 'websockets>=12' msgpack msgpack-numpy opencv-python-headless
@@ -73,7 +73,7 @@ arrangements, so two builds are compared round by round.
 
 The requests depend on the model:
 
-- **Wall-OSS (default):** synthetic observations, with two 640×480 JPEG wrist views, a raw 1280×720 head view and
+- **Wall-OSS and Wall-X 2B** use the default synthetic desktop observations, with two 640×480 JPEG wrist views, a raw 1280×720 head view and
   random arm poses (xyz within 0.5 m, roll/pitch/yaw within π, gripper 0..1). Wall-OSS writes the state into its
   prompt as text, so the prompt length varies, as with real robots (739–756 tokens for 200 random poses). After the
   first response each request carries RTC fields:
@@ -82,8 +82,8 @@ The requests depend on the model:
     1..`--max-inference-delay` model steps, plus two;
   - `num_flow_steps`: the flow steps the service's metadata frame declares (`flow_steps`, or `rtc.num_flow_steps`),
     else 5.
-- **Models without RTC (`--requests-file`):** robot *r* sends request (*r* + *k*) mod *n* of the
-  given files as its *k*-th request, without RTC fields. A request file is JSON (`.json`) or msgpack and holds one
+- **Recorded requests (`--requests-file`).** Robot *r* sends request (*r* + *k*) mod *n* of the
+  given files as its *k*-th request. It replays each request as supplied. A request file is JSON (`.json`) or msgpack and holds one
   request map or a list of them, as for `xinfer-serve --warmup`.
 
 The repository's load convention: 80 requests per robot, the first 20 as
@@ -112,9 +112,8 @@ warmup covers the requests' shapes.
 
 Statistics use the steady rows: each robot's requests after its first
 `--warmup-requests`. Errors are counted over all rows. A response is an error
-when it has an `error` or a `status` other than `"ok"`, or, for Wall-OSS, when
-it carries no absolute poses. A robot whose connection fails stops, and its
-remaining rows count as missing.
+when it has an `error` or a `status` other than `"ok"`, or when the default synthetic workload receives no valid absolute arm poses.
+A robot whose connection fails stops, and its remaining rows count as missing.
 
 - **`client_ms`**: from just before the request is serialized until the
   response has been received. It excludes building the observation
@@ -126,15 +125,11 @@ underflow. A robot sends at most one request per 180 ms, so a throughput below
 5.6 req/s per robot means that the service no longer keeps up. The exit status
 is 0 when no round has errors or missing rows.
 
-**Single-GPU capacity** is the largest robot count whose rounds all have no
-errors or missing rows and a steady `server_infer_ms` P50 below 150 ms, with
-every smaller count meeting the same rule. Measure each count on a newly
-started service, and report each round separately.
+`robot_load.py` reports each round separately. Use `performance.py` to start a fresh service for each robot count and apply the [capacity rule](#performance-table).
 
 ## Performance table
 
-[docs/performance.md](performance.md) lists each serving configuration's current single-request latency and
-single-GPU capacity. `benchmarks/performance.py` measures one row on the visible GPU, which must run nothing else:
+The [performance table](performance.md) reports Wall-OSS and Wall-X 2B on an RTX 5090. Run `benchmarks/performance.py` on an idle GPU with a compatible checkpoint and representative wire requests.
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "Wall-OSS" --model wall_oss \
@@ -142,18 +137,25 @@ CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "Wall-OSS" --mode
   --warmup flow.msgpack rtc.msgpack --robots 3 4 5 --out artifacts/perf-wall-oss
 ```
 
+For Wall-X 2B, supply your own `requests.msgpack` in the [desktop request format](models/wallx2b.md#request-and-response) and one flow and one RTC request for service warmup. The published row used a set of 216 requests for the single-request benchmark. The load client generates its own desktop traffic and sends a shifted action chunk after the first response.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python benchmarks/performance.py --name "Wall-X 2B" --model wallx2b \
+  --checkpoint /path/to/wallx2b-checkpoint --latency-requests requests.msgpack \
+  --warmup flow.msgpack rtc.msgpack --robots 14 15 16 --out artifacts/perf-wallx2b
+```
+
 - **Single request:** `request_latency.py` on the model's request set (50 runs after 5 warmup runs), with the views
   decoded and resized on the device (`image_preprocess_device="gpu"`, `Policy`'s default). An
   `image_preprocess_device` in `--model-options` applies to this part and to the load.
 - **Load:** for each robot count, in increasing order, a newly started `xinfer-serve` with the default settings and
   the model's warmup files, then `robot_load.py` with the repository convention (80 requests per robot, the first 20
-  dropped, 8 rounds with random start phases). A model with real-time chunking gets the synthetic desktop observations with RTC (the default
-  workload); a model without gets its request set (`--load-requests`). The script stops after the first count that
-  fails.
+  dropped, 8 rounds with random start phases). The default workload sends synthetic desktop observations with RTC for both
+  Wall-OSS and Wall-X 2B. Passing `--load-requests` replays the supplied requests. The script stops at the first
+  robot count that fails.
 - **Capacity:** the largest count with no error or missing row in any round and a median round server P50 (the
   median over the 8 rounds of each round's P50) below 150 ms, with every smaller measured count passing too. The
-  table gives that count's median round P50 and P95; `row.json` also records the worst round. The saturation
-  throughput is the highest completed rate measured.
+  table gives that count's median round P50 and P95; `row.json` also records the worst round. If the highest tested count passes, the script reports a lower bound (`≥`). Saturation throughput is the highest completed request rate observed in any round at any measured count.
 - **Output:** `row.json` with every number, the configuration, the environment and the machine's load before and
   after each count, and the table row on standard output.
 

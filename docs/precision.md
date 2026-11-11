@@ -2,6 +2,8 @@
 
 English | [简体中文](precision.zh-CN.md)
 
+Wall-X 2B uses an open-loop evaluation at RTC delays 0, 3 and 6. Its [validation results](models/wallx2b_validation.md) cover the optimized and reference compositions.
+
 A change that can alter Wall-OSS outputs must pass the embodied-serving
 quick100 gate, the gate the Wall-X 4B service was admitted with.
 

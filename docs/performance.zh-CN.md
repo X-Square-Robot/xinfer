@@ -2,22 +2,26 @@
 
 [English](performance.md) | 简体中文
 
-表中是 Wall-OSS 在单个 GPU 上的单请求时延和服务容量，使用 `benchmarks/performance.py` 按[性能表测试口径](benchmark.zh-CN.md#性能表)测得。分阶段时延和精度结果见 [Wall-OSS 验证](models/wall_oss_validation.zh-CN.md)。
+2026 年 11 月 9 日，上游使用 `benchmarks/performance.py`，按[同一测试口径](benchmark.zh-CN.md#性能表)在单张 RTX 5090 上测量了 Wall-OSS 和 Wall-X 2B 的 BF16 优化组合。
 
 | # | 模型 | 精度、组合 | GPU | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 饱和吞吐 | 精度门禁 |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | Wall-OSS | BF16，优化组合 | RTX 5090 | 49.2 ms | 4 | 117 ms | 125 ms | 26.3 req/s | quick100 B1 −6.58 %：PASS |
+| 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 15 | 144 ms | 155 ms | 83.3 req/s | 对 HarriX 开环：PASS |
 
-- **单请求：** 进程内（`Policy`）从传输格式的请求到响应，视图在设备上解码和 resize。
-- **单卡机器人数：** 在 `xinfer serve` 默认设置下（视图在 CPU 上处理），8 轮（机器人起步相位随机）中没有错误、且各轮服务端 P50 的中位数低于 150 ms 的最大机器人数。P50 和 P95 两列给出该机器人数各轮的中位数。
-- **饱和吞吐：** 测得的最高完成速率，单位为每秒请求数。
+- **单请求 P50** 包括进程内从请求处理、GPU 图像解码与缩放、模型推理到生成响应的时间。图预热后依次运行输入集中的请求，丢弃前 5 次，对随后 50 次计时取中位数。
+- **单卡机器人数**是通过容量测试的最大实测机器人数。每档运行 8 轮，机器人随机起步，服务在 CPU 上处理图像。所有轮都须无错误、无缺失响应，且各轮服务端 P50 的中位数低于 150 ms。表中 P50 和 P95 分别是该档各轮对应分位数的中位数。
+- **饱和吞吐**是所有实测机器人数和轮次中最高的稳态请求完成率。
 
 ## 条件
 
 所有行：RTX 5090（SM120），torch 2.10.0+cu130，flash-attn 2.8.3.post1，xcompute `7336b0d`（`xcompute.so` sha256 `d061051e…`），于 2026-11-09 测量，GPU 上没有其他任务。
 
-| # | 模型选项 | 单请求的请求集 | 压测负载 | 预热 | 验证 |
+| # | 模型选项 | 单请求输入集 | 压测负载 | 服务预热 | 验证 |
 |---|---|---|---|---|---|
 | 1 | 默认 | x2robot dummy 客户端的一个普通请求和一个 RTC 请求（一路 1280×720 原始前视图、两路 640×480 JPEG 腕部视图） | 带 RTC 的合成桌面观测 | 同样的两个请求 | [Wall-OSS](models/wall_oss_validation.zh-CN.md) |
+| 2 | 默认 | 参考抓包中的 216 个请求（三路机器人相机 JPEG） | 带 RTC 的合成桌面观测 | 其中两个请求 | [Wall-X 2B](models/wallx2b_validation.zh-CN.md) |
 
-另见 [Wall-OSS 验证](models/wall_oss_validation.zh-CN.md)，其中记录了延迟、精度结果及测量条件。
+上游测试 Wall-X 2B 时，通过 xcompute 的 SM120 专用接口直接复用了转置的 GEMM 权重。GitHub 移植版使用新版 `layout="kn"` 接口，在 xcompute `7336b0d` 上会复制这些权重。移植版的时延和容量尚未复测。
+
+这两行的延迟样本、逐轮负载统计和服务配置记录在上游基准归档 `xinfer-xcompute-main-20261109.tar.gz`（SHA-256 `a15e9f7632b36be4c2f0b86dc9aa05a0314012865387796c614f63192ab40ee4`）。

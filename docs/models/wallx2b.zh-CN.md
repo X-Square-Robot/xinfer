@@ -4,6 +4,8 @@
 
 在 CUDA GPU 上使用模型 ID `wallx2b` 加载 BF16 Wall-X 2B checkpoint。模型接收三路相机图像、桌面双臂机器人的状态和任务指令，每次预测双臂接下来 16 步的动作。实时分块（RTC）可固定上一轮预测中的部分动作，使相邻两轮预测在时间上重叠。
 
+RTX 5090 上的延迟、单卡服务容量和开环精度见[验证结果](wallx2b_validation.zh-CN.md)。
+
 ## Checkpoint 要求
 
 请自行准备兼容的 checkpoint 目录。仓库提供推理代码。下列文件应来自同一次训练导出：

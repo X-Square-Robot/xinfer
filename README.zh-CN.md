@@ -22,7 +22,7 @@
 
 - **快速。** 单请求时延低，每个加速器能服务更多机器人。异步阶段发射、设备事件以及（在支持的平台上）图回放降低了主机开销。阶段队列和零等待组批把排队中的兼容请求合并执行，共享权重，并让不同阶段的工作相互重叠。
 - **稳定。** 时延可预测，服务在机队负载下持续运行：服务前先预热，有准入限制，并对逐请求的故障进行隔离。
-- **准确。** 输出忠实于原始模型。不同批大小可能带来浮点舍入差异。Wall-OSS 的验证方法与结果见[精度门禁](docs/precision.zh-CN.md)。
+- **准确。** 输出忠实于原始模型。不同批大小可能带来浮点舍入差异。Wall-OSS 和 Wall-X 2B 的验证标准见[精度门禁](docs/precision.zh-CN.md)。
 - **可扩展。** 可复用的层和阶段接口简化了模型接入。平台适配器和算子适配器把模型代码接到新芯片和优化过的 kernel 上。
 
 ## 快速开始
@@ -79,7 +79,7 @@ finally:
 | Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
 | Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
-Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。Wall-OSS 的单请求时延和单卡机器人数见[性能表](docs/performance.zh-CN.md)。
+Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。两款模型在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)。
 
 | 硬件 | 设备 | 运行时 |
 |---|---|---|
@@ -107,8 +107,9 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 |---|---|
 | [单请求时延](benchmarks/request_latency.py) | 进程内的输入处理、引擎执行、输出处理耗时及总耗时 |
 | [机器人负载](benchmarks/robot_load.py) | 多台机器人并发流量下的客户端与服务端时延、吞吐、错误及动作队列下溢（underflow） |
+| [性能表测量脚本](benchmarks/performance.py) | 同一服务配置的单请求时延和单卡机器人数 |
 
-[基准测试指南](docs/benchmark.zh-CN.md)给出了命令和测量口径。各模型的结果与数值检查记录在 [Wall-OSS 验证](docs/models/wall_oss_validation.zh-CN.md)等页面中。
+命令和测量口径见[基准测试指南](docs/benchmark.zh-CN.md)。各阶段耗时和精度结果见 [Wall-OSS 验证](docs/models/wall_oss_validation.zh-CN.md)和 [Wall-X 2B 验证](docs/models/wallx2b_validation.zh-CN.md)。
 
 ## 文档
 
