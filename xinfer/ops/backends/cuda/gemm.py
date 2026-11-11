@@ -5,9 +5,10 @@ Stream-K GEMMs may differ at rounding level across runs (``deterministic=False``
 
 from __future__ import annotations
 
-from xinfer.ops.backends._xcompute import XCOMPUTE, xc
+from xinfer.ops.backends._xcompute import XCOMPUTE, xc, xcompute_with
 from xinfer.ops.registry import register
 
+_supports_kn = True
 _packed = {}  # (op, weight data_ptr, weight shape) -> packed weight, or None when packing does not help
 
 
@@ -29,8 +30,17 @@ def _listed_weight(op, x, weight, **options):
 
 
 def _kn(weight):
-    """A ``[N, K]`` view of ``[K, N]`` storage as a weight of xcompute's ``kn`` layout, sharing the storage."""
-    packed = xc.prepack_weight(weight, op="gemm", layout="kn")
+    """Share the transposed weight when xcompute supports ``kn``. Older builds need a dense ``[N, K]`` weight."""
+    global _supports_kn
+    if not _supports_kn:
+        return weight.contiguous()
+    try:
+        packed = xc.prepack_weight(weight, op="gemm", layout="kn")
+    except ValueError as exc:
+        if "layout= only takes 'nk_k64blk'" not in str(exc):
+            raise
+        _supports_kn = False
+        return weight.contiguous()
     if packed.tensors["w"].data_ptr() != weight.data_ptr():
         raise ValueError("xcompute packed the GEMM weight into a copy")
     return packed
@@ -62,6 +72,17 @@ def gemm_glu_epilogue(x, weight, *, bias=None, modulation=None, row_class=None, 
 def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim):
     return xc.qkv_proj_rope(x.contiguous(), weight, bias, rope_table=xc.pack_rope_table(cos, sin),
                             num_heads=num_heads, num_kv_heads=num_heads, head_dim=head_dim, backend="auto")
+
+
+@register("qkv_norm_rope_kvcache", backend="cuda", deterministic=False, **xcompute_with("QkNorm"))
+def qkv_norm_rope_kvcache(x, weight, q_weight, k_weight, cos, sin, k_cache, v_cache, start, num_heads,
+                          num_kv_heads, head_dim, eps):
+    return xc.qkv_proj_rope(
+        x.contiguous(), weight, cos=cos, sin=sin, rotary_dim=2 * cos.shape[-1], num_heads=num_heads,
+        num_kv_heads=num_kv_heads, head_dim=head_dim,
+        extra_cols=weight.shape[0] - (num_heads + 2 * num_kv_heads) * head_dim,
+        qk_norm=xc.QkNorm(q_weight, k_weight, float(eps), zero_centered=True),
+        kv_cache=(k_cache, v_cache, int(start)), backend="auto")
 
 
 @register("qkv_rope_kvcache", backend="cuda", deterministic=False, **XCOMPUTE)

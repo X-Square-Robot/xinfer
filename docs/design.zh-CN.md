@@ -25,7 +25,7 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 | kernel | 沿用现有 xcompute 仓库，由算子组负责；XInfer 通过 ops 层的 xcompute 绑定接入 |
 | 算子绑定 | xcompute 默认使用 TVM-FFI；有明确的 PyTorch 编译、导出需求时，按需增加 `torch.library` 适配并复用底层实现（§14.2） |
 | 部署场景 | 每个加速器运行一个模型实例，为一台或多台机器人提供服务。 |
-| 内置模型 | Wall-OSS |
+| 内置模型 | Wall-OSS、Wall-X 2B |
 | 首批硬件 | RTX 5090（sm120）、Jetson Thor（sm110） |
 | GPU 进程布局 | 默认 `colocated`：每 GPU 一个 Engine，Vision / Prefill / Action 同进程；v1 只实现这一布局，`split` 暂不实现 |
 | 阶段与部署边界 | 逻辑阶段与进程映射分离；StageGraph 声明计算与依赖，阶段的进程归属由运行时负责（§9.3） |
@@ -55,7 +55,7 @@ Wall-OSS 各项测量的条件见性能和验证指南。
 | §9.2 Frontend 进程 | 已实现 | 默认 2 个进程，SO_REUSEPORT，每个进程 4 个处理线程；共享内存加 pipe 通知（不是 ZMQ）；不初始化 CUDA，但 import torch。进程内调用由 `Policy` 提供 |
 | §10 配置解析 | 部分实现 | 显式值 > 调优表 > 模型 / 平台规则 > 默认值，启动时打印每项来源（docs/configuration.md）；目前没有随包发布的调优表；`xinfer tune`、显存规划器参与推导、`Platform.derive` / `validate` 未实现 |
 | §11 模型接入 | 已实现 | 模型声明阶段、交接张量、能力、输入输出处理和形状桶。前端通过模型类的 `build_processors` 构建处理器，引擎预热时调用模型的 `pad` 钩子。 |
-| §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过 quick100 门禁。 |
+| §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过 quick100 门禁。 Wall-X 2B 使用 Qwen3.5 骨干，支持桌面双臂 RTC。 |
 | §12 量化 | 部分实现 | 框架支持按模块组配置 `QuantConfig`。Wall-OSS 使用 BF16。MXFP8 和 NVFP4 具有 PyTorch 参考实现，详见[量化](quantization.zh-CN.md)。 |
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
 | §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn，由 `cuda` 后端模块注册，与 `xinfer.ops` entry point 一起加载（§14.2）；`xinfer.ops.conformance` 未实现 |
@@ -474,6 +474,8 @@ Frontend 只导入 processing，不导入模型代码；Engine 才导入 model�
 ### 11.4 内置模型
 
 Wall-OSS 使用 Qwen2.5-VL 视觉塔、prefill 专家和流匹配动作专家。张量布局、执行阶段和数值配置见 [Wall-OSS 设计](models/wall_oss_design.zh-CN.md)。
+
+Wall-X 2B 将 Qwen3.5 视觉编码器、混合注意力语言骨干与流匹配动作专家组合在一起。兼容 checkpoint 所需文件、桌面双臂协议和服务命令见 [Wall-X 2B 指南](models/wallx2b.zh-CN.md)。
 
 ---
 

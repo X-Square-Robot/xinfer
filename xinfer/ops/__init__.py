@@ -147,6 +147,59 @@ for _spec in (
         "mxfp8_gemm_residual(a_q, a_scales, w_q, w_scales, residual_bf16[M, N], bias=None) -> bf16[M, N]",
         mxfp8.gemm_residual,
     ),
+    # Fused vision, language and action operators for Wall-X 2B.
+    OpSpec("layer_norm_cast", "layer_norm_cast(x, weight, bias, eps) -> x.dtype  # FP32 inside",
+           fused.layer_norm_cast),
+    OpSpec("zero_centered_rms_norm", "zero_centered_rms_norm(x, w, eps) -> x̂·(1 + w)  # FP32, one rounding",
+           fused.zero_centered_rms_norm),
+    OpSpec("add_zero_centered_rms_norm",
+           "add_zero_centered_rms_norm(x, residual, w, eps) -> (residual + x, zero_centered_rms_norm(·))",
+           fused.add_zero_centered_rms_norm),
+    OpSpec("gated_delta_net",
+           "gated_delta_net(qkv[B, L, C], zba[B, L, HvDv + 2Hv], conv_weight[C, Kc], A_log, dt_bias, norm_weight,"
+           " num_k_heads, num_v_heads, head_k_dim, head_v_dim, eps) -> [B, L, HvDv]  # zero initial state",
+           fused.gated_delta_net),
+    OpSpec("pos_embed_interp", "pos_embed_interp(weight[G², C], grids, merge_size) -> [N, C]  # bilinear, one rounding",
+           fused.pos_embed_interp),
+    OpSpec("rot_pos", "rot_pos(inv_freq[F], grids, merge_size) -> fp32 [N, 2F]  # [row·f | col·f]",
+           fused.rot_pos),
+    OpSpec("rope_full", "rope_full(q[B, L, H, D], k[B, L, KV, D], cos[B|1, L, R/2], sin, rotary_dim) -> (q, k)",
+           fused.rope_full),
+    OpSpec("qkv_norm_split",
+           "qkv_norm_split(packed[B, L, 2HD + 2KVD], q_weight, k_weight, num_heads, num_kv_heads, head_dim, eps)"
+           " -> (q, k, v, gate)  # [q_h | gate_h] per head, then K, V",
+           fused.qkv_norm_split),
+    OpSpec("segment_attention",
+           "segment_attention(q[T, H, D], k, v, cu_seqlens, *, scale=None) -> [T, H, D]"
+           "  # varlen_attention's function on xcompute's attention_varlen",
+           fused.segment_attention),
+    OpSpec("gated_causal_attention",
+           "gated_causal_attention(q[T, H, D], k[T, KV, D], v, gate[T, HD], *, scale=None) -> attention·sigmoid(gate)",
+           fused.gated_causal_attention),
+    OpSpec("gated_kvcache_attention",
+           "gated_kvcache_attention(q[B, M, H, D], k_cache[B, L, KV, D], v_cache, prefix_len[B], new_pos,"
+           " gate[B, M, HD], *, flash_mask=None, scale=None) -> attention·sigmoid(gate)"
+           "  # keys [0, prefix) ∪ [new_pos, new_pos + M)",
+           fused.gated_kvcache_attention),
+    OpSpec("flow_input_embed",
+           "flow_input_embed(x[B, M, A] fp32, weight[heads, N, 2A] fp32, head_index=None, extra=None,"
+           " input_mask=None, addends=(), override=None, override_mask=None) -> bf16[B, M, N]",
+           fused.flow_input_embed),
+    OpSpec("modulated_rms_norm",
+           "modulated_rms_norm(x[B, L, K], modulation[B, 3K], eps, pinned_modulation=None, pinned_rows=None)"
+           " -> (normed, gate[B, 1 or L, K])", fused.modulated_rms_norm),
+    OpSpec("gated_residual_modulated_rms_norm",
+           "gated_residual_modulated_rms_norm(residual[B, L, K], branch, branch_gate, modulation[B, 3K], eps,"
+           " pinned_modulation=None, pinned_rows=None) -> (normed, gate, residual + branch·branch_gate)",
+           fused.gated_residual_modulated_rms_norm),
+    OpSpec("identity_layer_norms_",
+           "identity_layer_norms_(residual[B, L, K], branch, branch_gate, input_modulation[B, 3K],"
+           " post_modulation[B, 3K], eps, pinned_input_modulation=None, pinned_post_modulation=None,"
+           " pinned_rows=None) -> gate  # residual and branch updated in place", fused.identity_layer_norms_),
+    OpSpec("qkv_norm_rope_kvcache",
+           "qkv_norm_rope_kvcache(x[M, K], weight[(H + 2KV)D + G, K], q_weight[D], k_weight[D], cos[M, R/2],"
+           " sin, k_cache[KV, rows, D], v_cache, start, H, KV, D, eps) -> [M, HD + G]  # K/V written in place",
+           fused.qkv_norm_rope_kvcache),
     # Fused BF16 operators used by Wall-OSS.
     OpSpec("gemm_epilogue",
            "gemm_epilogue(x[M, K], weight[N, K], bias[N]=None, *, activation=None, residual=None, residual_gate[R, N]"

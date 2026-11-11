@@ -2,7 +2,7 @@
 
 [English](kernels.md) | 简体中文
 
-Wall-OSS 默认的 BF16 组合在 CUDA 上使用 xcompute 融合算子。没有兼容的 xcompute 构建时，XInfer 用 PyTorch 参考实现运行同一组合。安装可选的 `flash-attn` 包可启用视觉和 prompt 注意力的优化实现。
+Wall-OSS 和 Wall-X 2B 默认的 BF16 组合在 CUDA 上使用 xcompute 融合算子。没有兼容的 xcompute 构建时，XInfer 用 PyTorch 参考实现运行同一组合。安装可选的 `flash-attn` 包可启用视觉和 prompt 注意力的优化实现。
 
 内置的 `cuda` 后端模块（`xinfer/ops/backends/cuda/`）调用 xcompute 和 flash-attn 库，与 `xinfer.ops` 入口点中的扩展以同样方式加载（[注册](design.zh-CN.md#142-后端注册与选择)）。库 import 失败时，相应算子运行 torch 参考实现，并由一条告警列出变慢的算子；设置 `XINFER_OPS_STRICT=1` 时这条告警变成错误。例如，设置 `XINFER_FLASH_ATTN=0` 会在加载时跳过 flash-attn。
 
@@ -12,7 +12,7 @@ xcompute 构建必须支持服务所用 GPU 的架构。可通过 `xcompute.buil
 
 ## 安装与选择构建
 
-从提供方获得相互匹配的 xcompute Python 包与动态库并安装；XInfer 发行包不包含它们。BF16 需要统一的 GEMM、注意力和归一化接口。权重预打包需要提供 `prepack_weight(layout="kn")` 的构建。若从源码构建 CUDA 13 版本，请在同一环境安装 `apache-tvm-ffi`，并针对部署 GPU 编译。
+从提供方获得相互匹配的 xcompute Python 包与动态库并安装；XInfer 发行包不包含它们。BF16 需要统一的 GEMM、注意力和归一化接口。支持 `prepack_weight(layout="kn")` 的构建可以直接使用转置权重；旧版构建会把这些权重复制到连续张量中。Wall-X 2B 会逐项检查当前构建是否提供所需入口，选择可用的 CUDA 算子。若从源码构建 CUDA 13 版本，请在同一环境安装 `apache-tvm-ffi`，并针对部署 GPU 编译。
 
 ## 运行
 

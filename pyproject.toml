@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Tokenization, image processing, and pose conversion for Wall-OSS.
+# Tokenization, image processing, and pose conversion for Wall-OSS and Wall-X 2B.
 models = [
     "tokenizers>=0.19",
     "opencv-python-headless>=4.10",

@@ -18,6 +18,15 @@ def _meta_param(*shape: int) -> nn.Parameter:
     return nn.Parameter(torch.empty(*shape, device="meta"), requires_grad=False)
 
 
+class ParamGroup(nn.Module):
+    """A named group of meta parameters ``{name: shape}``."""
+
+    def __init__(self, **shapes):
+        super().__init__()
+        for name, shape in shapes.items():
+            setattr(self, name, _meta_param(*shape))
+
+
 class Linear(nn.Module):
     """A linear layer whose method (unquantized, MXFP8, ...) comes from the active QuantConfig.
 

@@ -43,13 +43,17 @@ Use Python 3.10+ and a PyTorch build matched to your accelerator. These examples
 python -m pip install -e ".[models,serve]"
 ```
 
-Bring a compatible checkpoint with its tokenizer, configuration, and normalization assets. Replace MODEL_ID in the examples with a registered model ID.
+The default Wall-X 2B BF16 path uses **xcompute**. Install a build for your CUDA GPU and
+check the selected backends in the [kernel guide](docs/kernels.md). If the build is unavailable,
+XInfer uses the slower PyTorch reference implementations.
+
+The examples use BF16 and require a [compatible Wall-X 2B checkpoint](docs/models/wallx2b.md#checkpoint-requirements), including its tokenizer and normalization files.
 
 ### Serve a model
 
 ```bash
 xinfer-serve \
-  --model MODEL_ID \
+  --model wallx2b \
   --checkpoint /path/to/checkpoint \
   --device cuda \
   --warmup observation.msgpack \
@@ -57,7 +61,7 @@ xinfer-serve \
 ```
 
 `observation.msgpack` is one representative request in the
-[request format](docs/serving.md#protocol). Warmup runs before the
+[request format](docs/models/wallx2b.md#request-and-response). Warmup runs before the
 server accepts connections. For RTC traffic, include both a standard request and
 an RTC request in `--warmup`.
 
@@ -74,7 +78,7 @@ from xinfer import Policy
 from xinfer.frontend.protocol import unpackb
 
 observation = unpackb(Path("observation.msgpack").read_bytes())
-policy = Policy("MODEL_ID", "/path/to/checkpoint", device="cuda")
+policy = Policy("wallx2b", "/path/to/checkpoint", device="cuda")
 
 try:
     policy.warmup([observation])
@@ -87,6 +91,12 @@ The response contains the model's action chunk. Camera names, state fields,
 and action representations are documented in each model guide.
 
 ## Models and hardware
+
+| Model | Model ID | Precision | Real-time chunking | Guide |
+|---|---|---|---|---|
+| Wall-X 2B | `wallx2b` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
+
+Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format.
 
 | Hardware | Device | Runtime |
 |---|---|---|
