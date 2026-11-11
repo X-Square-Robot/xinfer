@@ -12,7 +12,7 @@
 - pipeline-overlap-vla 研究；
 - vLLM、SGLang 当前 main 源码。
 
-Wall-OSS 各项测量的条件见性能和验证指南。
+[性能表](performance.zh-CN.md)列出 Wall-OSS 和 Wall-X 2B 的测量条件，并链接到各自的验证结果。
 
 ---
 

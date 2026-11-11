@@ -2,6 +2,8 @@
 
 [English](precision.md) | 简体中文
 
+Wall-X 2B 在 RTC 延迟为 0、3、6 步时进行开环评估，优化实现和参考实现的结果见 [Wall-X 2B 验证](models/wallx2b_validation.zh-CN.md)。
+
 可能改变 Wall-OSS 输出的改动必须通过 embodied-serving 的 quick100 门禁，即 Wall-X 4B 服务上线时所用的门禁。
 
 **规则。** 每个必选场景相对冻结的原始 BF16 模型，GT-MSE 的增幅不得超过 +1 %：`MSE_candidate / MSE_BF16 − 1 ≤ 0.01`。

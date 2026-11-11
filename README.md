@@ -29,8 +29,7 @@ for robots, from onboard inference to shared fleet serving.
 - **Stable.** Predictable latency and a service that keeps running under fleet
   load, with warmup before serving, admission limits, and per-request failure
   isolation.
-- **Accurate.** Outputs follow the original model. Batch size can affect floating-point rounding. The
-  [precision guide](docs/precision.md) describes the Wall-OSS gate and its results.
+- **Accurate.** Outputs follow the original model. Batch size can affect floating-point rounding. See the [precision guide](docs/precision.md) for the Wall-OSS and Wall-X 2B validation criteria.
 - **Extensible.** Reusable layers and stage interfaces
   simplify model integration. Platform and operator adapters connect model
   code to new chips and optimized kernels.
@@ -98,7 +97,7 @@ and action representations are documented in each model guide.
 | Wall-OSS · internal checkpoints | `wall_oss` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wall_oss.md) |
 | Wall-X 2B | `wallx2b` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
 
-Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. Published Wall-OSS latency and capacity measurements are in the [performance table](docs/performance.md).
+Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for both models on an RTX 5090.
 
 | Hardware | Device | Runtime |
 |---|---|---|
@@ -135,10 +134,9 @@ defined response-latency target:
 |---|---|
 | [Single-request latency](benchmarks/request_latency.py) | Input processing, Engine execution, output processing, and total time in process |
 | [Robot load](benchmarks/robot_load.py) | Client and server latency, throughput, errors, and action-queue underflow under concurrent robot traffic |
+| [Performance table runner](benchmarks/performance.py) | Single-request latency and robot capacity for one serving configuration |
 
-The [benchmark guide](docs/benchmark.md) includes commands and measurement
-definitions. Model-specific results and numerical checks are recorded in the
-[Wall-OSS validation](docs/models/wall_oss_validation.md) page.
+For commands and measurement definitions, see the [benchmark guide](docs/benchmark.md). For stage timings and numerical checks, see the [Wall-OSS validation](docs/models/wall_oss_validation.md) and [Wall-X 2B validation](docs/models/wallx2b_validation.md).
 
 ## Documentation
 
