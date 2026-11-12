@@ -3,7 +3,9 @@
 Each stage runs the steps of the reference composition (``numerics="reference"``, the Wall-X eager model) on
 operators of ``xinfer/ops/reference/`` (each a kernel call where the CUDA backend lists a kernel, else its torch
 reference). GEMM weights are ``[N, K]``; the action stage's output and down projections are stored ``[K, N]``,
-which selects the small-M kernel. Differences to the reference:
+which selects the small-M kernel. On the Ascend provider the ``[N, K]`` projections are read as given (a
+transposed view would cost the v22 CANN route a full materialization per call) and the action loop feeds its
+projections the attention output's native BNSD form. Differences to the reference:
 
 - every residual add and the RMSNorm after it are one call (``add_rms_norm``), the sum rounded to BF16 as before;
   in the ViT the projection before it joins them (``gemm_add_rms_norm``), which on integrated GPUs adds the residual
@@ -17,6 +19,8 @@ which selects the small-M kernel. Differences to the reference:
 """
 
 from __future__ import annotations
+
+from contextlib import nullcontext
 
 import torch
 from torch import nn
@@ -111,14 +115,10 @@ class OptimizedVision(nn.Module):
         return ops.gemm_epilogue(merged, self.merger.fc2_weight, self.merger.fc2_bias)[layout["reverse_index"]]
 
 
-def _layer_params(hidden, intermediate, qkv_rows, q_width, down_t):
-    """Parameters of one decoder layer; the output and down projections stored ``[K, N]`` when ``down_t``."""
+def _layer_params(hidden, intermediate, qkv_rows, q_width):
+    """Parameters of one decoder layer; the output and down projections stored ``[N, K]``."""
     shapes = dict(input_norm=(hidden,), qkv=(qkv_rows, hidden), qkv_bias=(qkv_rows,), post_norm=(hidden,),
-                  gate_up=(2 * intermediate, hidden))
-    if down_t:
-        shapes.update(o_t=(q_width, hidden), down_t=(intermediate, hidden))
-    else:
-        shapes.update(o=(hidden, q_width), down=(hidden, intermediate))
+                  gate_up=(2 * intermediate, hidden), o=(hidden, q_width), down=(hidden, intermediate))
     return ParamGroup(**shapes)
 
 
@@ -135,7 +135,7 @@ class OptimizedPrefill(nn.Module):
         expert = c.experts[0]
         q_width = c.num_attention_heads * c.head_dim
         rows = q_width + 2 * c.num_key_value_heads * c.head_dim
-        self.layers = nn.ModuleList(_layer_params(expert.hidden_size, expert.intermediate_size, rows, q_width, False)
+        self.layers = nn.ModuleList(_layer_params(expert.hidden_size, expert.intermediate_size, rows, q_width)
                                     for _ in range(c.num_hidden_layers))
         self.ops = active_ops()
 
@@ -159,8 +159,18 @@ class OptimizedPrefill(nn.Module):
                                      kv_heads, d)
             if i == last:
                 return
-            o = ops.causal_attention(q.view(1, p, heads, d), keys.transpose(0, 1)[None], values.transpose(0, 1)[None])
-            h, normed = ops.add_rms_norm(ops.gemm_epilogue(o.reshape(p, -1), layer.o).view(1, p, -1), h,
+            # The pinned prefill finish writes Q head-major BNSD [H, P, D]; the strided [1, P, H, D] view
+            # turns contiguous inside the attention transpose, so the per-call Q copy disappears. Fallback
+            # widths keep the packed view.
+            bnsd = q.ndim == 3
+            q_arg = q.transpose(0, 1)[None] if bnsd else q.view(1, p, heads, d)
+            # With ``return_bnsd`` the pinned causal op hands back its native BNSD [1, H, P, D] buffer and the
+            # o-projection reads it directly (the M768 Cube route folds the packed reshape copy and the finish
+            # round); fallback widths keep the packed view and the old chain.
+            o = ops.causal_attention(q_arg, keys.transpose(0, 1)[None], values.transpose(0, 1)[None],
+                                     return_bnsd=bnsd)
+            rows = o[0] if bnsd else o.reshape(p, -1)
+            h, normed = ops.add_rms_norm(ops.gemm_epilogue(rows, layer.o).view(1, p, -1), h,
                                          layer.post_norm, eps)
             h, normed = ops.mlp_add_rms_norm(normed.view(p, -1), layer.gate_up, layer.down, h,
                                              self.layers[i + 1].input_norm, eps)
@@ -180,7 +190,7 @@ class OptimizedAction(nn.Module):
         expert = c.experts[1]
         q_width = c.num_attention_heads * c.head_dim
         rows = q_width + 2 * c.num_key_value_heads * c.head_dim
-        self.layers = nn.ModuleList(_layer_params(expert.hidden_size, expert.intermediate_size, rows, q_width, True)
+        self.layers = nn.ModuleList(_layer_params(expert.hidden_size, expert.intermediate_size, rows, q_width)
                                     for _ in range(c.num_hidden_layers))
         self.final_norm = nn.Parameter(torch.empty(expert.hidden_size, device="meta"), requires_grad=False)
         self.action_head = action_head
@@ -219,11 +229,18 @@ class OptimizedAction(nn.Module):
             shifted = (rows >= delay) & (delay > 0) & (delay < horizon)
             positions = positions + shifted.to(positions.dtype)[None] * c.rtc_rope_gap
         cos, sin = compact_rope(self.inv_freq, positions[None].expand(3, 1, horizon), c.mrope_section)
-        valid = x_in["prompt_valid"].reshape(1) if "prompt_valid" in x_in else torch.full((1,), p, device=device)
-        columns = torch.arange(p + horizon, device=device)
-        lts = torch.where((columns < valid) | (columns >= p), horizon, 0)
-        ute = torch.where(columns >= p + delay, delay, 0)
-        flash_mask = torch.stack((lts, ute), dim=-1).to(torch.int32)[None, None].contiguous()
+        # The host all-keep guarantee (processor-computed: delay == 0 and prompt_valid == p). A host input the
+        # stage reads keys the NPU graph, so the per-forward flash-mask build (13.4 us) and the FIA mask read
+        # disappear on the flow path; RTC and padded prompts keep the mask.
+        all_keep = "mask_all_keep" in x_in and bool(x_in["mask_all_keep"])
+        if all_keep:
+            flash_mask = None
+        else:
+            valid = x_in["prompt_valid"].reshape(1) if "prompt_valid" in x_in else torch.full((1,), p, device=device)
+            columns = torch.arange(p + horizon, device=device)
+            lts = torch.where((columns < valid) | (columns >= p), horizon, 0)
+            ute = torch.where(columns >= p + delay, delay, 0)
+            flash_mask = torch.stack((lts, ute), dim=-1).to(torch.int32)[None, None].contiguous()
         cache = torch.empty((*prompt_kv.shape[:-2], p + horizon, d), dtype=prompt_kv.dtype, device=device)
         cache[..., :p, :].copy_(prompt_kv)
         start = torch.full((1,), p, dtype=torch.int32, device=device)
@@ -240,26 +257,60 @@ class OptimizedAction(nn.Module):
             dof_mask, padding = dof, x_in["padding_action"].to(torch.float32) - x
         pinned_rows = delay.to(torch.int32) if rtc else None
         last = len(self.layers) - 1
-        for step in range(steps):
-            tau = torch.where(pinned, torch.ones_like(times[step]), times[step])
-            h = self.action_head.embed(x, tau, dof).to(DTYPE)
-            normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
-            for i, layer in enumerate(self.layers):
-                # this layer's later weights and the next layer's QKV, read while the QKV and attention run
-                following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
-                ops.prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
-                keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
-                q = ops.qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin, keys[0], values[0], p, heads,
-                                         kv_heads, d)
-                o = ops.prefix_kvcache_attention(q.view(1, horizon, heads, d), keys.transpose(1, 2),
-                                                 values.transpose(1, 2), start, p, flash_mask=flash_mask)
-                h, normed = ops.add_rms_norm(ops.gemm_epilogue(o[0], layer.o_t.t())[None], h, layer.post_norm, eps)
-                hidden = ops.gemm_glu_epilogue(normed[0], layer.gate_up)
-                following = self.final_norm if i == last else self.layers[i + 1].input_norm
-                h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down_t.t())[None], h, following, eps)
-            x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
-                                        pinned_rows, prefix)
-        ops.join_prefetch()
+        # The prefix-attention metadata scope: the native cache-attention bridge exposes it, and one open
+        # scope per forward lets all of the loop's prefix calls share the dense drop mask (built once from
+        # the live flash_mask/prefix_len instead of once per call). The torch reference keeps a null context.
+        scope = getattr(ops.prefix_kvcache_attention, "action_scope", nullcontext)
+        # The sinusoidal time embedding is a pure function of the step schedule (linspace(0, 1, steps + 1)
+        # * FLOW_TIME_SCALE; pinned RTC rows read 1.0), so its rows are precomputed once per (steps, device)
+        # and selected per step: sin/cos are elementwise in tau, every row value comes from the same scalar
+        # through the same op chain, and the per-step selection only picks rows — bitwise-equal to
+        # time_embedding(tau). The per-step arange/exp/sin/cos/cat chain (~8 tiny kernels inside the action
+        # graph) collapses to a row broadcast.
+        te_key = (steps, device.index if device.index is not None else 0)
+        te_cache = getattr(self, "_te_rows", None)
+        if te_cache is None or te_key not in te_cache:
+            ah = self.action_head
+            with torch.no_grad():
+                sched = ah.time_embedding(times[:-1]).reshape(steps, 1, -1)
+                one = ah.time_embedding(torch.ones_like(times[:1])).reshape(1, 1, -1)
+            te_cache = {} if te_cache is None else te_cache
+            te_cache[te_key] = (sched, one)
+            self._te_rows = te_cache
+        te_sched, te_one = self._te_rows[te_key]
+        ah = self.action_head
+        with scope():
+            for step in range(steps):
+                tau_emb = (torch.where(pinned[..., None], te_one, te_sched[step]) if rtc
+                           else te_sched[step].expand(1, horizon, -1))
+                af = ah.w1(torch.cat([x, dof], dim=-1))
+                jf = ah.w2(torch.cat([af, tau_emb], dim=-1))
+                h = ah.w3(ah._silu(jf)).to(DTYPE)
+                normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
+                for i, layer in enumerate(self.layers):
+                    # this layer's later weights and the next layer's QKV, read while the QKV and attention run
+                    following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
+                    ops.prefetch_weights((layer.o, layer.gate_up, layer.down, following_qkv))
+                    keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
+                    q = ops.qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin, keys[0], values[0], p, heads,
+                                             kv_heads, d)
+                    # The NPU M16 epilogue returns Q already in BNSD [H, M, D] order (ACLNN FIA rejects the
+                    # strided-query descriptor, error 561103, so the kernel writes the layout the attention
+                    # consumes). The strided [1, M, H, D] view turns contiguous inside the attention
+                    # transpose; the reference and CUDA backends return packed [M, H*D].
+                    q_arg = q.transpose(0, 1)[None] if q.ndim == 3 else q.view(1, horizon, heads, d)
+                    o = ops.prefix_kvcache_attention(q_arg, keys.transpose(1, 2),
+                                                     values.transpose(1, 2), start, p, flash_mask=flash_mask,
+                                                     all_keep=all_keep, return_bnsd=True)
+                    # The BNSD [H, M, D] output feeds the o-projection directly: the pinned CANN route reads
+                    # it with the transpose folded into the Cube A-load; every other backend permutes.
+                    h, normed = ops.add_rms_norm(ops.gemm_epilogue(o[0], layer.o)[None], h, layer.post_norm, eps)
+                    hidden = ops.gemm_glu_epilogue(normed[0], layer.gate_up)
+                    following = self.final_norm if i == last else self.layers[i + 1].input_norm
+                    h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down)[None], h, following, eps)
+                x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
+                                            pinned_rows, prefix)
+            ops.join_prefetch()
         out.copy_(x)
 
 
@@ -267,8 +318,9 @@ def optimized_weight_mapping(model) -> dict[str, Source]:
     """Checkpoint key → tensor of the optimized composition, in its dtypes and orientations.
 
     The ViT, the token embedding and the action head load as for the reference composition (BF16; the action head
-    FP32), the language-model RMSNorm weights FP32. The action stage's output and down projections are stored
-    ``[K, N]``.
+    FP32), the language-model RMSNorm weights FP32. Both stages' output and down projections are stored ``[N, K]``:
+    the v22 CannProjection gemm route reads the weight as given, and a transposed view would cost it a full
+    materialization per call (the ``[K, N]`` layout predates that route).
 
     Args:
         model: The ``WallOSS`` shell built with ``numerics="optimized"``.
@@ -278,7 +330,6 @@ def optimized_weight_mapping(model) -> dict[str, Source]:
     """
     bf16, fp32 = torch.bfloat16, torch.float32
     one = lambda key: Source.one(key, bf16)  # noqa: E731
-    t = lambda key: Source((key,), bf16, combine=lambda w: w[0].t().contiguous())  # noqa: E731
     vision = model.vision.config
     mapping = {
         "vision.patch.weight": Source(("visual.patch_embed.proj.weight",), bf16,
@@ -313,8 +364,5 @@ def optimized_weight_mapping(model) -> dict[str, Source]:
             mapping[f"{target}.gate_up"] = one(f"{source}.moe.experts.{expert}.gate_up_proj.weight")
             o = f"{source}.self_attn.o_proj_experts.{expert}.weight"
             down = f"{source}.moe.experts.{expert}.down_proj.weight"
-            if expert == 0:
-                mapping[f"{target}.o"], mapping[f"{target}.down"] = one(o), one(down)
-            else:
-                mapping[f"{target}.o_t"], mapping[f"{target}.down_t"] = t(o), t(down)
+            mapping[f"{target}.o"], mapping[f"{target}.down"] = one(o), one(down)
     return mapping
