@@ -21,7 +21,7 @@ class ThreeStage(VLAModel):
 def _platform(cudagraphs=True, arch="sm120"):
     capabilities = PlatformCapabilities(device_type="cuda" if cudagraphs else "cpu", arch=arch, cudagraphs=cudagraphs,
                         stream_priorities=cudagraphs, unified_memory=False, multiprocess_service=None, sm_count=170,
-                        total_memory_bytes=32 << 30)
+                        total_memory_bytes=32 << 30, stream_priority_range=(-1, 0) if cudagraphs else None)
     return Platform(name=f"cuda-{arch}" if cudagraphs else "cpu", device="cuda:0" if cudagraphs else "cpu",
                     capabilities=capabilities)
 

@@ -171,7 +171,7 @@ def nvfp4_gemm(a_q, a_scales, w_q, w_scales, bias=None, *, alpha=1.0) -> OpCost:
     return _gemm("nvfp4", a_q, a_scales, w_q, w_scales, bias, 2 * a_q.shape[1], w_q.shape[0])
 
 
-# ------------------------------------------------------------ fused operators (xinfer/ops/reference/fused.py)
+# ------------------------------------------------------------ fused operators (xinfer/ops/reference/)
 def gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, residual_gate=None, row_class=None,
                   row_scale=None) -> OpCost:
     """``2·M·N·K`` on the pipe of ``x.dtype``, also reading the residual, gate rows, row classes and row scales."""

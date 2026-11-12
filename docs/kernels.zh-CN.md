@@ -34,7 +34,7 @@ XInfer 加载可导入的 `xcompute` 包所用的库，并使用其统一的 GEM
 xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue': 'xcompute', 'gemm_glu_epilogue': 'xcompute', ...}
 ```
 
-`--resolved-config FILE` 会把同样的列表写入 `FILE`；在 Python 中，`Policy.describe()["ops"]` 也会列出它。构建可用时，融合算子（`gemm_epilogue`、`gemm_glu_epilogue`、`qkv_rope_kvcache`，以及模型用到的 `xinfer/ops/reference/fused.py` 中的其他算子）显示为 `xcompute`。它们显示为 `reference` 说明 XInfer 没有找到可用的构建：
+`--resolved-config FILE` 会把同样的列表写入 `FILE`；在 Python 中，`Policy.describe()["ops"]` 也会列出它。构建可用时，融合算子（`gemm_epilogue`、`gemm_glu_epilogue`、`qkv_rope_kvcache`，以及模型用到的 `xinfer/ops/reference/` 中的其他算子）显示为 `xcompute`。它们显示为 `reference` 说明 XInfer 没有找到可用的构建：
 
 - 没有可导入的 `xcompute` 包且没有设置 `XINFER_XCOMPUTE_LIBRARY`，或它指向的文件不存在；
 - 构建没有针对当前 GPU 的架构（`python -c "import xcompute; print(xcompute.build_target_archs())"`）；
@@ -49,3 +49,9 @@ xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: doc
 ```
 
 对于没有专用 kernel 的权重形状，xcompute 可以选择通用的 cuBLASLt GEMM。
+
+## 昇腾
+
+`ascend` 后端使用相同的共享 xcompute 加载器与 `XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0`
+设置。可用实现会自动选中；不支持的调用使用 torch 回退。运行环境、图像处理和 NPU 图执行见
+[昇腾指南](ascend950dt.zh-CN.md)。

@@ -24,14 +24,17 @@
 | `max_running_requests` | 32 | 在途的已准入请求数。这是一个上限：槽位不预分配内存，且每个机器人只有一个请求时，只有 32 台机器人才会达到它 |
 | `max_queued_requests` | 256 | 已提交、等待准入的请求数 |
 | `lanes.<stage>` | 调优值，否则为 2 | 一个通道是一条带有自己 graph 池的 stream；第二个通道让两个请求可以同时运行该阶段 |
-| `stream_priorities.<stage>` | CUDA 上最终阶段为 −1（Wall-OSS：`action`），其他为 0 | 该阶段各通道的 CUDA stream 优先级，越小越高（`--stream-priorities action=0`、`Policy(stream_priorities={...})`） |
+| `stream_priorities.<stage>` | 最终阶段（Wall-OSS：`action`）：将 −1 限制在支持范围内；范围未知、不支持或其他阶段时为 0 | 该阶段各通道的加速器 stream 优先级，越小越高（`--stream-priorities action=0`、`Policy(stream_priorities={...})`） |
 | `batch_sizes.<stage>` | 模型声明的所有大小 | 允许更大的批大小从不会延迟请求，因为批只由已排队的请求组成；模型只为组批结果能通过其精度门禁的阶段声明大于 1 的批大小 |
 | `cudagraphs` | 平台支持捕获时开启 | |
 | `frontends` | 2，最多为容器配额 CPU 数的一半 | 每个前端会在引擎进程中增加一个桥接线程 |
 | `frontend_workers` | 4，且 `frontends × frontend_workers` 不超过配额 CPU 数的一半 | 每个前端的处理线程数；不同连接的请求同时处理 |
 | `shm_buffers` | 每个前端 `ceil(max_running_requests / frontends)` 个 | 每个运行中的请求一个缓冲区；缓冲区全部被租用的前端会等待。默认：2 × 16 个 `--shm-buffer-mib`（32 MiB）缓冲区，锁页 |
 
-stream 优先级只是对就绪 GPU 工作的提示：它不会抢占正在运行的 kernel，也不会绕过事件等待，因此它只是把延迟在阶段之间转移，而不是消除延迟。未知阶段、非整数、设备无法表示的值，以及在不支持 stream 优先级的平台上设置非零值，都会报错（`--dry-run` 解析这些值时不创建通道，因此不检查设备支持的范围）。
+stream 优先级是对就绪加速器工作的调度提示，不会绕过事件等待，也不保证抢占。未知阶段、非整数、超出平台
+报告范围的值，以及在不支持 stream 优先级的平台上设置非零值，都会报错。`--dry-run` 检查已报告的范围，但不
+创建通道。创建通道时还会验证声明支持优先级的运行时是否准确采用请求值。CUDA 支持时继续使用最终阶段
+默认值 −1；范围为 0–7 的运行时保持该默认值为 0。
 
 下述 MXFP8 数据是早期 Wall-OSS 配置的历史测量；当前 [Wall-OSS 组合](models/wall_oss.zh-CN.md)支持 BF16。
 

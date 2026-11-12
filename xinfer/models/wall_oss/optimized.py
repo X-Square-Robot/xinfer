@@ -1,7 +1,7 @@
 """Wall-OSS on xcompute (``numerics="optimized"``, the default), BF16.
 
 Each stage runs the steps of the reference composition (``numerics="reference"``, the Wall-X eager model) on
-operators of ``xinfer/ops/reference/fused.py`` (each an xcompute call where xcompute lists a kernel, else its torch
+operators of ``xinfer/ops/reference/`` (each an xcompute call where xcompute lists a kernel, else its torch
 reference). GEMM weights are ``[N, K]``; the action stage's output and down projections are stored ``[K, N]``,
 which selects xcompute's small-M kernel. Differences to the reference:
 
@@ -33,7 +33,7 @@ OPTIMIZED_STAGE_OPS = {
     "prefill": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "rms_norm", "add_rms_norm",
                 "causal_attention"),
     "action": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "prefix_kvcache_attention",
-               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "silu"),
+               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear"),
 }
 
 

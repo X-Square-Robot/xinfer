@@ -18,57 +18,81 @@ from typing import Any
 import torch
 
 from xinfer.models.interface import StageBatch, VLAModel
+from xinfer.platforms.devices import device_module_for
 from xinfer.platforms.interface import Platform
 
 
 class Lane:
-    """One of a stage's parallel executors: a stream (on CUDA) and its identity.
+    """One of a stage's parallel executors: an accelerator stream and its identity.
 
     A lane runs one dispatch at a time; the engine treats it as busy until ``event`` completes.
 
     Attributes:
         stage: name of the stage the lane serves.
         index: the lane's index within the stage.
-        stream: the lane's ``torch.cuda.Stream`` on the platform device, or None on the CPU.
-        cudagraphs: the lane's ``LaneCUDAGraphs`` when the engine uses CUDA graphs, else None.
-        copy_stream: for a final stage on CUDA, the stream that copies results to the host (set by the engine,
+        stream: the lane's stream on the platform device, or None on the CPU.
+        cudagraphs: the lane's ``LaneCUDAGraphs`` when the engine uses graph capture, else None.
+        copy_stream: for a final stage on an accelerator, the stream that copies results to the host (set by the engine,
             never captured); else None.
         event: completion event of the lane's current dispatch, or None (set and cleared by the engine).
     """
 
     def __init__(self, stage: str, index: int, platform: Platform, *, priority: int = 0):
-        """Create the lane; on CUDA its new stream first waits for the work queued so far on the current stream.
+        """Create the lane; its accelerator stream first waits for work queued so far on the current stream.
 
         Args:
             stage: stage name.
             index: lane index within the stage.
-            platform: the platform; a stream is created only when it is CUDA.
-            priority: CUDA scheduling hint; smaller integers have higher priority. Default 0.
+            platform: the platform; a stream is created on accelerators.
+            priority: accelerator scheduling hint within the platform's declared range. Default 0.
 
         Raises:
             ValueError: priority is not an integer, is nonzero on an unsupported platform,
-                or CUDA cannot honor the requested value without clamping.
+                or the runtime cannot verify or honor the requested value without clamping.
         """
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise ValueError(f"stream priority for {stage} must be an integer, got {priority!r}")
-        if priority != 0 and (not platform.is_cuda or not platform.capabilities.stream_priorities):
+        if priority != 0 and not platform.capabilities.stream_priorities:
             raise ValueError(f"platform {platform.name} does not support nonzero stream priorities")
+        bounds = platform.capabilities.stream_priority_range
+        if bounds is not None and not bounds[0] <= priority <= bounds[1]:
+            raise ValueError(f"stream priority {priority} for {stage} is outside {platform.name}'s range {bounds}")
         self.stage = stage
         self.index = index
-        self.stream = torch.cuda.Stream(device=platform.device, priority=priority) if platform.is_cuda else None
+        self._device_module = device_module_for(platform.device)
+        if self._device_module is None:
+            self.stream = None
+        else:
+            self.stream = self._device_module.Stream(device=platform.device, priority=priority)
         if self.stream is not None:
-            if self.stream.priority != priority:
-                raise ValueError(f"stream priority {priority} for {stage} is unsupported on {platform.device}; "
-                                 f"CUDA would clamp it to {self.stream.priority}")
+            if platform.capabilities.stream_priorities:
+                try:
+                    actual = self.stream.priority
+                except (AttributeError, RuntimeError) as exc:
+                    raise ValueError(f"cannot verify stream priority {priority} for {stage} "
+                                     f"on {platform.device}") from exc
+                if actual != priority:
+                    raise ValueError(f"stream priority {priority} for {stage} is unsupported on {platform.device}; "
+                                     f"the runtime would clamp it to {actual}")
             # Weights were loaded and converted on the current stream; order the lane after that work.
-            self.stream.wait_stream(torch.cuda.current_stream(platform.device))
+            self.stream.wait_stream(self._device_module.current_stream(platform.device))
         self.cudagraphs = None  # LaneCUDAGraphs when the engine uses CUDA graphs
         self.copy_stream = None  # final stages on CUDA: copies results to the host
         self.event = None  # completion event of the lane's current dispatch
 
     def use_stream(self):
         """Context manager that makes the lane's stream current (a no-op on the CPU)."""
-        return torch.cuda.stream(self.stream) if self.stream is not None else contextlib.nullcontext()
+        return self._device_module.stream(self.stream) if self.stream is not None else contextlib.nullcontext()
+
+    def make_event(self, *, enable_timing: bool = False):
+        """An event on the lane's device, not yet recorded; None on the CPU.
+
+        Args:
+            enable_timing: whether ``elapsed_time`` may be read from it (timing costs a little on some runtimes).
+        """
+        if self._device_module is None:
+            return None
+        return self._device_module.Event(enable_timing=enable_timing)
 
     def record(self):
         """Record an event on the lane's stream after the work enqueued so far.
@@ -78,7 +102,7 @@ class Lane:
         """
         if self.stream is None:
             return None
-        event = torch.cuda.Event()
+        event = self._device_module.Event()
         event.record(self.stream)
         return event
 

@@ -1,14 +1,13 @@
-"""One row of docs/performance.md: single-request latency and single-GPU capacity of one serving configuration.
+"""One row of docs/performance.md: single-request latency and single-device capacity of one configuration.
 
-Runs on the visible GPU (select it with ``CUDA_VISIBLE_DEVICES``), with nothing else on it:
+Runs on one accelerator, with nothing else on it. Use ``--device npu:N`` for Ascend or the normal CUDA selection:
 
 1. ``request_latency.py`` on the configuration's request set, with its model options; ``Policy`` decodes and resizes
-   the views on the device unless they set ``image_preprocess_device``;
-2. for each robot count, in increasing order, a newly started ``xinfer-serve`` with the same model options (the views
-   processed in the frontends unless they set ``image_preprocess_device``) and the warmup files, then
-   ``robot_load.py`` with the repository convention (80 requests per robot, the first 20 dropped, 8 rounds, each with
-   random robot start phases): synthetic desktop observations with RTC, or ``--load-requests`` without RTC. It stops
-   after the first count that fails.
+   the views on the device where supported unless they set ``image_preprocess_device``;
+2. for each robot count, in increasing order, a newly started ``xinfer-serve`` with the configuration's model options
+   and warmup files, then ``robot_load.py`` with the repository convention (80 requests per robot, the first 20
+   dropped, 8 rounds, each with random robot start phases): synthetic desktop observations with RTC, or
+   ``--load-requests`` without RTC. It stops after the first count that fails.
 
 A count passes when no round has an error or missing row and the median over its rounds of the ``server_infer_ms``
 P50 is below 150 ms; the capacity is the largest count that passes with every smaller measured count passing too.
@@ -76,21 +75,34 @@ def row(result: dict) -> str:
             f"{throughput:.1f} req/s |")
 
 
-def environment() -> dict:
-    """Where the row was measured (the GPU name comes from ``request_latency.py``; this process stays off the GPU)."""
+def environment(npu: bool = False) -> dict:
+    """Where the row was measured (device name comes from ``request_latency.py``)."""
     import torch
 
     library = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
     revision = subprocess.run(["git", "-C", str(HERE), "rev-parse", "HEAD"], capture_output=True,
                               text=True).stdout.strip() if (HERE.parent / ".git").exists() else None
-    return {"created_utc": datetime.now(timezone.utc).isoformat(), "host": platform.node(), "revision": revision,
-            "torch": torch.__version__, "xcompute_library": library,
-            "xcompute_sha256": hashlib.sha256(Path(library).read_bytes()).hexdigest() if library else None}
+    result = {"created_utc": datetime.now(timezone.utc).isoformat(), "host": platform.node(), "revision": revision,
+              "torch": torch.__version__, "xcompute_library": library,
+              "xcompute_sha256": hashlib.sha256(Path(library).read_bytes()).hexdigest() if library else None}
+    if npu:
+        from importlib.metadata import version
+
+        result["torch_npu"] = version("torch-npu")
+    return result
 
 
 def gpu_processes() -> str:
     return subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"],
                           capture_output=True, text=True).stdout.strip()
+
+
+def machine_snapshot(npu: bool) -> dict:
+    """Record host load and the matching accelerator telemetry."""
+    if npu:
+        result = subprocess.run(["npu-smi", "info"], capture_output=True, text=True, timeout=10)
+        return {"npu_smi": result.stdout.strip(), "loadavg": os.getloadavg()}
+    return {"gpu_processes": gpu_processes(), "loadavg": os.getloadavg()}
 
 
 def serve_and_load(args, robots: int, out: Path) -> list[dict]:
@@ -100,6 +112,10 @@ def serve_and_load(args, robots: int, out: Path) -> list[dict]:
     command = [sys.executable, "-m", "xinfer.entrypoints.serve", "--model", args.model, "--checkpoint",
                args.checkpoint, "--model-options", args.model_options, "--port", str(port),
                "--resolved-config", str(out / "resolved.json"), "--warmup", *args.warmup]
+    if args.op_backends:
+        command += ["--op-backends", args.op_backends]
+    if args.device is not None:
+        command += ["--device", args.device]
     log_path = out / "server.log"
     with log_path.open("w") as log:
         server = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
@@ -108,15 +124,14 @@ def serve_and_load(args, robots: int, out: Path) -> list[dict]:
                 if server.poll() is not None:
                     raise RuntimeError(f"xinfer-serve exited before it was ready; see {log_path}")
                 time.sleep(1)
-            before = {"gpu_processes": gpu_processes(), "loadavg": os.getloadavg()}
+            before = machine_snapshot(args.npu)
             load = [sys.executable, str(HERE / "robot_load.py"), "--url", f"ws://127.0.0.1:{port}", "--robots",
                     str(robots), "--requests", "80", "--warmup-requests", "20", "--rounds", str(ROUNDS), "--out",
                     str(out / "load")]
             if args.load_requests:
                 load += ["--requests-file", *args.load_requests]
             subprocess.run(load, check=False)
-            (out / "machine.json").write_text(json.dumps(
-                {"before": before, "after": {"gpu_processes": gpu_processes(), "loadavg": os.getloadavg()}}))
+            (out / "machine.json").write_text(json.dumps({"before": before, "after": machine_snapshot(args.npu)}))
         finally:
             server.send_signal(signal.SIGINT)
             server.wait(timeout=120)
@@ -130,26 +145,39 @@ def main(argv=None) -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-options", default="{}", help="JSON options for xinfer-serve and Policy")
+    parser.add_argument("--device", default=None, help="cuda, cuda:N, npu or npu:N (default: automatic CUDA selection)")
     parser.add_argument("--latency-requests", nargs="+", required=True, help="the single-request request set")
     parser.add_argument("--warmup", nargs="+", required=True, help="xinfer-serve --warmup files")
     parser.add_argument("--load-requests", nargs="+", help="load without RTC from these requests (robot_load.py)")
     parser.add_argument("--robots", type=int, nargs="+", required=True, help="robot counts to measure")
+    parser.add_argument("--op-backends", default=None,
+                        help="JSON operator name to backend pin, as for xinfer-serve --op-backends; also "
+                             "applied to the single-request run so both halves use one wiring")
     parser.add_argument("--port", type=int, default=34000)
     parser.add_argument("--out", type=Path, required=True, help="new output directory")
     args = parser.parse_args(argv)
+    device_type = args.device.partition(":")[0] if args.device is not None else "cuda"
+    if device_type not in ("cuda", "npu"):
+        parser.error("the performance table needs a CUDA or NPU device")
+    args.npu = device_type == "npu"
     if args.out.exists():
         parser.error(f"{args.out} already exists")
     args.out.mkdir(parents=True)
     result = {"name": args.name, "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-              "environment": environment(), "latency": {}, "load": {}}
+              "environment": environment(args.npu), "latency": {}, "load": {}}
     target = args.out / "latency.json"
-    subprocess.run([sys.executable, str(HERE / "request_latency.py"), "--model", args.model, "--checkpoint",
-                    args.checkpoint, "--model-options", args.model_options, "--requests-file", *args.latency_requests,
-                    "--out", str(target)], check=True)
+    command = [sys.executable, str(HERE / "request_latency.py"), "--model", args.model, "--checkpoint",
+               args.checkpoint, "--model-options", args.model_options, "--requests-file", *args.latency_requests,
+               "--out", str(target)]
+    if args.op_backends:
+        command += ["--op-backends", args.op_backends]
+    if args.device is not None:
+        command += ["--device", args.device]
+    subprocess.run(command, check=True)
     latency = json.loads(target.read_text())
     result["latency"] = {k: latency[k] for k in ("total_ms", "prepare_ms", "engine_ms", "output_ms",
                                                  "captures_after_warmup")}
-    result["environment"]["gpu"] = latency["device"]
+    result["environment"]["npu" if args.npu else "gpu"] = latency["device"]
     for robots in sorted(args.robots):
         rounds = serve_and_load(args, robots, args.out / f"robots-{robots}")
         result["load"][str(robots)] = rounds

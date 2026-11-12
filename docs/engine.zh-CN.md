@@ -68,14 +68,14 @@ completion thread:
 | 字段 | 默认值 | 含义 |
 |---|---|---|
 | `lanes` | 每阶段 1 个 | 每个阶段的通道数（stream + graph 池），例如 `{"prefill": 2, "action": 2}` |
-| `stream_priorities` | 每阶段 0 | 一个阶段所有通道的 CUDA stream 优先级；整数越小优先级越高 |
+| `stream_priorities` | 每阶段 0 | 一个阶段所有通道的加速器 stream 优先级，须在平台支持范围内；整数越小优先级越高 |
 | `max_batch` | 每阶段 1 | 每个阶段的批上限；受 `Capabilities.batch_sizes` 限制 |
 | `max_running_requests` | 8 | 在途的已准入请求数 |
 | `max_queued_requests` | 256 | 已提交、等待准入的请求数（超出则 `AdmitError("queue_full")`） |
 | `per_robot_inflight` | 1 | 每个机器人 id 未完成的请求数（`AdmitError("per_robot_limit")`） |
 | `cudagraphs` | `None` | 设为 `CUDAGraphConfig()` 时回放 CUDA graph（见 `xinfer.engine.cudagraph`） |
 
-通道的 stream 优先级在创建通道时确定；上传 stream 和拷贝 stream 保持优先级 0。优先级只改变 GPU 执行就绪工作的顺序：准入、组批和事件等待都不变，graph 仍在同一个通道 stream 上捕获和回放。
+通道的 stream 优先级在创建通道时确定；上传 stream 和拷贝 stream 保持优先级 0。优先级只改变加速器执行就绪工作的顺序：准入、组批和事件等待都不变，graph 仍在同一个通道 stream 上捕获和回放。
 
 `xinfer-serve` 和 `Policy` 依据调优表（目前尚未随附任何表）、模型与平台规则以及与负载无关的固定默认值来确定这些设置（[配置](configuration.zh-CN.md)）；显式指定的值仍然优先。
 
