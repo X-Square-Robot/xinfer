@@ -2,7 +2,7 @@
 
 [English](wallx2b.md) | 简体中文
 
-在 CUDA GPU 上使用模型 ID `wallx2b` 加载 BF16 Wall-X 2B checkpoint。模型接收三路相机图像、桌面双臂机器人的状态和任务指令，每次预测双臂接下来 16 步的动作。实时分块（RTC）可固定上一轮预测中的部分动作，使相邻两轮预测在时间上重叠。
+在 CUDA GPU 或昇腾 950DT NPU 上使用模型 ID `wallx2b` 加载 BF16 Wall-X 2B checkpoint。后者所需的算子清单与环境配置见[昇腾指南](../ascend950dt.zh-CN.md)，下文的命令以 `--device cuda` 为例。模型接收三路相机图像、桌面双臂机器人的状态和任务指令，每次预测双臂接下来 16 步的动作。实时分块（RTC）可固定上一轮预测中的部分动作，使相邻两轮预测在时间上重叠。
 
 RTX 5090 上的延迟、单卡服务容量和开环精度见[验证结果](wallx2b_validation.zh-CN.md)。
 
