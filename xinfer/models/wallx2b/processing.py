@@ -22,6 +22,8 @@ import torch
 from xinfer.models.layers.vision.qwen3_5_vit import vision_layout
 from xinfer.models.interface import BucketSpec, PreparedRequest
 from xinfer.models.processing import (
+    _view_pool,
+    _wirefast,
     SegmentTokenizer,
     check_image_preprocess_device,
     device_image,
@@ -52,6 +54,29 @@ _OPTIONAL_STATE = {"velocity_decomposed": "velocity_decomposed", "height": "lift
 # Action dims the desktop robot never commands.
 _DESKTOP_MASKED_DOF = ("velocity_decomposed", "height", "head_actions")
 _ARMS = (("left", "follow1_pos"), ("right", "follow2_pos"))
+
+
+def _wire_view_fast(value):
+    """``wire_view`` with the GIL released for the wire decodes (the 2B-HOST port of the r11 knife A).
+
+    The base64 decode of a view is a single C call that holds the GIL for its whole
+    execution, so the view pool's parallelism is nominal and the device tickets are not
+    put until late in prepare (probe-timeline-r10, wall_oss lineage). The built
+    ``_wirefast`` helper decodes canonical base64 and copies bytes-like buffers under
+    ``Py_BEGIN_ALLOW_THREADS``; anything it declines falls back to ``wire_view``, so the
+    decoded values are equal by construction. Arrays take ``wire_view`` unchanged.
+    """
+    if isinstance(value, str):
+        if _wirefast is not None:
+            decoded = _wirefast.b64decode(value)
+            if decoded is not None:
+                return decoded
+    elif isinstance(value, (bytearray, memoryview)):
+        if _wirefast is not None:
+            copied = _wirefast.to_bytearray(value)
+            if copied is not None:
+                return copied
+    return wire_view(value)
 
 
 @dataclass(frozen=True)
@@ -500,13 +525,23 @@ class Wallx2bInputProcessor:
 
         if self.config.image_preprocess_device == "gpu":
             # JPEG bytes go to the device decoder; other encodings are decoded here and resized on the device.
-            images = [wire_view(wire(camera)) for camera in c.cameras]
-            images = [image if isinstance(image, np.ndarray) or is_jpeg(image) else decode_image(image)
-                      for image in images]
-            sizes = [resize_sizes(*source_size(image), c.resolution.get(camera.view, -1), c)
-                     for image, camera in zip(images, c.cameras)]
-            images = [device_image(image, size, DEVICE_RESIZE) for image, size in zip(images, sizes)]
-            shapes = [size[-1] for size in sizes]
+            # Per-view handoff (the 2B-HOST port of the walloss r10/r11 prepare knives): every wire
+            # decode runs in the view pool through _wire_view_fast, which releases the GIL for the
+            # base64 decode, and each result is waited for in camera order (each wait also
+            # releases the GIL); device_image then claims a per-view prefetch slot and hands the
+            # view to the engine's device-image thread immediately, so the DVPP chain overlaps
+            # the remaining host prepare (state, prompt, tokenizer, positions) instead of
+            # running after it. Same decodes, same sizes, same values, camera order.
+            pool = _view_pool()
+            futures = [pool.submit(_wire_view_fast, wire(camera)) for camera in c.cameras]
+            images, shapes = [], []
+            for future, camera in zip(futures, c.cameras):
+                image = future.result()
+                if not (isinstance(image, np.ndarray) or is_jpeg(image)):
+                    image = decode_image(image)
+                size = resize_sizes(*source_size(image), c.resolution.get(camera.view, -1), c)
+                images.append(device_image(image, size, DEVICE_RESIZE))
+                shapes.append(size[-1])
         else:
             images = [torch.from_numpy(image) for image in map_views(
                 lambda camera: resize_view(decode_view(wire(camera)), c.resolution.get(camera.view, -1), c), c.cameras)]

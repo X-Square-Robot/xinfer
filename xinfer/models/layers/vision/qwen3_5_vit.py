@@ -10,6 +10,7 @@ on the image grids; ``vision_layout`` computes them on the host.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -66,7 +67,8 @@ class Qwen35VisionConfig:
         return int(self.num_position_embeddings ** 0.5)
 
 
-def vision_layout(grids, config: Qwen35VisionConfig) -> dict:
+@functools.lru_cache(maxsize=64)
+def _vision_layout_compute(grids: tuple, spatial_merge_size: int, grid_side: int) -> dict:
     """Host-side layout of packed images with grids ``[(t, h, w), ...]``.
 
     The patch order is the merge-block order of the Qwen2-VL image processor. The learned position table
@@ -85,7 +87,7 @@ def vision_layout(grids, config: Qwen35VisionConfig) -> dict:
     Raises:
         ValueError: A grid side is not divisible by the merge size.
     """
-    m, side = config.spatial_merge_size, config.grid_side
+    m, side = spatial_merge_size, grid_side
     positions, index, weight, cu_seqlens = [], [[] for _ in range(4)], [[] for _ in range(4)], [0]
     for t, h, w in grids:
         t, h, w = int(t), int(h), int(w)
@@ -117,6 +119,21 @@ def vision_layout(grids, config: Qwen35VisionConfig) -> dict:
         pos_weight=torch.stack([torch.cat(w) for w in weight]),
         cu_seqlens=cu_seqlens,
     )
+
+
+def vision_layout(grids, config: Qwen35VisionConfig) -> dict:
+    """Host-side layout of packed images with grids ``[(t, h, w), ...]`` (cached compute).
+
+    The layout is a pure function of ``(grids, config)`` and costs ~1.1 ms of host compute per request on
+    the wallx2b prepare path (the largest single host item after the wire decodes, probe-prepare-2b); a
+    request set that repeats grids hits the cache. Each caller still gets its own tensor objects (clone)
+    and its own ``cu_seqlens`` list - the exact fresh-object semantics of the uncached path, so no
+    downstream code can observe the sharing.
+    """
+    cached = _vision_layout_compute(tuple(tuple(grid) for grid in grids), int(config.spatial_merge_size),
+                                     int(config.grid_side))
+    return {"positions": cached["positions"].clone(), "pos_index": cached["pos_index"].clone(),
+            "pos_weight": cached["pos_weight"].clone(), "cu_seqlens": list(cached["cu_seqlens"])}
 
 
 class LayerNorm(nn.Module):
