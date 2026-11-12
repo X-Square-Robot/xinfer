@@ -204,10 +204,113 @@ def linear(x, weight, bias=None):
 _no_action_rows = {}  # (batch, device) -> zero action-row starts/ends [B] and offsets [B + 1] (int64)
 
 
-@register("qkv_norm_split", backend="ascend", requires=xc if callable(_split_forward) else None,
+try:
+    from xcompute.kernel.cann_action import _qkv_2b_cache_finish_pair as _qkv_2b_pair
+except Exception:  # builds without the package's CANN bridge module
+    _qkv_2b_pair = None
+
+_qkv_2b_tail = None      # (call, get_error) of the fused wallx2b QKV tail, or False
+_qkv_2b_tables = {}      # device -> (ones [2048, 32], zeros [2048, 32]) FP32 identity rotation
+_qkv_2b_factors = {}     # (weight ptr, shape, dtype) -> (source, 1 + weight FP32)
+_qkv_2b_warmed = False
+
+
+def _qkv_2b_tail_pair():
+    global _qkv_2b_tail
+    if _qkv_2b_tail is None:
+        _qkv_2b_tail = (_qkv_2b_pair() or False) if callable(_qkv_2b_pair) else False
+    return _qkv_2b_tail or None
+
+
+def _qkv_2b_factor(weight):
+    entry = _qkv_2b_factors.get((weight.data_ptr(), tuple(weight.shape), weight.dtype))
+    if entry is None:
+        factor = 1 + weight.float()
+        _qkv_2b_factors[(weight.data_ptr(), tuple(weight.shape), weight.dtype)] = (weight, factor)
+        return factor
+    return entry[1]
+
+
+def _qkv_2b_identity_tables(device):
+    pair = _qkv_2b_tables.get(device)
+    if pair is None:
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("warm up the fused 2B QKV split on this stream before graph capture")
+        pair = (torch.ones(2048, 32, dtype=torch.float32, device=device),
+                torch.zeros(2048, 32, dtype=torch.float32, device=device))
+        _qkv_2b_tables[device] = pair
+    return pair
+
+
+def _qkv_2b_split(packed, q_weight, k_weight, tail):
+    """The wallx2b prefill split through the 2b-qkv fused tail (one AOT launch).
+
+    The tail kernel takes its rows as a runtime parameter and fuses the per-head RMS
+    norm, the (1 + w) factors, the 64-dim partial rotary, the head-major K/V append and
+    the packed [Q | gate] return. The prefill chunk order -- each head's [q_h | gate_h]
+    side by side, then K, then V -- is permuted into the accumulator layout the kernel
+    reads, and identity rotation tables (cos = 1, sin = 0) neutralize its in-kernel
+    rotary: ``z * 1 - partner * 0`` is exact, so the split returns unrotated values for
+    the model's own ``rope_full``. Measured ~202us per call against ~516us for the
+    replace kernel, with the outputs a single rounding apart (2 flips of 1.19M).
+    """
+    global _qkv_2b_warmed
+    import ctypes
+
+    rows = int(packed.shape[1])
+    if not 0 < rows <= 2048:
+        return None
+    call, get_error = tail
+    if torch.npu.is_current_stream_capturing() and not _qkv_2b_warmed:
+        raise RuntimeError("warm up the fused 2B QKV split on this stream before graph capture")
+    ones, zeros = _qkv_2b_identity_tables(packed.device)
+    q_factor = _qkv_2b_factor(q_weight)
+    k_factor = _qkv_2b_factor(k_weight)
+    accumulator = torch.empty((rows, 5120), dtype=torch.float32, device=packed.device)
+    head = accumulator.view(rows, 20, 256)
+    source = packed.view(rows, 20, 256)
+    head[:, 0:8] = source[:, 0:16:2]
+    head[:, 8:10] = source[:, 16:18]
+    head[:, 10:12] = source[:, 18:20]
+    head[:, 12:20] = source[:, 1:16:2]
+    q_out = torch.empty((rows, 4096), dtype=torch.bfloat16, device=packed.device)
+    k_cache = torch.empty((2, rows, 256), dtype=torch.bfloat16, device=packed.device)
+    v_cache = torch.empty((2, rows, 256), dtype=torch.bfloat16, device=packed.device)
+    stream = ctypes.c_void_p(torch.npu.current_stream(packed.device).npu_stream)
+    status = call(ctypes.c_void_p(q_out.data_ptr()), ctypes.c_void_p(k_cache.data_ptr()),
+                  ctypes.c_void_p(v_cache.data_ptr()), ctypes.c_void_p(accumulator.data_ptr()),
+                  ctypes.c_void_p(q_factor.data_ptr()), ctypes.c_void_p(k_factor.data_ptr()),
+                  ctypes.c_void_p(ones.data_ptr()), ctypes.c_void_p(zeros.data_ptr()),
+                  rows, rows, 0, stream)
+    _qkv_2b_warmed = True
+    if status != 0:
+        message = get_error()
+        raise RuntimeError(f"gemm_qkv_2b_norm_gate_cache: {message.decode('utf-8', 'replace') if message else 'unknown failure'}")
+    q = q_out[:, :2048].view(rows, 8, 256).unsqueeze(0)
+    k = k_cache.transpose(0, 1).unsqueeze(0).contiguous()
+    v = v_cache.transpose(0, 1).unsqueeze(0).contiguous()
+    gate = q_out[:, 2048:].reshape(1, rows, 2048)
+    return q, k, v, gate
+
+
+@register("qkv_norm_split", backend="ascend",
+          requires=xc if callable(_split_forward) or callable(_qkv_2b_pair) else None,
           version=VERSION)
 @partial(reference.qkv_norm_split)
 def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim, eps):
+    tail = _qkv_2b_tail_pair()
+    if (tail is not None
+            and packed.dim() == 3 and packed.shape[0] == 1
+            and num_heads == 8 and num_kv_heads == 2 and head_dim == 256
+            and float(eps) == 1e-6 and packed.shape[2] == 5120
+            and packed.dtype == torch.bfloat16 and packed.is_contiguous()
+            and q_weight is not None and k_weight is not None
+            and tuple(q_weight.shape) == (256,) and tuple(k_weight.shape) == (256,)
+            and q_weight.dtype == torch.float32 and k_weight.dtype == torch.float32
+            and q_weight.is_contiguous() and k_weight.is_contiguous()):
+        split = _qkv_2b_split(packed, q_weight, k_weight, tail)
+        if split is not None:
+            return split
     b, n = packed.shape[:2]
     key = (b, packed.device)
     if key not in _no_action_rows:  # every row is a text row

@@ -135,10 +135,47 @@ def _modulated_supported(x, modulation, eps, pinned_modulation=None, pinned_rows
             and modulation.shape[-1] == 3 * x.shape[-1])
 
 
+_identity_operands = {}  # (device, pinned) -> (zero residual [1, 16, 1024], one branch gate)
+
+
+def _modulated_identity_operands(x, pinned):
+    """The 2B action shape's identity operands, cached per device and pinned state.
+
+    The plain Ada call has no fused plan of its own: at ``[1, 16, 1024]`` with an FP32
+    ``[1, 3072]`` modulation the generic statistics + pair programs measure ~424us while
+    the gated-residual entry dispatches the fused action kernel (~8us) for exactly this
+    shape. A zero residual and a one branch gate reduce that entry to the plain
+    semantics -- ``residual_output = 0 + x * 1`` is exact in BF16 -- and the probe shows
+    the outputs and gate bit for bit equal to the plain programs. With a pinned
+    modulation the entry takes the branch gate per token (gate rows = the input rows),
+    so the one buffer follows the pinned state.
+    """
+    key = (x.device, bool(pinned))
+    pair = _identity_operands.get(key)
+    if pair is None:
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("warm up the identity operands on this stream before graph capture")
+        gate = (torch.ones(1, 16, 1024, dtype=torch.bfloat16, device=x.device) if pinned
+                else torch.ones(1, 1, 1024, dtype=torch.bfloat16, device=x.device))
+        pair = (torch.zeros(1, 16, 1024, dtype=torch.bfloat16, device=x.device), gate)
+        _identity_operands[key] = pair
+    return pair
+
+
 @register("modulated_rms_norm", backend="ascend", requires=xc if _adarms is not None else None,
           version=VERSION)
 @partial(reference_modulated_rms_norm, check=_modulated_supported)
 def modulated_rms_norm(x, modulation, eps, pinned_modulation=None, pinned_rows=None):
+    if (x.dim() == 3 and modulation.dim() == 2
+            and tuple(x.shape) == (1, 16, 1024) and tuple(modulation.shape) == (1, 3072)
+            and x.dtype == torch.bfloat16 and modulation.dtype == torch.float32
+            and x.is_contiguous() and modulation.is_contiguous()):
+        zeros, ones = _modulated_identity_operands(
+            x, pinned_modulation is not None or pinned_rows is not None)
+        out, gate, _ = _adarms(x, modulation, float(eps), True,
+                               pinned_modulation=pinned_modulation, pinned_rows=pinned_rows,
+                               residual=zeros, branch_gate=ones)
+        return out, gate
     return _adarms(x, modulation, float(eps), True,
                    pinned_modulation=pinned_modulation, pinned_rows=pinned_rows)
 

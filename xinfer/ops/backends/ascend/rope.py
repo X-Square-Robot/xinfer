@@ -31,6 +31,26 @@ _full = _rope().full if callable(_rope) else None
          and cos.device == q.device and sin.device == q.device
          and 0 < rotary_dim <= q.shape[-1] and cos.shape[-1] * 2 >= rotary_dim)
 def rope_full(q, k, cos, sin, rotary_dim):
+    # The 2B prefill heads are 256 wide with a 64-dim rotary prefix: the affine fast
+    # kernels take full rotations of 64/128-wide heads only, so this shape falls to the
+    # generic scalar pair program (~264us per call). Gather the rotary prefix into a
+    # contiguous head, rotate it with the affine kernel (its width equals the rotary
+    # dim there) and splice the pass-through suffix back: bit for bit the generic
+    # program's values at ~27us per call. Other shapes keep the direct entry.
+    if (q.ndim == 4 and k.ndim == 4 and rotary_dim in (64, 128)
+            and 0 < int(rotary_dim) < q.shape[-1] and q.shape[-1] == k.shape[-1]
+            and q.shape[:-2] == k.shape[:-2]
+            and q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16
+            and cos.dtype == torch.float32 and sin.dtype == torch.float32
+            and cos.dim() == 3 and cos.shape[0] == 1 and sin.shape == cos.shape
+            and cos.is_contiguous() and sin.is_contiguous()
+            and cos.shape[-1] * 2 >= rotary_dim):
+        rot = int(rotary_dim)
+        prefix_q = q[..., :rot].contiguous()
+        prefix_k = k[..., :rot].contiguous()
+        rotated_q, rotated_k = _full(prefix_q, prefix_k, cos, sin, False, rot)
+        return (torch.cat((rotated_q, q[..., rot:]), dim=-1),
+                torch.cat((rotated_k, k[..., rot:]), dim=-1))
     return _full(q, k, cos, sin, False, rotary_dim)
 
 
