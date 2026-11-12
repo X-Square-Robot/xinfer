@@ -117,6 +117,29 @@ So VLA serving cannot simply reuse the token-level scheduling and paged KV of vL
 | Chained dispatch | When an upstream stage is dispatched, its downstream stage is dispatched with it, linked by GPU events (§6) |
 | Tuning table | The measured best resource configuration, stored per (model, platform, quantization) (§10) |
 
+### 3.1 Device, platform and toolchain naming
+
+Three layers take three words, and one object never takes two names inside one layer. This is what keeps
+`npu` and `ascend` from reading as synonyms.
+
+| Layer | Word | Written as | Not used for |
+|---|---|---|---|
+| torch device | `npu` | device strings `npu:0`, the `torch.npu` / `torch_npu` API, `platforms/npu.py` (the module that resolves a torch device), `Platform.is_npu`, `NpuJpegDecoder` | backend or vendor identity |
+| platform and backend | `ascend` | `PlatformCapabilities.device_type == "ascend"`, platform name `ascend-<arch>`, `xinfer/ops/backends/ascend/`, selection names `ascend:xcompute` and `ascend:torch` | torch device strings |
+| toolchain | `cann` | prose and error text about DVPP, ACLNN and FIA; `load_npu_media` imports CANN's Python ACL | selectors of any kind |
+
+Rules:
+
+1. A torch device string, or the torch API that consumes one, is `npu`.
+2. Whatever identifies *which hardware and backend* serves a request — `device_type`, the platform name, the
+   backend package, a selection name — is `ascend`.
+3. The vendor software stack is `cann`, named only in prose and error messages, never as a selector.
+4. `Platform.name` is therefore `ascend-<arch>`, for example `ascend-950dt9582`, matching its `device_type` and
+   its backend. The `npu` in `Platform.is_npu` and in `platforms/npu.py` answers the device-layer question
+   "is this a torch NPU device", which is why those two keep it.
+5. External names keep their spelling: `npu-smi`, `torch_npu`, `ASCEND_HOME`, and vendor error text are quoted
+   verbatim rather than normalised to the rule above.
+
 ---
 
 ## 4. Overall architecture
@@ -778,7 +801,7 @@ XInfer/
 │   ├── ops/
 │   │   ├── spec.py                 # operator signatures and numerical contracts
 │   │   ├── registry.py             # backend registration, build-time selection, selection table
-│   │   ├── reference/              # torch reference implementations on every platform: basic operators, fused.py, mxfp8.py, nvfp4.py
+│   │   ├── reference/              # torch reference implementations on every platform: attn.py, gemm.py, norm.py, flow.py, rope.py, elementwise.py, conv.py, mxfp8.py, nvfp4.py
 │   │   ├── layout/                 # storage layouts of the low-precision formats: mxfp8.py, nvfp4.py
 │   │   ├── backends/
 │   │   │   ├── _xcompute.py        # imports the xcompute library (currently via TVM-FFI), shared by the backends
