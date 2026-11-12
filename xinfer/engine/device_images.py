@@ -48,15 +48,46 @@ class DeviceImageDecoder:
         stream. JPEGs are submitted together to the platform decoder.
         """
         images = {name: value for name, value in inputs.items() if isinstance(value, DeviceImage)}
+        out = dict(inputs)
+        if self.device.type == "npu":
+            # Per-view: a prefetched view (its ticket ran ahead of the request's admission item,
+            # on this same thread) is taken from its slot -- the decode that ran there -- and any
+            # view without a completed slot decodes here in its own DVPP transaction, the same
+            # transaction per JPEG in the same order as the former single batched call.
+            for name, image in images.items():
+                slot = getattr(image, "prefetch", None)
+                if (slot is not None and slot.device == self.device
+                        and (slot.view is not None or slot.error is not None)):
+                    if slot.error is not None:
+                        raise slot.error
+                    out[name] = slot.view
+                else:
+                    out[name] = self.decode_one(image)
+            return out
         jpegs = [name for name, image in images.items() if image.data.dim() == 1]
         decoded = {}
         if jpegs:
             decoded = dict(zip(jpegs, self._decode([images[name].data for name in jpegs])))
-        out = dict(inputs)
         for name, image in images.items():
             view = decoded[name] if name in decoded else _to_device(image.data, self.device).permute(2, 0, 1)
             out[name] = _resize(view, image)
         return out
+
+    def decode_one(self, image: DeviceImage) -> torch.Tensor:
+        """One view's ``[h, w, 3]`` uint8 tensor on the NPU: its decode or upload, then the resize steps.
+
+        The engine's per-view prefetch and the admission-time fallback share this path: a JPEG
+        takes one synchronous DVPP V2 transaction (the same transaction the former batched call
+        ran, one JPEG at a time), a raw frame uploads through ``_to_device`` on the caller's
+        stream, and both then run ``_resize`` on that stream.
+        """
+        if self.device.type != "npu":
+            raise RuntimeError("per-view decode is the NPU path; CUDA batches its JPEGs in __call__")
+        if image.data.dim() == 1:
+            view = self._decode([image.data])[0]
+        else:
+            view = _to_device(image.data, self.device).permute(2, 0, 1)
+        return _resize(view, image)
 
 
 def _resize(view: torch.Tensor, image: DeviceImage) -> torch.Tensor:

@@ -41,6 +41,7 @@ from typing import Any
 import torch
 
 from xinfer.engine import batching
+from xinfer.engine import image_prefetch
 from xinfer.engine.device_images import DeviceImageDecoder
 from xinfer.engine.executor import Lane, _to_device, allocate_outputs
 from xinfer.engine.cudagraph import CUDAGraphConfig, LaneCUDAGraphs, _ReadTracker, capture_batch_sizes, warmup_requests
@@ -263,6 +264,19 @@ class Engine:
         self._device_requests: queue.Queue = queue.Queue()
         self._device_ready: list = []
         self._device_inflight = 0
+        # Per-view prefetch tickets (NPU): processors hand each DeviceImage to this queue at
+        # prepare time, ahead of the request's admission item, so the DVPP decode overlaps the
+        # processor's remaining host work (r10 knife 1). Bound only where the device-image
+        # thread decodes per-view: NPU platforms with device-image support.
+        self._prefetch_bound = bool(platform.is_npu and self._device_stream is not None)
+        if self._prefetch_bound:
+            image_prefetch.bind(self._device_requests)
+            # models never import the engine and the engine may use only the model interface
+            # (tests/unit/test_layering.py): the hand-off runs through the interface module's
+            # hook, installed here and cleared at shutdown.
+            import xinfer.models.interface
+
+            xinfer.models.interface._prefetch_hook = image_prefetch.hand_off
         self._device_thread = threading.Thread(target=self._device_images_loop, name="xinfer-device-images",
                                                daemon=True)
         if start:
@@ -424,6 +438,12 @@ class Engine:
         if self._device_thread.is_alive():
             self._device_requests.put(None)
             self._device_thread.join()
+        if getattr(self, "_prefetch_bound", False):
+            image_prefetch.unbind(self._device_requests)
+            import xinfer.models.interface
+
+            if xinfer.models.interface._prefetch_hook is image_prefetch.hand_off:
+                xinfer.models.interface._prefetch_hook = None
         for lanes in self.lanes.values():
             for lane in lanes:
                 lane.cudagraphs = None
@@ -550,8 +570,8 @@ class Engine:
                 self._queues[stage].append(request)
 
     def _device_images_loop(self) -> None:
-        """Device-image thread body: turn each handed-over request's ``DeviceImage`` values into views, in admission
-        order.
+        """Device-image thread body: per-view prefetch tickets, then each handed-over request's ``DeviceImage``
+        values turned into views, in queue (admission) order.
 
         The ``DeviceImageDecoder`` is created on first use. If initialization raises, the request fails and the next
         one tries again. The work runs on the thread's stream after the request's upload, and an event recorded
@@ -564,6 +584,9 @@ class Engine:
         stream = self._device_stream
         while True:
             request = self._device_requests.get()
+            if isinstance(request, image_prefetch.Ticket):
+                self._prefetch_view(request.image)
+                continue
             if request is None:
                 if self._decoder is not None:
                     try:
@@ -596,6 +619,29 @@ class Engine:
             with self._lock:
                 self._device_ready.append((request, inputs, event, error))
                 self._wake.notify()
+
+    def _prefetch_view(self, image) -> None:
+        """Decode and resize one prefetched ``DeviceImage`` into its slot (device-image thread).
+
+        The same stream, decoder and per-view path as the admission-time decode, one queue item
+        per view: a ticket always completes before its request's admission item (FIFO). A decode
+        that raises is recorded in the slot and fails the request at admission, as an
+        admission-time decode failure would.
+        """
+        slot = getattr(image, "prefetch", None)
+        if slot is None:
+            return
+        try:
+            if self._decoder is None:
+                self._decoder = DeviceImageDecoder(self.platform.device)
+            context = (self._device_module.stream(self._device_stream) if self._device_stream is not None
+                       else contextlib.nullcontext())
+            with context, torch.inference_mode():
+                view = self._decoder.decode_one(image)
+            slot.device = self._decoder.device
+            slot.view = view
+        except Exception as exc:  # noqa: BLE001 - the request fails with it when admitted
+            slot.error = exc
 
     def _queue_device_ready(self) -> bool:
         """Queue the requests whose views are ready for their first stages; fail those whose decoding raised.
