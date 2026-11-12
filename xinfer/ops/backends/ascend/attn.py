@@ -87,26 +87,45 @@ def varlen_attention(q, k, v, cu_seqlens, *, scale=None):
 @register("causal_attention", backend="ascend", requires=xc if callable(native_causal) else None,
           version=VERSION)
 @partial(_torch_attn.causal_attention)
-def causal_attention(q, k, v, *, scale=None):
-    return native_causal(q, k, v, scale=scale)
+def causal_attention(q, k, v, *, scale=None, return_bnsd=False):
+    return native_causal(q, k, v, scale=scale, return_bnsd=return_bnsd)
 
 
-def _prefix_supported(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+def _prefix_supported(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None, all_keep=False,
+                      return_bnsd=False):
     return callable(native_cache) or _cache_supported(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
 
 
 @register("prefix_kvcache_attention", backend="ascend", requires=xc if callable(native_cache) else raw_cache,
           version=VERSION)
 @partial(_torch_attn.prefix_kvcache_attention, check=_prefix_supported)
-def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
+                             all_keep=False, return_bnsd=False):
     # The OpSpec contract is [B, M, HD]: a provider that returns [B, M, H, D] must be flattened here, and for a
     # provider that already returns [B, M, HD] this reshape is the identity. Never trust the provider's shape.
     if callable(native_cache):
-        out = native_cache(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+        out = native_cache(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale,
+                           all_keep=all_keep, return_bnsd=return_bnsd)
     else:
+        if all_keep and flash_mask is not None:
+            raise ValueError("all_keep cannot be combined with a flash mask")
         out = xc.attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=new_pos,
-                                   flash_mask=flash_mask, softmax_scale=scale, backend="ascend_tilelang", pdl=False)
+                                   flash_mask=None if all_keep else flash_mask, softmax_scale=scale,
+                                   backend="ascend_tilelang", pdl=False)
+        if return_bnsd:
+            b, m, h, d = q.shape
+            out = out.view(b, m, h, d).transpose(1, 2)
+    if return_bnsd:
+        return out
     return out.reshape(q.shape[0], q.shape[1], -1)
+
+
+# The cache-attention metadata scope rides the prefix attention: models open it around their action loop so the
+# dense drop mask is built once per forward from the live flash mask instead of once per call. The torch
+# composition keeps a null context (the model's getattr default).
+_action_scope = getattr(attention, "action_scope", None) if attention is not None else None
+if callable(_action_scope):
+    prefix_kvcache_attention.action_scope = _action_scope
 
 
 # ---------------------------------------------------------------- Wall-X 2B attention family

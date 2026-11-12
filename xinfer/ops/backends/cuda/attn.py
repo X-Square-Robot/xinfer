@@ -108,12 +108,12 @@ def varlen_attention(q, k, v, cu_seqlens, *, scale=None):
 
 
 @register("causal_attention", backend="cuda", requires=flash_attn)
-def causal_attention(q, k, v, *, scale=None):
+def causal_attention(q, k, v, *, scale=None, return_bnsd=False):
     """``causal_attention`` via ``flash_attn_with_kvcache`` (the Wall-X 4B service's Stage-1 kernel).
 
     The service appended ``k``/``v`` to empty caches with ``num_splits=1``. Here ``k``/``v`` are the
-    caches (``cache_seqlens = L``), so no key is written; ``cache_batch_idx`` keeps flash-attn on the
-    same split-KV kernel, which gives the service's bits without its per-CTA rewrite of the keys
+    caches (``cache_seqlens = L``), so no key is written; ``cache_batch_idx`` keeps flash-attn on
+    the same split-KV kernel, which gives the service's bits without its per-CTA rewrite of the keys
     (68 -> 28 µs at L = 768, 16/2/128 heads, RTX 5090). Without ``cache_batch_idx`` flash-attn runs
     another kernel configuration and the bits differ.
 
@@ -122,14 +122,16 @@ def causal_attention(q, k, v, *, scale=None):
         k: ``[B, L, KV, D]`` keys.
         v: ``[B, L, KV, D]`` values.
         scale: softmax scale; None for ``1/sqrt(D)``.
+        return_bnsd: Return the head-major ``[B, H, L, D]`` form instead of the transposed layout.
 
     Returns:
-        ``[B, L, H, D]`` in ``q.dtype``.
+        ``[B, L, H, D]`` in ``q.dtype``, or ``[B, H, L, D]`` with ``return_bnsd``.
     """
     batch_size, length = q.shape[:2]
     rows = torch.arange(batch_size, dtype=torch.int32, device=q.device)
-    return flash_attn.flash_attn_with_kvcache(q, k, v, cache_seqlens=length, cache_batch_idx=rows,
-                                              softmax_scale=scale, causal=True, num_splits=1)
+    out = flash_attn.flash_attn_with_kvcache(q, k, v, cache_seqlens=length, cache_batch_idx=rows,
+                                             softmax_scale=scale, causal=True, num_splits=1)
+    return out.transpose(1, 2) if return_bnsd else out
 
 
 @register("prefix_attention", backend="cuda", requires=flash_attn)
@@ -243,15 +245,21 @@ def _takes(entry, probe, key, *args, **kwargs) -> bool:
 
 
 @register("prefix_kvcache_attention", backend="cuda", **XCOMPUTE)
-def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
+                             all_keep=False, return_bnsd=False):
     options = dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
     key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
     if not _takes("kvcache", xc.attention_kvcache_backend, key, q, k_cache, v_cache, **options):
         return reference_attn.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
                                                        flash_mask=flash_mask,
-                                                       scale=scale)
+                                                       scale=scale, all_keep=all_keep,
+                                                       return_bnsd=return_bnsd)
     b, m = q.shape[:2]
-    return xc.attention_kvcache(q, k_cache, v_cache, **options).reshape(b, m, -1)
+    out = xc.attention_kvcache(q, k_cache, v_cache, **options)
+    if return_bnsd:
+        h, d = q.shape[2], q.shape[3]
+        return out.view(b, m, h, d).transpose(1, 2)
+    return out.reshape(b, m, -1)
 
 
 _segment_layouts = {}  # (segment bounds, heads, head_dim) -> whether attention_varlen's kernel list takes the layout

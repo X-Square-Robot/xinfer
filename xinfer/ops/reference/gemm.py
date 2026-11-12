@@ -41,7 +41,8 @@ def gemm_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     ``bf16(residual + bf16(y · residual_gate[row_class]))``.
 
     Args:
-        x: ``[M, K]`` BF16.
+        x: ``[M, K]`` BF16, or the head-major attention output ``[H, M, D]`` (the native form the attention
+            kernels return; equivalent to its packed ``[M, H·D]`` flatten).
         weight: ``[N, K]`` BF16.
         bias: ``[N]`` or None.
         activation: ``"silu"``, ``"gelu"`` (erf), ``"gelu_tanh"`` or None.
@@ -53,6 +54,8 @@ def gemm_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     Returns:
         ``[M, N]`` in ``x.dtype``.
     """
+    if x.ndim == 3:
+        x = x.transpose(0, 1).reshape(x.shape[1], -1)
     y = x.float() @ weight.float().t()
     if bias is not None:
         y = y + bias.float()

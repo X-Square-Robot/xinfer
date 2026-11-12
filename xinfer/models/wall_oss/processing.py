@@ -439,6 +439,9 @@ def pad_prompt(tensors: Mapping[str, Any], width: int) -> dict[str, Any]:
                                      positions[:, :, start:]], dim=2)
     out["prompt_len"] = width
     out["prompt_valid"] = torch.tensor([keep], dtype=torch.int32)
+    # Bucket padding can shorten the prompt: only a fully valid bucket width keeps the action stage's
+    # all-keep guarantee (no flash mask needed).
+    out["mask_all_keep"] = bool(tensors.get("mask_all_keep", False) and keep == width)
     return out
 
 
@@ -693,6 +696,12 @@ class WallOSSInputProcessor:
                 num_steps = int(requested)
         tensors["inference_delay"] = torch.tensor([meta["inference_delay"]], dtype=torch.int64)
         tensors["num_steps"] = num_steps
+        # The host all-keep guarantee for the action stage: with no RTC delay every cache row is visible, so
+        # the flow path can skip the flash-mask build and the FIA mask read. A host value the stage reads
+        # keys the NPU graph, so requests whose value differs (RTC delay > 0, padded prompts) keep the dense
+        # drop-mask path. Bucket padding can shorten the prompt: only a fully valid bucket width keeps the
+        # guarantee (``pad_prompt`` re-checks).
+        tensors["mask_all_keep"] = bool(meta["inference_delay"] == 0)
         if config.prompt_bucket:
             tensors = pad_prompt(tensors, self.bucket.width(prompt_len))
         return PreparedRequest(tensors=tensors, meta=meta)
