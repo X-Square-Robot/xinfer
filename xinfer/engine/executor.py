@@ -37,48 +37,58 @@ class Lane:
     """
 
     def __init__(self, stage: str, index: int, platform: Platform, *, priority: int = 0):
-        """Create the lane; on CUDA its new stream first waits for the work queued so far on the current stream.
+        """Create the lane; on an accelerator its stream first waits for work on the current stream.
 
         Args:
             stage: stage name.
             index: lane index within the stage.
-            platform: the platform; a stream is created only when it is CUDA.
-            priority: CUDA scheduling hint; smaller integers have higher priority. Default 0.
+            platform: the platform; a stream is created only when there's a torch-style device module
+                (``device_module_for`` returned one: CUDA, NPU, ...). CPU platforms leave ``stream`` None.
+            priority: accelerator scheduling hint; smaller integers have higher priority. Default 0.
 
         Raises:
             ValueError: priority is not an integer, is nonzero on an unsupported platform,
-                or CUDA cannot honor the requested value without clamping.
+                or the accelerator cannot honor the requested value without clamping.
         """
+        from xinfer.platforms.devices import device_module_for
+
+        if platform.capabilities.execution_model != "cuda-lanes":
+            raise ValueError("lane dispatch requires execution_model='cuda-lanes'; "
+                             f"got {platform.capabilities.execution_model!r}")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise ValueError(f"stream priority for {stage} must be an integer, got {priority!r}")
-        if priority != 0 and (not platform.is_cuda or not platform.capabilities.stream_priorities):
+        self._device_module = device_module_for(platform.device)
+        if priority != 0 and (self._device_module is None or not platform.capabilities.stream_priorities):
             raise ValueError(f"platform {platform.name} does not support nonzero stream priorities")
         self.stage = stage
         self.index = index
-        self.stream = torch.cuda.Stream(device=platform.device, priority=priority) if platform.is_cuda else None
+        self.stream = (self._device_module.Stream(device=platform.device, priority=priority)
+                       if self._device_module is not None else None)
         if self.stream is not None:
             if self.stream.priority != priority:
                 raise ValueError(f"stream priority {priority} for {stage} is unsupported on {platform.device}; "
-                                 f"CUDA would clamp it to {self.stream.priority}")
+                                 f"the runtime would clamp it to {self.stream.priority}")
             # Weights were loaded and converted on the current stream; order the lane after that work.
-            self.stream.wait_stream(torch.cuda.current_stream(platform.device))
+            self.stream.wait_stream(self._device_module.current_stream(platform.device))
         self.cudagraphs = None  # LaneCUDAGraphs when the engine uses CUDA graphs
-        self.copy_stream = None  # final stages on CUDA: copies results to the host
+        self.copy_stream = None  # final stages on an accelerator: copies results to the host
         self.event = None  # completion event of the lane's current dispatch
 
     def use_stream(self):
         """Context manager that makes the lane's stream current (a no-op on the CPU)."""
-        return torch.cuda.stream(self.stream) if self.stream is not None else contextlib.nullcontext()
+        if self.stream is None:
+            return contextlib.nullcontext()
+        return self._device_module.stream(self.stream)
 
     def record(self):
         """Record an event on the lane's stream after the work enqueued so far.
 
         Returns:
-            The recorded ``torch.cuda.Event``, or None on the CPU, where the work has already run.
+            The recorded device event, or None on the CPU, where the work has already run.
         """
         if self.stream is None:
             return None
-        event = torch.cuda.Event()
+        event = self._device_module.Event()
         event.record(self.stream)
         return event
 

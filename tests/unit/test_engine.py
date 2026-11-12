@@ -438,7 +438,7 @@ def test_device_images_fail_their_request_without_a_cuda_device():
     engine = Engine(Pipe(), CPU, EngineConfig())
     assert torch.equal(engine.run(_req(1))["y"], _expect(1))
     for _ in range(2):  # every request with device images fails, the others are served
-        with pytest.raises(ValueError, match="need a CUDA device"):
+        with pytest.raises(ValueError, match="need a CUDA or NPU device|need a CUDA device"):
             engine.run(_image_req(2))
         assert torch.equal(engine.run(_req(3))["y"], _expect(3))
     assert engine.slots.in_use() == 0

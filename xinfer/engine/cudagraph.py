@@ -187,7 +187,13 @@ class LaneCUDAGraphs:
         self.stream = stream
         self.device = device
         self.policy = policy
-        self.pool = torch.cuda.graph_pool_handle()
+        # Vendor-agnostic handle (CUDA, NPU) delivered by ``graph_api_for``: its ``graph_pool_handle`` /
+        # ``CUDAGraph`` / ``graph(...)`` / ``stream(...)`` / ``synchronize`` match torch.cuda's surface.
+        # A None from the factory means the engine never calls into it (CPU path uses no graph).
+        from xinfer.platforms.devices import graph_api_for
+
+        self._graph_api = graph_api_for(device)
+        self.pool = self._graph_api.graph_pool_handle()
         self._static_buffers: dict[tuple[str, str, torch.dtype], torch.Tensor] = {}
         self._graphs: OrderedDict[tuple, _Captured] = OrderedDict()
         # Input names each stage reads; may be shared by the lanes of an engine.
@@ -345,7 +351,7 @@ class LaneCUDAGraphs:
         """
         batch = StageBatch(stage, batch_size, MappingProxyType(dict(inputs)))
         batch.out = self._alloc_outputs(stage, batch, static=False)
-        with torch.cuda.stream(self.stream), torch.inference_mode():
+        with self._graph_api.stream(self.stream), torch.inference_mode():
             stage_function(batch)
         return batch.out
 
@@ -373,7 +379,7 @@ class LaneCUDAGraphs:
         tracked = _ReadTracker(inputs)
         batch = StageBatch(stage, batch_size, tracked)
         batch.out = self._alloc_outputs(stage, batch, static=False)
-        with torch.cuda.stream(self.stream), torch.inference_mode():
+        with self._graph_api.stream(self.stream), torch.inference_mode():
             stage_function(batch)
         self._reads.setdefault(stage, set()).update(tracked.names)
         static_in, host, used = {}, {}, set()
@@ -391,12 +397,12 @@ class LaneCUDAGraphs:
         batch = StageBatch(stage, batch_size, MappingProxyType(view_inputs))
         batch.out = self._alloc_outputs(stage, batch, static=True)
         used.update(("out", n, t.dtype) for n, t in batch.out.items())
-        with torch.cuda.stream(self.stream):
+        with self._graph_api.stream(self.stream):
             for name, view in static_in.items():
                 view.copy_(inputs[name], non_blocking=True)
-        graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(graph, pool=self.pool, stream=self.stream,
-                                                      capture_error_mode="thread_local"):
+        graph = self._graph_api.CUDAGraph()
+        with torch.inference_mode(), self._graph_api.graph(graph, pool=self.pool, stream=self.stream,
+                                                           capture_error_mode="thread_local"):
             stage_function(batch)
         elapsed = (time.perf_counter() - start) * 1000
         self.stats["captures"] += 1
@@ -438,5 +444,11 @@ def capture_batch_sizes(lanes: Mapping[str, list], batch_sizes: Mapping[str, lis
                 batch = merge(stage, [inputs] * batch_size)
                 if not lane.cudagraphs.known(stage, batch_size, batch):
                     lane.cudagraphs.run(stage, batch_size, batch)
-    torch.cuda.synchronize()
+    # Wait for the vendor runtime to finish capture work on all lanes used above.
+    # No CUDA graph vocabulary leaks beyond ``graph_api_for``; lane._device_module (torch.npu etc.)
+    # answers the same ``synchronize`` surface as torch.cuda.
+    module = next((lane._device_module for stage_lanes in lanes.values() for lane in stage_lanes
+                   if lane._device_module is not None), None)
+    if module is not None:
+        module.synchronize()
 

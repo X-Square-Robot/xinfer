@@ -138,12 +138,13 @@ class _Request:
 
 
 def _timing_event(lane):
-    """A timing CUDA event recorded on ``lane``'s stream, or None on the CPU."""
+    """A timing device event recorded on ``lane``'s stream, or None on the CPU."""
     if lane.stream is None:
         return None
-    event = torch.cuda.Event(enable_timing=True)
+    event = lane._device_module.Event(enable_timing=True)
     event.record(lane.stream)
     return event
+
 
 
 class Engine:
@@ -183,9 +184,15 @@ class Engine:
                 of its consumer.
             RuntimeError: ``config.cudagraphs`` is set but the platform does not support graph capture.
         """
+        from xinfer.platforms.devices import device_module_for
+
+        if platform.capabilities.execution_model != "cuda-lanes":
+            raise ValueError("engine.core.Engine requires execution_model='cuda-lanes'; "
+                             f"got {platform.capabilities.execution_model!r} on {platform.name}")
         self.model = model
         self.platform = platform
         self.config = config = config or EngineConfig()
+        self._device_module = device_module_for(platform.device)
         self.stages = model.stage_graph
         self.order = [stage.name for stage in self.stages]
         self.final_stages = [stage for stage in self.order if not self.stages.consumers(stage)]
@@ -231,11 +238,11 @@ class Engine:
                                                      self._reads)
                 lanes.append(lane)
             self.lanes[stage] = lanes
-        if platform.is_cuda:
+        if self._device_module is not None:
             for stage in self.final_stages:
                 for lane in self.lanes[stage]:
-                    lane.copy_stream = torch.cuda.Stream(device=platform.device)
-        self._upload = torch.cuda.Stream(device=platform.device) if platform.is_cuda else None
+                    lane.copy_stream = self._device_module.Stream(device=platform.device)
+        self._upload = self._device_module.Stream(device=platform.device) if self._device_module else None
 
         self.slots = SlotPool(config.max_running_requests)
         self._queues = {stage: deque() for stage in self.order}
@@ -255,7 +262,8 @@ class Engine:
         # DeviceImage inputs are decoded off the engine thread: on one thread (torchvision shares one nvJPEG decoder
         # per device) with its own stream and a decoder created on first use. Requests in it are counted in
         # _device_inflight (engine thread only) and come back through _device_ready.
-        self._device_stream = torch.cuda.Stream(device=platform.device) if platform.is_cuda else None
+        self._device_stream = (self._device_module.Stream(device=platform.device)
+                               if self._device_module is not None else None)
         self._decoder = None
         self._device_requests: queue.Queue = queue.Queue()
         self._device_ready: list = []
@@ -362,7 +370,8 @@ class Engine:
                         "reserved %.2f GiB", variants, time.perf_counter() - started,
                         {stage: counters["graphs"] for stage, counters in stats.items()},
                         sum(counters["capture_ms"] for counters in stats.values()) / 1000,
-                        torch.cuda.memory_reserved(self.platform.device) / 2 ** 30)
+                        (self._device_module.memory_reserved(self.platform.device) / 2 ** 30
+                         if self._device_module is not None else 0))
         return outputs
 
     def cudagraph_stats(self) -> dict:
@@ -423,12 +432,12 @@ class Engine:
         for lanes in self.lanes.values():
             for lane in lanes:
                 lane.cudagraphs = None
-        if self.platform.is_cuda:
-            torch.cuda.synchronize()
+        if self._device_module is not None:
+            self._device_module.synchronize()
             import gc
 
             gc.collect()
-            torch.cuda.empty_cache()
+            self._device_module.empty_cache()
 
     # ------------------------------------------------------------- engine loop
     def _run_engine_loop(self) -> None:
@@ -506,14 +515,15 @@ class Engine:
                 self._waiting.popleft()
             request.admitted_at = time.perf_counter()
             stream = self._upload
-            stream_context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+            stream_context = (self._device_module.stream(stream)
+                              if stream is not None else contextlib.nullcontext())
             admitted = True
             try:
                 with stream_context, span("admit", request=request.id, robot=request.robot):
                     request.inputs = {name: _to_device(value, self.platform.device)
                                       for name, value in request.prepared.tensors.items()}
                     if stream is not None:
-                        request.inputs_ready = torch.cuda.Event(enable_timing=self.stats_sink is not None)
+                        request.inputs_ready = self._device_module.Event(enable_timing=self.stats_sink is not None)
                         request.inputs_ready.record(stream)
             except Exception as exc:  # noqa: BLE001 - only this request fails
                 self._fail_request(request, exc)
@@ -551,7 +561,8 @@ class Engine:
             try:
                 if self._decoder is None:
                     self._decoder = DeviceImageDecoder(self.platform.device)
-                context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+                context = (self._device_module.stream(stream)
+                           if stream is not None else contextlib.nullcontext())
                 with context, torch.inference_mode():
                     if stream is not None and request.inputs_ready is not None:
                         stream.wait_event(request.inputs_ready)
@@ -560,7 +571,7 @@ class Engine:
                 error = exc
             if stream is not None:
                 try:
-                    event = torch.cuda.Event(enable_timing=self.stats_sink is not None)
+                    event = self._device_module.Event(enable_timing=self.stats_sink is not None)
                     event.record(stream)
                 except Exception:  # noqa: BLE001 - the device is in an error state; the request still fails or runs
                     logger.exception("could not record the device images' completion")
@@ -848,12 +859,12 @@ class Engine:
         if lane.copy_stream is None:
             return [self._to_host(stage, out, i, batch_size) for i in range(batch_size)], lane.record()
         ready = lane.record()
-        with torch.cuda.stream(lane.copy_stream):
+        with self._device_module.stream(lane.copy_stream):
             lane.copy_stream.wait_event(ready)
             for value in out.values():  # eager outputs must outlive the copies
                 value.record_stream(lane.copy_stream)
             hosts = [self._to_host(stage, out, i, batch_size) for i in range(batch_size)]
-            event = torch.cuda.Event()
+            event = self._device_module.Event()
             event.record(lane.copy_stream)
         return hosts, event
 
@@ -876,7 +887,7 @@ class Engine:
         host = {}
         for name, value in out.items():
             row = self._row(stage, name, value, i, batch_size)
-            if self.platform.is_cuda:
+            if self._device_module is not None:
                 host_buffer = torch.empty(row.shape, dtype=row.dtype, pin_memory=True)
                 host_buffer.copy_(row, non_blocking=True)
                 host[name] = host_buffer

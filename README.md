@@ -94,6 +94,7 @@ and action representations are documented in each model guide.
 | Model | Model ID | Precision | Real-time chunking | Guide |
 |---|---|---|---|---|
 | Wall-X 2B | `wallx2b` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
+| Wall-X 2B RPU · TP8 | `wallx2b` on `rpu:0` | FP16 | — | [RPU profile](docs/models/wallx2b_rpu.md) |
 
 Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for Wall-X 2B on an RTX 5090.
 
@@ -101,6 +102,7 @@ Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 
 |---|---|---|
 | NVIDIA GPUs · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
+| xcompute TP8 RPU | `rpu:0` | Native SDK prepared executions, explicit completion waits |
 | CPU | `cpu` | Reference implementations and tests |
 
 Each accelerator runs its own Engine and weights.
