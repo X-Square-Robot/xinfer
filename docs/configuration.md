@@ -28,19 +28,18 @@ Code: `xinfer/config/` (`resolve.py`, `tuned.py`).
 | `max_running_requests` | 32 | admitted requests in flight. An upper bound: slots hold no preallocated memory, and with one request per robot it is reached only by 32 robots |
 | `max_queued_requests` | 256 | submitted requests waiting for admission |
 | `lanes.<stage>` | tuned value, else 2 | a lane is a stream with its own graph pool; a second lane lets two requests run the stage at once |
-| `stream_priorities.<stage>` | −1 for the final stage on CUDA (Wall-OSS: `action`), else 0 | CUDA stream priority of the stage's lanes, lower is higher (`--stream-priorities action=0`, `Policy(stream_priorities={...})`) |
+| `stream_priorities.<stage>` | final stage (Wall-OSS: `action`): −1 bounded by the supported range; 0 when unknown or unsupported, and for other stages | accelerator stream priority of the stage's lanes, lower is higher (`--stream-priorities action=0`, `Policy(stream_priorities={...})`) |
 | `batch_sizes.<stage>` | every size the model declares | a larger allowed size never delays a request, because batches form only from queued requests; a model declares sizes above 1 only for a stage whose batched results pass its precision gate |
 | `cudagraphs` | on where the platform supports capture | |
 | `frontends` | 2, at most half the CPUs of the container quota | each frontend adds a bridge thread in the engine process |
 | `frontend_workers` | 4, with `frontends × frontend_workers` at most half the CPUs of the quota | processing threads per frontend; requests of different connections are processed at the same time |
 | `shm_buffers` | `ceil(max_running_requests / frontends)` per frontend | one buffer per running request; a frontend whose buffers are all leased waits. Default: 2 × 16 buffers of `--shm-buffer-mib` (32 MiB), pinned |
 
-A stream priority is a hint for ready GPU work: it does not preempt a running
-kernel or bypass event waits, so it moves delay between stages rather than
-removing it. Unknown stages, non-integers, values the device cannot
-represent, and nonzero values on a platform without stream priorities are
-errors (`--dry-run` resolves the values without creating lanes, so it does not
-check the device range).
+A stream priority is a scheduling hint for ready accelerator work; it does not bypass event waits or
+guarantee preemption. Unknown stages, non-integers, values outside the platform's reported range, and nonzero
+values on a platform without stream priorities are errors. `--dry-run` checks the reported range without
+creating lanes. Lane creation also verifies that a runtime advertising priorities honors the exact requested
+value. CUDA keeps the final-stage default −1 when supported; a runtime with range 0–7 keeps it at 0.
 
 The MXFP8 measurements below are historical results from an earlier Wall-OSS configuration. The current [Wall-OSS composition](models/wall_oss.md) supports BF16.
 

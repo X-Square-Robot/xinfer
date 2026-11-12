@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from xinfer.config import ConfigError, apply_image_preprocess_device
-from xinfer.platforms.detect import _cpu_platform
+from xinfer.platforms.cpu import cpu_platform as _cpu_platform
 
 
 def _platform(device_images):

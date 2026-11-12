@@ -46,7 +46,7 @@ import torch
 
 from xinfer.ops import reference
 from xinfer.ops.backends._xcompute import XCOMPUTE, xc, xcompute_with
-from xinfer.ops.reference import fused
+from xinfer.ops.reference import attn as reference_attn
 from xinfer.ops.registry import register
 
 flash_attn = flash_attn_2_cuda = None
@@ -247,8 +247,9 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_
     options = dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
     key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
     if not _takes("kvcache", xc.attention_kvcache_backend, key, q, k_cache, v_cache, **options):
-        return fused.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask,
-                                              scale=scale)
+        return reference_attn.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
+                                                       flash_mask=flash_mask,
+                                                       scale=scale)
     b, m = q.shape[:2]
     return xc.attention_kvcache(q, k_cache, v_cache, **options).reshape(b, m, -1)
 
@@ -277,7 +278,7 @@ def segment_attention(q, k, v, cu_seqlens, *, scale=None):
 def gated_causal_attention(q, k, v, gate, *, scale=None):
     options = dict(seg_len=q.shape[0], causal=True, out_gate=gate, gate_act="sigmoid")
     if not _takes("varlen", xc.attention_varlen_backend, (q.shape, k.shape), q, k, v, **options):
-        return fused.gated_causal_attention(q, k, v, gate, scale=scale)  # no kernel listed for these heads
+        return reference_attn.gated_causal_attention(q, k, v, gate, scale=scale)  # no kernel listed for these heads
     return xc.attention_varlen(q, k, v, softmax_scale=scale, pdl=False, **options)
 
 

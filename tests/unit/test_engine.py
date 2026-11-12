@@ -1,6 +1,8 @@
-"""Engine core: admission, batching, chaining and lifecycle (CPU, fake model)."""
+"""Engine core: admission, batching, chaining and lifecycle (fake model, CPU and optional CUDA)."""
 
 import contextlib
+import math
+import queue
 import threading
 import time
 from concurrent.futures import wait
@@ -12,6 +14,7 @@ import torch
 from xinfer.engine import AdmitError, Engine, EngineConfig, core
 from xinfer.models.interface import (BucketSpec, Capabilities, DeviceImage, HandoffSpec, OutputSpec, PreparedRequest,
                                      Stage, StageGraph, TensorSpec, VLAModel)
+from xinfer.observability.stats import RequestStats
 from xinfer.platforms import resolve_platform
 
 CPU = resolve_platform("cpu")
@@ -60,6 +63,24 @@ def _expect(i, n=3):
 def test_direct_engine_rejects_invalid_stream_priorities(priorities, message):
     with pytest.raises(ValueError, match=message):
         Engine(Pipe(), CPU, EngineConfig(stream_priorities=priorities), start=False)
+
+
+def test_shutdown_after_initialization_still_drains_queued_requests():
+    engine = Engine(Pipe(), CPU, start=False)
+    initialized, proceed = threading.Event(), threading.Event()
+    queued = engine.submit(_req(1))
+    engine.start()
+    shutdown = threading.Thread(target=engine.shutdown)
+    shutdown.start()
+    try:
+        with engine._wake:
+            assert engine._wake.wait_for(lambda: engine._stopping, timeout=10)
+    finally:
+        proceed.set()
+        shutdown.join(timeout=10)
+    assert not shutdown.is_alive()
+    assert torch.equal(queued.result(timeout=1)["y"], _expect(1))
+    assert engine.slots.in_use() == 0
 
 
 def test_stage_dispatches_run_in_spans_that_are_free_when_annotation_is_off(monkeypatch):
@@ -404,6 +425,77 @@ def _image_req(i, n=3):
     return PreparedRequest({"x": image, "bias": torch.full((1, n), 0.5)})
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("device_images", [False, True])
+def test_two_consecutive_cuda_requests_complete_and_report_stage_statistics(monkeypatch, device_images):
+    """Real CUDA events cover both upload and image completion; no image codec or model assets are needed."""
+    class Decoder:
+        def __init__(self, device):
+            self.device = device
+
+        def __call__(self, inputs):
+            return {name: value.data.to(self.device, dtype=torch.float32).reshape(1, -1)
+                    if isinstance(value, DeviceImage) else value for name, value in inputs.items()}
+
+        def close(self):
+            pass
+
+    if device_images:
+        monkeypatch.setattr(core, "DeviceImageDecoder", Decoder)
+    platform = resolve_platform("cuda")
+    engine = Engine(Pipe(), platform, EngineConfig(max_running_requests=2))
+    reported = queue.Queue()
+    engine.stats_sink = reported.put
+    try:
+        # Resolve each request before submitting the next. A dead completer must fail the second call,
+        # and missing timing must fail the statistics assertions even if both outputs were returned.
+        for value in (1, 2):
+            request = _image_req(value) if device_images else _req(value)
+            output = engine.submit(request).result(timeout=10)
+            torch.testing.assert_close(output["y"], _expect(value), atol=0, rtol=0)
+        for _ in range(2):
+            stats = reported.get(timeout=10)
+            assert isinstance(stats, RequestStats) and set(stats.stages) == {"a", "b"}
+            values = [stats.admission_wait, *(t for stage in stats.stages.values()
+                                             for t in (stage.wait, stage.execution))]
+            assert all(math.isfinite(value) and value >= 0 for value in values)
+            assert all(stage.batch_size == 1 for stage in stats.stages.values())
+        assert engine.health() is None
+    finally:
+        errors = []
+
+        def shutdown():
+            try:
+                with torch.cuda.device(platform.device):
+                    engine.shutdown()
+            except Exception as exc:  # cleanup failures still fail the test
+                errors.append(exc)
+
+        cleanup = threading.Thread(target=shutdown, daemon=True)
+        cleanup.start()
+        cleanup.join(timeout=10)
+        assert not cleanup.is_alive(), "engine shutdown did not complete"
+        if errors:
+            raise errors[0]
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_unavailable_event_timing_has_no_statistics(error_type):
+    queried = []
+
+    class UnavailableEvent:
+        def elapsed_time(self, other):
+            queried.append(other)
+            raise error_type("event timing unavailable")
+
+    engine = Engine(Pipe(), CPU, start=False)
+    request = SimpleNamespace(inputs_ready=UnavailableEvent(),
+                              timing={"a": (object(), object(), 1), "b": (object(), object(), 1)})
+    assert engine._request_stats(request) is None
+    assert len(queried) == 1
+
+
 def test_device_images_are_decoded_on_their_own_thread_while_other_requests_run(decoder):
     """A request without device images, submitted after one whose decoding is held, completes meanwhile; only the
     request with a device image reaches the decoder, created on the device-image thread at its first use."""
@@ -438,7 +530,7 @@ def test_device_images_fail_their_request_without_a_cuda_device():
     engine = Engine(Pipe(), CPU, EngineConfig())
     assert torch.equal(engine.run(_req(1))["y"], _expect(1))
     for _ in range(2):  # every request with device images fails, the others are served
-        with pytest.raises(ValueError, match="need a CUDA device"):
+        with pytest.raises(ValueError, match="need a CUDA or NPU device"):
             engine.run(_image_req(2))
         assert torch.equal(engine.run(_req(3))["y"], _expect(3))
     assert engine.slots.in_use() == 0

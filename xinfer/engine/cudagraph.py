@@ -1,4 +1,4 @@
-"""CUDA graph capture and replay of stage dispatches (docs/design.md §8.3).
+"""Accelerator graph capture and replay of stage dispatches (docs/design.md §8.3).
 
 Each lane owns one graph memory pool, shared by all graphs captured on that
 lane (they run one at a time on the lane's stream). A graph is keyed by the
@@ -19,6 +19,7 @@ or hands them off before then.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections import OrderedDict
@@ -30,6 +31,7 @@ from typing import Any
 import torch
 
 from xinfer.models.interface import PreparedRequest, StageBatch, VLAModel
+from xinfer.platforms.devices import device_module_for, graph_api_for
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +173,7 @@ class LaneCUDAGraphs:
             and static-buffer growth) and ``capture_ms`` (total capture time, eager pre-runs included).
     """
 
-    def __init__(self, model: VLAModel, stream: torch.cuda.Stream, device: str, policy: CUDAGraphConfig,
+    def __init__(self, model: VLAModel, stream: Any, device: str, policy: CUDAGraphConfig,
                  reads: dict[str, set[str]] | None = None):
         """Create an empty graph cache with its own graph memory pool.
 
@@ -187,7 +189,12 @@ class LaneCUDAGraphs:
         self.stream = stream
         self.device = device
         self.policy = policy
-        self.pool = torch.cuda.graph_pool_handle()
+        self._device_module = device_module_for(device)
+        self._graph_api = graph_api_for(device)
+        device_context = (self._device_module.device(device) if str(device).partition(":")[0] == "npu"
+                          else contextlib.nullcontext())
+        with device_context:
+            self.pool = self._graph_api.graph_pool_handle()
         self._static_buffers: dict[tuple[str, str, torch.dtype], torch.Tensor] = {}
         self._graphs: OrderedDict[tuple, _Captured] = OrderedDict()
         # Input names each stage reads; may be shared by the lanes of an engine.
@@ -291,11 +298,11 @@ class LaneCUDAGraphs:
         if captured is None:
             if self.warmed_up and self.policy.on_miss_after_warmup != "capture":
                 if self.policy.on_miss_after_warmup == "error":
-                    raise CUDAGraphMiss(f"no graph for {stage} {key[2]}")
+                    raise CUDAGraphMiss(f"no graph for {stage} {key[2] if key is not None else ()}")
                 self.stats["eager"] += 1
                 return self._eager(stage, batch_size, inputs, stage_function)
             if self.warmed_up:
-                logger.warning("capturing a graph after warmup for %s: %s", stage, key[2])
+                logger.warning("capturing a graph after warmup for %s: %s", stage, key[2] if key is not None else ())
                 self.stats["captures_after_warmup"] += 1
             captured = self._capture(stage, batch_size, inputs, stage_function)
             key = self._key(stage, batch_size, inputs)  # reads may have grown during capture
@@ -345,7 +352,7 @@ class LaneCUDAGraphs:
         """
         batch = StageBatch(stage, batch_size, MappingProxyType(dict(inputs)))
         batch.out = self._alloc_outputs(stage, batch, static=False)
-        with torch.cuda.stream(self.stream), torch.inference_mode():
+        with self._device_module.stream(self.stream), torch.inference_mode():
             stage_function(batch)
         return batch.out
 
@@ -373,7 +380,7 @@ class LaneCUDAGraphs:
         tracked = _ReadTracker(inputs)
         batch = StageBatch(stage, batch_size, tracked)
         batch.out = self._alloc_outputs(stage, batch, static=False)
-        with torch.cuda.stream(self.stream), torch.inference_mode():
+        with self._device_module.stream(self.stream), torch.inference_mode():
             stage_function(batch)
         self._reads.setdefault(stage, set()).update(tracked.names)
         static_in, host, used = {}, {}, set()
@@ -391,12 +398,12 @@ class LaneCUDAGraphs:
         batch = StageBatch(stage, batch_size, MappingProxyType(view_inputs))
         batch.out = self._alloc_outputs(stage, batch, static=True)
         used.update(("out", n, t.dtype) for n, t in batch.out.items())
-        with torch.cuda.stream(self.stream):
+        with self._device_module.stream(self.stream):
             for name, view in static_in.items():
                 view.copy_(inputs[name], non_blocking=True)
-        graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(graph, pool=self.pool, stream=self.stream,
-                                                      capture_error_mode="thread_local"):
+        graph = self._graph_api.CUDAGraph()
+        with torch.inference_mode(), self._graph_api.graph(graph, pool=self.pool, stream=self.stream,
+                                                           capture_error_mode="thread_local"):
             stage_function(batch)
         elapsed = (time.perf_counter() - start) * 1000
         self.stats["captures"] += 1
@@ -412,7 +419,8 @@ class LaneCUDAGraphs:
         return len(self._graphs)
 
 
-def capture_batch_sizes(lanes: Mapping[str, list], batch_sizes: Mapping[str, list[int]], merge) -> None:
+def capture_batch_sizes(lanes: Mapping[str, list], batch_sizes: Mapping[str, list[int]], merge, *,
+                        device: str = "cuda") -> None:
     """Capture the inputs recorded during warmup on every lane of their stage at every allowed batch size.
 
     The recorded inputs are repeated to fill each batch and merged by ``merge``, as serving merges a batch, so the
@@ -424,6 +432,7 @@ def capture_batch_sizes(lanes: Mapping[str, list], batch_sizes: Mapping[str, lis
         lanes: ``{stage: [lane, ...]}``; each lane has ``cudagraphs`` (a ``LaneCUDAGraphs``) and ``use_stream()``.
         batch_sizes: ``{stage: allowed batch sizes}``.
         merge: ``merge(stage, [inputs, ...])`` builds one batch's inputs from per-request inputs.
+        device: device to synchronize after capture.
     """
     tasks = []
     for stage, stage_lanes in lanes.items():
@@ -438,5 +447,8 @@ def capture_batch_sizes(lanes: Mapping[str, list], batch_sizes: Mapping[str, lis
                 batch = merge(stage, [inputs] * batch_size)
                 if not lane.cudagraphs.known(stage, batch_size, batch):
                     lane.cudagraphs.run(stage, batch_size, batch)
-    torch.cuda.synchronize()
+    if str(device).partition(":")[0] == "npu":
+        device_module_for(device).synchronize(device)
+    else:
+        torch.cuda.synchronize()
 

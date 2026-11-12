@@ -14,14 +14,28 @@ import request_latency  # noqa: E402
 from xinfer.frontend.protocol import packb  # noqa: E402
 
 
-def test_single_request_latency_is_measured_per_run(tmp_path):
+def test_single_request_latency_is_measured_per_run(tmp_path, monkeypatch):
+    import xinfer
+
+    create_policy = xinfer.Policy
+    passed_options = []
+
+    def policy(*args, **kwargs):
+        passed_options.append(kwargs)
+        return create_policy(*args, **kwargs)
+
+    monkeypatch.setattr(xinfer, "Policy", policy)
     requests = tmp_path / "requests.msgpack"
     requests.write_bytes(packb([{"x": np.zeros(3, np.float32)}, {"x": np.ones(3, np.float32)}]))
     out = tmp_path / "latency.json"
+    options = {"scale": 3.0, "op_backends": {"rms_norm": "reference"}, "reference_ops": True, "cudagraphs": False}
     code = request_latency.main(["--model", "echo_model:EchoModel", "--checkpoint", "unused", "--device", "cpu",
                                  "--requests-file", str(requests), "--runs", "7", "--warmup-runs", "2",
-                                 "--model-options", json.dumps({"scale": 3.0}), "--out", str(out)])
+                                 "--model-options", json.dumps(options), "--out", str(out)])
     assert code == 0
+    assert passed_options
+    assert all(all(kwargs.get(name) == value for name, value in {"device": "cpu", **options}.items())
+               for kwargs in passed_options)
     result = json.loads(out.read_text())
     assert result["runs"] == 7 and result["device"] == "cpu" and result["policy"]["platform"] == "cpu"
     samples = result["samples"]
