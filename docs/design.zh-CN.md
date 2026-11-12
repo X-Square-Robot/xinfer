@@ -117,6 +117,26 @@
 | 链式发射 | 上游阶段发射时，把下游阶段一起发射，靠 GPU 事件衔接（§6） |
 | 调优表 | 按（模型, 平台, 量化）存放的实测最优资源配置（§10） |
 
+### 3.1 设备、平台与工具链的命名
+
+三层各用一词，同一层内一个对象不取两个名字。这是 `npu` 与 `ascend` 不被读成同义词的前提。
+
+| 层 | 用词 | 出现在 | 不用于 |
+|---|---|---|---|
+| torch 设备 | `npu` | 设备串 `npu:0`、`torch.npu` / `torch_npu` 接口、`platforms/npu.py`（解析 torch 设备的模块）、`Platform.is_npu`、`NpuJpegDecoder` | 后端或厂商标识 |
+| 平台与后端 | `ascend` | `PlatformCapabilities.device_type == "ascend"`、平台名 `ascend-<arch>`、`xinfer/ops/backends/ascend/`、选择名 `ascend:xcompute` 与 `ascend:torch` | torch 设备串 |
+| 工具链 | `cann` | 关于 DVPP、ACLNN、FIA 的正文与错误文本；`load_npu_media` 导入 CANN 的 Python ACL | 任何选择器 |
+
+规则：
+
+1. torch 设备串、以及吃设备串的 torch 接口，用 `npu`。
+2. 标识"由哪块硬件、哪个后端来服务"的东西——`device_type`、平台名、后端包、选择名——用 `ascend`。
+3. 厂商软件栈用 `cann`，只出现在正文与错误信息里，从不作为选择器。
+4. 因此 `Platform.name` 是 `ascend-<arch>`，例如 `ascend-950dt9582`，与它的 `device_type` 和后端一致。
+   `Platform.is_npu` 与 `platforms/npu.py` 里的 `npu` 回答的是设备层的问题"这是不是一个 torch NPU 设备"，
+   所以这两处保留 `npu`。
+5. 外部名字保持原拼写：`npu-smi`、`torch_npu`、`ASCEND_HOME` 与厂商错误文本按原样引用，不按上述规则改写。
+
 ---
 
 ## 4. 总体架构
@@ -778,7 +798,7 @@ XInfer/
 │   ├── ops/
 │   │   ├── spec.py                 # 算子签名与数值契约
 │   │   ├── registry.py             # 后端注册、构建时选择、选择表
-│   │   ├── reference/              # 所有平台上的 torch 参考实现：基础算子、fused.py、mxfp8.py、nvfp4.py
+│   │   ├── reference/              # 所有平台上的 torch 参考实现：attn.py、gemm.py、norm.py、flow.py、rope.py、elementwise.py、conv.py、mxfp8.py、nvfp4.py
 │   │   ├── layout/                 # 低精度格式的存储布局：mxfp8.py、nvfp4.py
 │   │   ├── backends/
 │   │   │   ├── _xcompute.py        # import xcompute 库（现用 TVM-FFI），各后端共用

@@ -1,9 +1,10 @@
 """Dependency direction between packages, and the torch-free interfaces (docs/design.md §4).
 
-The torch and device boundaries of §4 are targets and are not checked yet.
+Most torch and device boundaries of §4 remain targets; the engine's device-image modules are checked below.
 """
 
 import ast
+import inspect
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2] / "xinfer"
@@ -73,5 +74,35 @@ def test_concrete_models_do_not_import_runtime_internals():
 def test_interfaces_do_not_import_torch():
     violations = [f"{module} imports {name}" for module in TORCH_FREE for name in _imports(ROOT / module)
                   if name.split(".")[0] == "torch"]
+    assert not violations, "\n".join(violations)
+
+
+def test_engine_image_modules_leave_vendor_code_and_streams_to_platforms():
+    from xinfer.engine.device_images import DeviceImageDecoder
+
+    forbidden = ("torchvision", "torch_npu", "acl", "pyacl", "torch.cuda", "torch.npu",
+                 "xinfer.platforms.cuda", "xinfer.platforms.npu")
+    violations = []
+    for path in (Path(inspect.getsourcefile(DeviceImageDecoder)),):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        aliases = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+                aliases.update({alias.asname or alias.name.split(".")[0]:
+                                alias.name if alias.asname else alias.name.split(".")[0] for alias in node.names})
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [f"{node.module}.{alias.name}" for alias in node.names]
+                aliases.update({alias.asname or alias.name: f"{node.module}.{alias.name}" for alias in node.names})
+            else:
+                continue
+            violations += [f"{path.name}:{node.lineno} imports {name}" for name in names
+                           if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden)]
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                root, separator, rest = ast.unparse(node).partition(".")
+                name = aliases.get(root, root) + separator + rest
+                if name in ("torch.cuda", "torch.npu"):
+                    violations.append(f"{path.name}:{node.lineno} uses {name}")
     assert not violations, "\n".join(violations)
 
