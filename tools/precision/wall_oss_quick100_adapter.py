@@ -14,7 +14,8 @@ delays the model used. The optimized composition takes one request per action ca
 scenario only; a batched request group raises.
 
 Config JSON keys: ``xinfer_src``, ``checkpoint``, ``numerics`` ("optimized" | "reference"), optional
-``xcompute_library``, ``op_backends`` ({op: backend}), ``processing`` (ProcessingConfig fields),
+``xinfer_device`` (for example "npu:0"), ``xcompute_library`` (``XINFER_XCOMPUTE_LIBRARY``),
+``op_backends`` ({op: backend}), ``processing`` (ProcessingConfig fields),
 ``image_preprocess_device`` ("cpu", the default, or "gpu"; the top-level model option of docs/configuration.md),
 ``norm_key``.
 
@@ -54,7 +55,10 @@ class Adapter:
         for name, expected in checkpoint_hashes.items():
             if _sha256(ckpt / name) != expected:
                 raise ValueError(f"checkpoint hash mismatch: {name}")
-        os.environ.update(CUDA_VISIBLE_DEVICES=str(device), NUMBA_NUM_THREADS="1", TOKENIZERS_PARALLELISM="false")
+        device_override = config.get("xinfer_device")
+        if device_override is None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
+        os.environ.update(NUMBA_NUM_THREADS="1", TOKENIZERS_PARALLELISM="false")
         if config.get("xcompute_library"):
             os.environ["XINFER_XCOMPUTE_LIBRARY"] = config["xcompute_library"]
         self.xinfer_src = Path(config["xinfer_src"]).resolve()
@@ -67,17 +71,23 @@ class Adapter:
         from xinfer.models.wall_oss.model import WallOSS
         from xinfer.models.wall_oss.processing import ProcessingConfig
         from xinfer.platforms import resolve_platform
+        from xinfer.platforms.devices import device_module_for
 
         import xinfer
         if not Path(xinfer.__file__).resolve().is_relative_to(self.xinfer_src):
             raise ValueError("imported xinfer does not come from the configured source")
         self.torch = torch
         torch.set_grad_enabled(False)
-        self.platform = resolve_platform("cuda")
+        self.platform = resolve_platform(device_override or "cuda")
+        self.device_module = device_module_for(self.platform.device)
         ops.registry.load_plugins()
-        self.table = ops.registry.build_table(self.platform, backends=config.get("op_backends") or None)
-        options = {"processing": config.get("processing", {}),
+        self.table = ops.registry.build_table(self.platform, backends=config.get("op_backends") or None,
+                                              reference_only=config.get("reference_ops", False))
+        options = {"processing": dict(config.get("processing", {})),
                    "image_preprocess_device": config.get("image_preprocess_device")}
+        if options["image_preprocess_device"] is None:
+            # The frozen harness nests the image path under "processing"; this repository's option is top-level.
+            options["image_preprocess_device"] = options["processing"].pop("image_preprocess_device", None)
         options = apply_image_preprocess_device(options, self.platform, default="cpu")
         processing = ProcessingConfig(**options["processing"])
         with ops.use_ops(self.table):
@@ -101,14 +111,24 @@ class Adapter:
         if self._sources() != self.source_hashes:
             raise ValueError("XInfer source changed during the precision run")
         library = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
-        return {"engine": "xinfer", "xinfer_src": str(self.xinfer_src), "source_sha256": self.source_hashes,
-                "config": self.config, "ops": self.table.report(), "numerics": self.model.numerics,
+        identity = {"engine": "xinfer", "xinfer_src": str(self.xinfer_src), "source_sha256": self.source_hashes,
+                "config": self.config, "ops": self.table.report(),
+                "numerics": self.model.numerics,
                 "xcompute_sha256": _sha256(library) if library else None, "adapter_sha256": _sha256(__file__),
-                "torch": self.torch.__version__, "cuda": self.torch.version.cuda,
-                "gpu": self.torch.cuda.get_device_name()}
+                "torch": self.torch.__version__, "cuda": self.torch.version.cuda}
+        if self.platform.is_cuda:
+            identity["gpu"] = self.torch.cuda.get_device_name()
+        else:
+            identity["device"] = self.platform.device
+            identity["platform"] = self.platform.name
+        return identity
 
     def begin_scenario(self, name, batch):
-        self.torch.cuda.synchronize()
+        self._synchronize()
+
+    def _synchronize(self):
+        if self.device_module is not None:
+            self.device_module.synchronize(self.platform.device)
 
     def infer(self, requests):
         from precision_wallx import normalize_wire  # the harness's own wire normalization
@@ -140,7 +160,7 @@ class Adapter:
         for i, (r, p) in enumerate(zip(requests, prepared)):
             value = self.finish({"predict_action": actions[i:i + 1].cpu()}, p)
             outputs.append(normalize_wire(value, r["state"], self.minimum, self.delta))
-        torch.cuda.synchronize()
+        self._synchronize()
         calls = [{"ids": [r["id"] for r in requests], "batch": len(requests), "delays": delays,
                   "context_delays": delays}]
         return np.stack(outputs), calls

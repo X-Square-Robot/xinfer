@@ -81,3 +81,9 @@ flash-attn), B1:
 Evidence: run `gates/q100-run` in `xinfer-xcompute-prepack-20261108.tar.gz`; the earlier runs `q100-wos210-run`
 (torch 2.10) and `q100-wos-run` (2.9.1) in `xinfer-wall-oss-optimized-20261107.tar.gz` (hashes in
 docs/models/wall_oss_validation.md).
+
+On Ascend 950DT (2026-11-11, CANN 9.1.1, TorchNPU 2.10.0.post4, B1), the eight xcompute implementations
+listed in the [Ascend guide](ascend950dt.md) pass the same quick100 gate: **−6.45 % with CPU image processing**
+and **−6.81 % with DVPP device images**. Both runs use 100 delay-5 windows and the same frozen BF16 reference;
+keep the image paths separate when comparing results. The binary identity and evidence archive are recorded in
+[performance](performance.md#ascend-950dt).
