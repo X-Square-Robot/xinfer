@@ -16,6 +16,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional model input processing for Wall-X 2B on RPU: exact Transformers/Torchvision versions used by the CPU
+# processing reference and the frozen request adapter (see docs/models/wallx2b_rpu.md).
+wallx2b = [
+    "transformers==5.2.0",
+    "torchvision>=0.25",
+    "pyyaml>=6",
+    "pillow>=10",
+]
 # Tokenization, image processing, and pose conversion for Wall-OSS and Wall-X 2B.
 models = [
     "tokenizers>=0.19",
@@ -37,6 +45,8 @@ serve = [
 test = [
     "pytest>=7",
     "websockets>=12",
+    # The RPU host tests compare banded cameras against Torchvision on CPU.
+    "torchvision>=0.25",
     "prometheus_client>=0.20",
     "msgpack>=1.0",
     "msgpack-numpy>=0.4.8",
@@ -49,6 +59,7 @@ test = [
 
 [project.scripts]
 xinfer-serve = "xinfer.entrypoints.serve:main"
+xinfer-wallx2b-openloop = "xinfer.entrypoints.wallx2b_openloop:main"
 xinfer-profile = "xinfer.entrypoints.profile:main"
 
 [tool.setuptools.packages.find]

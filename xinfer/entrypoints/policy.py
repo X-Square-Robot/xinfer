@@ -16,7 +16,7 @@ from typing import Any
 
 from xinfer import ops
 from xinfer.config import ExplicitSettings, apply_image_preprocess_device, resolve
-from xinfer.engine.core import Engine
+from xinfer.entrypoints import _factory as _engine_factory
 from xinfer.engine.cudagraph import CUDAGraphConfig
 from xinfer.models.interface import PreparedRequest, connect
 from xinfer.models.registry import get_model_class
@@ -84,10 +84,18 @@ class Policy:
             ValueError: unsupported device type.
         """
         self.platform = resolve_platform(device)
-        ops.registry.load_plugins()
-        self.op_table = ops.registry.build_table(
-            self.platform, backends=op_backends, reference_only=reference_ops
-        )
+        if self.platform.capabilities.op_selection == "external":
+            if reference_ops or op_backends:
+                raise ValueError(f"platform {self.platform.name} selects operators through its own binding "
+                                 "(op_selection='external'); Torch operator overrides are unsupported")
+            from xinfer.ops.registry import OpTable
+
+            self.op_table = OpTable(self.platform.name, {})
+        else:
+            ops.registry.load_plugins()
+            self.op_table = ops.registry.build_table(
+                self.platform, backends=op_backends, reference_only=reference_ops
+            )
         model_cls = get_model_class(model)
         model_options = apply_image_preprocess_device(
             {**model_options, "image_preprocess_device": image_preprocess_device}, self.platform)
@@ -96,17 +104,59 @@ class Policy:
                 checkpoint, device=self.platform.device, ops=self.op_table, **model_options
             )
         self.capabilities = self.model.capabilities()
-        ops.warn_slow_fallbacks(model, self.op_table, self.capabilities.stage_ops, self.platform.device)
+        if self.platform.capabilities.op_selection == "table":
+            ops.warn_slow_fallbacks(model, self.op_table, self.capabilities.stage_ops, self.platform.device)
         self.io_schema = self.model.io_schema()
         self._prepare = connect(self.model.input_processor())
         self._finish = self.model.output_processor()
-        quantization = model_options.get("quantization", "bf16")
+        default_quant = "fp16" if self.platform.capabilities.op_selection == "external" else "bf16"
+        quantization = model_options.get("quantization", default_quant)
         self.resolved = resolve(self.model, self.platform, model_name=model,
                                 quantization=quantization if isinstance(quantization, str) else None,
                                 explicit=ExplicitSettings(cudagraphs=None if cudagraphs is None else bool(cudagraphs),
                                                           stream_priorities=stream_priorities or {}))
-        policy = cudagraphs if isinstance(cudagraphs, CUDAGraphConfig) else None
-        self.engine = Engine(self.model, self.platform, self.resolved.engine_config(policy))
+        graph_policy = cudagraphs if isinstance(cudagraphs, CUDAGraphConfig) else None
+        try:
+            self.engine = _engine_factory.create_engine(self.platform, self.model,
+                                                        self.resolved.engine_config(graph_policy))
+        except BaseException:
+            close_processor = getattr(self._prepare, "close", None)
+            if close_processor is not None:
+                close_processor()
+            raise
+
+
+    def close(self) -> None:
+        """Drain outstanding work and release the model execution resources."""
+        failure = None
+        try:
+            self.engine.shutdown()
+        except BaseException as error:
+            failure = error
+        close_processor = getattr(self._prepare, "close", None)
+        if close_processor is not None:
+            try:
+                close_processor()
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+                elif hasattr(failure, "add_note"):
+                    failure.add_note(f"Input processor cleanup failed: {error}")
+        if failure is not None:
+            raise failure
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, error, traceback):
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if error is None:
+                raise
+            if hasattr(error, "add_note"):
+                error.add_note(f"Policy cleanup failed: {cleanup_error}")
+        return False
 
     def prepare(self, observation: Mapping[str, Any]) -> PreparedRequest:
         """Run the model's InputProcessor on one observation (CPU, calling thread).

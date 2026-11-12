@@ -9,8 +9,6 @@ the ``xinfer.ops`` entry point group.
 
 import logging
 
-import torch
-
 from xinfer.ops import reference
 from xinfer.ops.reference import fused, mxfp8, nvfp4
 from xinfer.ops.registry import (
@@ -270,8 +268,14 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
     Raises:
         RuntimeError: there are such operators and ``XINFER_OPS_STRICT`` is set.
     """
-    if torch.device(device).type != "cuda":
+    from xinfer.platforms.devices import device_module_for
+
+    if device_module_for(device) is None:
+        # CPU, non-torch vendor addresses or platforms whose model carries its own kernel
+        # binding (op_selection='external') have no "slow torch fallback" to warn about;
+        # the caller already gates the call on op_selection=='table'.
         return []
+
     names = sorted({name for names in stage_ops.values() for name in names
                     if table.selection(name).backend == REFERENCE_BACKEND
                     and registry.spec(name).reference.__module__ == fused.__name__})
