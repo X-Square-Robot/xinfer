@@ -123,6 +123,7 @@ _DEVICE_TO_DEVICE = 3
 _CHANNEL_EXISTS = 0xA0058004
 _FORMAT_UNSUPPORTED = 0xA0058008
 _TIMEOUT_MS = 3000
+_MAX_CHANNELS = 16
 _MEDIA_LOCK = Lock()
 _MEDIA_USERS: dict[torch.device, int] = {}
 
@@ -174,6 +175,13 @@ class NpuJpegDecoder:
         self.device = device
         self._leased = False
         self._closed = False
+        # Persistent VDEC channels, one per (width, height, stream-buffer) shape: a fresh
+        # channel costs ~1.5 ms inside the compiled binding and the per-JPEG create/destroy
+        # made every decode pay it while holding the GIL (probe-gil-r12 iso). Channels keep
+        # exactly the attributes the per-JPEG creation used, so every decode runs the same
+        # send/get/release transaction; a channel that fails mid-transaction is dropped and
+        # recreated by the next decode, and ``close`` tears them all down.
+        self._channels: dict[tuple[int, int, int], int] = {}
 
     def __call__(self, jpegs):
         with _MEDIA_LOCK:
@@ -196,6 +204,8 @@ class NpuJpegDecoder:
             if not self._leased:
                 return
             self._leased = False
+            with torch.npu.device(self.device):
+                self._close_channels()
             users = _MEDIA_USERS[self.device] - 1
             if users:
                 _MEDIA_USERS[self.device] = users
@@ -239,20 +249,19 @@ class NpuJpegDecoder:
             _check(status, "dvpp_malloc output")
             stack.callback(_call, media.dvpp_free, output)
 
-            attrs = dict(type=_JPEG, mode=_SEND_FRAME, pic_width=width, pic_height=height,
-                         stream_buf_size=max(size, width * height), frame_buf_size=0, frame_buf_cnt=0)
-            channel = self._open_channel(attrs)
-            stack.callback(_call, media.vdec_destroy_chn, channel)
-            # Keep an odd final row or column in a subsampled JPEG.
-            _call(media.vdec_set_jpegd_precision_mode, channel, _ALIGN_UP)
-            _call(media.vdec_start_recv_stream, channel)
-            stack.callback(_call, media.vdec_stop_recv_stream, channel)
+            channel = self._channel_for(width, height, size)
             picture = dict(width=width, height=height, width_stride=info["width_stride"],
                            height_stride=info["height_stride"], pixel_format=_SOURCE_FORMAT,
                            vir_addr=output, buffer_size=out_size)
-            _call(media.vdec_send_stream, channel, stream, picture, _TIMEOUT_MS)
-            frame, _, _, status = media.vdec_get_frame(channel, _TIMEOUT_MS)
-            _check(status, "vdec_get_frame")
+            try:
+                _call(media.vdec_send_stream, channel, stream, picture, _TIMEOUT_MS)
+                frame, _, _, status = media.vdec_get_frame(channel, _TIMEOUT_MS)
+                _check(status, "vdec_get_frame")
+            except Exception:
+                # a channel that failed mid-transaction is not trusted again: drop it so the
+                # next decode recreates a fresh one, as the per-JPEG lifecycle always did
+                self._drop_channel(self._channel_key(width, height, size))
+                raise
             stack.callback(_call, media.vdec_release_frame, channel, frame)
             view = frame["v_frame"]
             if view["frame_flag"] != 0:
@@ -268,6 +277,56 @@ class NpuJpegDecoder:
                 _check(status, "vdec_create_chn")
                 return channel
         raise RuntimeError("no CANN JPEGD channel is available")
+
+    @staticmethod
+    def _channel_key(width: int, height: int, size: int) -> tuple[int, int, int]:
+        """The channel shape one JPEG needs: its dimensions and the stream buffer it pays for."""
+        return width, height, max(size, width * height)
+
+    def _channel_for(self, width: int, height: int, size: int) -> int:
+        """The started VDEC channel of one JPEG's shape, reused across decodes.
+
+        Creating a channel costs ~1.5 ms inside the compiled binding (probe-gil-r12 iso), paid
+        by every decode when each JPEG created and destroyed its own. The cached channel holds
+        exactly the attributes that per-JPEG creation built -- type, mode, dimensions, stream
+        buffer size, the odd-row/column JPEGD precision mode and the started receive state --
+        so each decode runs the same send/get/release transaction on the same channel state.
+        """
+        media = self.acl.himpi
+        key = self._channel_key(width, height, size)
+        channel = self._channels.get(key)
+        if channel is not None:
+            return channel
+        if len(self._channels) >= _MAX_CHANNELS:
+            self._drop_channel(next(iter(self._channels)))
+        attrs = dict(type=_JPEG, mode=_SEND_FRAME, pic_width=width, pic_height=height,
+                     stream_buf_size=key[2], frame_buf_size=0, frame_buf_cnt=0)
+        channel = self._open_channel(attrs)
+        try:
+            # Keep an odd final row or column in a subsampled JPEG.
+            _call(media.vdec_set_jpegd_precision_mode, channel, _ALIGN_UP)
+            _call(media.vdec_start_recv_stream, channel)
+        except Exception:
+            _call(media.vdec_destroy_chn, channel)
+            raise
+        self._channels[key] = channel
+        return channel
+
+    def _drop_channel(self, key) -> None:
+        """Stop and destroy one cached channel, freeing its id for a fresh one."""
+        media = self.acl.himpi
+        channel = self._channels.pop(key, None)
+        if channel is None:
+            return
+        try:
+            _call(media.vdec_stop_recv_stream, channel)
+        finally:
+            _call(media.vdec_destroy_chn, channel)
+
+    def _close_channels(self) -> None:
+        """Tear down every cached channel before the media session ends."""
+        for key in list(self._channels):
+            self._drop_channel(key)
 
     def _copy_frame(self, frame, output, out_size, height, width):
         fmt, addresses = frame["pixel_format"], frame["virt_addr"]

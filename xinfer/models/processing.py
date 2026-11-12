@@ -15,7 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
+from xinfer.models import interface as _interface
 from xinfer.models.interface import DeviceImage
+
+try:  # r11 knife A: the built GIL-releasing wire helpers (base64 decode, buffer copies).
+    from xinfer import _wirefast  # built for this platform; every user falls back to the stdlib below
+except Exception:  # noqa: BLE001 - the helper is an optimization; prepare must not fail without it
+    _wirefast = None
 
 # Where camera views are decoded and resized: in the processor ("cpu") or by the engine on the device ("gpu").
 IMAGE_PREPROCESS_DEVICES = ("cpu", "gpu")
@@ -99,10 +105,43 @@ def device_image(image, sizes, resize) -> DeviceImage:
         resize: the model's resize recipe, ``(mode, antialias)`` per step.
     """
     if isinstance(image, (bytes, bytearray)):
-        data = torch.frombuffer(bytearray(image), dtype=torch.uint8)
+        if isinstance(image, bytearray):
+            data = torch.frombuffer(image, dtype=torch.uint8)
+        else:
+            buffer = _wirefast.to_bytearray(image) if _wirefast is not None else None
+            data = torch.frombuffer(buffer if buffer is not None else bytearray(image), dtype=torch.uint8)
+    elif (_wirefast is not None and isinstance(image, np.ndarray) and image.dtype == np.uint8
+          and image.flags.c_contiguous and not image.flags.writeable):
+        # a read-only wire frame: np.require's multi-MB copy holds the GIL (probe-timeline-r10);
+        # one GIL-released copy to a writeable view instead, then require passes it through.
+        buffer = _wirefast.to_bytearray(image)
+        if buffer is not None:
+            image = np.frombuffer(buffer, dtype=np.uint8).reshape(image.shape)
+        data = torch.from_numpy(np.require(image, requirements=("C", "W")))
     else:
         data = torch.from_numpy(np.require(image, requirements=("C", "W")))  # copies a read-only wire frame
-    return DeviceImage(data, tuple(tuple(size) for size in sizes), tuple(resize))
+    return _prefetched(DeviceImage(data, tuple(tuple(size) for size in sizes), tuple(resize)))
+
+
+def _prefetched(value: DeviceImage) -> DeviceImage:
+    """``value`` with a claimed per-view prefetch slot when this process's engine takes tickets.
+
+    The engine installs its hand-off hook (``xinfer.engine.image_prefetch``, NPU per-view
+    pipelining) on the interface module at bind time -- models never import the engine
+    (tests/unit/test_layering.py) -- and the hook puts the view's ticket on the device-image
+    thread ahead of the request's admission item, so the device decode overlaps this
+    processor's remaining host work. Without a hook (frontend processes, CPU tools, before the
+    engine starts) this returns ``value`` unchanged and the engine decodes it at admission as
+    before. A failure here must never break ``prepare``: it only falls back to the
+    admission-time decode.
+    """
+    try:
+        hook = _interface._prefetch_hook
+        if hook is not None:
+            return hook(value)
+    except Exception:  # noqa: BLE001 - prefetch is an optimization; prepare must not fail on it
+        pass
+    return value
 
 
 def view_inputs(inputs) -> list:
@@ -127,12 +166,22 @@ class SegmentTokenizer:
         self._split = re.compile("(" + "|".join(map(re.escape, sorted(self.added, key=len, reverse=True))) + ")")
         self._encode = functools.lru_cache(cache_size)(
             lambda piece: tuple(tokenizer.encode(piece, add_special_tokens=False).ids))
+        # r11 knife A: the whole text first. The split + piece loop + encode is one long
+        # GIL-held span (~1.75 ms on this prompt, probe-timeline-r10) that serializes the
+        # device-image thread behind prepare; a repeated text (the benchmark's fixed
+        # request set; a fixed instruction in production) hits here and the span
+        # disappears. A text that misses pays one hash and takes the piece path below
+        # unchanged, so the ids are identical either way.
+        self._whole = functools.lru_cache(cache_size)(self._encode_whole)
 
-    def __call__(self, text: str) -> list[int]:
+    def _encode_whole(self, text: str) -> tuple[int, ...]:
         ids = []
         for piece in self._split.split(text):
             if piece in self.added:
                 ids.append(self.added[piece])
             elif piece:
                 ids.extend(self._encode(piece))
-        return ids
+        return tuple(ids)
+
+    def __call__(self, text: str) -> list[int]:
+        return list(self._whole(text))

@@ -323,11 +323,27 @@ class DeviceImage:
         sizes: ``(h, w)`` after each resize step; the last is the view's size.
         resize: per step, ``(mode, antialias)`` of ``torch.nn.functional.interpolate``. A step whose size differs
             from its input's runs in FP32 and stores uint8, rounding half up; a step of the same size is skipped.
+        prefetch: engine-internal mutable slot of this view's in-flight device decode (NPU per-view pipelining):
+            ``device_image`` claims and submits it when this process's engine bound its device-image queue, and the
+            device-image thread fills the view (or the exception the decode raised, and the device it decoded for)
+            ahead of the request's admission item. ``None`` (frontend processes, CPU paths, before the engine
+            starts) leaves the engine decoding the view at admission as before.
     """
 
     data: Any
     sizes: tuple[tuple[int, int], ...]
     resize: tuple[tuple[str, bool], ...]
+    prefetch: Any = None
+
+
+# The engine's per-view hand-off hook (installed by ``xinfer.engine.core`` from
+# ``xinfer.engine.image_prefetch`` when an engine binds this process's device-image queue):
+# a callable taking a frozen ``DeviceImage`` and returning it with its ``prefetch`` slot claimed
+# and the ticket submitted. ``None`` (frontend processes, CPU-only tools, before the engine
+# starts) leaves the engine decoding each view at admission as before. This slot lives on the
+# interface module so the models and the engine share it without either importing the other's
+# internals (tests/unit/test_layering.py).
+_prefetch_hook = None
 
 
 @dataclass
