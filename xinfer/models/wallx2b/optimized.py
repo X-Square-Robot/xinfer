@@ -2,7 +2,7 @@
 
 The ViT and the prompt stream are the shared ``xinfer/models/wallx/optimized.py``. The action stage runs the steps
 of the reference composition (``numerics="reference"``, the wall-x model under autocast) on operators of
-``xinfer/ops/reference/fused.py`` (each an xcompute call) chosen for its 16 rows and width 1024, where the GEMMs with
+``xinfer/ops/reference/`` (each an xcompute call) chosen for its 16 rows and width 1024, where the GEMMs with
 fused norms and residuals have no fast kernel: the adaptive norms are separate calls that also add the gated residual
 (the two norms of a linear layer, around its identity mixer, in one call), and the GEMMs are plain (the output
 projections and the MLP down projection read ``[K, N]`` weights, which select xcompute's small-M kernel).
