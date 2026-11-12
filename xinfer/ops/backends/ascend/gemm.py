@@ -48,6 +48,12 @@ bnsd_gemm = getattr(cann_projection, "gemm_epilogue", None)
 cann_glu = getattr(cann_projection, "gemm_glu_epilogue", None)
 native_qkv = canonical_qkv or getattr(cann_projection, "qkv_rope_epilogue", None)
 native_cache = canonical_cache or getattr(cann_action, "qkv_rope_kvcache", None)
+# The wallx2b action QKV takes the CANN action bridge first as well: its 2b-qkv tail-fused kernel (one
+# AOT launch for the per-head RMS norm, the (1 + w) factors, the 64-dim partial rotary, the head-major
+# K/V append and the packed [Q | gate] return) and its memoized torch chain for other shapes are the
+# lineage's fast paths - the raw [N, K] weight the unified projection entry would take runs its generic
+# route there. The unified entry stays the fallback for builds without the bridge.
+native_2b_cache = getattr(cann_action, "qkv_norm_rope_kvcache", None)
 
 
 @register("gemm_epilogue", backend="ascend", requires=xc if callable(native_gemm) else None,
@@ -228,11 +234,15 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
 
 
 @register("qkv_norm_rope_kvcache", backend="ascend",
-          requires=xc if callable(_fused_projection) and callable(_qk_norm) else None,
+          requires=xc if (callable(_fused_projection) and callable(_qk_norm)) or callable(native_2b_cache)
+          else None,
           version=VERSION, deterministic=False)
 @partial(reference.qkv_norm_rope_kvcache)
 def qkv_norm_rope_kvcache(x, weight, q_weight, k_weight, cos, sin, k_cache, v_cache, start, num_heads,
                           num_kv_heads, head_dim, eps):
+    if callable(native_2b_cache):
+        return native_2b_cache(x, weight, q_weight, k_weight, cos, sin, k_cache, v_cache, start, num_heads,
+                               num_kv_heads, head_dim, eps)
     return _fused_projection(
         x.contiguous(), weight, cos=cos, sin=sin, rotary_dim=2 * cos.shape[-1], num_heads=num_heads,
         num_kv_heads=num_kv_heads, head_dim=head_dim,
