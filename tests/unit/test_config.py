@@ -173,8 +173,7 @@ def test_policy_consumes_stream_priorities_as_runtime_settings(monkeypatch):
 
     monkeypatch.setattr(policy_module, "get_model_class", lambda name: SimpleNamespace(from_checkpoint=load))
     monkeypatch.setattr(policy_module.ops.registry, "load_plugins", lambda: None)
-    monkeypatch.setattr(policy_module._engine_factory, "create_engine",
-                        lambda platform, model, config: SimpleNamespace(config=config))
+    monkeypatch.setattr(policy_module, "Engine", lambda model, platform, config: SimpleNamespace(config=config))
     policy = policy_module.Policy("test", "unused", device="cpu", stream_priorities={"action": 0}, scale=3)
     assert received_options == [{"scale": 3}]
     assert policy.engine.config.stream_priorities == {"vision": 0, "prefill": 0, "action": 0}
