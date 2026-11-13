@@ -17,7 +17,7 @@
 
 | 名称 | 类型 | 标签 | 含义 |
 |---|---|---|---|
-| `xinfer_requests_total` | counter | `status` | 已发出的响应数，按响应状态分（`ok`、`invalid_request`、`queue_full`、`per_robot_limit`、`unavailable`、`internal_error`；见[服务](serving.zh-CN.md#协议)） |
+| `xinfer_requests_total` | counter | `status` | 已发出的响应数，按响应状态分（`ok`、`invalid_request`、`queue_full`、`per_robot_limit`、`unavailable`、`timeout`、`internal_error`；见[服务](serving.zh-CN.md#协议)） |
 | `xinfer_request_duration_seconds` | histogram | | 成功请求从收到消息到构造好响应的时间（`server_timing.infer_ms`） |
 | `xinfer_request_prepare_seconds` | histogram | | 解码和模型的 InputProcessor（`server_timing.prepare_ms`） |
 | `xinfer_request_engine_seconds` | histogram | | 共享内存打包和引擎往返（`server_timing.engine_ms`） |

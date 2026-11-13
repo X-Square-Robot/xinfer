@@ -287,6 +287,49 @@ def test_health_endpoint(server):
         assert response.status == 200
 
 
+def test_info_endpoint(server):
+    import json
+    import urllib.request
+
+    port, _, _ = server
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/info", timeout=5) as response:
+        info = json.loads(response.read())
+    assert info["model"] == "echo_model:EchoModel" and info["platform"] == "cpu"
+    assert info["model_options"] == {"scale": 3.0} and info["capacity"] is None
+    assert info["connection_state"] is True and len(info["metadata_sha256"]) == 64  # the echo model has connect()
+
+
+def test_a_request_the_engine_does_not_finish_in_time_is_answered_timeout():
+    port, process, lines = _start("--request-timeout", "0.3")
+    try:
+        x = {"x": np.arange(3, dtype=np.float32)}
+        with connect(f"ws://127.0.0.1:{port}", max_size=None) as websocket:
+            websocket.recv()
+            started = time.time()
+            websocket.send(packb(dict(x, slow=True)))  # the engine takes 1 s
+            reply = unpackb(websocket.recv())
+            assert reply["status"] == "timeout" and "0.3 s" in reply["error"] and time.time() - started < 0.9
+            time.sleep(max(0.0, started + 1.2 - time.time()))  # the engine has finished the slow request
+            websocket.send(packb(x))
+            assert unpackb(websocket.recv())["status"] == "ok"
+    finally:
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=30) == 0, "".join(lines[-20:])
+
+
+def test_requests_with_the_same_robot_id_share_the_per_robot_limit_across_connections(server):
+    port, _, _ = server
+    x = {"x": np.arange(3, dtype=np.float32)}
+    with connect(f"ws://127.0.0.1:{port}", max_size=None) as first, \
+            connect(f"ws://127.0.0.1:{port}", max_size=None) as second:
+        first.recv(), second.recv()
+        first.send(packb(dict(x, slow=True, robot_id=7)))  # the engine takes 1 s
+        time.sleep(0.2)
+        second.send(packb(dict(x, robot_id="7")))  # the same robot, on another connection
+        assert unpackb(second.recv())["status"] == "per_robot_limit"
+        assert unpackb(first.recv())["status"] == "ok"
+
+
 def test_metrics_endpoint_sums_the_engine_and_every_frontend(server):
     import urllib.request
 
@@ -392,6 +435,41 @@ def test_a_drain_that_does_not_finish_exits_1_and_the_frontends_still_clean_up()
     finally:
         if process.poll() is None:
             process.kill()
+
+
+def _frontends(pid):
+    """The frontend processes of the server process ``pid``."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        try:
+            if entry.name.isdigit() and int((entry / "stat").read_text().rsplit(")", 1)[1].split()[1]) == pid \
+                    and b"spawn_main" in (entry / "cmdline").read_bytes():
+                found.append(int(entry.name))
+        except OSError:
+            pass
+    return found
+
+
+def _running(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def test_the_frontends_exit_when_the_server_process_is_killed():
+    port, process, lines = _start()
+    frontends = _frontends(process.pid)
+    try:
+        assert len(frontends) == 2
+        process.kill()  # as the OOM killer would: the frontends must not keep serving without the engine
+        deadline = time.time() + 10
+        while any(map(_running, frontends)) and time.time() < deadline:
+            time.sleep(0.1)
+        assert not any(map(_running, frontends))
+    finally:
+        for pid in filter(_running, frontends):
+            os.kill(pid, signal.SIGKILL)
 
 
 def test_shutdown_is_clean(server):

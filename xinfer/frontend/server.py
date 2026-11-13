@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
+import json
 import os
 import signal
 import sys
@@ -22,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from typing import Any
 
-from xinfer.frontend.protocol import INTERNAL_ERROR, INVALID_REQUEST, OK, UNAVAILABLE, packb, unpackb
+from xinfer.frontend.protocol import INTERNAL_ERROR, INVALID_REQUEST, OK, TIMEOUT, UNAVAILABLE, packb, unpackb
 from xinfer.models.interface import connect
 
 
@@ -54,7 +56,9 @@ def run_frontend(index: int, pipe, options: dict) -> None:
         options: ``model``, ``checkpoint``, ``model_options``, ``host``, ``port``, ``buffers`` (ring
             size), ``buffer_bytes`` (bytes per buffer), ``workers`` (processing threads), ``shm_prefix``,
             ``metrics`` (record ``FrontendMetrics`` and answer ``GET /metrics``) and optionally ``env`` (sent in the
-            metadata frame, default ``"x2robot"``).
+            metadata frame, default ``"x2robot"``), ``info`` (the ``GET /info`` fields the server knows) and
+            ``request_timeout`` (seconds the engine may take for a request before it is answered ``timeout``; 0:
+            no limit).
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = ""  # frontends never touch the GPU
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # until the event loop runs; unwind to unlink the buffers
@@ -85,7 +89,7 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
 
     Pipe protocol with the engine's bridge thread: the frontend sends
     ``("ready", index, None, None)`` once it listens, and
-    ``("request", request_id, connection, manifest)`` per request; the engine answers
+    ``("request", request_id, robot, manifest)`` per request; the engine answers
     ``(request_id, "ok", outputs)`` or ``(request_id, status, error_repr)``. A receiver thread
     resolves the matching futures on the event loop. Input and output
     processing run on ``options["workers"]`` threads: their heavy parts (image
@@ -122,22 +126,27 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
     worker = ThreadPoolExecutor(max_workers=options["workers"], thread_name_prefix=f"xinfer-prepare-{index}")
 
     def receive():
-        """Receiver thread: resolve pending futures with the engine's replies until the pipe closes."""
+        """Receiver thread: resolve pending futures with the engine's replies until the pipe closes, then drain the
+        frontend as on SIGTERM: without the engine process (killed, for example by the OOM killer) it can answer
+        nothing, and it must not keep the port."""
         while True:
             try:
                 message = pipe.recv()
             except (EOFError, OSError):
-                return
+                break
             if message is None:
-                return
+                break
             request_id, status, payload = message
             future = pending.pop(request_id, None)
             if future is not None:
                 loop.call_soon_threadsafe(_resolve, future, status, payload)
+        loop.call_soon_threadsafe(terminated.set)
 
     receiver = threading.Thread(target=receive, name=f"xinfer-frontend-rx-{index}", daemon=True)
     receiver.start()
     hello = packb(dict(metadata, env=options.get("env", "x2robot")))
+    info = dict(options.get("info", {}), metadata_sha256=hashlib.sha256(hello).hexdigest(),
+                connection_state=getattr(prepare, "connect", None) is not None)
 
     async def handler(websocket):
         """Serve one robot connection: send the metadata frame, then answer requests one at a time.
@@ -180,6 +189,7 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
             buffer, status = None, INVALID_REQUEST
             try:
                 observation = unpackb(message)
+                robot_id = observation.get("robot_id")  # else the connection is the robot
                 prepared = await loop.run_in_executor(worker, prepare_connection, observation)
                 prepared_at = time.perf_counter()
                 status = INTERNAL_ERROR
@@ -191,8 +201,14 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
                 future = loop.create_future()
                 pending[request_id] = future
                 with send_lock:
-                    pipe.send(("request", request_id, connection, packed))
-                outputs = await future
+                    pipe.send(("request", request_id, connection if robot_id is None else str(robot_id), packed))
+                try:
+                    outputs = await asyncio.wait_for(asyncio.shield(future), options.get("request_timeout") or None)
+                except asyncio.TimeoutError:
+                    # The engine may still read the buffer: release it once the engine has answered.
+                    held, buffer = buffer, None
+                    future.add_done_callback(lambda done: (done.exception(), ring.release(held)))
+                    raise EngineError(TIMEOUT, f"not finished within {options['request_timeout']:g} s") from None
                 engine_done_at = time.perf_counter()
                 ring.release(buffer)
                 buffer = None
@@ -223,11 +239,14 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
                 answering -= 1
 
     async def process_request(connection, request):
-        """Answer ``/healthz``, ``/ready`` and ``/metrics``; return None to continue the WebSocket handshake."""
+        """Answer ``/healthz``, ``/ready``, ``/info`` (JSON) and ``/metrics``; return None to continue the WebSocket
+        handshake."""
         # Plain HTTP health check on the serving port. Frontends start only
         # after the engine finished warmup, so an open port means ready.
         if request.path in ("/healthz", "/ready"):
             return connection.respond(HTTPStatus.OK, "ok\n")
+        if request.path == "/info":
+            return connection.respond(HTTPStatus.OK, json.dumps(info))
         if request.path.split("?")[0] == "/metrics":
             if recorded is None:
                 return connection.respond(HTTPStatus.NOT_FOUND, "metrics are disabled\n")

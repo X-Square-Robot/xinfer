@@ -60,6 +60,7 @@ the device-image thread in [Device images](engine.md#device-images).
   - `infer_ms`: request decoded → response encoded;
   - `prepare_ms`, `engine_ms`, `output_ms`;
   - `frontend`: which frontend process served it.
+- A request may carry the robot's id as the top-level field `robot_id`, beside `state` and `views`. The engine then limits requests in flight per robot id (`--per-robot-inflight`), across connections; without it, per connection.
 - A failed request is answered as `{"status": ..., "error": "<message>"}`, without `server_timing`; the connection stays open. A protocol error the robot acts on also carries `error_info`:
 
   | `status` | Meaning |
@@ -68,10 +69,12 @@ the device-image thread in [Device images](engine.md#device-images).
   | `queue_full` | the engine's admission queue is full (`--max-queued-requests`); retry later |
   | `per_robot_limit` | the robot already has `--per-robot-inflight` requests in flight |
   | `unavailable` | the server is shutting down |
+  | `timeout` | the engine did not finish the request within `--request-timeout` |
   | `internal_error` | the server failed while serving the request (engine or output processing) |
 
   Count every response whose `status` is not `"ok"` as failed.
 - `GET /healthz` (or `/ready`) on the same port returns 200.
+- `GET /info` returns the served model as JSON: `model`, `quantization`, `numerics`, `platform`, `version`, `model_options`, `capacity` (`--capacity`, or null), `metadata_sha256` (of the metadata frame) and `connection_state` (whether the model's input processor keeps per-connection state).
 - `GET /metrics` on the same port returns the Prometheus metrics of the engine and every frontend ([metrics](metrics.md)).
 
 ## Run
@@ -93,6 +96,8 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkp
 | `--profile-dir` | record the engine's spans and write each request's engine segments to this directory at shutdown; for profiling runs (`xinfer-profile load --serve`, [profiling](profiling.md#through-xinfer-serve---serve)), the records grow with the requests |
 | `--disable-metrics` | record no Prometheus metrics; `GET /metrics` answers 404 ([metrics](metrics.md)) |
 | `--hang-timeout` | seconds an admitted request may take before the engine counts as hung (default 30); 0 disables the check |
+| `--request-timeout` | seconds the engine may take for a request before the robot gets `timeout` (default 10; 0: no limit); the engine still finishes the request |
+| `--capacity` | robots this server serves, as measured for its GPU and model configuration ([performance](performance.md)); reported by `GET /info` |
 | `--drain-timeout` | seconds the frontends may take after SIGTERM to answer the requests they received (default 10) |
 | `--reference-ops`, `--op-backends` | use only torch reference operators; pin an implementation per operator by backend, library or both (`op=cuda`, `op=xcompute`, `op=cuda:xcompute`, `op=reference`), pins win over `--reference-ops` |
 
@@ -102,7 +107,8 @@ they had received and then close the connections with code 1001 (going away);
 a message that reaches a frontend after that gets no response. The server then
 releases graphs and pinned buffers and exits 0, or exits 1 when the requests
 are not answered within `--drain-timeout` seconds. SIGINT does the same, but Ctrl-C in a terminal also reaches the
-frontends and stops them at once. The server checks `Engine.health()` every 0.5 s. When the engine can
+frontends and stops them at once. A frontend whose server process is gone (killed, for example by the OOM killer)
+drains the same way and exits. The server checks `Engine.health()` every 0.5 s. When the engine can
 no longer serve (its engine or completion thread has stopped, the device
 reports a sticky CUDA error, or a request admitted more than `--hang-timeout`
 seconds ago has not finished), the server stops the frontends and exits 1

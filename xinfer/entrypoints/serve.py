@@ -94,6 +94,12 @@ def parse_args(argv=None):
     p.add_argument("--hang-timeout", type=float, default=30.0,
                    help="seconds an admitted request may take before the engine counts as hung and the server exits "
                         "1 (default 30; 0 disables)")
+    p.add_argument("--request-timeout", type=float, default=10.0,
+                   help="seconds the engine may take for a request before the robot gets 'timeout' (default 10; 0: no "
+                        "limit)")
+    p.add_argument("--capacity", type=int, default=None,
+                   help="robots this server serves, as measured for its GPU and model configuration; reported by "
+                        "GET /info")
     p.add_argument("--drain-timeout", type=float, default=10.0,
                    help="seconds the frontends may take on SIGTERM to answer the requests they received; then the "
                         "server exits 1 (default 10)")
@@ -138,7 +144,6 @@ def _start_metrics(args, model, platform, quantization):
     """
     import tempfile
 
-    import xinfer
     from xinfer.observability import metrics
 
     if not metrics.available():
@@ -148,9 +153,15 @@ def _start_metrics(args, model, platform, quantization):
     directory = given or tempfile.mkdtemp(prefix="xinfer-metrics-")
     metrics.enable(directory)
     logger.info("recording Prometheus metrics in %s; GET /metrics on the serving port", directory)
-    info = dict(model=args.model, quantization=quantization if isinstance(quantization, str) else "custom",
+    return metrics.EngineMetrics(_model_info(args, model, platform, quantization)), directory, not given
+
+
+def _model_info(args, model, platform, quantization) -> dict:
+    """The served model and build: the labels of ``xinfer_model_info``, and fields of ``GET /info``."""
+    import xinfer
+
+    return dict(model=args.model, quantization=quantization if isinstance(quantization, str) else "custom",
                 numerics=str(getattr(model, "numerics", "")), platform=platform.name, version=xinfer.__version__)
-    return metrics.EngineMetrics(info), directory, not given
 
 
 def _stop_metrics(directory, temporary: bool, pids) -> None:
@@ -279,6 +290,9 @@ def main(argv=None) -> None:
                    shm_prefix=f"xinfer-{uuid.uuid4().hex[:8]}")
     options["warmup"] = warmup  # the frontends run these requests through their processors before serving
     options["metrics"] = engine_metrics is not None
+    options["info"] = dict(_model_info(args, model, platform, quantization), model_options=model_options,
+                           capacity=args.capacity)
+    options["request_timeout"] = args.request_timeout
     reader = ShmReader(register_cuda=platform.is_cuda)
     reader_lock = threading.Lock()
     ready = threading.Semaphore(0)
@@ -295,9 +309,9 @@ def main(argv=None) -> None:
         """Serve one frontend's pipe (one ``xinfer-bridge`` thread per frontend).
 
         Receives ``("ready", index, None, None)``, which counts toward
-        startup, or ``("request", request_id, connection, manifest)``: maps the
-        shared-memory buffer, submits the tensors with ``connection`` (frontend
-        index, connection number) as the robot id, and replies
+        startup, or ``("request", request_id, robot, manifest)``: maps the
+        shared-memory buffer, submits the tensors with ``robot`` (the request's ``robot_id``, else the frontend
+        index and connection number) as the robot id, and replies
         ``(request_id, "ok", {name: np.ndarray})`` or ``(request_id, status, repr(exc))``, where ``status`` is
         the admission refusal (``ADMIT_STATUS``) or ``"internal_error"``. Returns when the pipe closes.
         """
@@ -325,7 +339,7 @@ def main(argv=None) -> None:
 
         while True:
             try:
-                kind, request_id, connection, packed = pipe.recv()
+                kind, request_id, robot, packed = pipe.recv()
             except (EOFError, OSError):
                 return
             if kind == "ready":
@@ -334,7 +348,7 @@ def main(argv=None) -> None:
             try:
                 with reader_lock:
                     tensors = reader.unpack(packed)
-                future = engine.submit(PreparedRequest(tensors), robot=connection)
+                future = engine.submit(PreparedRequest(tensors), robot=robot)
             except Exception as exc:  # noqa: BLE001
                 with send_lock:
                     pipe.send((request_id, INTERNAL_ERROR, repr(exc)))

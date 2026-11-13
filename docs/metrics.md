@@ -28,7 +28,7 @@ dashboard against a local service.
 
 | Name | Type | Labels | Meaning |
 |---|---|---|---|
-| `xinfer_requests_total` | counter | `status` | responses sent, by response status (`ok`, `invalid_request`, `queue_full`, `per_robot_limit`, `unavailable`, `internal_error`; [serving](serving.md#protocol)) |
+| `xinfer_requests_total` | counter | `status` | responses sent, by response status (`ok`, `invalid_request`, `queue_full`, `per_robot_limit`, `unavailable`, `timeout`, `internal_error`; [serving](serving.md#protocol)) |
 | `xinfer_request_duration_seconds` | histogram | | successful request, message received to response built (`server_timing.infer_ms`) |
 | `xinfer_request_prepare_seconds` | histogram | | decoding and the model's InputProcessor (`server_timing.prepare_ms`) |
 | `xinfer_request_engine_seconds` | histogram | | shared-memory packing and the engine round trip (`server_timing.engine_ms`) |
