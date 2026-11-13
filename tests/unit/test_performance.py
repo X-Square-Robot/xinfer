@@ -120,7 +120,7 @@ def test_cuda_default_leaves_image_selection_to_policy_capabilities(tmp_path, mo
                              "--out", str(tmp_path / "result")]) == 0
     assert set(options) == {"latency", "server"}
     assert all("image_preprocess_device" not in child for child in options.values())
-    # Without torchvision, Policy must retain its supported CPU image path.
+    # Without nvImageCodec, Policy must retain its supported CPU image path.
     platform = SimpleNamespace(name="cuda-sm120", device="cuda:0",
                                capabilities=SimpleNamespace(device_images=False))
     for child in options.values():

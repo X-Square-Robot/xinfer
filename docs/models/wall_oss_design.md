@@ -200,14 +200,14 @@ it sends each JPEG view's bytes (other encodings are decoded on the CPU) or raw
 frame as a `DeviceImage` with the size the CPU path would resize it to, read
 from the JPEG header, and the recipe `DEVICE_RESIZE`, so the prompt, grids and
 vision layout are unchanged. Before the first stage the engine decodes the
-request's JPEGs in one torchvision `decode_jpeg` call and resizes each view
+request's JPEGs in one call of the platform's JPEG decoder (nvImageCodec) and resizes each view
 with an FP32 bicubic interpolation (a = −0.75, no antialiasing, as
 INTER_CUBIC), rounded half up to uint8 ([engine](../engine.md#device-images)).
 The vision stage reads the views as with CPU preprocessing and they have the
 CPU path's shapes, so the vision graph and its key are the same. The resize of
-a raw frame is within one level of OpenCV's; decoded JPEGs differ from
-libjpeg-turbo's around sharp chroma edges, so the actions differ from the CPU
-path's and the option is off by default.
+a raw frame is within one level of OpenCV's and a decoded JPEG within one
+level of libjpeg-turbo's; the views are still not bitwise equal, so the
+actions differ from the CPU path's and the option is off by default.
 
 Deployment choices of the reference (fixed instruction, camera wire keys,
 embodiment text, admitted RTC delays, client step override) are explicit

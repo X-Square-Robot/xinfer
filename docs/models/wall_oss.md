@@ -38,7 +38,7 @@ yet.
   Rotation conversions run under numba for bitwise parity with the reference
   service (see [design](wall_oss_design.md#processing)).
 - A CUDA GPU with about 10 GB free for BF16 weights (CPU works for tests).
-- For `image_preprocess_device="gpu"`: `pip install -e '.[gpu-image]'` (torchvision ≥ 0.19).
+- For `image_preprocess_device="gpu"`: `pip install -e '.[gpu-image]'` (NVIDIA's nvImageCodec, `nvidia-nvimgcodec-cu13`).
 - Optimized composition (the default): the Python package of an xcompute build for the GPU's architecture
   importable. See [kernels](../kernels.md) for setup and checks. The reported measurements use an RTX 5090 (SM120).
   Without it the composition runs on the torch references (slowly).
@@ -77,7 +77,7 @@ The reference composition: pass `numerics="reference"` (serving: `--model-option
 | `rtc_wire_delay_range` | (3, 8) | admission on the raw `inference_delay` |
 | `prompt_bucket` | 16 | prompts are padded at their end, before the action tokens, to a multiple of this many tokens, so CUDA graphs are keyed by the bucket; both compositions mask the padding, which changes the actions at rounding level at most ([design](wall_oss_design.md#prompt-buckets)) |
 
-`image_preprocess_device`, a top-level model option (not in `processing`): `"cpu"` under `xinfer serve`; under `Policy` the platform's (`"gpu"` on CUDA). `"gpu"`: the frontend sends the JPEG bytes and raw frames with their target sizes, and the engine decodes the JPEGs with nvJPEG and resizes the views on the device (bicubic like OpenCV INTER_CUBIC) before the first stage. Saves the frontend's decode and resize time; the views, and so the actions, are not bitwise equal to the CPU path ([configuration](../configuration.md#image-preprocessing-on-the-gpu))
+`image_preprocess_device`, a top-level model option (not in `processing`): `"cpu"` under `xinfer serve`; under `Policy` the platform's (`"gpu"` on CUDA). `"gpu"`: the frontend sends the JPEG bytes and raw frames with their target sizes, and the engine decodes the JPEGs with nvImageCodec and resizes the views on the device (bicubic like OpenCV INTER_CUBIC) before the first stage. Saves the frontend's decode and resize time; the views, and so the actions, are not bitwise equal to the CPU path ([configuration](../configuration.md#image-preprocessing-on-the-gpu))
 
 Initial flow noise is drawn per request on the CPU by the input processor
 (`ProcessingConfig.noise_seed` fixes it); tests replace the prepared `noise`

@@ -24,9 +24,9 @@ models = [
     "numba>=0.60",
     "pillow>=10",
 ]
-# image_preprocess_device = "gpu": JPEG decoding with nvJPEG (batched CUDA decode_jpeg).
+# image_preprocess_device = "gpu": JPEG decoding on CUDA devices with NVIDIA's nvImageCodec (CUDA 13 build).
 gpu-image = [
-    "torchvision>=0.19",
+    "nvidia-nvimgcodec-cu13>=0.10",
 ]
 serve = [
     "websockets>=12",

@@ -138,7 +138,7 @@ RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 290
 | 测试 | 依赖 | 检查内容 |
 |---|---|---|
 | `tests/models/test_wall_oss_tiny.py` | CPU | 两种组合（optimized 组合运行在其算子的 torch 参考实现上）：权重映射完整性、引擎运行、精确的 RTC 固定、确定性、填充的 prompt；optimized 组合与参考组合相差在 5 % 以内；阶段拆分 = 联合前向；prompt 填充布局及其对算子的要求；使用 `image_preprocess_device="gpu"` 时视角图像是 `DeviceImage` |
-| `tests/models/test_image_preprocess.py` | GPU、torchvision、checkpoint、服务抓包 | `image_preprocess_device="gpu"`：设备端视角图像与 CPU 视角图像的差异在规定容差内（原始帧：平均 ≤ 0.01，最大 ≤ 1 级；抓包中的均匀噪声腕部视图编码为 JPEG：平均 ≤ 8，最大 ≤ 96）；由用 CPU 准备的请求预热的 graph 提供服务，预热后无捕获 |
+| `tests/models/test_image_preprocess.py` | GPU、nvImageCodec、checkpoint、服务抓包 | `image_preprocess_device="gpu"`：设备端视角图像与 CPU 视角图像的差异在规定容差内（原始帧：平均 ≤ 0.01，最大 ≤ 1 级；抓包中的均匀噪声腕部视图编码为 JPEG：平均 ≤ 0.05，最大 ≤ 2；实测 0.0007 / 1）；由用 CPU 准备的请求预热的 graph 提供服务，预热后无捕获 |
 | `tests/models/test_wall_oss_processing.py` | checkpoint、服务抓包 | 处理一致性，逐位一致；分桶的 prompt = 精确 prompt 加填充 |
 | `tests/unit/test_image_pack.py` | CPU；GPU | 视角图像归一化（逐通道和共享查找表）以及 vision 阶段的打包与 NumPy 计算结果一致；在 CUDA 上以及用新像素做 CUDA graph 回放时同样一致 |
 | `tests/unit/test_model_processing.py` | CPU | 视角图像按相机顺序并发处理，错误会传到调用方；`SegmentTokenizer` 在一个小型字节级 BPE 上与 tokenizer 一致；JPEG 帧头（baseline、progressive）以及把视角图像带到引擎的 `DeviceImage` 值 |
