@@ -285,23 +285,6 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
     explicit = explicit or ExplicitSettings()
     stages = tuple(s.name for s in model.stage_graph)
     capabilities = model.capabilities()
-    single_submission = platform.capabilities.execution_model == "explicit-completion"
-    if single_submission:
-        # The vendor SDK (RPU TP public ABI is the instance in tree today) permits one device submission
-        # in flight and no uploads/allocation while it runs. CUDA's pipelined defaults therefore
-        # cannot be inherited by this execution context.
-        constrained = {
-            "max_running_requests": explicit.max_running_requests,
-            "max_queued_requests": explicit.max_queued_requests,
-            "per_robot_inflight": explicit.per_robot_inflight,
-            "frontends": explicit.frontends,
-            "shm_buffers": explicit.shm_buffers,
-            **{f"lanes.{k}": v for k, v in explicit.lanes.items()},
-            **{f"max_batch.{k}": v for k, v in explicit.max_batch.items()},
-        }
-        for name, value in constrained.items():
-            if value is not None and value != 1:
-                raise ConfigError(f"single-submission execution context requires {name}=1, got {value}")
     out: dict[str, Setting] = {}
     for name, spec in model.shape_buckets().items():
         out[f"shape_buckets.{name}"] = Setting(asdict(spec), "model:bucket policy")
@@ -314,12 +297,11 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
             return Setting(_positive(name, value), "explicit")
         return Setting(default, source)
 
-    single_sub_source = f"platform:single-submission {platform.name}" if single_submission else "default"
-    out["per_robot_inflight"] = chosen("per_robot_inflight", explicit.per_robot_inflight, 1, single_sub_source)
+    out["per_robot_inflight"] = chosen("per_robot_inflight", explicit.per_robot_inflight, 1)
     out["max_running_requests"] = chosen("max_running_requests", explicit.max_running_requests,
-                                         1 if single_submission else DEFAULT_MAX_RUNNING_REQUESTS, single_sub_source)
+                                         DEFAULT_MAX_RUNNING_REQUESTS)
     out["max_queued_requests"] = chosen("max_queued_requests", explicit.max_queued_requests,
-                                        1 if single_submission else DEFAULT_MAX_QUEUED_REQUESTS, single_sub_source)
+                                        DEFAULT_MAX_QUEUED_REQUESTS)
 
     unknown = (set(explicit.lanes) | set(explicit.max_batch) | set(explicit.stream_priorities)) - set(stages)
     if unknown:
@@ -327,24 +309,17 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
     for stage in stages:
         if stage in explicit.lanes:
             out[f"lanes.{stage}"] = Setting(_positive(f"lanes.{stage}", explicit.lanes[stage]), "explicit")
-        elif single_submission:
-            out[f"lanes.{stage}"] = Setting(1, single_sub_source)
         elif tuned is not None and stage in tuned.lanes:
             out[f"lanes.{stage}"] = Setting(tuned.lanes[stage], tuned.source)
         else:
             out[f"lanes.{stage}"] = Setting(DEFAULT_LANES, "default")
 
-    from xinfer.platforms.devices import device_module_for
-
+    priorities = platform.capabilities.stream_priorities
     bounds = platform.capabilities.stream_priority_range
     if bounds is not None and bounds[0] > bounds[1]:
         # The clamp below only ever yields a value inside a well-formed range, so this guards a platform that
         # reports a reversed one instead of silently picking an out-of-range default.
         raise ConfigError(f"platform {platform.name} declares a reversed stream priority range {bounds}")
-    # RPU is not a torch-stream device: even if a future platform advertises stream_priorities,
-    # there is no runtime stream to honor them on, so the gate stays False.
-    priorities = (device_module_for(platform.device) is not None and platform.capabilities.stream_priorities)
-
     for stage in stages:
         if stage not in explicit.stream_priorities:
             final = priorities and not model.stage_graph.consumers(stage)
@@ -369,8 +344,6 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
             if limit > allowed[-1]:
                 raise ConfigError(f"stage {stage} supports batch sizes {allowed}, not {limit}")
             out[f"batch_sizes.{stage}"] = Setting([b for b in allowed if b <= limit], "explicit")
-        elif single_submission:
-            out[f"batch_sizes.{stage}"] = Setting([1], single_sub_source)
         elif allowed == [1]:
             out[f"batch_sizes.{stage}"] = Setting([1], "model:declares B1 only")
         else:
@@ -386,10 +359,8 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
 
     cpus = cpus or cpu_quota()
     max_frontends = max(1, cpus // 2)
-    out["frontends"] = chosen("frontends", explicit.frontends,
-                              1 if single_submission else min(DEFAULT_FRONTENDS, max_frontends),
-                              single_sub_source if single_submission
-                              else f"default, ≤ cpus/2 = {max_frontends}")
+    out["frontends"] = chosen("frontends", explicit.frontends, min(DEFAULT_FRONTENDS, max_frontends),
+                              f"default, ≤ cpus/2 = {max_frontends}")
     max_workers = max(1, max_frontends // out["frontends"].value)
     out["frontend_workers"] = chosen("frontend_workers", explicit.frontend_workers,
                                      min(DEFAULT_FRONTEND_WORKERS, max_workers),
