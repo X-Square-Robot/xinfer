@@ -45,8 +45,10 @@ reference in either benchmark. The [Ascend guide](ascend950dt.md) lists each ope
 
 | Model | Precision and composition | Single request P50 | Robots per NPU | Server P50 at capacity | Server P95 at capacity | Highest measured rate | Numerical agreement |
 |---|---|---|---|---|---|---|---|
-| Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 41.61 ms | 5 | 127 ms | 139 ms | 31.9 req/s | quick100 B1, −6.32 % against the BF16 reference: PASS |
-| Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 50.03 ms | 8 | 104 ms | 120 ms | 45.0 req/s | fixed-noise action gate against the reference composition: PASS |
+| Wall-OSS | BF16, every operator on xcompute entries, DVPP images | **41.20 ms** (lineage combined stack) | 5 | 127 ms | 139 ms | 31.9 req/s | quick100 B1, −6.48 % against the BF16 reference: PASS |
+| Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | **35.24 ms** (lineage combined stack) | 10 | 87 ms | 108 ms | 54.9 req/s | fixed-noise action gate, max_abs 0.0051 against the reference composition: PASS |
+
+The bold latency numbers are the strongest measured configurations to date (the lineage combined stacks, gates included: quick100 -6.48 % / action max_abs 0.0051); the Wall-OSS capacity columns still cite the integrated-branch measurement. Porting the lineage stacks onto this branch is in progress, and the rows will be re-measured on the branch composition once that lands.
 
 Conditions for the Ascend rows:
 
