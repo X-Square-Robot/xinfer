@@ -334,16 +334,14 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
         else:
             out[f"lanes.{stage}"] = Setting(DEFAULT_LANES, "default")
 
-    from xinfer.platforms.devices import device_module_for
-
     bounds = platform.capabilities.stream_priority_range
     if bounds is not None and bounds[0] > bounds[1]:
         # The clamp below only ever yields a value inside a well-formed range, so this guards a platform that
         # reports a reversed one instead of silently picking an out-of-range default.
         raise ConfigError(f"platform {platform.name} declares a reversed stream priority range {bounds}")
-    # RPU is not a torch-stream device: even if a future platform advertises stream_priorities,
-    # there is no runtime stream to honor them on, so the gate stays False.
-    priorities = (device_module_for(platform.device) is not None and platform.capabilities.stream_priorities)
+    # Explicit-completion execution has no stream priorities. Configuration uses capability
+    # metadata without importing or initializing the platform's device runtime.
+    priorities = not single_submission and platform.capabilities.stream_priorities
 
     for stage in stages:
         if stage not in explicit.stream_priorities:

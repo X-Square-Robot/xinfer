@@ -48,6 +48,7 @@ from xinfer.engine.slots import PoolExhausted, SlotPool
 from xinfer.models.interface import DeviceImage, PreparedRequest, StageBatch, VLAModel
 from xinfer.observability.annotate import span
 from xinfer.observability.stats import RequestStats, StageStats
+from xinfer.platforms.devices import device_module_for
 from xinfer.platforms.interface import Platform
 
 logger = logging.getLogger(__name__)
@@ -184,8 +185,6 @@ class Engine:
                 of its consumer.
             RuntimeError: ``config.cudagraphs`` is set but the platform does not support graph capture.
         """
-        from xinfer.platforms.devices import device_module_for
-
         if platform.capabilities.execution_model != "cuda-lanes":
             raise ValueError("engine.core.Engine requires execution_model='cuda-lanes'; "
                              f"got {platform.capabilities.execution_model!r} on {platform.name}")

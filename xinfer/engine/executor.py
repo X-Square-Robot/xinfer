@@ -18,6 +18,7 @@ from typing import Any
 import torch
 
 from xinfer.models.interface import StageBatch, VLAModel
+from xinfer.platforms.devices import device_module_for
 from xinfer.platforms.interface import Platform
 
 
@@ -50,8 +51,6 @@ class Lane:
             ValueError: priority is not an integer, is nonzero on an unsupported platform,
                 or the runtime cannot verify or honor the requested value without clamping.
         """
-        from xinfer.platforms.devices import device_module_for
-
         if platform.capabilities.execution_model != "cuda-lanes":
             raise ValueError("lane dispatch requires execution_model='cuda-lanes'; "
                              f"got {platform.capabilities.execution_model!r}")
