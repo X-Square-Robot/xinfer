@@ -31,52 +31,37 @@ this profile does not add an RPU mode to `xinfer-serve`.
 ## Board-free checkpoint inspection
 
 Install the model-processing dependencies, for example in an environment
-provisioned with `python -m pip install -e ".[wallx2b]"`. Preflight checks
+provisioned with `python -m pip install -e ".[models]"`. Preflight checks
 checkpoint metadata, configuration and asset hashes without loading tensors or
 importing xcompute:
 
-```bash
-python -m xinfer.entrypoints.wallx2b_openloop \
-  --checkpoint "$CHECKPOINT" --model wallx2b --check
+```python
+from xinfer.models.wallx2b.rpu.config import preflight_checkpoint
 
-python -m xinfer.entrypoints.wallx2b_openloop \
-  --checkpoint "$CHECKPOINT" --check --validate-assets \
-  --output-dir "$EVIDENCE/preflight"
+manifest = preflight_checkpoint(checkpoint_path)
+print(manifest)
 ```
 
 For frozen-request inspection, provide a non-pickled NPZ with `face_view`,
 `left_wrist_view` and `right_wrist_view` as RGB uint8 HWC arrays, `state` as
 `[26]`, a Unicode scalar `instruction`, and `initial_noise` as FP32
 `[1,16,26]`. Supply the actual noise array; a seed alone does not establish
-identical input bytes.
+identical input bytes. The request's views, state and explicit initial noise
+are then handed to the same input processor the serving path uses.
 
-```bash
-python -m xinfer.entrypoints.wallx2b_openloop \
-  --checkpoint "$CHECKPOINT" --request "$REQUEST" --check \
-  --output-dir "$EVIDENCE/prepared"
-```
-
-The output directory receives prepared input arrays and their dtype, shape and
-byte-hash metadata. Video decoding, task evaluation and ground-truth scoring
-are outside this entry point.
+Video decoding, task evaluation and ground-truth scoring are outside this
+interface.
 
 ## Explicit candidate admission
 
 Select an SDK-prepared AOT library explicitly before creating a real execution
 context. The selected library must match the already imported xcompute Python
 package and must provide the RPU ABI. Acquire the deployment's board lease and
-check device occupancy first.
+check device occupancy first. Set `XCOMPUTE_LIBRARY_PATH` to the chosen library
+(and disable auto-build with `XCOMPUTE_SKIP_AUTO_BUILD=1` when appropriate).
 
-```bash
-export XCOMPUTE_SKIP_AUTO_BUILD=1
-export XCOMPUTE_LIBRARY_PATH="$RPU_AOT_LIBRARY"
-python -m xinfer.entrypoints.wallx2b_openloop \
-  --checkpoint "$CHECKPOINT" --request "$REQUEST" --allow-candidate \
-  --output-dir "$EVIDENCE/request"
-```
-
-The same execution is available through `Policy`. Its context manager closes
-the engine and the input processor even when inference raises:
+Execution is available through `Policy`. Its context manager closes the engine
+and the input processor even when inference raises:
 
 ```python
 from xinfer import Policy

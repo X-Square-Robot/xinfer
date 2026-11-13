@@ -77,7 +77,6 @@ finally:
 | 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
 |---|---|---|---|---|
 | Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
-| Wall-X 2B RPU · TP8 | `wallx2b`，设备 `rpu:0` | FP16 | — | [RPU 配置](docs/models/wallx2b_rpu.zh-CN.md) |
 
 Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。Wall-X 2B 在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)。
 
@@ -85,7 +84,7 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 |---|---|---|
 | NVIDIA GPU · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
-| xcompute TP8 RPU | `rpu:0` | 原生 SDK 预编译执行，显式完成等待 |
+| huixi R1 | `rpu` | huixi SDK AOT · [配置](docs/models/wallx2b_rpu.zh-CN.md) |
 | CPU | `cpu` | 参考实现与测试 |
 
 每个加速器运行各自的引擎（Engine）和权重。

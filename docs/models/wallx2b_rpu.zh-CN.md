@@ -27,48 +27,33 @@ stream/event 或通用 CUDA `Engine`。支持的接口是进程内 `Policy` 和�
 
 ## 无板卡的 checkpoint 检查
 
-安装模型处理依赖，例如在通过 `python -m pip install -e ".[wallx2b]"`
+安装模型处理依赖，例如在通过 `python -m pip install -e ".[models]"`
 准备的环境中。预检查不加载张量或导入 xcompute，即可检查 checkpoint 元数据、
 配置和资产哈希：
 
-```bash
-python -m xinfer.entrypoints.wallx2b_openloop \
-  --checkpoint "$CHECKPOINT" --model wallx2b --check
+```python
+from xinfer.models.wallx2b.rpu.config import preflight_checkpoint
 
-python -m xinfer.entrypoints.wallx2b_openloop \
-  --checkpoint "$CHECKPOINT" --check --validate-assets \
-  --output-dir "$EVIDENCE/preflight"
+manifest = preflight_checkpoint(checkpoint_path)
+print(manifest)
 ```
 
 检查冻结请求时，提供不使用 pickle 的 NPZ，其中 `face_view`、
 `left_wrist_view` 和 `right_wrist_view` 是 RGB uint8 HWC 数组，`state`
 形状为 `[26]`，`instruction` 是 Unicode 标量，`initial_noise` 是形状
 `[1,16,26]` 的 FP32 数组。必须提供实际噪声数组；只有种子不能保证输入字节相同。
+请求中的视图、状态和显式初始噪声随后交给与服务路径相同的输入处理器。
 
-```bash
-python -m xinfer.entrypoints.wallx2b_openloop \
-  --checkpoint "$CHECKPOINT" --request "$REQUEST" --check \
-  --output-dir "$EVIDENCE/prepared"
-```
-
-输出目录收到准备好的输入数组及其 dtype、形状和字节哈希元数据。视频解码、
-任务评估和 ground-truth 评分不在此入口的范围内。
+视频解码、任务评估和 ground-truth 评分不在此接口的范围内。
 
 ## 显式候选准入
 
 在创建实际执行上下文前，显式选择 SDK 准备的 AOT 库。选定的库必须与已经
 导入的 xcompute Python 包匹配，并提供 RPU ABI。先取得部署环境的板卡租约，
-并检查设备占用情况。
+并检查设备占用情况。将 `XCOMPUTE_LIBRARY_PATH` 指向所选库
+（需要时用 `XCOMPUTE_SKIP_AUTO_BUILD=1` 关闭自动构建）。
 
-```bash
-export XCOMPUTE_SKIP_AUTO_BUILD=1
-export XCOMPUTE_LIBRARY_PATH="$RPU_AOT_LIBRARY"
-python -m xinfer.entrypoints.wallx2b_openloop \
-  --checkpoint "$CHECKPOINT" --request "$REQUEST" --allow-candidate \
-  --output-dir "$EVIDENCE/request"
-```
-
-同样的执行也可通过 `Policy` 获得。其上下文管理器会在推理抛出异常时仍关闭
+执行可通过 `Policy` 获得。其上下文管理器会在推理抛出异常时仍关闭
 引擎和输入处理器：
 
 ```python
