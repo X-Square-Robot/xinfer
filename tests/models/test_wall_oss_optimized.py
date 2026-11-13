@@ -6,8 +6,7 @@ Uses the assets of ``test_wall_oss_parity.py`` (``XINFER_WALL_OSS_CHECKPOINT``, 
 
 The composition rounds at other points than the eager model, so each stage is compared with the reference's
 result from the reference's inputs to it within a tolerance, the full chain must stay closer to the BF16 reference
-than the MXFP8 production service, and graph replays must equal eager. The quick100 precision gate is the
-end-to-end check.
+than the MXFP8 production service, and graph replays must equal eager.
 """
 
 import json

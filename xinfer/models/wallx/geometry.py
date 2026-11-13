@@ -1,8 +1,7 @@
 """Rotation helpers shared by Wall-X models (numba, ported verbatim).
 
-Provenance: embodied-serving gl/main 9633ffd
-``src/embodied_serving/adapters/wallx/runtime_helpers/geometry.py``, itself
-extracted from the pinned Wall-X inference dependencies (identical, apart from
+Provenance: the production Wall-X service's geometry helpers, extracted
+from the pinned Wall-X inference dependencies (identical, apart from
 comments, to ``x2robot_utils.geometry``). The arithmetic order and the numba
 specializations (float32 inputs evaluate cos/sin in float32) are part of the
 served numerics, so these functions are kept as numba code rather than

@@ -1,7 +1,7 @@
 """NVFP4 reference: E2M1 elements with E4M3 block scales, torch only.
 
-Format, following the Wall-X NVFP4 kernels (``wall_x/infer/csrc/nvfp4/ops.cu``
-of the embodied-serving ``nvfp4_v2.patch``) and the GEMMs they feed:
+Format, following the Wall-X NVFP4 kernels of the production service and the
+GEMMs they feed:
 
 - elements are E2M1 (0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives), packed
   two per byte as uint8 ``[M, K/2]``: column ``2j`` in the low nibble,

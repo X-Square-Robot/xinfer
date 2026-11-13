@@ -135,8 +135,7 @@ bound = roofline(op_cost(name, args, kwargs, outputs), PEAKS["NVIDIA GeForce RTX
 
 Measured on 2026-11-06 with driver 595.91.07 and torch 2.9.1+cu130, at steady state: each entry after about two
 seconds of continuous load, the median of 20 runs timed with CUDA events. The BF16 GEMM then ran at the 575 W power
-limit with the SM clock at 2617–2632 MHz (maximum 3090 MHz). Evidence archive:
-`xinfer-profiling-foundation-20261106.tar.gz` (sha256 `a2e7b27836e6b1410dade4835cd5904dcafaaab1ecb0f334589a4ee637f5779f`).
+limit with the SM clock at 2617–2632 MHz (maximum 3090 MHz).
 
 - BF16, FP32: `torch.mm` of random 8192 × 8192 matrices (FP32 with TF32 off), 2N³ / time.
 - MXFP8: the xcompute `mxfp8_gemm` backend used for that measurement on 8192³ operands with `fast_accum=False`, the

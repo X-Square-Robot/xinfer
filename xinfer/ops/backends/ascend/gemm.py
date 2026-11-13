@@ -9,7 +9,7 @@ Stream-K reductions may differ at rounding level across runs.
 
 import torch
 
-from xinfer.ops.backends.ascend._support import VERSION, bridge, canonical, has_functions, partial, xc
+from xinfer.ops.backends.ascend._support import VERSION, bridge, canonical, partial, xc
 from xinfer.ops.reference import gemm as reference
 from xinfer.ops.registry import register
 
@@ -81,9 +81,9 @@ _qk_norm = getattr(xc, "QkNorm", None) if xc is not None else None
 
 
 # ``qkv_rope_kvcache`` takes the unified projection entry first: the same ``qkv_proj_rope`` call with its
-# ``kv_cache`` epilogue that the reference-composed quick100 gate validated end to end. The CANN action bridge
-# also serves the operator, but its composition fails that gate for Wall-OSS (+1100 % GT-MSE against the frozen
-# reference; every other operator family passes), so it stays the fallback for builds without the entry.
+# ``kv_cache`` epilogue that the end-to-end precision gate validated. The CANN action bridge also serves the
+# operator, but its composition fails that gate for Wall-OSS (every other operator family passes), so it stays the
+# fallback for builds without the entry.
 @register("qkv_rope_kvcache", backend="ascend",
           requires=xc if callable(_fused_projection) or callable(native_cache) else None,
           version=VERSION, deterministic=False)

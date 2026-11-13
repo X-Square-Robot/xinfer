@@ -59,7 +59,7 @@ robot ◀──WebSocket── frontend: release the buffer → OutputProcessor 
 ## 运行
 
 ```bash
-python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/5_25000 \
+python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkpoint \
   --port 33985 --warmup flow.msgpack rtc.msgpack \
   --model-options '{"quantization": "bf16", "processing": {"instruction_override": null}}'
 ```
