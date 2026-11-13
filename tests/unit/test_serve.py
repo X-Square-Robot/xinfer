@@ -458,7 +458,7 @@ def _running(pid):
 
 
 def test_the_frontends_exit_when_the_server_process_is_killed():
-    port, process, lines = _start()
+    port, process, lines = _start("--frontends", "2")  # the default is 1 on a machine with fewer than 4 CPUs
     frontends = _frontends(process.pid)
     try:
         assert len(frontends) == 2
