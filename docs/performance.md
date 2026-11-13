@@ -32,8 +32,10 @@ See [Wall-OSS validation](models/wall_oss_validation.md) for the latency and mea
 ## Ascend 950DT
 
 Both rows were measured on 2026-11-13 on one exclusively reserved Ascend 950DT (CANN 9.1.1, TorchNPU
-2.10.0.post4): the Wall-OSS row at revision `3eacd03` of this branch with the r4 delivery `xcompute.so`
-(SHA-256 `a7db13d8…`), and the Wall-X 2B row at revision `49ad6d5` with the r5 delivery
+2.10.0.post4): the Wall-OSS row at revision `f07d8d8` of this branch with the walloss delivery
+`xcompute.so` (SHA-256 `fad3a6c1…`), its combined python package and AOT artifacts and the combined
+fast-path flags (MX8 down prepack/split-K, G2112, SMALLM, COPYKILL, RMSFUSE) enabled, and the
+Wall-X 2B row at revision `49ad6d5` with the r5 delivery
 (SHA-256 `903ff6de…`, which adds the 2B fused qkv tail kernel), each loaded through
 `XINFER_XCOMPUTE_LIBRARY` with its matching Python package. Both models ran
 with their default operator selection: every operator either model calls resolves to `ascend:xcompute`, and a
@@ -43,14 +45,14 @@ reference in either benchmark. The [Ascend guide](ascend950dt.md) lists each ope
 
 | Model | Precision and composition | Single request P50 | Robots per NPU | Server P50 at capacity | Server P95 at capacity | Highest measured rate | Numerical agreement |
 |---|---|---|---|---|---|---|---|
-| Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 47.75 ms | 4 | 120.4 ms | 129.9 ms | 29.2 req/s | quick100 B1, DVPP −6.77 % against the BF16 reference: PASS |
+| Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 41.61 ms | 5 | 127 ms | 139 ms | 31.9 req/s | quick100 B1, −6.32 % against the BF16 reference: PASS |
 | Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 50.03 ms | 8 | 104 ms | 120 ms | 45.0 req/s | fixed-noise action gate against the reference composition: PASS |
 
 Conditions for the Ascend rows:
 
 | # | Model options | Single-request input set | Load | Server warmup | Validation |
 |---|---|---|---|---|---|
-| 3 | defaults, `image_preprocess_device` on the NPU (DVPP) | a flow and an RTC request | synthetic desktop observations with RTC | the same two | quick100 B1 ([precision gate](precision.md)) |
+| 3 | defaults, `image_preprocess_device` on the NPU (DVPP), the delivered package's combined fast-path flags on | a flow and an RTC request | synthetic desktop observations with RTC | the same two | quick100 B1 ([precision gate](precision.md)) |
 | 4 | defaults, `image_preprocess_device` on the NPU (DVPP) | the 216 requests of the reference capture (fixed noise seed 20261112) | synthetic desktop observations with RTC | two of them | fixed-noise action gate |
 
 Both models' rows report one wiring: the xcompute package's own entries, which mix CANN ACLNN Matmul,
