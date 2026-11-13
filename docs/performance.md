@@ -4,12 +4,15 @@ English | [简体中文](performance.zh-CN.md)
 
 ## Capacity with the latency-knee protocol
 
-These BF16 measurements used an otherwise idle RTX 5090, PyTorch 2.10.0+cu130 and flash-attn 2.8.3.post1. A count fails if any round has errors or missing responses, or if median server P50 rises by more than 50% from the previous tested count. Host time is the sum of the median preparation and output times. The components may not add up exactly to the median total.
+These measurements used an otherwise idle RTX 5090, PyTorch 2.10.0+cu130 and flash-attn 2.8.3.post1. A count fails if any round has errors or missing responses, or if median server P50 rises by more than 50% from the previous tested count. Host time is the sum of the median preparation and output times. The components may not add up exactly to the median total.
 
 | Model | Single request P50 (host + engine) | Robots | Server P50 / P95 at capacity | Peak req/s | Build and date |
 |---|---|---:|---|---:|---|
-| Wall-OSS | 47.1 ms (2.6 + 44.5) | 4 | 115 / 134 ms | 25.8 | xcompute `c0d03ca`, 2026-11-13 |
-| Wall-X 2B | 22.3 ms (3.5 + 18.8) | 14 | 84 / 108 ms | 81.5 | xcompute `24b678f`, 2026-11-12 |
+| Wall-OSS BF16 | 47.1 ms (2.6 + 44.5) | 4 | 115 / 134 ms | 25.8 | xcompute `c0d03ca`, 2026-11-13 |
+| Wall-X 2B BF16 | 22.3 ms (3.5 + 18.8) | 14 | 84 / 108 ms | 81.5 | xcompute `24b678f`, 2026-11-12 |
+| Wall-X 2B MXFP8 (vision and prefill) | 17.0 ms (3.5 + 13.5) | 22 | 63 / 93 ms | 131.2 | xcompute `4665d78`, 2026-11-13 |
+
+The MXFP8 run kept the action stage in BF16. Its all-BF16 control on the same card and build measured 22.4 ms and 14 robots. Upstream reported position error metrics 1.4% to 10.7% higher than BF16. The upstream runs have yet to be reproduced with this port on an RTX 5090.
 
 These upstream runs used the request sets described below. For new measurements follow the [benchmark protocol](benchmark.md#performance-table). The November 9 table and the Ascend results on this page used the fixed 150 ms limit.
 
