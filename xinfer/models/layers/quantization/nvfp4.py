@@ -1,6 +1,6 @@
 """NVFP4 linear layers: E2M1 weights and activations with E4M3 block scales.
 
-Two methods, the two Wall-X NVFP4 recipes of the embodied-serving NVFP4
+Two methods, the two Wall-X NVFP4 recipes of the production NVFP4
 service:
 
 - ``nvfp4`` (``nvfp4_1d1d_16bs``): weight block scales from the block amax,

@@ -1,89 +1,39 @@
-# Precision gate
+# Precision
 
 English | [简体中文](precision.zh-CN.md)
 
-Wall-X 2B uses an open-loop evaluation at RTC delays 0, 3 and 6. Its [validation results](models/wallx2b_validation.md) cover the optimized and reference compositions.
+XInfer serves each model in two compositions. The reference composition (`numerics="reference"`) follows the
+original model implementation step by step on PyTorch operators. The optimized composition (the default) fuses steps
+into xcompute kernels, so it rounds at other points and is not bitwise equal to the reference. XInfer states
+precision as the agreement between the two, checked by the tests in this repository; the accuracy of a model itself
+is that of its checkpoint.
 
-A change that can alter Wall-OSS outputs must pass the embodied-serving
-quick100 gate, the gate the Wall-X 4B service was admitted with.
+## How agreement is checked
 
-**Rule.** The GT-MSE of each required scenario relative to the frozen original
-BF16 model must stay within +1 %: `MSE_candidate / MSE_BF16 − 1 ≤ 0.01`.
+| Check | Test | What it compares |
+|---|---|---|
+| Reference composition against the original implementation | `tests/models/test_wall_oss_parity.py` | Wall-OSS's reference composition against the original eager BF16 model on recorded requests: each stage from the original's inputs to it, and the actions |
+| Optimized against reference, per stage | `tests/models/test_wall_oss_optimized.py` | each stage of the optimized composition against the reference's result from the same inputs, within a tolerance; CUDA graph replays equal eager runs bit for bit |
+| Structure of both compositions | `tests/models/test_wall_oss_tiny.py`, `tests/models/test_wallx2b_tiny.py` | a tiny random checkpoint on the CPU: complete weight mapping, the stages through the engine, pinned RTC actions returned exactly, the optimized composition close to the reference |
+| End to end | `tests/models/test_wallx2b_policy.py` | Wall-X 2B through `Policy` with a supplied checkpoint, in both compositions |
 
-**Scope** (embodied-serving `docs/PRECISION_REGRESSION.md`):
-- **Inputs**: 5 real episodes, 100 windows, seed 42, RTC delay 5.
-- **Metric**: GT-MSE in normalized space over the 18 non-gripper dimensions, excluding the first `delay` steps of each window.
-- **Reference**: the original full BF16 Wall-X model, B1, frozen.
+The tests with real checkpoints need a GPU and the model's assets (the environment variables each test names); they
+skip without them. The tiny-checkpoint tests run in CI. Wall-X 2B's optimized composition was also compared stage by
+stage with its checkpoint's BF16 sampler on full checkpoints ([Wall-X 2B validation](models/wallx2b_validation.md#numerical-checks-against-the-bf16-sampler)).
 
-XInfer runs the gate through an adapter for the embodied-serving harness
-(`scripts/check_precision.py`, profile `quick100-batch32-v1`, scope
-`model_batch`).
+## Known differences
 
-## Tools
+- **Rounding.** The optimized composition applies epilogues (bias, RoPE, activations, residual adds) to FP32
+  accumulators and rounds to BF16 once, where the reference rounds after each step.
+- **Pinned RTC actions.** The served semantics cut the attention of pinned RTC action tokens to the denoising tokens
+  at every step, while the original eager model lets them attend at step 0
+  ([Wall-OSS design](models/wall_oss_design.md)). Both compositions serve the cut form.
+- **Batching.** Batch size can change floating-point rounding; the per-stage tolerances cover single requests.
 
-| File | Role |
-|---|---|
-| `tools/precision/wall_oss_quick100_adapter.py` | `PRECISION_ADAPTER` for the harness (details below) |
-| `tools/precision/configs/optimized.example.json` | candidate configuration: the optimized composition (the default) |
-| `tools/precision/quick100_b1_score.py` | scores the B1 scenario of saved harness runs with the harness's functions |
+## Internal validation
 
-What the adapter does for each request group:
-- runs XInfer's input processing on the wire observation, with the request's saved FP32 noise (prompts padded to
-  `processing.prompt_bucket`, 16 tokens by default, as served); with `image_preprocess_device="gpu"` (a top-level key of
-  its config) it decodes and resizes the views on the GPU before the vision stage, as the engine does (`xinfer.engine.device_images`);
-- runs vision and prefill per request;
-- runs one action-stage call over the whole group (B1 or the scenario's BN). Different prompt lengths, for example 760 and 761 tokens, are merged left-padded as the engine does (`xinfer.engine.batching`). The optimized composition takes one request per action call: the adapter raises for a batched group, so the harness stops after B1 and the run is scored with `quick100_b1_score.py`;
-- reports that call's actual batch and delays.
+Every change that can alter a model's outputs also passes an internal precision gate on real robot data before it
+is released. Its data and tools are not part of this repository.
 
-## Running
-
-The harness, the assets and the BF16 reference live outside this repository:
-
-| Input | What it is |
-|---|---|
-| harness | an embodied-serving checkout at `fa2e8af` (clean) |
-| assets | the quick100 import: manifest SHA `d2ec98c8…`, checkpoint `5_25000` weights SHA `37a4b2ea…` |
-| BF16 reference | the frozen original BF16 outputs (`reference1` in the import) |
-| target | the old Wall-X 4B MXFP8 service's run, embodied-serving `54691d0` |
-
-```bash
-PYTHONPATH=/path/to/xinfer/tools/precision python scripts/check_precision.py \
-  --assets $ASSETS --reference $ASSETS/reference1 \
-  --target $TARGET_RUN --target-ref 54691d0e20b5745eae8ebb6c1f25cdf039067dff \
-  --require-scope model_batch --adapter wall_oss_quick100_adapter:Adapter \
-  --config optimized.json --device 0 --output /path/to/run
-python /path/to/xinfer/tools/precision/quick100_b1_score.py . $ASSETS $ASSETS/reference1 $TARGET_RUN /path/to/run
-```
-
-Run it from the harness checkout. The checkpoint is checked against the
-manifest hashes, so use the original checkpoint directory, not a copy with
-edited `config.yml`.
-
-## Wall-OSS quick100 gate
-
-Result (2026-11-08, RTX 5090, torch 2.10.0+cu130): `numerics="optimized"` with the default backends (xcompute `0c48a46`,
-flash-attn), B1:
-
-| Scenario | GT-MSE vs BF16 | Episode 95 % CI | vs old service (target) |
-|---|---|---|---|
-| quick100 B1, delay 5 (100 windows) | **−6.58 %: PASS** | [−12.48, −0.34] | +0.05 % |
-
-- Scored the same way: the old MXFP8 service −6.62 %, XInfer's reference composition with the eager model's kernels
-  −6.28 % (torch 2.9.1), and the optimized composition under torch 2.9.1 −6.25 % (CI [−12.17, −0.25]; its actions
-  are not bitwise those under 2.10, whose torch operators round differently).
-- **The original BF16 is not the served semantics.** The services and XInfer cut the attention of pinned RTC action
-  tokens to the denoising tokens at every step, while the original eager model lets them attend at step 0
-  (docs/models/wall_oss_design.md). Most of the distance to the original BF16 is that difference.
-- The batch scenarios need an action stage that takes several requests per call; the optimized composition takes one.
-- The GPU tests compare each stage with the eager BF16 model and check graphs bit for bit; output quality is judged
-  by this gate only.
-
-Evidence: run `gates/q100-run` in `xinfer-xcompute-prepack-20261108.tar.gz`; the earlier runs `q100-wos210-run`
-(torch 2.10) and `q100-wos-run` (2.9.1) in `xinfer-wall-oss-optimized-20261107.tar.gz` (hashes in
-docs/models/wall_oss_validation.md).
-
-On Ascend 950DT (2026-11-11, CANN 9.1.1, TorchNPU 2.10.0.post4, B1), the eight xcompute implementations
-listed in the [Ascend guide](ascend950dt.md) pass the same quick100 gate: **−6.45 % with CPU image processing**
-and **−6.81 % with DVPP device images**. Both runs use 100 delay-5 windows and the same frozen BF16 reference;
-keep the image paths separate when comparing results. The binary identity and evidence archive are recorded in
-[performance](performance.md#ascend-950dt).
+On Ascend 950DT, the xcompute implementations listed in the [Ascend guide](ascend950dt.md) passed the same internal
+gate, with image processing on the CPU and on the device.

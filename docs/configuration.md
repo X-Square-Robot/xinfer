@@ -44,8 +44,8 @@ value. CUDA keeps the final-stage default −1 when supported; a runtime with ra
 The MXFP8 measurements below are historical results from an earlier Wall-OSS configuration. The current [Wall-OSS composition](models/wall_oss.md) supports BF16.
 
 Why these values:
-- **Lanes 2.** On Wall-OSS MXFP8 (RTX 5090), two action lanes gave 7 robots of capacity against 5 with one (batched action stage), and 2/2/2 beat 1/1/1 without batching (31.2 vs 27.2 req/s saturated); three or more lanes were not measured. Evidence: `xinfer-action-batching-20261101.tar.gz` and `xinfer-flash-attn-20261101.tar.gz` (hashes in docs/models/wall_oss_validation.md).
-- **Two frontends.** Wall-X input processing takes 7.1 ms per request from the x2robot dummy client (one raw 720×1280 view and two 640×480 JPEG views; 1.7 ms with three raw views), so 8 robots at 5.6 Hz keep one frontend busy about a third of the time (`xinfer-wallx-input-processing-v3-20261105.tar.gz`, sha256 `04df60bd…`). The comparisons below were measured when it took 22.2 ms per request, with one process busy about 100 % of the time at 8 robots. More did not help at low load: at 4 robots (2026-11-01, before action-stage batching; one run each) the server P50 / P99 was 94.8 / 123.8 ms with 1 frontend, 95.9 / 133.0 ms with 2 and 119.9 / 144.0 ms with 4. With action batching, 4 robots had the same end-to-end latency with 1 and 2 frontends (pooled P50 85–87 and 86–88 ms); with one frontend requests queued for input processing (P50 28 ms against 21 ms), with two they waited in the engine instead (`xinfer-config-defaults-20261103.tar.gz`, sha256 `6f85d5eb…`).
+- **Lanes 2.** On Wall-OSS MXFP8 (RTX 5090), two action lanes gave 7 robots of capacity against 5 with one (batched action stage), and 2/2/2 beat 1/1/1 without batching (31.2 vs 27.2 req/s saturated); three or more lanes were not measured.
+- **Two frontends.** Wall-X input processing takes 7.1 ms per request from the x2robot dummy client (one raw 720×1280 view and two 640×480 JPEG views; 1.7 ms with three raw views), so 8 robots at 5.6 Hz keep one frontend busy about a third of the time. The comparisons below were measured when it took 22.2 ms per request, with one process busy about 100 % of the time at 8 robots. More did not help at low load: at 4 robots (2026-11-01, before action-stage batching; one run each) the server P50 / P99 was 94.8 / 123.8 ms with 1 frontend, 95.9 / 133.0 ms with 2 and 119.9 / 144.0 ms with 4. With action batching, 4 robots had the same end-to-end latency with 1 and 2 frontends (pooled P50 85–87 and 86–88 ms); with one frontend requests queued for input processing (P50 28 ms against 21 ms), with two they waited in the engine instead.
 - **Four processing workers per frontend.** Image decode and resize release the GIL, so one process prepares several requests at once.
 - **Final stage first.** With equal priorities, ready work of the final stage waits behind vision and prefill kernels of later requests. On an RTX 5090 (repository load convention, paired instances on one tree), action priority −1 against 0:
   - Wall-OSS MXFP8, 8 robots: pooled server P50 120.9 / 123.4 against 137.1 / 142.4 ms, P99 167.5 / 162.3 against 182.2 / 203.4 ms;
@@ -55,7 +55,7 @@ Why these values:
   - Wall-OSS BF16, 5 robots (overloaded): a 42 ms lower median and 15 % more throughput, but a 24–37 ms higher P99;
   - Wall-OSS MXFP8, 10 robots (overloaded): a 13 ms lower median, a lower P95 and 10 % more throughput, but fewer requests under 150 ms (2–11 % against 28–32 %).
 
-  `--stream-priorities action=0` restores equal priorities. Evidence: `xinfer-stream-priorities-20261104.tar.gz` (sha256 `b642823fb11b337e6dd5f49ec35108c1e7fafb529c6f96a283704a7de5ff2ec7`).
+  `--stream-priorities action=0` restores equal priorities.
 
 ## Prompt shape buckets
 
@@ -104,7 +104,7 @@ Single-request P50 for Wall-OSS MXFP8 on RTX 5090 with CUDA graphs, measured wit
 | Wall-OSS, x2robot dummy client (raw 1280×720 front view, two 640×480 noise JPEG wrist views) | 40.4 (7.4 / 32.8) | 37.4 (3.1 / 34.2) |
 | Wall-OSS, three robot camera JPEG views (1280×720 and 640×480) | 39.0 (6.1 / 32.8) | 35.7 (1.9 / 33.6) |
 
-On the GPU path, the device-image thread spends 1.1–1.4 ms per request on decoding and resizing on its own stream ([engine](engine.md#device-images)). With Wall-OSS MXFP8 at 8 robots, both modes served 44.0–44.3 req/s. Round P50 was 83–93 ms with GPU preprocessing and 83–88 ms with CPU preprocessing. The quick100 B1 GT-MSE was 6.13% below the BF16 reference with GPU preprocessing and 5.01% below it with CPU preprocessing. See [Wall-OSS validation](models/wall_oss_validation.md) for the evidence.
+On the GPU path, the device-image thread spends 1.1–1.4 ms per request on decoding and resizing on its own stream ([engine](engine.md#device-images)). With Wall-OSS MXFP8 at 8 robots, both modes served 44.0–44.3 req/s. Round P50 was 83–93 ms with GPU preprocessing and 83–88 ms with CPU preprocessing. Both modes passed the internal precision gate ([precision](precision.md#internal-validation)).
 
 Not resolved yet:
 - the memory planner (design §8.2);

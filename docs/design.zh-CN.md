@@ -6,10 +6,7 @@
 
 依据的现有代码与记录：
 
-- embodied-serving main `e910f50`：FleetServe 运行时、论文实验记录和模型文档；
-- HarriX main `9e633ac`；
-- vla-engine 原型 `a774bb0`（2026-04）；
-- pipeline-overlap-vla 研究；
+- 这些模型此前的内部服务原型及其测量；
 - vLLM、SGLang 当前 main 源码。
 
 [性能表](performance.zh-CN.md)列出 Wall-OSS 和 Wall-X 2B 的测量条件，并链接到各自的验证结果。
@@ -21,7 +18,7 @@
 | 事项 | 决定 |
 |---|---|
 | 项目名 | XInfer |
-| 仓库 | GitHub 上的 X-Square-Robot/x2infer。 |
+| 仓库 | GitHub 上的 X-Square-Robot/xinfer。 |
 | kernel | 沿用现有 xcompute 仓库，由算子组负责；XInfer 通过 ops 层的 xcompute 绑定接入 |
 | 算子绑定 | xcompute 默认使用 TVM-FFI；有明确的 PyTorch 编译、导出需求时，按需增加 `torch.library` 适配并复用底层实现（§14.2） |
 | 部署场景 | 每个加速器运行一个模型实例，为一台或多台机器人提供服务。 |
@@ -30,11 +27,11 @@
 | GPU 进程布局 | 默认 `colocated`：每 GPU 一个 Engine，Vision / Prefill / Action 同进程；v1 只实现这一布局，`split` 暂不实现 |
 | 阶段与部署边界 | 逻辑阶段与进程映射分离；StageGraph 声明计算与依赖，阶段的进程归属由运行时负责（§9.3） |
 | 硬件方向 | v1 只实现首批硬件；其他芯片经 Platform 插件与算子后端接入（§13、§18.3）。不提供图编译类执行后端（§9.4） |
-| 不含 | SLO 调度器（FleetServe-T、central-ssbp 等）；只保留调度策略插件接口 |
+| 不含 | SLO 调度器；只保留调度策略插件接口 |
 
 ---
 
-## 实现状态（2026-11-04，main `b4f1ac8`）
+## 实现状态（2026-11-04）
 
 本文其余各节描述目标设计。下表列出各设计项在 main 上的实现情况；“未实现”的条目在实现前仍按原文评审。
 
@@ -55,13 +52,13 @@
 | §9.2 Frontend 进程 | 已实现 | 默认 2 个进程，SO_REUSEPORT，每个进程 4 个处理线程；共享内存加 pipe 通知（不是 ZMQ）；不初始化 CUDA，但 import torch。进程内调用由 `Policy` 提供 |
 | §10 配置解析 | 部分实现 | 显式值 > 调优表 > 模型 / 平台规则 > 默认值，启动时打印每项来源（docs/configuration.md）；目前没有随包发布的调优表；`xinfer tune`、显存规划器参与推导、`Platform.derive` / `validate` 未实现 |
 | §11 模型接入 | 已实现 | 模型声明阶段、交接张量、能力、输入输出处理和形状桶。前端通过模型类的 `build_processors` 构建处理器，引擎预热时调用模型的 `pad` 钩子。 |
-| §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过 quick100 门禁。 Wall-X 2B 使用 Qwen3.5 骨干，支持桌面双臂 RTC。 |
+| §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过内部精度门禁。 Wall-X 2B 使用 Qwen3.5 骨干，支持桌面双臂 RTC。 |
 | §12 量化 | 部分实现 | 框架支持按模块组配置 `QuantConfig`。Wall-OSS 使用 BF16。MXFP8 和 NVFP4 具有 PyTorch 参考实现，详见[量化](quantization.zh-CN.md)。 |
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
 | §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn，由 `cuda` 后端模块注册，与 `xinfer.ops` entry point 一起加载（§14.2）；`xinfer.ops.conformance` 未实现 |
 | §15 协议与前端 | 部分实现 | WebSocket + msgpack，兼容 x2robot 客户端；`xinfer.Policy` 进程内 API；Client SDK 与兼容适配未实现 |
 | §16 可观测性与基准工具 | 部分实现 | 服务通过 [/metrics](metrics.zh-CN.md) 导出 Prometheus 指标。使用[压测工具](benchmark.zh-CN.md)测单请求延迟和闭环容量，或用 [xinfer-profile](profiling.zh-CN.md) 分析算子、排队及各阶段执行时间。 |
-| §17 测试 | 部分实现 | CPU 单元与契约测试；GPU 与资产测试需要本地资产，手动运行；CI（`.gitlab-ci.yml`）只跑 ruff 与 CPU 测试 |
+| §17 测试 | 部分实现 | CPU 单元与契约测试；GPU 与资产测试需要本地资产，手动运行；CI（GitHub Actions，`.github/workflows/ci.yml`）跑 ruff、仓库与文档检查和 CPU 测试 |
 | §18.1 仓库结构与命令行 | 与规划不同 | 目录以仓库为准；服务入口为 `xinfer-serve`（即 `python -m xinfer.entrypoints.serve`），profiling 入口为 `xinfer-profile`（`ops`）；统一的 `xinfer` 命令未实现 |
 
 ---
@@ -77,7 +74,7 @@
 | 瓶颈 | 显存带宽、KV 容量 | 小 batch 下 GPU 利用率低；CPU 预处理与发射开销；阶段之间计算量差别大 |
 | 指标 | TTFT、TPOT、吞吐 | 单请求延迟；单卡容量 N\*（给定延迟口径下能服务的机器人数） |
 
-所以 VLA 不能直接套用 vLLM/SGLang 的 token 级调度和分页 KV。实测上，FleetServe 在 RTX 5090 的同口径对比中，容量显著高于 SGLang 和 vLLM-Omni（附录 A）。
+所以 VLA 不能直接套用 vLLM/SGLang 的 token 级调度和分页 KV。
 
 ---
 
@@ -87,8 +84,8 @@
 
 | 目标 | 验收口径 | 现有参考 |
 |---|---|---|
-| Thor 单请求 | Thor 上 Wall-OSS，同输入 | 不高于 HarriX `mxfp8-thor` |
-| 单卡容量最高 | 5090，统一输入，客户端 P50 < 150 ms，三遍 | FleetServe FIFO 路径的同口径容量（基线数字需按 §20 M1 复核） |
+| Thor 单请求 | Thor 上 Wall-OSS，同输入 | 不高于该模型此前的 Thor 移植 |
+| 单卡容量最高 | 5090，统一输入，客户端 P50 < 150 ms，三遍 | 此前内部服务运行时的同口径容量（基线数字需按 §20 M1 复核） |
 | 单请求与满载结果一致 | 同一输入单独运行和满载运行 | 两者都通过该模型的精度门禁；阶段算子都是确定性时输出逐位相同（§6.4） |
 | 接入新模型容易 | 骨干和动作头已有构件时 | 只写模型文件和权重映射，不改运行时 |
 | 接入新硬件和量化容易 | 新平台或新量化方法 | 只实现平台层、算子后端或 QuantMethod，不改模型文件 |
@@ -99,7 +96,7 @@
 - **训练、RL、在线换权重。**
 - **多卡张量并行。** 首批模型单卡放得下；多卡用数据并行副本加 Router。
 - **GPU 阶段拆进程（`split`）。** v1 只实现 `colocated`，不实现阶段间 CUDA IPC、copy-ACK 或 MPS 生命周期；CPU Frontend 多进程仍在范围内。保留职责边界，不预建远程执行框架（§9.3）。
-- **默认开启改变数值的优化。** 例如近似阶段重叠（pipeline-overlap-vla 的代理 KV 方案在 LIBERO 上成功率约 95% vs 97%）或减少去噪步数。量化作为显式配置提供，带精度门禁。
+- **默认开启改变数值的优化。** 例如近似阶段重叠（跨阶段复用近似 KV，会降低任务成功率）或减少去噪步数。量化作为显式配置提供，带精度门禁。
 - **自回归动作 token 模型**（FAST、OpenVLA 类）。阶段抽象为 decode 阶段预留接口，v1 不实现。
 
 ---
@@ -250,7 +247,7 @@ Engine Scheduler: 接纳（分配请求 slot）→ H2D（uint8 图像、token、
 
 **效果：** 1 台机器人时，每个请求从 vision 到 action 一次发射完，就是单请求最快路径。机器人一多，下游有了排队，自动变成流水线加组批。每个请求按发射时刻的队列状态各自决定，从空载到满载是连续的。
 
-**不做整链图。** 所有部署都是单卡服务多台机器人，把整条链捕获成一张图会取消阶段间的流水和组批；单请求的最快路径靠链式发射。HarriX 的 `mxfp8-thor` 用的是整调用图，Thor 的 CPU 也较弱；若 M0 测出 Thor 上"三段图 + 事件"明显慢于整调用图（§6.5），再评估只在空载时使用的整链图。
+**不做整链图。** 所有部署都是单卡服务多台机器人，把整条链捕获成一张图会取消阶段间的流水和组批；单请求的最快路径靠链式发射。该模型此前的 Thor 移植用的是整调用图，Thor 的 CPU 也较弱；若 M0 测出 Thor 上"三段图 + 事件"明显慢于整调用图（§6.5），再评估只在空载时使用的整链图。
 
 ### 6.4 正确性契约：单独运行与满载运行
 
@@ -276,12 +273,12 @@ Engine Scheduler: 接纳（分配请求 slot）→ H2D（uint8 图像、token、
 ### 7.1 接纳
 
 - 在途请求数不超过 slot 数；默认每台机器人至多一个在途请求。
-- 接纳和分配一步完成，返回 `AdmitReady(slot)`、`AdmitDelay` 或 `AdmitFail(code)`，避免"先探测、后分配"的竞态（vla-engine 的教训）。
+- 接纳和分配一步完成，返回 `AdmitReady(slot)`、`AdmitDelay` 或 `AdmitFail(code)`，避免"先探测、后分配"的竞态（此前原型的教训）。
 - 队列有界。错误码区分 `queue_full`、`per_robot_limit` 和 `admission_timeout`。
 
 ### 7.2 阶段队列
 
-`q_vision → q_prefill → q_action`，默认均按到达 FIFO。这与 FleetServe 现在的 `greedy-fair` 行为一致，论文中称为 FIFO 基线。
+`q_vision → q_prefill → q_action`，默认均按到达 FIFO。
 
 ### 7.3 组批
 
@@ -305,7 +302,7 @@ class StagePolicy(Protocol):
 
 - **职责划分**：策略只决定"发射哪些请求、现在发还是等"。lane 分配、链式发射、组批拼装和回收都由运行时完成。
 - **开源版**：只带 `fifo`。
-- **内部 SLO 调度器**：作为插件实现，不修改核心。这样也避免了 embodied-serving `global_scheduler.py` 里 SLO 代码与通用代码交织的问题。
+- **SLO 调度器**：作为插件实现，不修改核心，SLO 代码不会与通用调度交织在一起。
 
 ---
 
@@ -313,7 +310,7 @@ class StagePolicy(Protocol):
 
 ### 8.1 Slot 状态机
 
-沿用 embodied-serving `kv_cache/batch_manager.py` 已验证的状态机：
+沿用此前内部服务中已验证的 slot 状态机：
 
 ```text
 FREE → WRITING → READY → READING → RELEASING(等事件) → FREE (generation+1)
@@ -366,7 +363,7 @@ v1 只实现 `colocated`。Vision、Prefill、Action 共享一个 Engine 进程�
 - **模型边界**：StageGraph 只声明阶段及依赖，HandoffSpec 只声明跨阶段张量布局；模型文件不感知阶段所在进程或传输方式。
 - **运行时边界**：阶段队列、组批和 lane 按逻辑阶段管理；slot 归请求所有，其读写与回收遵循阶段依赖。执行资源的组装与交接由运行时负责；v1 将全部 GPU 阶段固定映射到同一 Engine，通过请求 slot 和 GPU event 交接。
 - **当前范围**：不实现 `split`，不增加进程布局切换参数、远程 StageExecutor、阶段间 IPC 通道或 MPS 启停代码。CPU Frontend 的共享内存和通知通道不受此限制。仅保留上述职责边界，不预建空实现。
-- **后续扩展**：若实测表明 colocated 在消除阻塞和热路径开销后仍受 CPU 提交瓶颈限制，再单独评审进程拆分。可考察 FleetServe 的 Vision + Prefill / Action 两组映射，复用逻辑阶段和数值契约；不纳入当前 M0–M3 的实现或验收承诺。
+- **后续扩展**：若实测表明 colocated 在消除阻塞和热路径开销后仍受 CPU 提交瓶颈限制，再单独评审进程拆分。可考察 Vision + Prefill / Action 两组映射，复用逻辑阶段和数值契约；不纳入当前 M0–M3 的实现或验收承诺。
 
 各阶段位于同一进程时可直接使用请求 slot，并通过设备事件衔接发射。应在目标负载下测量该布局的时延和容量。
 
@@ -424,7 +421,7 @@ frontend_workers      4          default, frontends × workers ≤ cpus/2 = 12
 
 - 组合会随"模型×硬件×部署"成倍增长，而且容易过时。
 - 值的来源不可见。
-- 与硬件无关的设置容易被藏进硬件 profile。例如 embodied-serving 的 `rtx5090` profile 里设置了 `OMP_NUM_THREADS=1`，这本该是所有平台的默认值。
+- 与硬件无关的设置容易被藏进硬件 profile。例如此前某个服务的 `rtx5090` profile 里设置了 `OMP_NUM_THREADS=1`，这本该是所有平台的默认值。
 
 ---
 
@@ -559,8 +556,8 @@ class Platform:
 | 内存 | 32 GB 独立显存 | 统一内存：H2D 可以零拷贝或映射 |
 | CPU | 服务器 CPU（测试容器配额 24 核） | ARM，较弱：发射开销占比更高，机队下 Frontend 预处理也更容易成为瓶颈 |
 | MXFP8 GEMM | PyTorch 参考实现 | PyTorch 参考实现 |
-| MPS | 支持（FleetServe split 布局使用）；v1 colocated 不依赖 | 待确认；v1 colocated 不依赖 |
-| 已知参考 | FleetServe、HarriX `mxfp8-sm120` | HarriX `mxfp8-thor`（ViT BF16、整调用图、RTC 关闭） |
+| MPS | 支持；v1 colocated 不依赖 | 待确认；v1 colocated 不依赖 |
+| 已知参考 | 此前的内部服务运行时 | 该模型此前的 Thor 移植（ViT BF16、整调用图、RTC 关闭） |
 
 AMD GPU 也是目标平台，接入时机与型号待定（§22）。Platform 接口按 HIP 的差异设计：HIP Graph、没有 MPS、CU mask；可用的量化格式由型号决定，经 `supported_quant` 表达。
 
@@ -700,13 +697,13 @@ def causal_attention(q, k, v, *, scale=None): ...
 ## 18. 仓库与开发流程
 
 - XInfer 通过 §14 中的算子契约、绑定和一致性检查接入 xcompute。
-- **沿用 embodied-serving 的规范**：
+- **规范**：
   - MR 描述必须写明问题、改动、验证和限制；
   - 实验原始数据不进 Git；
   - 性能声明附口径和证据位置；
   - 默认值必须有同口径证据。
 - **语言**：代码、注释和对外文档用英文；内部评审文档在公开前可以用中文。
-- **CI**：每个 MR 和 `main` 都跑 CPU 检查（ruff、CPU 测试，`.gitlab-ci.yml`）；GPU（5090、Thor）计划按夜间跑，尚未接入。
+- **CI**：每个 PR 和 `main` 都在 GitHub Actions 中跑 CPU 检查（`.github/workflows/ci.yml`：ruff、仓库与文档检查、CPU 测试）；GPU 测试手动运行。
 
 ### 18.1 XInfer 仓库结构
 
@@ -715,9 +712,9 @@ def causal_attention(q, k, v, *, scale=None): ...
 ```text
 XInfer/
 ├── README.md
-├── CONTRIBUTING.md                 # MR 规范、证据规则（沿用 embodied-serving）
+├── CONTRIBUTING.md                 # 贡献规范、证据规则
 ├── pyproject.toml                  # 包名待定（§22）；extras: test / bench / kernels
-├── .gitlab-ci.yml                  # 每个 MR 跑 CPU 检查；5090、Thor 夜间跑 GPU
+├── .github/workflows/ci.yml        # 每个 PR 跑 CPU 检查
 ├── docs/
 │   ├── design.md                   # 本文档
 │   ├── architecture/               # 子系统设计：scheduler、memory、ops 契约、配置解析
@@ -861,12 +858,12 @@ XInfer 不直接 import 外部扩展，而是在启动时按 Python entry point 
 | 入口组 | 用途 | 例子 |
 |---|---|---|
 | `xinfer.ops` | 注册算子实现 | xcompute 绑定，以及其他厂商算子包 |
-| `xinfer.models` | 树外模型 | 内部未公开的模型 |
-| `xinfer.policies` | 调度策略 | 内部 SLO 调度器 |
+| `xinfer.models` | 树外模型 | 私有或第三方模型 |
+| `xinfer.policies` | 调度策略 | 面向 SLO 的调度器 |
 | `xinfer.platforms` | 注册 Platform | 厂商 NPU 包；内置的 cuda、cpu 走同一机制 |
 | `xinfer.quantization` | 注册 QuantMethod | 厂商量化格式 |
 
-这样，内部 SLO 调度器、未公开的模型和受 NDA 约束的芯片 SDK 绑定都放在私有包里，不需要 fork 开源仓库。
+这样，SLO 调度器、私有模型和受 NDA 约束的芯片 SDK 绑定都可以放在独立的包里，不需要 fork 仓库。
 
 **激活协议**（vLLM 与 SGLang 的做法一致）：
 
@@ -886,36 +883,18 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 | M2 | `models/layers/quantization/nvfp4.py`、精度门禁和扩展模型所用的构件 |
 | M3 | 兼容适配、Router、文档、Docker 镜像、GitHub 发布 |
 
-### 18.5 关键文件的迁移来源
-
-| XInfer 文件 | 来源 |
-|---|---|
-| `engine/memory/slots.py` | embodied-serving `kv_cache/batch_manager.py` 的状态机 |
-| `engine/scheduler/admission.py` | embodied-serving `global_scheduler.py` 的通用接纳部分；vla-engine 的 Admit 三态 |
-| `engine/scheduler/batching.py` | embodied-serving `multiprocess/batching.py`（`BatchIssuer` 规则） |
-| `frontend/shm.py`、`worker.py` | embodied-serving 的共享内存传输与前端工作进程 |
-| `models/wall_oss/` | HarriX `mxfp8-sm120` / `mxfp8-thor`，拆为共享 layers 与模型文件 |
-| `ops/backends/_xcompute.py` | embodied-serving `adapters/wallx/mxfp8_ops.py`、HarriX 各 track 的 `ops.py` |
-| `config/schema.py` | HarriX `launch_config.py` 的严格加载方式 |
-
 ---
 
 ## 19. 与现有代码的关系
 
-**选择新建仓库，不在现有仓库上演进：**
+**选择新建仓库，不在现有仓库上演进。** 此前的内部服务代码把移植来的私有代码和 SLO 调度与通用调度交织在一起，依赖未声明的构建，内核按"模型×GPU"逐个移植。XInfer 保留其中已验证的部分：
 
-- embodied-serving：adapters 中有移植来的私有代码，SLO 代码与通用调度交织在一起。
-- HarriX：依赖未在 setup.py 中声明的 `wall_x` 和内部 xcompute 构建，内核按"模型×GPU"逐个移植。
+- 通用接纳、队列链、lane 上限、slot 分配与回收、失败排空，以及 slot 状态机；
+- 组批规则、frontend 进程池与共享内存；
+- Executor/Engine 分离（prepare → engine → decode）、构建时能力校验、预热后封存图、严格的配置加载；
+- 接纳结果（`AdmitReady` / `AdmitDelay` / `AdmitFail`）、slot handle generation，以及预热完成前 `/ready` 返回 503。
 
-### 迁移来源
-
-| 来源 | 迁移内容 |
-|---|---|
-| embodied-serving | `global_scheduler` 中的通用部分（接纳、队列链、lane 上限、slot 分配与回收、失败排空）；slot 状态机；`BatchIssuer` 规则；frontend 进程池与共享内存；cluster 层 |
-| HarriX | Executor/Engine 分离（prepare → engine → decode）；构建时能力校验；预热后封存图；严格的配置加载；`mxfp8-sm120` / `mxfp8-thor` 的 4B 实现 |
-| vla-engine | AdmitReady/Delay/Fail；slot handle generation；预热完成前 `/ready` 返回 503；分层精度阈值配置 |
-
-迁移的是逻辑阶段、组批和所有权规则；本版不迁移 GPU 阶段的 ActionProcess、CUDA IPC 传输及私有 MPS 启停实现。CPU Frontend 进程池与共享内存按原计划保留。
+迁移的是逻辑阶段、组批和所有权规则；本版不迁移 GPU 阶段的 ActionProcess、CUDA IPC 传输及 MPS 启停实现。CPU Frontend 进程池与共享内存按原计划保留。
 
 ### 迁移时不带过来的耦合
 
@@ -924,7 +903,7 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 - Wall-X 命名的线程和环境变量；
 - 硬编码的 5.6 Hz；
 - 热路径里导入消融门控；
-- 相机名和双臂写死在通用类型里（HarriX）。
+- 相机名和双臂写死在通用类型里。
 
 ---
 
@@ -932,7 +911,7 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| M-1 评审与建仓 | 主仓库 kc/XInfer 已创建（私有），算子仓库确定为 xcompute；本文档评审及算子契约待完成；CPU CI 已接入 | 仓库安排已确定；本里程碑其余事项完成后记录评审与验收结论 |
+| M-1 评审与建仓 | 主仓库已创建，算子仓库确定为 xcompute；本文档评审及算子契约待完成；CPU CI 已接入 | 仓库安排已确定；本里程碑其余事项完成后记录评审与验收结论 |
 | M0 数据面 | 平台、算子后端、模型层、Wall-OSS、单通道发射和基准测试 | Wall-OSS 通过精度门禁，并记录目标平台的时延与图发射开销。 |
 | M1 机队运行时 | 多通道发射、零等待组批、前端工作进程、slot 生命周期与配置解析 | 测量负载下的机队容量、组批精度和发射开销。 |
 | M2 量化与扩展 | NVFP4 与模型扩展 | 记录各模型及量化方法的数值结果。 |
@@ -959,14 +938,3 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 5. **对外稳定面与支持等级**：API 版本号的起点与破坏性变更规则，Tier 2 的准入标准（§13.3）。
 6. **AMD GPU 的接入时机与型号**：是否进入 v1；型号决定可用的量化格式和 kernel 来源（§13.2）。
 
----
-
-## 附录 A：证据索引
-
-均为 RTX 5090；"T-xxx" 为 embodied-serving `papers/fleetserve/experiments/` 中的记录。
-
-| 数据 | 出处 | 说明 |
-|---|---|---|
-| 4B 整请求并发饱和 39.9 vs FIFO 42.8 req/s | G1c（T-37） | |
-| ViT 第 2 份 +25%，第 3 份无增益 | T-76 | |
-| SM 预留无端到端收益 | SM_SHARING_STUDY_20261013 | 旧 4B |
