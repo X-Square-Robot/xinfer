@@ -39,7 +39,7 @@ xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue':
 
 `--resolved-config FILE` writes the same list to `FILE`, and in Python `Policy.describe()["ops"]` lists it. With a
 working build the fused operators (`gemm_epilogue`, `gemm_glu_epilogue`, `qkv_rope_kvcache` and the other
-operators of `xinfer/ops/reference/fused.py` that the model uses) report `xcompute`. `reference` for them means XInfer found no
+operators of `xinfer/ops/reference/` that the model uses) report `xcompute`. `reference` for them means XInfer found no
 usable build:
 
 - no `xcompute` package is importable and `XINFER_XCOMPUTE_LIBRARY` is unset, or it points to a missing file;
@@ -55,3 +55,9 @@ xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: doc
 ```
 
 xcompute may select its generic cuBLASLt GEMM when a build has no shape-specific kernel for a weight.
+
+## Ascend
+
+The `ascend` backend uses the same shared xcompute loader and `XINFER_XCOMPUTE_LIBRARY` /
+`XINFER_XCOMPUTE=0` settings. Available implementations are selected automatically; unsupported calls use
+their torch fallback. See the [Ascend guide](ascend950dt.md) for runtime, image processing and NPU graphs.

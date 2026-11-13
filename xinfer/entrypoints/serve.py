@@ -96,8 +96,8 @@ def parse_args(argv=None):
     p.add_argument("--shm-buffer-mib", type=int, default=32)
     p.add_argument("--lanes", default=None, help="per stage, e.g. vision=2,prefill=2,action=2")
     p.add_argument("--stream-priorities", default=None,
-                   help="CUDA stream priority per stage, e.g. action=0; lower is higher; "
-                        "default -1 for the final stage on CUDA, else 0")
+                   help="accelerator stream priority per stage, e.g. action=0; lower is higher; "
+                        "final-stage default -1 bounded by the supported range, else 0")
     p.add_argument("--max-batch", default=None, help="per stage, e.g. action=4")
     p.add_argument("--max-running-requests", type=int, default=None,
                    help="requests admitted and running in the engine (default 32)")

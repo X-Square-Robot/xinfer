@@ -3,8 +3,8 @@
 Set ``XINFER_XCOMPUTE_LIBRARY`` to the path of an xcompute shared library or install an xcompute Python package with
 its matching library. The operators registered with ``XCOMPUTE`` need the Python package of the same build (the
 entries in ``UNIFIED``) and run on the architectures the build targets; without it (or with ``XINFER_XCOMPUTE=0``)
-they are not registered and run on their torch references. The architectures are CUDA ones (``sm120``) as long as
-the builds target CUDA only.
+they are not registered and run on their torch references. CUDA builds report chip architectures (``sm120``);
+Ascend builds report their backend and bind entries individually.
 """
 
 from __future__ import annotations
@@ -67,6 +67,24 @@ class _Library:
             return self.function(name)(*args)
 
 
+def is_ascend(library) -> bool:
+    """Whether ``library`` is an Ascend build.
+
+    Two shapes exist. The older Ascend builds export ``build_backend()``, which answers ``"ascend"``. The delivery
+    builds drop that export and identify themselves only by reporting no CUDA arch from ``build_target_archs()``:
+    their work is AOT device images, so there is no SM family to name. Treating that as Ascend keeps such a build
+    from being classified as a CUDA library, which would leave every Ascend operator on the reference.
+    """
+    if not hasattr(library, "has_function"):
+        return False
+    if library.has_function("build_backend"):
+        return str(library.function("build_backend")()) == "ascend"
+    if not library.has_function("build_target_archs"):
+        return False
+    reported = str(library.function("build_target_archs")())
+    return not any(part.isdigit() for part in reported.split(","))
+
+
 def _import():
     """``(package, library, archs, version)`` of the usable xcompute build, or None (the reason is logged).
 
@@ -111,21 +129,28 @@ def _python_package(library):
         import xcompute
     except ImportError:
         return None
-    if (Path(xcompute.KERNEL_LIB_PATH).resolve() != Path(library.path)
-            or not all(hasattr(xcompute, name) for name in UNIFIED)
+    if Path(xcompute.KERNEL_LIB_PATH).resolve() != Path(library.path):
+        return None
+    if is_ascend(library):
+        return xcompute
+    if (not all(hasattr(xcompute, name) for name in UNIFIED)
             or not all(library.has_function(name) for name in LIBRARY_ENTRIES)):
         return None
     return xcompute
 
 
 def target_archs(library) -> tuple[str, ...]:
-    """The arch names (``"sm120"``) the library's build targets."""
+    """The device family or CUDA arch names (``"sm120"``) the library's build targets."""
+    if is_ascend(library):
+        return ("ascend",)
     return tuple(f"sm{arch}" for arch in str(library.function("build_target_archs")()).split(",") if arch.isdigit())
 
 
 xc, library, archs, version = _import() or (None, None, (), None)
 # ``register`` arguments of every operator that calls xcompute
-XCOMPUTE = dict(requires=xc, platforms=archs, version=version)
+cuda_archs = tuple(arch for arch in archs if arch.startswith("sm"))
+XCOMPUTE = dict(requires=xc if cuda_archs else None, platforms=cuda_archs, version=version)
+ASCEND_XCOMPUTE = dict(requires=xc if "ascend" in archs else None, version=version)
 
 
 def xcompute_with(*entries, functions=()):

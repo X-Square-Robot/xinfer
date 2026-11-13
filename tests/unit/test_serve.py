@@ -327,7 +327,17 @@ def test_metrics_can_be_disabled():
 
 def test_shutdown_is_clean(server):
     port, process, lines = server
-    shm_before = {p for p in os.listdir("/dev/shm") if p.startswith("xinfer-")}
+    with connect(f"ws://127.0.0.1:{port}", max_size=None) as websocket:
+        websocket.recv()
+        websocket.send(packb({"x": np.ones(2, dtype=np.float32)}))
+        assert unpackb(websocket.recv())["status"] == "ok"
+    # Identify this service from its mapped buffers, then include every slot of
+    # its rings, even slots the engine has not read. Other services own their rings.
+    maps = Path(f"/proc/{process.pid}/maps").read_text().splitlines()
+    mapped = {Path(line.split(maxsplit=5)[-1]).name for line in maps if "/dev/shm/" in line}
+    prefixes = {name.rsplit("-f", 1)[0] + "-f" for name in mapped if name.startswith("xinfer-")}
+    assert prefixes
+    shm_before = {p for p in os.listdir("/dev/shm") if p.startswith(tuple(prefixes))}
     assert shm_before  # frontends own their buffers while running
     metrics_dir = Path(next(line for line in lines if "recording Prometheus metrics in" in line).split(" in ")[1]
                        .split(";")[0])

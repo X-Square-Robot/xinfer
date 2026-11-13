@@ -65,3 +65,8 @@ python /path/to/xinfer/tools/precision/quick100_b1_score.py . $ASSETS $ASSETS/re
 - GPU 测试把每个阶段与 eager BF16 模型比较，并逐位检查 graph；输出质量只由本门禁判断。
 
 证据：`xinfer-xcompute-prepack-20261108.tar.gz` 中的运行 `gates/q100-run`；之前的运行 `q100-wos210-run`（torch 2.10）和 `q100-wos-run`（2.9.1）在 `xinfer-wall-oss-optimized-20261107.tar.gz` 中（哈希见 docs/models/wall_oss_validation.zh-CN.md）。
+
+昇腾 950DT（2026-11-11，CANN 9.1.1、TorchNPU 2.10.0.post4，B1）使用[昇腾指南](ascend950dt.zh-CN.md)
+中的 8 个 xcompute 实现，通过同一 quick100 门禁：**CPU 图像处理为 −6.45 %**，**DVPP 设备图像为 −6.81 %**。
+两次运行都使用 100 个 delay-5 窗口与相同的冻结 BF16 参考；比较结果时应区分图像路径。
+动态库身份与证据包见[性能](performance.zh-CN.md#昇腾-950dt)。

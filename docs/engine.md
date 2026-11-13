@@ -173,7 +173,7 @@ variant), which `xinfer-serve` passes to the frontends for their own warmup
 | Field | Default | Meaning |
 |---|---|---|
 | `lanes` | 1 per stage | lanes (stream + graph pool) per stage, e.g. `{"prefill": 2, "action": 2}` |
-| `stream_priorities` | 0 per stage | CUDA stream priority of every lane of a stage; lower integers have higher priority |
+| `stream_priorities` | 0 per stage | accelerator stream priority of every lane of a stage, within the platform's supported range; lower integers have higher priority |
 | `max_batch` | 1 per stage | batch limit per stage; capped by `Capabilities.batch_sizes` |
 | `max_running_requests` | 8 | admitted requests in flight |
 | `max_queued_requests` | 256 | submitted requests waiting for admission (`AdmitError("queue_full")` beyond) |
@@ -181,7 +181,7 @@ variant), which `xinfer-serve` passes to the frontends for their own warmup
 | `cudagraphs` | `None` | `CUDAGraphConfig()` replays CUDA graphs (see `xinfer.engine.cudagraph`) |
 
 A lane's stream priority is fixed when the lane is created; the upload and
-copy streams keep priority 0. Priorities change only the order in which the GPU
+copy streams keep priority 0. Priorities change only the order in which the accelerator
 runs ready work: admission, batching and event waits are unchanged, and graphs
 are captured and replayed on the same lane stream.
 
