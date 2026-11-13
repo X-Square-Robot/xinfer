@@ -32,8 +32,8 @@ call); the other calls run on the reference:
 | ``prefix_kvcache_attention`` | ``attention_kvcache`` | reference |
 | ``segment_attention`` | ``attention_varlen`` (segment layout on the host) | reference |
 | ``gated_causal_attention`` | ``attention_varlen`` with the gate | reference |
-| ``gated_kvcache_attention`` | ``attention_kvcache`` with the gate | ``attention_kvcache``, then ``sigmoid_gate_mul_inplace`` |
-| ``gated_delta_net`` | ``gated_delta_rule_prefill`` | one sequence with heads of 128 only (ValueError) |
+| ``gated_kvcache_attention`` | ``attention_kvcache`` with the gate | ungated kernel and separate sigmoid gate when listed, otherwise reference |
+| ``gated_delta_net`` | ``gated_delta_rule_prefill`` | reference for unlisted lengths or head configurations |
 
 Contracts against the torch references: tolerance.
 """
@@ -46,6 +46,7 @@ import torch
 
 from xinfer.ops import reference
 from xinfer.ops.backends._xcompute import XCOMPUTE, xc, xcompute_with
+from xinfer.ops.backends.cuda._support import takes
 from xinfer.ops.reference import attn as reference_attn
 from xinfer.ops.registry import register
 
@@ -224,29 +225,11 @@ def action_attention(q, k, v, k_prompt, v_prompt, num_pinned, prompt_lengths=Non
     return out.reshape(b, n, heads, d)
 
 
-_listed = {}  # (entry, shapes, options) -> whether the entry's kernel list takes the call
-
-
-def _takes(entry, probe, key, *args, **kwargs) -> bool:
-    """Whether ``probe(*args, **kwargs)``, an xcompute ``*_backend`` query, finds a kernel (it raises ValueError
-    otherwise).
-
-    Asked once per ``(entry, key)``, on its first (eager) call: the engine runs every new graph key before capturing it.
-    """
-    if (entry, key) not in _listed:
-        try:
-            probe(*args, **kwargs)
-            _listed[entry, key] = True
-        except ValueError:
-            _listed[entry, key] = False
-    return _listed[entry, key]
-
-
 @register("prefix_kvcache_attention", backend="cuda", **XCOMPUTE)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
     options = dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
-    key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
-    if not _takes("kvcache", xc.attention_kvcache_backend, key, q, k_cache, v_cache, **options):
+    key = (q.shape, q.dtype, k_cache.shape, k_cache.dtype, int(new_pos), flash_mask is not None)
+    if not takes(xc.attention_kvcache_backend, ("ungated", *key), q, k_cache, v_cache, **options):
         return reference_attn.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
                                                        flash_mask=flash_mask,
                                                        scale=scale)
@@ -277,7 +260,7 @@ def segment_attention(q, k, v, cu_seqlens, *, scale=None):
 @register("gated_causal_attention", backend="cuda", **xcompute_with("attention_varlen", "attention_varlen_backend"))
 def gated_causal_attention(q, k, v, gate, *, scale=None):
     options = dict(seg_len=q.shape[0], causal=True, out_gate=gate, gate_act="sigmoid")
-    if not _takes("varlen", xc.attention_varlen_backend, (q.shape, k.shape), q, k, v, **options):
+    if not takes(xc.attention_varlen_backend, (q.shape, q.dtype, k.shape, k.dtype), q, k, v, **options):
         return reference_attn.gated_causal_attention(q, k, v, gate, scale=scale)  # no kernel listed for these heads
     return xc.attention_varlen(q, k, v, softmax_scale=scale, pdl=False, **options)
 
@@ -285,20 +268,27 @@ def gated_causal_attention(q, k, v, gate, *, scale=None):
 @register("gated_kvcache_attention", backend="cuda", **xcompute_with("sigmoid_gate_mul_inplace"))
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
     options = dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
-    key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
-    if _takes("kvcache_gated", xc.attention_kvcache_backend, key, q, k_cache, v_cache, out_gate=gate,
+    key = (q.shape, q.dtype, k_cache.shape, k_cache.dtype, int(new_pos), flash_mask is not None)
+    if takes(xc.attention_kvcache_backend, ("gated", *key), q, k_cache, v_cache, out_gate=gate,
               gate_act="sigmoid", **options):
         return xc.attention_kvcache(q, k_cache, v_cache, out_gate=gate, gate_act="sigmoid", **options)
-    o = xc.attention_kvcache(q, k_cache, v_cache, **options)  # no gated kernel for these heads
+    if not takes(xc.attention_kvcache_backend, ("ungated", *key), q, k_cache, v_cache, **options):
+        return reference_attn.gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate,
+                                                      flash_mask=flash_mask, scale=scale)
+    o = xc.attention_kvcache(q, k_cache, v_cache, **options)
     return xc.sigmoid_gate_mul_inplace(o.reshape(gate.shape), gate, round_sigmoid=True)
 
 
-@register("gated_delta_net", backend="cuda", **xcompute_with("gated_delta_rule_prefill"))
+@register("gated_delta_net", backend="cuda", **xcompute_with("gated_delta_rule_prefill", "gated_delta_rule_prefill_backend"))
 def gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim,
                     head_v_dim, eps):
     b, n, _ = qkv.shape
-    if b != 1 or head_k_dim != 128 or head_v_dim != 128 or zba.shape[-1] != num_v_heads * (head_v_dim + 2):
-        raise ValueError("xcompute gated_delta_rule_prefill takes one sequence with heads of 128")
-    out = xc.gated_delta_rule_prefill(qkv.reshape(n, -1), zba.reshape(n, -1), conv_weight, A_log, dt_bias,
-                                      norm_weight, num_k_heads=num_k_heads, eps=float(eps))
-    return out.view(1, n, -1)
+    if b == 1 and head_k_dim == head_v_dim == 128 and zba.shape[-1] == num_v_heads * (head_v_dim + 2):
+        qrows, zrows = qkv.reshape(n, -1), zba.reshape(n, -1)
+        key = (qrows.shape, zrows.shape, num_k_heads)
+        if takes(xc.gated_delta_rule_prefill_backend, key, qrows, zrows, num_k_heads=num_k_heads):
+            out = xc.gated_delta_rule_prefill(qrows, zrows, conv_weight, A_log, dt_bias, norm_weight,
+                                              num_k_heads=num_k_heads, eps=float(eps))
+            return out.view(1, n, -1)
+    return reference_attn.gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads,
+                                          num_v_heads, head_k_dim, head_v_dim, eps)
