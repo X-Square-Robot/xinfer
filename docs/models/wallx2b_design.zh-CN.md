@@ -30,4 +30,4 @@ Wall-X 2B 包含 Qwen3.5 主干和基于流匹配的动作专家。每条请求�
 
 [小型 checkpoint 测试](../../tests/models/test_wallx2b_tiny.py)使用相同的阶段输入，对照 BF16 参考计算逐阶段检查精度。测试覆盖普通 flow 请求和 RTC 请求，并检查固定的动作前缀逐值一致。[算子测试](../../tests/unit/test_mxfp8.py)覆盖舍入、提示词填充掩码、融合归一化和旋转投影；在配有兼容 xcompute 构建的 CUDA 设备上，还会按 Wall-X 2B 的投影尺寸对比 kernel 与 PyTorch 参考算子。
 
-此前在 RTX 5090 上测得，从序列化请求到进程内返回响应，单请求 P50 为 17.0 ms。图像在 GPU 上解码和缩放；主机输入输出处理耗时 3.5 ms，引擎耗时 13.5 ms。同一配置下，BF16 对照组测得 22.4 ms。这些数据来自本次移植之前的测量。MXFP8 对动作的改变超出舍入量级。启用 MXFP8 前，请在目标机器人任务上评估精度。
+在 RTX 5090 和 xcompute `536ea8f`（带 MXFP8 GEMM 系列）上，MXFP8 从序列化请求到进程内返回响应的单请求 P50 为 17.0 ms（`benchmarks/request_latency.py`，图像在 GPU 上解码和缩放）：主机输入输出处理 3.4 ms，引擎 13.6 ms。同一构建上 BF16 为 22.3 ms（3.5 + 18.9）。机器人负载下（`benchmarks/performance.py`，每档 8 轮，14–24 台、步长 2），MXFP8 支撑 22 台，服务端 P50 / P95 中位数为 76 / 116 ms，24 台时为 151 ms。BF16 在 14 台时为 86 / 103 ms；14 台是它在 xcompute `7336b0d` 上的容量，那里 15 台时为 170 ms。MXFP8 对动作的改变超出舍入量级。启用 MXFP8 前，请在目标机器人任务上评估精度。
