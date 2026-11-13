@@ -266,8 +266,9 @@ class Views(Toy):
 def test_device_images_are_decoded_off_the_lanes_and_replay_one_graph(monkeypatch):
     """JPEGs of different lengths and a frame become ``x`` on the device-image thread's stream, not a lane's, from
     host memory; every request replays the graph warmed with the first and equals the eager engine's output."""
-    pytest.importorskip("torchvision")
-    from torchvision.io import encode_jpeg
+    if not resolve_platform("cuda").capabilities.device_images:
+        pytest.skip("needs nvImageCodec")
+    cv2 = pytest.importorskip("cv2")
 
     from xinfer.engine.device_images import DeviceImageDecoder
 
@@ -287,7 +288,7 @@ def test_device_images_are_decoded_off_the_lanes_and_replay_one_graph(monkeypatc
             base = _request(4, seed=seed).tensors
             g = torch.Generator().manual_seed(seed)
             frame = torch.randint(0, 256, (12 + seed, 10 + seed, 3), dtype=torch.uint8, generator=g)
-            data = encode_jpeg(frame.permute(2, 0, 1).contiguous()) if jpeg else frame
+            data = torch.from_numpy(cv2.imencode(".jpg", frame.numpy())[1]) if jpeg else frame
             image = DeviceImage(data, ((6, 5), (4, 4)), (("bicubic", True), ("bilinear", True)))
             return PreparedRequest(dict(x=image, w=base["w"], bias=base["bias"], steps=3))
 
