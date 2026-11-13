@@ -234,7 +234,8 @@ def apply_image_preprocess_device(model_options: Mapping[str, Any], platform,
     elif device == "gpu" and not platform.capabilities.device_images:
         if platform.device.partition(":")[0] == "npu":
             raise ConfigError(f"platform {platform.name} cannot decode images on the device (needs CANN DVPP V2)")
-        raise ConfigError(f"platform {platform.name} cannot decode images on the device (needs CUDA and torchvision)")
+        raise ConfigError(f"platform {platform.name} cannot decode images on the device (on CUDA it needs "
+                          "NVIDIA's nvImageCodec, pip install xinfer[gpu-image])")
     if device == "gpu":
         options["processing"] = {**processing, "image_preprocess_device": "gpu"}
     return options

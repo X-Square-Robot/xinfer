@@ -1,4 +1,4 @@
-"""``processing.image_preprocess_device="gpu"`` on the served models (GPU, torchvision, external assets).
+"""``processing.image_preprocess_device="gpu"`` on the served models (GPU, nvImageCodec, external assets).
 
 The Wall-OSS parity assets are configured by ``XINFER_WALL_OSS_CHECKPOINT`` and ``XINFER_WALL_OSS_REFERENCE``.
 The recorded dummy-client wrist views are encoded as JPEG and the front view stays a raw frame.
@@ -19,11 +19,10 @@ import torch
 pytestmark = [pytest.mark.gpu, pytest.mark.assets,
               pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
 
-# Mean and largest per-channel |GPU − CPU| of the uint8 views. nvJPEG and libjpeg-turbo reconstruct sharp chroma
-# edges differently: on camera images a few pixels differ by tens of levels while the mean stays far below one
-# level, and on uniform noise, where every pixel is an edge, the mean is several levels (Wall-X dummy-client
-# views: 5.5 / 55). Resizing alone (a raw frame) differs by at most one level.
-NOISE_JPEG = (8.0, 96)
+# Mean and largest per-channel |GPU − CPU| of the uint8 views. nvImageCodec decodes within one level of
+# libjpeg-turbo, and the Wall-OSS views are resized without antialiasing like a raw frame, so both differ by at most
+# one level (uniform-noise JPEGs: 0.0007 / 1).
+NOISE_JPEG = (0.05, 2)
 FRAME = (0.01, 1)
 
 
@@ -45,7 +44,10 @@ def _wall_oss_requests():
 @pytest.fixture(scope="module")
 def served():
     """A Wall-OSS policy and its CPU-path processor for the same recorded requests."""
-    pytest.importorskip("torchvision")
+    from xinfer.platforms import resolve_platform
+
+    if not resolve_platform("cuda").capabilities.device_images:
+        pytest.skip("needs nvImageCodec")
     checkpoint = os.environ.get("XINFER_WALL_OSS_CHECKPOINT")
     if not checkpoint or not os.environ.get("XINFER_WALL_OSS_REFERENCE"):
         pytest.skip("Wall-OSS assets not configured")

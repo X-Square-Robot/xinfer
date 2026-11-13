@@ -49,11 +49,13 @@ completion thread:
 
 准备好的输入可以是 `DeviceImage`（`xinfer.models.interface`）而非张量：即到达时原样的相机视图（JPEG 字节或 RGB 帧），附带每个 resize 步骤之后的尺寸以及每一步的 `interpolate` 模式。输入处理器在 `image_preprocess_device="gpu"` 时发送这种输入（每个内置模型；[配置](configuration.zh-CN.md#在-gpu-上做图像预处理)）。在请求的第一个阶段之前、CUDA graph 之外，引擎把其中每一个转成 `[h, w, 3]` uint8 视图，各阶段以同一名称读取它，与 CPU 预处理时相同。这些视图与 CPU 路径的形状相同，因此 graph 及其键不变，变长的 JPEG 字节也不会成为 graph 的键。
 
-准入时，请求的张量照常上传，其 `DeviceImage` 值留在主机内存中。带设备图像的请求随后进入**设备图像线程**，而不是其起始阶段的队列。该线程按准入顺序处理：让自己的 CUDA stream 等待该请求的上传，用一次批量的 torchvision `decode_jpeg` 调用解码该请求的全部 JPEG，上传其帧，以 FP32 resize 各视图（四舍五入到 uint8），然后记录一个事件，该事件即成为请求的 `inputs_ready` 事件。随后引擎线程把请求放入其起始阶段的队列，这些阶段的通道在 GPU 上等待该事件：引擎线程从不等待解码，一个请求的解码与它之前各请求的阶段重叠执行。不带设备图像的请求不经过该线程。视图归请求所有，直到请求在最终阶段之后完成，因此不会有阶段读到已释放的内存。如果解码抛出异常，只有该请求失败（其张量保留到该线程的事件之后）；`shutdown` 会排空并停止该线程。预热请求走同一条路径。
+准入时，请求的张量照常上传，其 `DeviceImage` 值留在主机内存中。带设备图像的请求随后进入**设备图像线程**，而不是其起始阶段的队列。该线程按准入顺序处理：让自己的 CUDA stream 等待该请求的上传，用平台 JPEG 解码器的一次批量调用解码该请求的全部 JPEG，上传其帧，以 FP32 resize 各视图（四舍五入到 uint8），然后记录一个事件，该事件即成为请求的 `inputs_ready` 事件。随后引擎线程把请求放入其起始阶段的队列，这些阶段的通道在 GPU 上等待该事件：引擎线程从不等待解码，一个请求的解码与它之前各请求的阶段重叠执行。不带设备图像的请求不经过该线程。视图归请求所有，直到请求在最终阶段之后完成，因此不会有阶段读到已释放的内存。如果解码抛出异常，只有该请求失败（其张量保留到该线程的事件之后）；`shutdown` 会排空并停止该线程。预热请求走同一条路径。
 
-解码器（`xinfer.engine.device_images`）在该线程上、处理第一个带设备图像的请求时创建。没有 CUDA 设备或没有 torchvision 时，每个带设备图像的请求都会以此为原因失败；在 `xinfer serve --warmup` 下，预热请求由相同的处理器准备，因此服务会在启动时失败。
+解码器（`xinfer.engine.device_images`）在该线程上、处理第一个带设备图像的请求时由 `xinfer.platforms.devices.jpeg_decoder_for` 创建：在 CUDA 上是 NVIDIA 的 nvImageCodec（`xinfer.platforms.cuda.CudaJpegDecoder`）。没有 CUDA 设备或没有 nvImageCodec 时，每个带设备图像的请求都会以此为原因失败；在 `xinfer serve --warmup` 下，预热请求由相同的处理器准备，因此服务会在启动时失败。
 
-一个线程既足够也必要：torchvision 每个进程只有一个 nvJPEG 解码器，其解码调用会阻塞调用线程。对 baseline JPEG，它使用 nvJPEG 的硬件后端，运行在 GPU 的 JPEG 引擎上（NVJPG，RTX 5090 具备）：熵解码和 IDCT 都在那里执行，CPU 只解析文件头并提交批次，唯一的 CUDA kernel 是每张图约 2 µs 的 RGBA 到 RGB 转换。Progressive JPEG 则走 nvJPEG 的混合路径，Huffman 解码在 CPU 上、IDCT 在 CUDA kernel 中执行。在 RTX 5090 上（torchvision 0.24.1），三路机器人相机视图的一次调用阻塞约 0.7 ms，原因在于等待：torchvision 用进程级锁串行化调用，并在批次前后同步其解码 stream，nvJPEG 的硬件路径则在一个事件上同步；该线程的 CPU 时间都花在这些等待的自旋上。该调用会释放 GIL，因此不占用引擎线程的任何时间。JPEG 字节留在主机内存，因为 nvJPEG 从那里读取码流（torchvision 不接受 CUDA 张量作为输入）。
+nvImageCodec 在解码器自己的 stream 上用 nvJPEG 的硬件解码器解码整批，它运行在 GPU 的 JPEG 引擎上（NVJPG，RTX 5090 和 Jetson Thor 都有）：熵解码和 IDCT 在那里执行，再由一个 CUDA kernel 像 libjpeg-turbo 一样做色度上采样并转成 RGB，因此解码出的视图与 CPU 路径相差不超过 1 级。解码出的图像属于 nvImageCodec 的内存。解码器在自己的 stream 上把它们拷进张量，并让线程的 stream 等待这次拷贝；它保留这些图像，直到拷贝之后记录的事件完成，再解码到这些图像里复用，所以一次调用既不分配新图像，也不等待 GPU。在 RTX 5090 上（nvImageCodec 0.10），一个请求的相机视图占用该线程 0.4–0.7 ms。解码器只用一个 CPU 线程：nvImageCodec 默认按可见核数起线程，等待时自旋，在有 CPU 配额的容器里压测时拖慢了前端和引擎。一个设备图像线程就够了，解码器也只从这个线程调用。JPEG 字节留在主机内存，nvImageCodec 从那里读取码流。
+
+CUDA 设备是否支持设备图像，通过创建解码器来检查，不做解码。若在这时（平台解析时）解码，该进程之后的每次 CUDA graph 回放都会变慢：在 RTX 5090 上，回放中 kernel 之间的间隙从 0.5 µs 以下变为 0.5–1 µs，Wall-X 2B 每个请求约多 0.6 ms，Wall-OSS 每个请求最多多 1 ms，不论请求是否带 JPEG。不在这时解码，单请求耗时与 XInfer 之前所用的 torchvision 解码器相同。
 
 ## 预热
 
