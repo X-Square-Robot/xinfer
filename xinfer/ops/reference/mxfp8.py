@@ -34,6 +34,8 @@ from __future__ import annotations
 import torch
 
 from xinfer.ops.layout.mxfp8 import BLOCK, SHARED_BLOCK, rope_table_cos_sin, scale_elements, scale_offsets
+from xinfer.ops.reference.gemm import ACTIVATIONS, qkv_rope_epilogue as bf16_qkv_rope_epilogue
+from xinfer.ops.reference.norm import layer_norm_cast, zero_centered_rms_norm
 
 E4M3_MAX = 448.0
 
@@ -311,3 +313,105 @@ def gemm_residual(a_q, a_scales, w_q, w_scales, residual, bias=None) -> torch.Te
     if bias is not None:
         acc = acc + bias.to(torch.float32)
     return (acc + residual.to(torch.float32)).to(torch.bfloat16)
+
+
+# ------------------------------------------------- forms of xcompute's GEMM family
+# Weights are ``(q [N, K], scales)`` pairs in the checkpoint's row order (a gate/up weight: the gate rows, then the
+# up rows); xcompute packs them for its kernels. Activations are ``(q, scales)`` pairs; outputs that feed the next
+# GEMM are quantized with one scale per 128 columns.
+
+
+def layer_norm_quantize(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+                        eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8 (1x128) of the BF16 LayerNorm (``layer_norm_cast``): ``(q [M, K], scales)``, ``M`` the leading dims."""
+    y = layer_norm_cast(x, weight, bias, eps)
+    return quantize(y.reshape(-1, x.shape[-1]))
+
+
+def zero_centered_rms_norm_quantize(x: torch.Tensor, weight: torch.Tensor,
+                                    eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8 (1x128) of the BF16 zero-centered RMSNorm (``zero_centered_rms_norm``): ``(q [M, K], scales)``."""
+    return quantize(zero_centered_rms_norm(x.reshape(-1, x.shape[-1]), weight, eps).to(torch.bfloat16))
+
+
+def add_zero_centered_rms_norm_quantize(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
+    """``s = residual + x`` in FP32; the zero-centered RMSNorm of the FP32 ``s``, rounded to BF16, then quantized.
+
+    Returns:
+        ``(bf16(s), (q [M, K], scales))``, ``s`` in the shape of ``x``.
+    """
+    s = residual.float() + x.float()
+    return s.to(x.dtype), quantize(zero_centered_rms_norm(s.reshape(-1, x.shape[-1]), weight, eps).to(torch.bfloat16))
+
+
+def gemm_epilogue(x, weight, bias=None, *, activation: str | None = None, residual: torch.Tensor | None = None,
+                  row_mask: torch.Tensor | None = None, out_quant: bool = False):
+    """MXFP8 ``x · weightᵀ`` with xcompute ``gemm``'s epilogue.
+
+    ``y = act(x̂·Ŵᵀ + bias)`` in FP32, ``x̂`` and ``Ŵ`` dequantized, rows of ``x`` with ``row_mask`` 0 taken as
+    zero. The result is ``bf16(y)``; with ``residual`` ``bf16(bf16(y) + residual)`` (two roundings, as xcompute's
+    MXFP8 GEMMs); with ``out_quant`` the MXFP8 (1x128) of the FP32 ``y``.
+
+    Args:
+        x: ``(q [M, K], scales)``.
+        weight: ``(q [N, K], scales)``.
+        bias: ``[N]`` or None.
+        activation: ``"silu"``, ``"gelu"`` (erf), ``"gelu_tanh"`` or None.
+        residual: BF16 ``[M, N]`` or None (not with ``out_quant``).
+        row_mask: ``[M]`` of 0 and 1, or None.
+        out_quant: return ``(q [M, N], scales)`` instead of BF16.
+
+    Returns:
+        BF16 ``[M, N]``, or ``(q, scales)`` with ``out_quant``.
+    """
+    a = dequantize(*x)
+    if row_mask is not None:
+        a = a * row_mask.float()[:, None]
+    y = a @ dequantize(*weight).T
+    if bias is not None:
+        y = y + bias.float()
+    if activation is not None:
+        y = ACTIVATIONS[activation](y)
+    if out_quant:
+        return quantize_values(y)
+    if residual is None:
+        return y.to(torch.bfloat16)
+    return (y.to(torch.bfloat16).float() + residual.float()).to(torch.bfloat16)
+
+
+def gemm_glu_quantize(x, weight) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8 (1x128) of ``silu(x̂·Ŵ_gateᵀ) · (x̂·Ŵ_upᵀ)`` computed in FP32 (xcompute ``gemm_glu``).
+
+    Args:
+        x: ``(q [M, K], scales)``.
+        weight: ``(q [2N, K], scales)``, the gate rows then the up rows.
+
+    Returns:
+        ``(q [M, N], scales)``.
+    """
+    y = dequantize(*x) @ dequantize(*weight).T
+    n = y.shape[1] // 2
+    return quantize_values(torch.nn.functional.silu(y[:, :n]) * y[:, n:])
+
+
+def qkv_rope_epilogue(x, weight, bias: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, num_heads: int,
+                      head_dim: int) -> torch.Tensor:
+    """MXFP8 ``[Q | K | V] = x̂·Ŵᵀ + bias`` with rotate-half RoPE on every Q and K head, on the FP32 accumulator.
+
+    As ``qkv_rope_epilogue`` (equal Q, K and V heads; the rotation covers ``2·cos.shape[-1]`` channels of a head)
+    with dequantized operands; the output rounds once.
+
+    Args:
+        x: ``(q [M, K], scales)``.
+        weight: ``(q [3·H·D, K], scales)``.
+        bias: ``[3·H·D]``.
+        cos: FP32 ``[M, R/2]``.
+        sin: FP32 ``[M, R/2]``.
+        num_heads: Heads ``H``.
+        head_dim: Head dimension ``D``.
+
+    Returns:
+        BF16 ``[M, 3·H·D]``.
+    """
+    return bf16_qkv_rope_epilogue(dequantize(*x), dequantize(*weight), bias, cos, sin, num_heads,
+                                  head_dim).to(torch.bfloat16)

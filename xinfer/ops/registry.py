@@ -31,6 +31,7 @@ PLUGIN_GROUP = "xinfer.ops"
 # Built-in backend modules, loaded like ``xinfer.ops`` entry points but without relying on installed package metadata.
 BUILTIN_MODULES = ("xinfer.ops.backends.cuda.attn", "xinfer.ops.backends.cuda.gemm", "xinfer.ops.backends.cuda.norm",
                    "xinfer.ops.backends.cuda.flow", "xinfer.ops.backends.cuda.position",
+                   "xinfer.ops.backends.cuda.mxfp8",
                    "xinfer.ops.backends.ascend._torch_attn", "xinfer.ops.backends.ascend.gemm",
                    "xinfer.ops.backends.ascend.attn", "xinfer.ops.backends.ascend.norm",
                    "xinfer.ops.backends.ascend.rope", "xinfer.ops.backends.ascend.flow",
