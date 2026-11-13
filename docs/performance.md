@@ -33,7 +33,7 @@ See [Wall-OSS validation](models/wall_oss_validation.md) for the latency and mea
 
 Both rows were measured on 2026-11-13 on one exclusively reserved Ascend 950DT (CANN 9.1.1, TorchNPU
 2.10.0.post4): the Wall-OSS row at revision `3eacd03` of this branch with the r4 delivery `xcompute.so`
-(SHA-256 `a7db13d8…`), and the Wall-X 2B row at revision `7d95b98` with the r5 delivery
+(SHA-256 `a7db13d8…`), and the Wall-X 2B row at revision `49ad6d5` with the r5 delivery
 (SHA-256 `903ff6de…`, which adds the 2B fused qkv tail kernel), each loaded through
 `XINFER_XCOMPUTE_LIBRARY` with its matching Python package. Both models ran
 with their default operator selection: every operator either model calls resolves to `ascend:xcompute`, and a
@@ -44,7 +44,7 @@ reference in either benchmark. The [Ascend guide](ascend950dt.md) lists each ope
 | Model | Precision and composition | Single request P50 | Robots per NPU | Server P50 at capacity | Server P95 at capacity | Highest measured rate | Numerical agreement |
 |---|---|---|---|---|---|---|---|
 | Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 47.75 ms | 4 | 120.4 ms | 129.9 ms | 29.2 req/s | quick100 B1, DVPP −6.77 % against the BF16 reference: PASS |
-| Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 51.05 ms | 6 | 93 ms | 111 ms | 33.4 req/s | fixed-noise action gate against the reference composition: PASS |
+| Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 50.03 ms | 8 | 104 ms | 120 ms | 45.0 req/s | fixed-noise action gate against the reference composition: PASS |
 
 Conditions for the Ascend rows:
 

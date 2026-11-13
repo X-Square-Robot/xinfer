@@ -31,12 +31,12 @@
 
 ## 昇腾 950DT
 
-两行均于 2026-11-13 在独占预留的 Ascend 950DT（CANN 9.1.1、TorchNPU 2.10.0.post4）上测得：Wall-OSS 行在本分支版本 `3eacd03`、r4 交付版 `xcompute.so`（SHA-256 `a7db13d8…`）上；Wall-X 2B 行在本分支版本 `7d95b98`、r5 交付版（SHA-256 `903ff6de…`，新增 2B qkv 尾融合核）上，均经 `XINFER_XCOMPUTE_LIBRARY` 与配套 Python 包加载。两模型均使用默认算子选择：两模型调用的每一个算子都解析到 `ascend:xcompute`，且对完整请求通过的逐 layout 分发审计确认每次调用都运行在 xcompute 入口上（Wall-X 2B：21/21 个算子、全部调用 layout 准入；Wall-OSS：11/11）。任一基准中都没有算子回退到 torch 参考实现。[昇腾指南](ascend950dt.zh-CN.md)列出每个算子的入口。
+两行均于 2026-11-13 在独占预留的 Ascend 950DT（CANN 9.1.1、TorchNPU 2.10.0.post4）上测得：Wall-OSS 行在本分支版本 `3eacd03`、r4 交付版 `xcompute.so`（SHA-256 `a7db13d8…`）上；Wall-X 2B 行在本分支版本 `49ad6d5`、r5 交付版（SHA-256 `903ff6de…`，新增 2B qkv 尾融合核）上，均经 `XINFER_XCOMPUTE_LIBRARY` 与配套 Python 包加载。两模型均使用默认算子选择：两模型调用的每一个算子都解析到 `ascend:xcompute`，且对完整请求通过的逐 layout 分发审计确认每次调用都运行在 xcompute 入口上（Wall-X 2B：21/21 个算子、全部调用 layout 准入；Wall-OSS：11/11）。任一基准中都没有算子回退到 torch 参考实现。[昇腾指南](ascend950dt.zh-CN.md)列出每个算子的入口。
 
 | 模型 | 精度与组合 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 最高实测吞吐 | 数值一致性 |
 |---|---|---|---|---|---|---|---|
 | Wall-OSS | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 47.75 ms | 4 | 120.4 ms | 129.9 ms | 29.2 req/s | quick100 B1，DVPP 对 BF16 参考 −6.77 %：PASS |
-| Wall-X 2B | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 51.05 ms | 6 | 93 ms | 111 ms | 33.4 req/s | 固定噪声动作门，对参考组合：PASS |
+| Wall-X 2B | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 50.03 ms | 8 | 104 ms | 120 ms | 45.0 req/s | 固定噪声动作门，对参考组合：PASS |
 
 昇腾两行的测量条件：
 
