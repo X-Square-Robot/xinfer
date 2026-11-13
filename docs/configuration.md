@@ -82,8 +82,8 @@ entry point, so one set of options serves both (`benchmarks/performance.py` pass
 - `xinfer serve` (and `xinfer-profile`): `--model-options '{"image_preprocess_device": "gpu"}'`; the default is
   `"cpu"`.
 - `Policy(..., image_preprocess_device=...)`: `None`, the default, takes the platform's: `"gpu"` where the views can be
-  decoded and resized on the device (a CUDA device with torchvision, the platform capability `device_images`), else
-  `"cpu"`.
+  decoded and resized on the device (the platform capability `device_images`: on CUDA, NVIDIA's nvImageCodec has a
+  decoder for the device), else `"cpu"`.
 
 It is not a `processing` field: there it raises `ConfigError`, as does `"gpu"` on a platform without device images.
 The entry point resolves it (`xinfer.config.apply_image_preprocess_device`) and hands it to the model's processors.
@@ -91,20 +91,21 @@ The entry point resolves it (`xinfer.config.apply_image_preprocess_device`) and 
 | Value | Where the views are decoded and resized | Numerics |
 |---|---|---|
 | `"cpu"` (`xinfer serve` default) | in the frontend: OpenCV decode and the model's OpenCV / Pillow resize, the views of a request in parallel | bitwise equal to the reference services |
-| `"gpu"` (`Policy` default on CUDA) | on the device, by the engine. The frontend sends each JPEG view's bytes (other encodings decoded on the CPU) or raw frame as a `DeviceImage`, with its target sizes, read from the JPEG header, and the model's resize recipe; before the first stage the engine decodes the request's JPEGs in one torchvision `decode_jpeg` call (nvJPEG) and resizes the views in FP32 ([engine](engine.md#device-images)) | not bitwise equal: decoded JPEGs differ from libjpeg-turbo's around sharp chroma edges (on robot camera views a mean of 0.1–0.2 levels, a few pixels by up to tens of levels), and the FP32 resizes differ from Pillow's (torch's bicubic uses a = −0.75, Pillow's −0.5), so the actions differ |
+| `"gpu"` (`Policy` default on CUDA) | on the device, by the engine. The frontend sends each JPEG view's bytes (other encodings decoded on the CPU) or raw frame as a `DeviceImage`, with its target sizes, read from the JPEG header, and the model's resize recipe; before the first stage the engine decodes the request's JPEGs in one batched call of NVIDIA's nvImageCodec, on the GPU's JPEG engine where it has one (RTX 5090, Jetson Thor), and resizes the views in FP32 ([engine](engine.md#device-images)) | not bitwise equal: the decoded JPEGs are within one level of libjpeg-turbo's, but the FP32 resizes differ from Pillow's (torch's bicubic uses a = −0.75, Pillow's −0.5), so the actions differ |
 
-`"gpu"` needs a CUDA device and torchvision ≥ 0.19 (`pip install -e '.[gpu-image]'`); otherwise every request
-fails, and `xinfer serve --warmup` fails at startup. The decoder is created for the first request, a warmup
+`"gpu"` needs a CUDA device and NVIDIA's nvImageCodec (`pip install -e '.[gpu-image]'`, the CUDA 13 build
+`nvidia-nvimgcodec-cu13`); otherwise `Policy` defaults to `"cpu"`, and `"gpu"` set explicitly raises `ConfigError` at
+startup. The decoder is created for the first request, a warmup
 request under `--warmup`. The views keep their shapes, so the CUDA graphs are the same in both modes.
 
-Single-request P50 for Wall-OSS MXFP8 on RTX 5090 with CUDA graphs, measured with `benchmarks/request_latency.py` over 50 runs (ms):
+Single-request P50 for Wall-OSS (the default BF16 composition) on RTX 5090 with CUDA graphs, measured with `benchmarks/request_latency.py` over 50 runs (ms; nvImageCodec 0.10, xcompute `7336b0d`):
 
 | Model, requests | `"cpu"`: total (prepare / engine) | `"gpu"`: total (prepare / engine) |
 |---|---|---|
-| Wall-OSS, x2robot dummy client (raw 1280×720 front view, two 640×480 noise JPEG wrist views) | 40.4 (7.4 / 32.8) | 37.4 (3.1 / 34.2) |
-| Wall-OSS, three robot camera JPEG views (1280×720 and 640×480) | 39.0 (6.1 / 32.8) | 35.7 (1.9 / 33.6) |
+| Wall-OSS, x2robot dummy client (raw 1280×720 front view, two 640×480 noise JPEG wrist views) | 51.9 (7.3 / 44.4) | 49.1 (3.2 / 45.8) |
+| Wall-OSS, three robot camera JPEG views (1280×720 and 640×480) | 50.9 (6.2 / 44.6) | 47.7 (2.0 / 45.5) |
 
-On the GPU path, the device-image thread spends 1.1–1.4 ms per request on decoding and resizing on its own stream ([engine](engine.md#device-images)). With Wall-OSS MXFP8 at 8 robots, both modes served 44.0–44.3 req/s. Round P50 was 83–93 ms with GPU preprocessing and 83–88 ms with CPU preprocessing. Both modes passed the internal precision gate ([precision](precision.md#internal-validation)).
+On the GPU path, the device-image thread spends about 1 ms per request on decoding and resizing on its own stream ([engine](engine.md#device-images)). With Wall-OSS at 4 robots (its single-GPU capacity, the [performance table](performance.md)'s protocol, 8 rounds), the median round server P50 / P95 was 94 / 104 ms with GPU preprocessing and 119 / 133 ms with CPU preprocessing; the rounds of one configuration differ by tens of milliseconds (their start phases). Both modes passed the internal precision gate ([precision](precision.md#internal-validation)).
 
 Not resolved yet:
 - the memory planner (design §8.2);

@@ -254,9 +254,9 @@ class Engine:
         self.stats_sink = None
         self._engine_thread = threading.Thread(target=self._run_engine_loop, name="xinfer-engine", daemon=True)
         self._completer = threading.Thread(target=self._completion_loop, name="xinfer-completer", daemon=True)
-        # DeviceImage inputs are decoded off the engine thread: on one thread (torchvision shares one nvJPEG decoder
-        # per device) with its own stream and a decoder created on first use. Requests in it are counted in
-        # _device_inflight (engine thread only) and come back through _device_ready.
+        # DeviceImage inputs are decoded off the engine thread: on one thread (the platform's decoder keeps state and
+        # is called from that thread only) with its own stream and a decoder created on first use. Requests in it are
+        # counted in _device_inflight (engine thread only) and come back through _device_ready.
         self._device_stream = (self._device_module.Stream(device=platform.device)
                                if platform.is_cuda or platform.capabilities.device_images else None)
         self._decoder = None

@@ -3,8 +3,8 @@
 The engine runs ``DeviceImageDecoder`` on its device-image thread before a request's first stage, outside the CUDA
 graphs (docs/engine.md). The views it produces have the shapes of the CPU path's views, so the graphs and their keys
 are the same in both modes; the variable-length JPEG bytes never reach a graph. The pixels are not bitwise equal to
-the CPU path's: nvJPEG and libjpeg-turbo decode differently, mostly around sharp chroma edges, and the resize computes
-in FP32 instead of OpenCV's or Pillow's fixed point.
+the CPU path's: the resize computes in FP32 instead of OpenCV's or Pillow's fixed point, and the decoded JPEGs differ
+slightly from libjpeg-turbo's (nvImageCodec's by at most one level; CANN JPEGD's mostly around sharp chroma edges).
 """
 
 from __future__ import annotations
