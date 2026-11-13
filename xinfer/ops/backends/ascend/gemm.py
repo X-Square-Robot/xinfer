@@ -190,14 +190,46 @@ def _linear_supported(x, weight, bias=None):
                                   and bias.shape == (weight.shape[0],))))
 
 
+# The unified entry serves a row count that is a multiple of 64 with its compact kernel and any other row
+# count by composing a zero-padded FP32 plan, a Cube pass and a finish pass (measured at the prompt stream's
+# [M, 2048] x [2048, 6144] shape: 33 us versus 363 us at M=464, of which 149 us is the pad pass alone). The
+# two plans agree bit for bit on every valid row -- output rows are independent -- so rounding the row count up
+# to the next multiple of 64 is a pure dispatch change: same operator, same weights, same values. The padded
+# rows read whatever the buffer held before (zero on first use, then the previous call's activations), and the
+# measured garbage-row case is identical, so their content only has to be finite.
+_pad_buffers: dict = {}       # (device, rows, K, dtype) -> zero-initialised [rows, K]
+_PAD_ALIGN = 64
+
+
+def _padded_rows(x, weight, bias):
+    """``_plain_gemm`` on ``x`` after rounding its row count up to the compact kernel's alignment."""
+    rows, k = x.shape
+    aligned = (rows + _PAD_ALIGN - 1) // _PAD_ALIGN * _PAD_ALIGN
+    if aligned == rows:
+        return _plain_gemm(x, weight, bias)
+    key = (x.device, aligned, k, x.dtype)
+    buffer = _pad_buffers.get(key)
+    if buffer is None:
+        if torch.npu.is_current_stream_capturing():
+            # No buffer for this geometry: keep the unpadded plan (identical values, only slower) rather than
+            # allocating graph-pool memory that would outlive the capture. The eager pre-run every capture
+            # starts with fills this, so a captured graph always finds its buffer.
+            return _plain_gemm(x, weight, bias)
+        buffer = torch.zeros((aligned, k), dtype=x.dtype, device=x.device)
+        _pad_buffers[key] = buffer
+    buffer[:rows].copy_(x)
+    return _plain_gemm(buffer, weight, bias)[:rows]
+
+
 @register("linear", backend="ascend", requires=xc if callable(_plain_gemm) else None,
           version=VERSION)
 @partial(reference.linear, check=_linear_supported)
 def linear(x, weight, bias=None):
     # The entry takes rank-matching operands, so flatten the leading dimensions of a higher-rank input and
-    # restore them (the same shape handling the official-operator alternative performs).
+    # restore them (the same shape handling the official-operator alternative performs). The row count is
+    # rounded up to the unified entry's compact-kernel alignment first (see _padded_rows: bitwise).
     lead = x.shape[:-1]
-    out = _plain_gemm(x.reshape(-1, x.shape[-1]), weight, bias)
+    out = _padded_rows(x.reshape(-1, x.shape[-1]), weight, bias)
     return out.reshape(*lead, weight.shape[0]) if lead else out
 
 
