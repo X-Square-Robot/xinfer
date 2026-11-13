@@ -2,10 +2,9 @@
 
 The InputProcessor turns a robot request into model inputs; the
 OutputProcessor turns the model's actions (checkpoint units) into the robot
-response. Behavior follows the embodied-serving Wall-X 4B service (es 9633ffd
-+ Wall-X 02c5351d), which is the reference these functions are tested
-against bit for bit; HarriX's bitwise port of the same service is the second
-source. Deployment choices of that service (fixed instruction, camera wire
+response. Behavior follows the production Wall-X 4B service (with Wall-X
+02c5351d), which is the reference these functions are tested against bit for
+bit. Deployment choices of that service (fixed instruction, camera wire
 keys, embodiment text, admitted RTC delays) are explicit fields of
 ``ProcessingConfig`` instead of hidden constants.
 """

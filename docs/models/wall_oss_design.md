@@ -7,10 +7,8 @@ Navigation: [usage](wall_oss.md) · [validation](wall_oss_validation.md)
 ## Source of semantics
 
 The reference is the eager `Qwen2_5_VLMoEForAction` flow path of Wall-X
-`02c5351d` (+ the embodied-serving standalone patch `1e24f619`) and, for
-request processing, the embodied-serving Wall-X 4B service (es `9633ffd`).
-HarriX's bitwise port of that service (`qwen2_5`, `mxfp8-sm120`) was the
-second source. Files: `xinfer/models/wall_oss/` (`config.py`, `model.py`,
+`02c5351d` (with the production service's standalone patch) and, for request
+processing, the production Wall-X 4B service. Files: `xinfer/models/wall_oss/` (`config.py`, `model.py`,
 `processing.py`, `geometry.py`) and the shared layers in `xinfer/models/layers/`.
 
 ## Stage split
@@ -169,8 +167,8 @@ masks and layouts). With flash-attn installed the default backend uses:
 ## RTC semantics (decision)
 
 For RTC requests the pinned action tokens (`k < delay`) do not attend to the
-denoising tokens at **every** step. This is what the embodied-serving and
-HarriX services run. The Wall-X eager code skips that cut at step 0 only
+denoising tokens at **every** step. This is what the production services
+run. The Wall-X eager code skips that cut at step 0 only
 (its step-0 joint mask is symmetric among action tokens), so for RTC requests
 the eager code and the served model differ in semantics, not just precision.
 XInfer follows the served model; the eager reference used for validation is

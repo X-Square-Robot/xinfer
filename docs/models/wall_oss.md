@@ -12,8 +12,7 @@ dimensions, and supports real-time chunking (RTC).
 Wall-OSS is the open-source name of this architecture
 ([X-Square-Robot/wall-x](https://github.com/X-Square-Robot/wall-x)). The
 results on these pages are measured with an internal checkpoint of the
-architecture (`5_25000`) against the embodied-serving Wall-X 4B service that
-served it. The open-source releases (Wall-OSS-0.5, WALL-OSS-FLOW) use a
+architecture against the production Wall-X 4B service that served it. The open-source releases (Wall-OSS-0.5, WALL-OSS-FLOW) use a
 different checkpoint layout and normalization statistics and cannot be loaded
 yet.
 
@@ -22,12 +21,12 @@ yet.
 | Item | State |
 |---|---|
 | Model numerics | Two compositions, BF16. `numerics="optimized"` (the default): the ViT, expert 0 and the action expert on xcompute's operators (residual adds fused into the RMSNorms, QKV with bias and RoPE writing the K/V cache, SiLU-mul and GELU in the GEMM epilogues, small-M GEMMs, cache attention and the readout-Euler tail in the action stage) ([design](wall_oss_design.md#optimized-composition)); each stage is within 2.8 % of the Wall-X eager model from the same inputs ([validation](wall_oss_validation.md#optimized-composition)). `numerics="reference"`: with reference (torch) operators the prefill and action stages are bitwise equal to the Wall-X eager BF16 model and the ViT differs only through the attention kernel ([validation](wall_oss_validation.md#reference-operator-model)) |
-| Input/output processing | Bitwise equal to the embodied-serving Wall-X 4B service on its 42-request reference capture; optionally the views are decoded and resized on the GPU (`image_preprocess_device="gpu"`, not bitwise equal; [below](#deployment-options-processingconfig)) |
+| Input/output processing | Bitwise equal to the production Wall-X 4B service on a service capture of 42 requests; optionally the views are decoded and resized on the GPU (`image_preprocess_device="gpu"`, not bitwise equal; [below](#deployment-options-processingconfig)) |
 | Execution | Colocated `Engine` ([docs/engine.md](../engine.md)): lanes per stage, chained dispatch, CUDA graphs (bitwise equal to eager). The optimized composition runs one request per dispatch; the reference composition batches the action stage B1–B8 under load, across prompt lengths and RTC delays, each request within rounding of its single run ([validation](wall_oss_validation.md)) |
 | Serving | `xinfer.entrypoints.serve` over WebSocket + msgpack, compatible with the x2robot desktop client ([serving](../serving.md)) |
 | Precision | BF16 only |
 | Attention | flash-attn backend for the ViT and prompt attention when installed; the action attention on xcompute's `attention_kvcache` (optimized composition) or flash-attn (reference composition) |
-| Precision gate | embodied-serving quick100 B1, the gate: the optimized composition −6.58 % GT-MSE vs the original BF16, PASS (≤ +1 %); its batch scenarios need a batched action stage and are not run ([precision](../precision.md#wall-oss-quick100-gate)) |
+| Numerical agreement | Agreement with the reference composition, checked by `tests/models/test_wall_oss_optimized.py` and `tests/models/test_wall_oss_parity.py`; the optimized composition also passes the internal precision gate ([precision](../precision.md#how-agreement-is-checked)) |
 | Speed | RTX 5090, optimized composition: stage graphs vision 15.6, prefill 21.3, action 7.3 ms (44.2 ms at the 768-token bucket, 5 steps); `Policy.infer` 47.3 ms (P50). Reference composition: 50.9 ms and 54.1 ms ([validation](wall_oss_validation.md#latency)). Single request with the views on the device and robots per GPU: [performance](../performance.md) |
 | Not yet | batching in the optimized action stage, static-prompt KV reuse (measured gain about 0.2 ms, not planned), MXFP8, NVFP4, Thor |
 
@@ -50,7 +49,7 @@ yet.
 from xinfer import Policy
 from xinfer.models.wall_oss.processing import ProcessingConfig
 
-policy = Policy("wall_oss", "/path/to/5_25000", device="cuda",
+policy = Policy("wall_oss", "/path/to/checkpoint", device="cuda",
                 processing=ProcessingConfig())
 response = policy.infer(request)   # request: the desktop robot msgpack dict
 ```

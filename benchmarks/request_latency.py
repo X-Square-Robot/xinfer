@@ -69,8 +69,10 @@ def main(argv=None) -> int:
     from xinfer.platforms.devices import device_module_for
 
     requests = [request for path in args.requests_file for request in read_requests(path)]
-    policy = Policy(args.model, args.checkpoint, device=args.device,
-                    op_backends=_parse_pins(args.op_backends), **json.loads(args.model_options))
+    options = json.loads(args.model_options)
+    if args.op_backends:
+        options["op_backends"] = _parse_pins(args.op_backends)
+    policy = Policy(args.model, args.checkpoint, device=args.device, **options)
     try:
         policy.warmup(requests)
         warmed = policy.engine.cudagraph_stats()

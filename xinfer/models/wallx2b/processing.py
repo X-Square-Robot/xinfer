@@ -1,8 +1,8 @@
 """Wall-X 2606 input and output processing (CPU only).
 
 The InputProcessor turns a desktop robot request into model inputs; the OutputProcessor turns the model's
-normalized actions into the robot response. Behavior follows the embodied-serving Wall-X 2606 service (es e910f50,
-with wall-x d882c37 and x2robot_dataset e8ebcf9) as deployed with its rtx5090 profile: uint8 patch rows normalized
+normalized actions into the robot response. Behavior follows the production Wall-X 2606 service (with wall-x d882c37
+and x2robot_dataset e8ebcf9) as deployed with its rtx5090 profile: uint8 patch rows normalized
 by a lookup table on the device, responses of ``H`` future poses without the state row (``omit_state_head``), and
 prompts without padding (``prompt_bucket=0``). The default pads prompts to 16-token buckets with masked padding.
 The exact-length configuration is tested against that service bit for bit.

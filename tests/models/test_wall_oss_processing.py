@@ -6,8 +6,8 @@ Needs external assets, so it is skipped unless both variables are set:
   tokenizer.json, normalizer_action.pth, normalizer_propri.pth).
 - ``XINFER_WALL_OSS_REFERENCE``: directory with ``requests.pkl`` (raw requests by
   name) and ``reference.npz`` (the old service's ``s1`` model inputs, ``pred``
-  and ``result`` per request), produced from the embodied-serving reference
-  capture; see docs/models/wall_oss.md.
+  and ``result`` per request), produced from a capture of the production
+  service; see docs/models/wall_oss.md.
 """
 
 import os
