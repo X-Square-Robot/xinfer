@@ -28,6 +28,7 @@ from torch import nn
 from xinfer.models.layers.basic import ParamGroup
 from xinfer.models.layers.rotary import inverse_frequencies, mrope_cos_sin, vision_rotary_angles
 from xinfer.loader import Source
+from xinfer.ops.backends.copykill_r2 import enabled as _copykill_enabled
 from xinfer.ops import active_ops
 
 DTYPE = torch.bfloat16
@@ -104,7 +105,11 @@ class OptimizedVision(nn.Module):
             cu_seqlens = layout["cu_full"] if i in c.fullatt_block_indexes else layout["cu_window"]
             qkv = ops.qkv_rope_epilogue(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d,
                                         qk_order="any")  # Q and K only feed the attention
-            q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+            if _copykill_enabled("k3"):
+                qkv_split = qkv.view(n, 3, heads, d).permute(1, 0, 2, 3).contiguous()
+                q, k, v = qkv_split.unbind(0)
+            else:
+                q, k, v = qkv.view(n, 3, heads, d).unbind(1)
             o = ops.varlen_attention(q, k, v, cu_seqlens).reshape(n, -1)
             x, normed = ops.gemm_add_rms_norm(o, block.proj_weight, x, block.norm2, eps, bias=block.proj_bias)
             hidden = ops.gemm_glu_epilogue(normed, block.gate_up_weight, bias=block.gate_up_bias)
@@ -304,10 +309,31 @@ class OptimizedAction(nn.Module):
                                                      all_keep=all_keep, return_bnsd=True)
                     # The BNSD [H, M, D] output feeds the o-projection directly: the pinned CANN route reads
                     # it with the transpose folded into the Cube A-load; every other backend permutes.
-                    h, normed = ops.add_rms_norm(ops.gemm_epilogue(o[0], layer.o)[None], h, layer.post_norm, eps)
+                    # The fused gemm+add_rms entries (RMSFUSE RF3 gemm_add_rms_r4, then COPYKILL K2's
+                    # gemm_add_rms) take the [H, M, D] operand directly and return the (sum, normalized)
+                    # pair; both need the delivered xcompute package and stay absent otherwise, and the
+                    # composition below is then exactly the previous chain.
+                    _fused_entry = getattr(ops.add_rms_norm, "gemm_add_rms_r4", None)
+                    _pair = _fused_entry(o[0], layer.o, h, layer.post_norm, eps) if _fused_entry is not None else None
+                    if _pair is not None:
+                        h, normed = _pair
+                    else:
+                        o_proj_fused = (getattr(ops.add_rms_norm, "gemm_add_rms", None)
+                                        if _copykill_enabled("k2") else None)
+                        if o_proj_fused is not None:
+                            try:
+                                h, normed = o_proj_fused(o[0], layer.o, h, layer.post_norm, eps)
+                            except ValueError:
+                                o_proj_fused = None
+                        if o_proj_fused is None:
+                            h, normed = ops.add_rms_norm(ops.gemm_epilogue(o[0], layer.o)[None], h, layer.post_norm, eps)
                     hidden = ops.gemm_glu_epilogue(normed[0], layer.gate_up)
                     following = self.final_norm if i == last else self.layers[i + 1].input_norm
-                    h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down)[None], h, following, eps)
+                    _pair = _fused_entry(hidden, layer.down, h, following, eps) if _fused_entry is not None else None
+                    if _pair is not None:
+                        h, normed = _pair
+                    else:
+                        h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down)[None], h, following, eps)
                 x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
                                             pinned_rows, prefix)
             ops.join_prefetch()

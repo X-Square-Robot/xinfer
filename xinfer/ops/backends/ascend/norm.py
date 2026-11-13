@@ -10,6 +10,7 @@ fail the ``check`` predicate) and the reference runs instead.
 import torch
 
 from xinfer.ops.backends.ascend._support import VERSION, canonical, entry, has_functions, partial, xc
+from xinfer.ops.backends.copykill_r2 import enabled as _copykill_enabled
 from xinfer.ops.reference.norm import (
     add_rms_norm as reference_add_rms_norm,
     add_zero_centered_rms_norm as reference_add_zero_centered_rms_norm,
@@ -42,11 +43,61 @@ def _supported(x, residual, weight, eps):
           version=VERSION)
 @partial(reference_add_rms_norm, check=_supported)
 def add_rms_norm(x, residual, weight, eps):
+    # RMSFUSE-r4 RF1 (the [1, 16, 1024] action norm and the wide [1, T, 2048] prompt norm) rides the
+    # delivered package's AOT kernels; the module is absent without that delivery and these guards
+    # fall through to the entries below, so the composition is unchanged.
+    try:
+        from xcompute.kernel import rmsfuse_r4
+        if (rmsfuse_r4.enabled("m16")
+                and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
+                and x.dtype == residual.dtype == torch.bfloat16
+                and residual.shape == x.shape and residual.device == x.device
+                and x.is_contiguous() and residual.is_contiguous()
+                and weight.dtype == torch.float32 and weight.device == x.device
+                and tuple(weight.shape) == (1024,) and 0 < eps <= torch.finfo(torch.float32).max):
+            return rmsfuse_r4.add_rms_m16(x, residual, weight, eps)
+        if (rmsfuse_r4.enabled("h2048w")
+                and x.dim() == 3 and x.shape[0] == 1 and x.shape[-1] == 2048
+                and x.shape[1] % 4 == 0
+                and x.dtype == residual.dtype == torch.bfloat16
+                and residual.shape == x.shape and residual.device == x.device
+                and x.is_contiguous() and residual.is_contiguous()
+                and weight.dtype == torch.float32 and weight.device == x.device
+                and tuple(weight.shape) == (2048,) and 0 < eps <= torch.finfo(torch.float32).max):
+            return rmsfuse_r4.add_rms_h2048w(x, residual, weight, eps)
+    except (ImportError, OSError):
+        pass
     if canonical_norm is not None:
         return canonical_norm(x, residual, weight, eps)
     # The legacy raw entry takes (residual, x) — the reverse of the OpSpec's (x, residual). The sum is commutative
     # so the values are right, but the tuple it returns is (sum, normalized) in that entry's order.
     return xc.add_rmsnorm(residual, x, weight.contiguous(), float(eps), inference=True)
+
+
+# The fused gemm+add_rms entries hang off this binding for the Wall-OSS action loop's getattr:
+# RMSFUSE-r4 RF3 (gemm_add_rms_r4) and COPYKILL K2 (gemm_add_rms, behind its flag and the
+# projection's f32-in capability probe). Both need the delivered python package and its AOT
+# artifacts plus the CANN projection bridge; without them the attributes stay absent and the
+# action loop keeps the operator composition above.
+try:
+    from xcompute.kernel import rmsfuse_r4
+    if rmsfuse_r4.enabled("f32in"):
+        from xinfer.ops.backends.ascend import gemm as _gemm_backend
+        _projection = getattr(_gemm_backend, "cann_projection", None)
+        if _projection is not None:
+            def _gemm_add_rms_r4(x, weight, residual, norm_weight, epsilon, _proj=_projection):
+                return rmsfuse_r4.gemm_add_rms_r4(x, weight, residual, norm_weight, epsilon, _proj)
+            add_rms_norm.gemm_add_rms_r4 = _gemm_add_rms_r4
+except (ImportError, OSError):
+    pass
+if _copykill_enabled("k2"):
+    from xinfer.ops.backends.ascend import gemm as _gemm_backend
+    _projection = getattr(_gemm_backend, "cann_projection", None)
+    _fused = getattr(_projection, "gemm_add_rms_norm", None) if _projection is not None else None
+    _capable = (_projection.copykill_f32in_available()
+                if _projection is not None and hasattr(_projection, "copykill_f32in_available") else False)
+    if callable(_fused) and _capable:
+        add_rms_norm.gemm_add_rms = _fused
 
 
 # ---------------------------------------------------------------- Wall-X 2B normalization family
