@@ -21,14 +21,12 @@
 
 ## 特性一览
 
-| 核心特性 | 说明 | 文档 |
-|---|---|---|
-| 实时分块（RTC） | 机器人执行上一段动作时即可用新观测请求下一段。Wall-OSS 和 Wall-X 2B 会保留推理期间已排定的动作，只预测后续部分。 | [Wall-OSS](docs/models/wall_oss.zh-CN.md) · [Wall-X 2B](docs/models/wallx2b.zh-CN.md) |
-| 单机器人极低时延推理 | 每次请求只做一次视觉编码和提示词预填充，各步动作去噪复用同一份 KV 缓存。Wall-X 2B BF16 在 RTX 5090 上从接收观测到返回动作的单请求 P50 为 **22.3 ms**（进程内测量）。 | [测量条件](docs/performance.zh-CN.md) |
-| 单卡服务多机器人 | 多台机器人共享一份模型权重，一台生成动作时，另一台可同时处理图像。11 月 9 日的 RTX 5090 压测中，以服务端 P50 低于 150 ms 为门槛，Wall-X 2B BF16 单卡可服务 15 台模拟机器人。 | [引擎调度](docs/engine.zh-CN.md#调度规则) · [容量实测](docs/performance.zh-CN.md) |
-| 按层组量化 | 接入模型时，可按层组为线性层选择 MXFP8 或 NVFP4，其余层保留 BF16。各内置模型可直接使用的精度配置见模型表。 | [量化方法](docs/quantization.zh-CN.md) · [模型与硬件](#模型与硬件) |
-| 多硬件后端 | Wall-OSS 和 Wall-X 2B 可在 NVIDIA CUDA GPU 和昇腾 950DT NPU 上运行，CPU 提供参考执行路径。 | [模型与硬件](#模型与硬件) |
-| 高性能算子库 xcompute 与第三方算子库 | xcompute 为矩阵乘法、归一化等操作提供融合算子。CUDA 上也可选用 FlashAttention；其他库可以通过 `xinfer.ops` 为单个算子注册实现。 | [算子库](docs/kernels.zh-CN.md) · [注册方式](docs/design.zh-CN.md#142-后端注册与选择) |
+- **实时分块（RTC）**　机器人执行当前动作段时，即可根据新观测预测下一段。
+- **单机器人极低时延**　Wall-X 2B BF16 在 RTX 5090 上的单请求 P50 为 22.3 ms。
+- **单卡服务多机器人**　多台机器人共享模型权重，不同请求的视觉编码与动作生成可重叠执行。
+- **低精度量化**　支持按层组对线性层使用 MXFP8 或 NVFP4。
+- **多硬件后端**　NVIDIA RTX 5090、Jetson Thor、昇腾 950DT、Huixi Rhino RPU（R1，适配中）。
+- **高性能算子库**　使用 xcompute 融合算子，支持 FlashAttention，也可接入其他算子库。
 
 ## 为什么选择 XInfer
 

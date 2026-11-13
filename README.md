@@ -23,14 +23,12 @@ for robots, from onboard inference to shared fleet serving.
 
 ## Features at a glance
 
-| Feature | What it does | Details |
-|---|---|---|
-| Real-time chunking (RTC) | The robot can send a fresh observation while executing the previous action chunk. Wall-OSS and Wall-X 2B keep the actions already scheduled during inference and predict the rest of the new chunk. | [Wall-OSS](docs/models/wall_oss.md) · [Wall-X 2B](docs/models/wallx2b.md) |
-| Ultra-low latency for a single robot | Each request encodes the images and runs prompt prefill once. Every action denoising step reuses the same KV cache. Wall-X 2B in BF16 measured **22.3 ms** P50 from observation to action in process on an RTX 5090. | [Benchmark conditions](docs/performance.md) |
-| Multiple robots on one accelerator | Robots share one set of model weights. While the engine generates actions for one robot, it can process images for another. In the Nov 9 RTX 5090 benchmark, Wall-X 2B BF16 served 15 simulated robots with a 150 ms server P50 limit. | [Scheduling](docs/engine.md#scheduling-rules) · [Measured capacity](docs/performance.md) |
-| Quantization by layer group | Model authors can choose MXFP8 or NVFP4 for groups of linear layers and keep other layers in BF16. See the model table for the presets available in each model. | [Quantization](docs/quantization.md) · [Model support](#models-and-hardware) |
-| Multiple hardware backends | Wall-OSS and Wall-X 2B run on NVIDIA CUDA GPUs and the Ascend 950DT NPU. A CPU path is available for reference execution. | [Models and hardware](#models-and-hardware) |
-| xcompute and third-party kernel libraries | xcompute provides fused kernels for operations such as matrix multiplication and normalization. CUDA can also use FlashAttention. Other libraries can register implementations for individual operators through `xinfer.ops`. | [Kernels](docs/kernels.md) · [Registration](docs/design.md#142-backend-registration-and-selection) |
+- **Real-time chunking (RTC).** Predict the next action chunk from a new observation while the robot executes the current one.
+- **Ultra-low single-robot latency.** Wall-X 2B in BF16 measured 22.3 ms P50 per request on an RTX 5090.
+- **Multi-robot serving on one accelerator.** Robots share model weights, and vision encoding can overlap with action generation across requests.
+- **Low-precision quantization.** Apply MXFP8 or NVFP4 to selected groups of linear layers.
+- **Hardware backends.** NVIDIA RTX 5090, Jetson Thor, Ascend 950DT, and Huixi Rhino RPU (R1) support in development.
+- **High-performance kernels.** Use xcompute fused kernels and FlashAttention, or plug in another kernel library.
 
 ## Why XInfer
 
