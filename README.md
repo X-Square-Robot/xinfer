@@ -23,13 +23,13 @@ for robots, from onboard inference to shared fleet serving.
 
 ## Features at a glance
 
-| Feature | What you can do | Guide |
+| Capability | How XInfer delivers it | Details |
 |---|---|---|
-| Local and network inference | Call `Policy.infer()` in a robot process or send observations to `xinfer-serve` over WebSocket. | [Serving](docs/serving.md) |
-| Real-time chunking (RTC) | Send the previous action chunk and the inference delay when requesting the next chunk from Wall-OSS or Wall-X 2B. | [Wall-OSS](docs/models/wall_oss.md) · [Wall-X 2B](docs/models/wallx2b.md) |
-| Multi-robot scheduling | Share one model across robots. Set per-robot limits and batch compatible requests at each stage. | [Engine](docs/engine.md) |
-| Operator backends | Inspect the selected kernels and run supported operators through xcompute or their PyTorch reference implementations. | [Kernels](docs/kernels.md) |
-| Benchmarks and monitoring | Measure single-request latency and robot capacity, then track queues and stage timings in Prometheus and Grafana. | [Benchmarks](docs/benchmark.md) · [Metrics](docs/metrics.md) |
+| Low observation-to-action latency | Each request encodes the images and runs prompt prefill once. Action denoising steps reuse the same key/value cache, and warmed CUDA graphs can replay each stage. Wall-X 2B in BF16 measured 22.3 ms median single-request latency on an RTX 5090. | [Stage split](docs/models/wall_oss_design.md#stage-split) · [Benchmark conditions](docs/performance.md) |
+| Multiple robots on one accelerator | While one robot's actions are being generated, the engine can start processing another robot's images. Requests share one set of weights. A ready request does not wait for another robot to form a batch. | [Scheduling](docs/engine.md#scheduling-rules) · [Capacity](docs/performance.md) |
+| Predict while the robot moves (RTC) | The robot can send a fresh observation while it executes the previous action chunk. Wall-OSS and Wall-X 2B keep the steps the robot will execute during inference and predict the rest of the new chunk. | [Wall-OSS](docs/models/wall_oss.md) · [Wall-X 2B](docs/models/wallx2b.md) |
+| Check actions against the original model | Feed the same inputs to each stage of the original and optimized models, then compare vision embeddings, prompt KV and predicted actions to see where their outputs start to differ. | [Precision checks](docs/precision.md) · [Wall-X 2B results](docs/models/wallx2b_validation.md) |
+| Deploy the same model on different chips | Wall-OSS and Wall-X 2B use the same model code on NVIDIA CUDA and Ascend 950DT. The runtime selects the underlying operators for each device. | [Models and hardware](#models-and-hardware) · [Operator backends](docs/kernels.md) |
 
 ## Why XInfer
 

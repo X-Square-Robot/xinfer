@@ -21,13 +21,13 @@
 
 ## 特性一览
 
-| 特性 | 可以做什么 | 指南 |
+| 核心能力 | XInfer 如何实现 | 了解更多 |
 |---|---|---|
-| 本地推理与网络服务 | 在机器人进程中调用 `Policy.infer()`，或通过 WebSocket 向 `xinfer-serve` 发送观测。 | [服务](docs/serving.zh-CN.md) |
-| 实时分块（RTC） | 使用 Wall-OSS 或 Wall-X 2B 请求下一段动作时，传入上一段动作和推理延迟。 | [Wall-OSS](docs/models/wall_oss.zh-CN.md) · [Wall-X 2B](docs/models/wallx2b.zh-CN.md) |
-| 多机器人调度 | 多台机器人共享一份模型权重，可限制每台机器人的在途请求数，并在各阶段将兼容请求组批。 | [引擎](docs/engine.zh-CN.md) |
-| 算子后端 | 查看实际选择的 kernel，用 xcompute 或 PyTorch 参考实现运行支持的算子。 | [Kernel](docs/kernels.zh-CN.md) |
-| 压测与监控 | 测量单请求时延和单卡能服务的机器人数，通过 Prometheus 和 Grafana 查看队列和各阶段耗时。 | [基准测试](docs/benchmark.zh-CN.md) · [指标](docs/metrics.zh-CN.md) |
+| 缩短从观测到动作的时间 | 每次请求只做一次视觉编码和提示词预填充。各步动作去噪复用同一份键值缓存（KV），预热后可用 CUDA Graph 回放各阶段。在 RTX 5090 上，Wall-X 2B BF16 的单请求时延中位数为 22.3 ms。 | [阶段划分](docs/models/wall_oss_design.zh-CN.md#阶段划分) · [测量条件](docs/performance.zh-CN.md) |
+| 多台机器人共享一张卡 | 一台机器人生成动作时，引擎可以开始处理另一台机器人的图像。多台机器人用同一份权重；就绪请求无需等其他机器人凑批。 | [调度规则](docs/engine.zh-CN.md#调度规则) · [单卡容量](docs/performance.zh-CN.md) |
+| 边执行边预测（RTC） | 机器人还在执行上一段动作时，就可以用新观测请求下一段。Wall-OSS 和 Wall-X 2B 会保留推理期间仍要执行的那几步，再预测后续动作。 | [Wall-OSS](docs/models/wall_oss.zh-CN.md) · [Wall-X 2B](docs/models/wallx2b.zh-CN.md) |
+| 验证加速后的动作 | 给原模型和加速版的每个阶段喂入相同的输入，比较视觉特征、提示词 KV 和动作输出，定位误差最早出现在哪一步。 | [精度验证](docs/precision.zh-CN.md) · [Wall-X 2B 实测](docs/models/wallx2b_validation.zh-CN.md) |
+| 同一模型部署到不同芯片 | Wall-OSS 和 Wall-X 2B 的模型代码可用于 NVIDIA CUDA 和昇腾 950DT。更换设备时，引擎按设备选择底层算子。 | [模型与硬件](#模型与硬件) · [算子后端](docs/kernels.zh-CN.md) |
 
 ## 为什么选择 XInfer
 
