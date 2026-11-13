@@ -31,15 +31,15 @@
 
 ## 昇腾 950DT
 
-两行均于 2026-11-13 在独占预留的 Ascend 950DT（CANN 9.1.1、TorchNPU 2.10.0.post4）上、本分支版本 `0864476` 测得，交付版 `xcompute.so`（SHA-256 `be3ee3e46e58…`）经 `XINFER_XCOMPUTE_LIBRARY` 与配套 Python 包加载。两模型均使用默认算子选择：两模型调用的每一个算子都解析到 `ascend:xcompute`，且对完整请求通过的逐 layout 分发审计确认每次调用都运行在 xcompute 入口上（Wall-X 2B：21/21 个算子、全部调用 layout 准入；Wall-OSS：11/11）。任一基准中都没有算子回退到 torch 参考实现。[昇腾指南](ascend950dt.zh-CN.md)列出每个算子的入口。
+两行均于 2026-11-13 在独占预留的 Ascend 950DT（CANN 9.1.1、TorchNPU 2.10.0.post4）上测得：Wall-OSS 行在本分支版本 `3eacd03`、r4 交付版 `xcompute.so`（SHA-256 `a7db13d8…`）上；Wall-X 2B 行在本分支版本 `7d95b98`、r5 交付版（SHA-256 `903ff6de…`，新增 2B qkv 尾融合核）上，均经 `XINFER_XCOMPUTE_LIBRARY` 与配套 Python 包加载。两模型均使用默认算子选择：两模型调用的每一个算子都解析到 `ascend:xcompute`，且对完整请求通过的逐 layout 分发审计确认每次调用都运行在 xcompute 入口上（Wall-X 2B：21/21 个算子、全部调用 layout 准入；Wall-OSS：11/11）。任一基准中都没有算子回退到 torch 参考实现。[昇腾指南](ascend950dt.zh-CN.md)列出每个算子的入口。
 
 | 模型 | 精度与组合 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 最高实测吞吐 | 数值一致性 |
 |---|---|---|---|---|---|---|---|
-| Wall-OSS | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s | 内部精度门禁（DVPP 图像）：PASS |
-| Wall-X 2B | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s | 固定噪声动作与参考组合相差 max_abs 0.0472 以内：PASS |
+| Wall-OSS | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 47.75 ms | 4 | 120.4 ms | 129.9 ms | 29.2 req/s | quick100 B1，DVPP 对 BF16 参考 −6.77 %：PASS |
+| Wall-X 2B | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 51.05 ms | 6 | 93 ms | 111 ms | 33.4 req/s | 固定噪声动作门，对参考组合：PASS |
 
-- **Wall-OSS** 的单请求集与服务端预热各用一个普通请求与一个 RTC 请求，`image_preprocess_device` 在 NPU（DVPP）上，合成桌面负载带 RTC 跑 2、3 台——共十六轮，零错误、零缺失响应、零 underflow。2 台时各轮服务端 P50 分布 118–121 ms、中位 120.1 ms、最差轮 P95 为 130.2 ms；3 台实测 161–166 ms，高于 150 ms 判定线，容量有界于 2 台。单请求分解为 prepare 2.23 ms、engine 78.42 ms、output 0.15 ms。
-- **Wall-X 2B** 的单请求集为 216 个请求的延迟采集（固定噪声种子 20261112），服务端预热用两个请求，合成桌面负载带 RTC 跑 2 台——共 八 轮，零 错误、零 缺失响应。其单请求分解为 prepare 2.80 ms、engine 76.76 ms、output 0.15 ms。
+- **Wall-OSS** 的单请求集与服务端预热各用一个普通请求与一个 RTC 请求，`image_preprocess_device` 在 NPU（DVPP）上，合成桌面负载带 RTC 跑 4、6 台——每档八轮，零错误、零缺失响应。4 台时服务端 P50/P95 中位为 120.4/129.9 ms、22.1 req/s；6 台实测 176.2/187.7 ms、29.2 req/s，高于 150 ms 判定线，容量有界于 4 台，6 台给出最高实测吞吐。单请求分解为 prepare 2.06 ms、engine 44.94 ms、output 0.15 ms。
+- **Wall-X 2B** 的单请求集为 216 个请求的延迟采集（固定噪声种子 20261112），服务端预热用两个请求，合成桌面负载带 RTC 跑 4、6 台——共十六轮，零错误、零缺失响应。4 台时服务端 P50/P95 中位为 61.7/77.8 ms，6 台为 93/111 ms、33.4 req/s，均在 150 ms 判定线内。其单请求分解为 prepare 2.60 ms、engine 48.40 ms、output 0.15 ms。
 
 两模型的行都报告同一接线：xcompute 包自身的入口——其在 xcompute 内部混合使用 CANN ACLNN Matmul、FusedInferAttentionScore V5 与官方算子，以及 TileLang 和 AOT 自定义内核。在后端选择层面，两模型默认都指向 xcompute；TorchNPU 官方算子与 CANN 桥接保持为显式 pin（`--op-backends linear=ascend:torch_npu`）。
 
