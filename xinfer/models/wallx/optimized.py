@@ -77,6 +77,43 @@ class _FormatStage(nn.Module):
         return self._op("gemm_epilogue")(x, self._weight(group, name), *args, **kwargs)
 
 
+_SOUPKILL_PROJECTION = []
+
+
+def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
+    """ViT QKV projection + bias + RoPE in one pass over the FP32 accumulator.
+
+    Opt-in through ``XINFER_SOUPKILL=vrope`` (xcompute's soupkill mount). Every
+    path that is not a clean envelope hit -- flag off, absent knife library, a
+    shape or table mismatch, any error from the fused launch -- returns the
+    released operator's result, so the model never depends on the knife being
+    installed and this call site can be reverted on its own.
+    """
+    released = lambda: ops.qkv_rope_epilogue(  # noqa: E731 - the single fallback
+        normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d
+    )
+    try:
+        from xcompute.kernel import soupkill
+    except Exception:  # noqa: BLE001 - the mount is optional
+        return released()
+    if not soupkill.enabled("vrope") or normed.dim() != 2 or cos2 is None or cos2.shape[-1] != d:
+        return released()
+    if not _SOUPKILL_PROJECTION:
+        from xcompute.kernel.cann_projection import CannProjection
+
+        _SOUPKILL_PROJECTION.append(CannProjection())
+    projection = _SOUPKILL_PROJECTION[0]
+    try:
+        with projection.accumulator(normed, block.qkv_weight) as acc:
+            out = normed.new_empty((normed.shape[0], n), dtype=torch.bfloat16)
+            fused = soupkill.vision_qkv_rope(acc, block.qkv_bias, cos2, sin2, out, heads, d)
+        if fused is not None:
+            return fused
+    except Exception:  # noqa: BLE001 - a fused-path failure must not fail the model
+        pass
+    return released()
+
+
 class OptimizedVision(_FormatStage):
     """The ViT and patch merger (BF16 weights, ``[out, in]`` as in the checkpoint).
 
@@ -118,12 +155,25 @@ class OptimizedVision(_FormatStage):
             ``[N / merge², out_hidden_size]`` BF16.
         """
         c, ops = self.config, self.ops
+        n, h, heads, d = pixel_values.shape[0], c.hidden_size, c.num_heads, c.head_dim
         x = ops.gemm_epilogue(pixel_values.to(DTYPE), self.patch.weight, self.patch.bias)
         x = x + ops.pos_embed_interp(self.pos_embed, grids, c.spatial_merge_size)
         angles = ops.rot_pos(self.inv_freq, grids, c.spatial_merge_size)
         cos, sin = angles.cos(), angles.sin()
+        # soupkill vrope: the rotary table duplicated to the head width, once per
+        # vision forward (the fused kernel reads the head's 64 lanes as [c | c]).
+        # Two cat kernels per request, not per block; None keeps the released op.
+        cos2 = sin2 = None
+        try:
+            from xcompute.kernel import soupkill
+
+            if soupkill.enabled("vrope") and cos.dim() == 2:
+                cos2 = torch.cat((cos, cos), dim=-1).contiguous()
+                sin2 = torch.cat((sin, sin), dim=-1).contiguous()
+        except Exception:  # noqa: BLE001 - the mount is optional
+            cos2 = sin2 = None
         for block in self.blocks:
-            x = self._block(block, x, cos, sin, cu_seqlens)
+            x = self._block(block, x, cos, sin, cu_seqlens, cos2, sin2)
         m = self.merger
         merged = ops.layer_norm_cast(x, m.norm_weight, m.norm_bias, c.eps).reshape(-1, self.merge_width)
         if self.fmt == "nvfp4":  # the merger's GEMMs are NVFP4 with NVFP4 blocks, else BF16
@@ -133,16 +183,20 @@ class OptimizedVision(_FormatStage):
         hidden = ops.gemm_epilogue(merged, m.fc1_weight, m.fc1_bias, activation="gelu")
         return ops.gemm_epilogue(hidden, m.fc2_weight, m.fc2_bias)
 
-    def _block(self, block, x, cos, sin, cu_seqlens):
+    def _block(self, block, x, cos, sin, cu_seqlens, cos2=None, sin2=None):
         """One ViT block. With MXFP8 or NVFP4 GEMMs every GEMM input is the BF16 tensor of the BF16 block, quantized:
         the LayerNorms and fc1 write the next GEMM's quantized input, the attention output is quantized for the
-        projection."""
+        projection. In BF16 the soupkill vrope knife (fused QKV + bias + RoPE) takes the QKV call when its
+        mount is enabled; every miss falls back to the released operator."""
         c, ops = self.config, self.ops
         n, h, heads, d = x.shape[0], c.hidden_size, c.num_heads, c.head_dim
         norm = ops.layer_norm_cast if self.fmt is None else self._op("layer_norm_quantize")
         normed = norm(x, block.norm1_weight, block.norm1_bias, c.eps)
-        qkv = self._op("qkv_rope_epilogue")(normed, self._weight(block, "qkv_weight"), block.qkv_bias, cos, sin, heads,
-                                            d)
+        if self.fmt is None:
+            qkv = _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, 3 * heads * d, heads, d)
+        else:
+            qkv = self._op("qkv_rope_epilogue")(normed, self._weight(block, "qkv_weight"), block.qkv_bias, cos, sin,
+                                                heads, d)
         q, k, v = qkv.view(n, 3, heads, d).unbind(1)
         o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
         x = self._gemm(o, block, "proj_weight", block.proj_bias, residual=x)
