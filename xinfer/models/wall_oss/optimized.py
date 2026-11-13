@@ -6,6 +6,8 @@ reference). GEMM weights are ``[N, K]``; the action stage's output and down proj
 which selects xcompute's small-M kernel. Differences to the reference:
 
 - every residual add and the RMSNorm after it are one call (``add_rms_norm``), the sum rounded to BF16 as before;
+  in the ViT the projection before it joins them (``gemm_add_rms_norm``), which on integrated GPUs adds the residual
+  to the FP32 product (one rounding);
 - the QKV projections add their bias and rotate q and k on the FP32 accumulator (one rounding); in the prefill and
   action stages the same call writes K and V to the head-major cache;
 - the gated MLPs apply SiLU-mul to the FP32 accumulator (one rounding); the merger's GELU is the fc1 epilogue;
@@ -28,19 +30,13 @@ DTYPE = torch.bfloat16
 FLOW_TIME_SCALE = 0.999
 
 OPTIMIZED_STAGE_OPS = {
-    "vision": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "rms_norm", "add_rms_norm",
+    "vision": ("gemm_epilogue", "gemm_glu_epilogue", "gemm_add_rms_norm", "qkv_rope_epilogue", "rms_norm",
                "varlen_attention"),
-    "prefill": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "rms_norm", "add_rms_norm",
+    "prefill": ("gemm_epilogue", "qkv_rope_kvcache", "mlp_add_rms_norm", "rms_norm", "add_rms_norm",
                 "causal_attention"),
     "action": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "prefix_kvcache_attention",
-               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear"),
+               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "prefetch_weights", "join_prefetch"),
 }
-
-
-def _can_fuse(ops, fused, *components):
-    """Use an optional fusion when its native implementation and the constituent CUDA operators are selected."""
-    return (ops.selection(fused).backend != "reference"
-            and all(ops.selection(op).name == "cuda:xcompute" for op in components))
 
 
 def compact_rope(inv_freq: torch.Tensor, positions: torch.Tensor, section) -> tuple[torch.Tensor, torch.Tensor]:
@@ -80,17 +76,6 @@ class OptimizedVision(nn.Module):
                              persistent=False)
         self.ops = active_ops()
 
-        qkv = _can_fuse(self.ops, "qkv_rope_for_attention", "qkv_rope_epilogue")
-        projection = _can_fuse(self.ops, "gemm_add_rms_norm", "gemm_epilogue", "add_rms_norm", "rms_norm")
-        self.optional_ops = tuple(name for name, enabled in (("qkv_rope_for_attention", qkv),
-                                                              ("gemm_add_rms_norm", projection)) if enabled)
-        self.qkv = self.ops.qkv_rope_for_attention if qkv else self.ops.qkv_rope_epilogue
-        self.project_norm = self.ops.gemm_add_rms_norm if projection else self._project_norm
-
-    def _project_norm(self, x, weight, residual, gamma, eps, *, bias):
-        projected = self.ops.gemm_epilogue(x, weight, bias)
-        return self.ops.add_rms_norm(projected, residual, gamma, eps)
-
     def forward(self, pixel_values, layout):
         """Image token embeddings (see ``VisionTower.forward``; the same layout and output order).
 
@@ -111,16 +96,16 @@ class OptimizedVision(nn.Module):
         angles = angles.reshape(n // unit, unit, -1)[window_index].reshape(n, -1)
         cos, sin = angles.cos(), angles.sin()
         normed = ops.rms_norm(x, self.blocks[0].norm1, eps)
-        qkv_options = {"table_cache": {}} if "qkv_rope_for_attention" in self.optional_ops else {}
         for i, block in enumerate(self.blocks):
             cu_seqlens = layout["cu_full"] if i in c.fullatt_block_indexes else layout["cu_window"]
-            qkv = self.qkv(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d, **qkv_options)
+            qkv = ops.qkv_rope_epilogue(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d,
+                                        qk_order="any")  # Q and K only feed the attention
             q, k, v = qkv.view(n, 3, heads, d).unbind(1)
             o = ops.varlen_attention(q, k, v, cu_seqlens).reshape(n, -1)
-            x, normed = self.project_norm(o, block.proj_weight, x, block.norm2, eps, bias=block.proj_bias)
+            x, normed = ops.gemm_add_rms_norm(o, block.proj_weight, x, block.norm2, eps, bias=block.proj_bias)
             hidden = ops.gemm_glu_epilogue(normed, block.gate_up_weight, bias=block.gate_up_bias)
-            next_norm = self.blocks[i + 1].norm1 if i + 1 < len(self.blocks) else self.merger.norm
-            x, normed = self.project_norm(hidden, block.down_weight, x, next_norm, eps, bias=block.down_bias)
+            following = self.blocks[i + 1].norm1 if i + 1 < len(self.blocks) else self.merger.norm
+            x, normed = ops.gemm_add_rms_norm(hidden, block.down_weight, x, following, eps, bias=block.down_bias)
         merged = ops.gemm_epilogue(normed.reshape(-1, self.merger.fc1_weight.shape[1]), self.merger.fc1_weight,
                                    self.merger.fc1_bias, activation="gelu")
         return ops.gemm_epilogue(merged, self.merger.fc2_weight, self.merger.fc2_bias)[layout["reverse_index"]]
@@ -154,16 +139,6 @@ class OptimizedPrefill(nn.Module):
                                     for _ in range(c.num_hidden_layers))
         self.ops = active_ops()
 
-        fused = _can_fuse(self.ops, "mlp_add_rms_norm", "gemm_glu_epilogue", "gemm_epilogue",
-                          "add_rms_norm", "rms_norm")
-        self.optional_ops = ("mlp_add_rms_norm",) if fused else ()
-        self.mlp = self.ops.mlp_add_rms_norm if fused else self._mlp
-
-    def _mlp(self, x, gate_up, down, residual, gamma, eps):
-        hidden = self.ops.gemm_glu_epilogue(x, gate_up)
-        projected = self.ops.gemm_epilogue(hidden, down).view_as(residual)
-        return self.ops.add_rms_norm(projected, residual, gamma, eps)
-
     def forward(self, h, cos, sin, prompt_kv):
         """Run expert 0 and write ``prompt_kv`` ``[layers, 2, 1, kv_heads, P, head_dim]``.
 
@@ -187,7 +162,8 @@ class OptimizedPrefill(nn.Module):
             o = ops.causal_attention(q.view(1, p, heads, d), keys.transpose(0, 1)[None], values.transpose(0, 1)[None])
             h, normed = ops.add_rms_norm(ops.gemm_epilogue(o.reshape(p, -1), layer.o).view(1, p, -1), h,
                                          layer.post_norm, eps)
-            h, normed = self.mlp(normed.view(p, -1), layer.gate_up, layer.down, h, self.layers[i + 1].input_norm, eps)
+            h, normed = ops.mlp_add_rms_norm(normed.view(p, -1), layer.gate_up, layer.down, h,
+                                             self.layers[i + 1].input_norm, eps)
 
 
 class OptimizedAction(nn.Module):
@@ -210,8 +186,6 @@ class OptimizedAction(nn.Module):
         self.action_head = action_head
         self.register_buffer("inv_freq", inverse_frequencies(c.head_dim, c.rope_theta), persistent=False)
         self.ops = active_ops()
-        hints = ("prefetch_weights", "join_prefetch")
-        self.optional_ops = hints if all(self.ops.selection(op).backend == "cuda" for op in hints) else ()
         self._steps: dict[int, list[float]] = {}
 
     def step_sizes(self, steps: int, device) -> list[float]:
@@ -266,30 +240,26 @@ class OptimizedAction(nn.Module):
             dof_mask, padding = dof, x_in["padding_action"].to(torch.float32) - x
         pinned_rows = delay.to(torch.int32) if rtc else None
         last = len(self.layers) - 1
-        side = None
-        try:
-            for step in range(steps):
-                tau = torch.where(pinned, torch.ones_like(times[step]), times[step])
-                h = self.action_head.embed(x, tau, dof).to(DTYPE)
-                normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
-                for i, layer in enumerate(self.layers):
-                    if self.optional_ops:
-                        next_qkv = self.layers[(i + 1) % len(self.layers)].qkv
-                        side = ops.prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, next_qkv))
-                    keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
-                    q = ops.qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin, keys[0], values[0], p,
-                                             heads, kv_heads, d)
-                    o = ops.prefix_kvcache_attention(q.view(1, horizon, heads, d), keys.transpose(1, 2),
-                                                     values.transpose(1, 2), start, p, flash_mask=flash_mask)
-                    h, normed = ops.add_rms_norm(ops.gemm_epilogue(o[0], layer.o_t.t())[None], h, layer.post_norm, eps)
-                    hidden = ops.gemm_glu_epilogue(normed[0], layer.gate_up)
-                    following = self.final_norm if i == last else self.layers[i + 1].input_norm
-                    h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down_t.t())[None], h, following, eps)
-                x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
-                                            pinned_rows, prefix)
-        finally:
-            if side is not None:
-                ops.join_prefetch(side)
+        for step in range(steps):
+            tau = torch.where(pinned, torch.ones_like(times[step]), times[step])
+            h = self.action_head.embed(x, tau, dof).to(DTYPE)
+            normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
+            for i, layer in enumerate(self.layers):
+                # this layer's later weights and the next layer's QKV, read while the QKV and attention run
+                following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
+                ops.prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
+                keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
+                q = ops.qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin, keys[0], values[0], p, heads,
+                                         kv_heads, d)
+                o = ops.prefix_kvcache_attention(q.view(1, horizon, heads, d), keys.transpose(1, 2),
+                                                 values.transpose(1, 2), start, p, flash_mask=flash_mask)
+                h, normed = ops.add_rms_norm(ops.gemm_epilogue(o[0], layer.o_t.t())[None], h, layer.post_norm, eps)
+                hidden = ops.gemm_glu_epilogue(normed[0], layer.gate_up)
+                following = self.final_norm if i == last else self.layers[i + 1].input_norm
+                h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down_t.t())[None], h, following, eps)
+            x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
+                                        pinned_rows, prefix)
+        ops.join_prefetch()
         out.copy_(x)
 
 

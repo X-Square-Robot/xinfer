@@ -88,7 +88,8 @@ separate operator-contract change.
 
 ### Wall-OSS operator list
 
-Every operator Wall-OSS calls selects `ascend:xcompute` with the default wiring: eleven operator bindings, and a
+Every operator Wall-OSS calls, except the no-op `prefetch_weights` and `join_prefetch`, selects `ascend:xcompute`
+with the default wiring: eleven operator bindings and two operators that call them in turn, and a
 per-layout dispatch audit of a full request pass confirmed every call layout admitted (no operator ran on a torch
 reference). These are not eleven independent custom kernels: the table records the actual routes and compute
 implementations in the measured build. Availability depends on the paired package and binary. Implementations must
@@ -106,6 +107,7 @@ in both modes.
 | `causal_attention` | prefill | `CannAttention.causal_attention` | CANN FIA V5 (BNSD) + Torch mask/layout |
 | `prefix_kvcache_attention` | action | `CannAttention.prefix_kvcache_attention` | CANN FIA V5 (BNSD) + Torch mask/layout |
 | `add_rms_norm` | vision, prefill, action | `xcompute.add_rmsnorm` | Custom AOT kernels; the package entry serves every row count and takes the BF16 weight the vision stores |
+| `gemm_add_rms_norm`, `mlp_add_rms_norm` | vision; prefill | the `gemm_epilogue`, `gemm_glu_epilogue` and `add_rms_norm` bindings above, in turn | the same calls as those operators |
 | `rms_norm` | vision, prefill, action | `xcompute.rmsnorm` | Custom AOT kernels; the input norms of all three streams |
 | `linear` | action | `xcompute.gemm` | The unified GEMM entry (CANN Mm at these shapes); leading dimensions are flattened for its rank-matching operands |
 | `flow_velocity_euler` | action | `xcompute.denoise_output_euler` | Custom AOT kernels; the auto table's admitted envelope retried as the named `ascend_tilelang` domain |
@@ -116,6 +118,8 @@ head width 128 and cache append position 768, with compatible contiguous buffers
 prefill use Torch/TorchNPU epilogues; the matrix multiplication remains CANN in both cases. The latency
 receipts do not record conditional-kernel hit counts or the share of time spent in CANN, custom kernels and
 reference operations. An exported alternative entry does not establish that the measured model selected it.
+
+`prefetch_weights` and `join_prefetch` (action) do nothing on the NPU (their references). An xcompute export named `qkv_rope_epilogue` must take the operator's `qk_order` keyword; the standard order serves both values.
 
 Wall-OSS action uses ordinary RMSNorm, biased QKV and unmodulated GLU.
 Switching binaries requires rerunning [precision](precision.md) and

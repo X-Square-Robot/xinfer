@@ -298,10 +298,7 @@ class WallOSS(VLAModel, nn.Module):
             ``1 .. config.rtc_max_delay``; and ``stage_ops``.
         """
         optimized = self.numerics == "optimized"
-        stage_ops = self.stage_ops
-        if optimized:
-            stages = {"vision": self.vision, "prefill": self.prefill_stack, "action": self.action}
-            stage_ops = {stage: OPTIMIZED_STAGE_OPS[stage] + module.optional_ops for stage, module in stages.items()}
+        stage_ops = OPTIMIZED_STAGE_OPS if optimized else self.stage_ops
         return Capabilities(
             # Vision and prefill are written for one request (packed image rows,
             # per-request prompt length); the reference action stage takes batches of

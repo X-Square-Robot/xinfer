@@ -60,20 +60,23 @@ the shape, else the operator's torch reference. All BF16, like the reference.
 | Step | Operator | Kernel at this model's shapes |
 |---|---|---|
 | ViT and LM residual add + RMSNorm | `add_rms_norm` (`rms_norm` for the first norm) | xcompute `add_rmsnorm` / `rmsnorm` |
-| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` | `qkv_proj_rope` → cuBLASLt and a RoPE kernel |
+| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` (`qk_order="any"`: Q and K only feed the attention) | `qkv_proj_rope` → cuBLASLt and a RoPE kernel; on SM110 `tcgen05_bf16_sm110` (Q and K in rotary-pair order) |
 | ViT attention (windows, full blocks) | `varlen_attention` | flash-attention 2 |
-| ViT projection, MLP down, merger (+ bias; merger fc1 + GELU) | `gemm_epilogue` | `gemm` → cuBLASLt |
+| ViT projection and MLP down (+ bias) + residual add + the next RMSNorm | `gemm_add_rms_norm` | `gemm` → cuBLASLt, `add_rmsnorm`; on integrated GPUs (Jetson Thor) `gemm` with the residual → cuBLASLt (β·C), `rmsnorm` |
+| Merger (+ bias; fc1 + GELU) | `gemm_epilogue` | `gemm` → cuBLASLt |
 | ViT gate/up + bias + SiLU-mul | `gemm_glu_epilogue` (`bias`) | `gemm_glu` → cuBLASLt and the SiLU-mul kernel |
 | Expert-0 QKV + bias + M-RoPE, K/V written to the prompt K/V | `qkv_rope_kvcache` | `qkv_proj_rope` (`kv_cache`) → cuBLASLt and a RoPE kernel |
 | Expert-0 causal attention | `causal_attention` | flash-attention 2 |
-| Expert-0 output and down projections; gate/up + SiLU-mul | `gemm_epilogue`; `gemm_glu_epilogue` | cuBLASLt; `tma_streamk_bf16_sm120` |
+| Expert-0 output projection | `gemm_epilogue` | cuBLASLt |
+| Expert-0 MLP (gate/up + SiLU-mul, down) + residual add + the next RMSNorm | `mlp_add_rms_norm` | `gemm_glu` → `tma_streamk_bf16_sm120`, `gemm` → cuBLASLt, `add_rmsnorm`; on SM110 `fused_mlp` → `mcast_bf16_sm110` and `rmsnorm` for M 513–768, other M `gemm_glu` → `mcast_bf16_sm110`, `gemm` with the residual → `mcast_bf16_sm110` and `rmsnorm` |
 | Action embedding (`ActionHead`, FP32) | `linear`, `silu` | cuBLAS (FP32) |
 | Expert-1 QKV + bias + M-RoPE + K/V append | `qkv_rope_kvcache` | `qkv_proj_rope` (`kv_cache`) → cuBLASLt and a RoPE kernel |
 | Expert-1 attention over the prompt K/V and the action keys | `prefix_kvcache_attention` | `attention_kvcache` → `splitkv` |
 | Expert-1 output and down projections (`[K, N]` weights); gate/up + SiLU-mul | `gemm_epilogue`; `gemm_glu_epilogue` | `gemm` → `smallm_bf16_sm120`; cuBLASLt and the SiLU-mul kernel |
+| Expert-1 weights read ahead: each layer's output, gate/up and down projections and the next layer's QKV, during its QKV and attention | `prefetch_weights`, `join_prefetch` (after the steps) | `l2_prefetch` on a side stream, on integrated GPUs (Jetson Thor); nothing on discrete ones, where it costs time |
 | Readout, velocity of the uncommanded dimensions, Euler step, pinned rows | `flow_velocity_euler` | `denoise_output_euler` → `fused_tail` |
 
-On RTX 5090, at this model's BF16 shapes xcompute lists no kernel faster than cuBLAS for the ViT and expert-0 GEMMs except the
+At this model's BF16 shapes xcompute lists no kernel faster than cuBLAS for the ViT and expert-0 GEMMs except the
 expert-0 gate/up; they are compute-bound (about 85 % of the vision and prefill stages). The gains are the fused
 residual adds and norms, the expert-0 gate/up kernel and the action stage's small-M kernels and cache attention.
 
@@ -87,14 +90,9 @@ Arithmetic that differs from the reference composition:
   and each other) are passed as per-column row ranges (FlashMask `LTS`/`UTE`). The velocity stays FP32.
 - **Prompt buckets**: the padding is masked in the action attention, so the actions of a padded prompt equal those
   of the exact prompt within rounding, not bit for bit.
-
-### Jetson Thor (SM110)
-
-With a compatible xcompute build, the vision stage can leave the rotated Q and K channels in the same paired order.
-Attention consumes them together and their dot products are unchanged. Vision projections can also accumulate the residual
-before rounding to BF16, then apply RMSNorm. Prefill selects a fused gate/up, SiLU, down and residual kernel for supported
-shapes. Action prefetches upcoming layer weights into L2 on a side stream and rejoins it before the stage finishes.
-These paths are selected at startup. Missing optional kernels use the existing stage operators.
+- **Jetson Thor**: on integrated GPUs the ViT projections add the residual to the FP32 product and round once, and
+  the fused expert-0 MLP does not fix its reduction order, so two runs can differ at rounding level. On discrete GPUs
+  `gemm_add_rms_norm` and `mlp_add_rms_norm` give the bits of the operators they join.
 
 ## Action-stage batching
 

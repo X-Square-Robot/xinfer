@@ -43,12 +43,13 @@ from xinfer.ops.reference.gemm import (
     gemm_add_rms_norm,
     gemm_epilogue,
     gemm_glu_epilogue,
+    join_prefetch,
     linear,
     mlp_add_rms_norm,
+    prefetch_weights,
     qkv_norm_rope_kvcache,
     qkv_norm_split,
     qkv_rope_epilogue,
-    qkv_rope_for_attention,
     qkv_rope_kvcache,
 )
 from xinfer.ops.reference.norm import (
@@ -75,26 +76,15 @@ from xinfer.ops.reference.rope import (
     rot_pos,
 )
 
-
-def prefetch_weights(weights):
-    """The portable weight-prefetch hint schedules no work and returns an empty handle."""
-    return None
-
-
-def join_prefetch(side):
-    """The portable hint has no outstanding work to join."""
-
-
 __all__ = (
     "action_attention", "ada_rms_norm", "add_rms_norm", "add_zero_centered_rms_norm", "apply_rotary",
     "attention", "causal_attention", "causal_conv1d", "chunk_gated_delta_rule", "conv2d", "flow_input_embed",
     "flow_velocity_euler", "gate_output", "gated_causal_attention", "gated_delta_net",
     "gated_kvcache_attention", "gated_residual", "gated_residual_modulated_rms_norm", "gated_rms_norm",
-    "gelu", "gelu_tanh", "gelu_tanh_and_mul", "gemm_epilogue", "gemm_glu_epilogue", "identity_layer_norms_",
-    "gemm_add_rms_norm", "mlp_add_rms_norm", "qkv_rope_for_attention",
-    "kvcache_attention", "l2_normalize", "layer_norm", "layer_norm_cast", "linear", "masked_joint_attention",
-    "modulated_rms_norm", "pos_embed_interp", "prefix_attention", "prefix_kvcache_attention",
-    "prefetch_weights", "join_prefetch",
+    "gelu", "gelu_tanh", "gelu_tanh_and_mul", "gemm_add_rms_norm", "gemm_epilogue", "gemm_glu_epilogue",
+    "identity_layer_norms_", "join_prefetch", "kvcache_attention", "l2_normalize", "layer_norm", "layer_norm_cast",
+    "linear", "masked_joint_attention", "mlp_add_rms_norm", "modulated_rms_norm", "pos_embed_interp",
+    "prefetch_weights", "prefix_attention", "prefix_kvcache_attention",
     "qkv_norm_rope_kvcache", "qkv_norm_split", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm",
     "rope_full", "rot_pos", "rotary_embedding", "rotary_embedding_rounded", "rotate_half", "rtc_pinned_mask",
     "segment_attention", "silu", "silu_and_mul", "varlen_attention", "zero_centered_rms_norm"
