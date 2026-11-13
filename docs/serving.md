@@ -3,7 +3,8 @@
 English | [简体中文](serving.zh-CN.md)
 
 `python -m xinfer.entrypoints.serve` (or `xinfer-serve`) serves one model on
-one GPU over WebSocket + msgpack, compatible with the x2robot desktop client.
+one GPU over WebSocket + msgpack, compatible with the x2robot desktop client. To serve
+one pool from several GPUs, put [xinfer-router](router.md) in front of one server per GPU.
 
 ## Process layout
 

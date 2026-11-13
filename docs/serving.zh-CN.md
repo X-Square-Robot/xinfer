@@ -2,7 +2,7 @@
 
 [English](serving.md) | 简体中文
 
-`python -m xinfer.entrypoints.serve`（或 `xinfer-serve`）在一块 GPU 上通过 WebSocket + msgpack 服务一个模型，与 x2robot 桌面客户端兼容。
+`python -m xinfer.entrypoints.serve`（或 `xinfer-serve`）在一块 GPU 上通过 WebSocket + msgpack 服务一个模型，与 x2robot 桌面客户端兼容。要用多块 GPU 服务同一个池，在每块 GPU 一个服务的前面放 [xinfer-router](router.zh-CN.md)。
 
 ## 进程布局
 

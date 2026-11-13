@@ -1,0 +1,102 @@
+# One pool of Wall-X 2B workers behind xinfer-router (docs/router.md#kubernetes). Each worker pod serves one GPU; the
+# routers find the ready workers through the headless Service, and robots connect to node port 30985.
+# Adapt the host paths of the checkpoint and the warmup requests.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xinfer-worker
+spec:
+  replicas: 2
+  strategy:  # replace one worker at a time without a spare GPU; with one, maxSurge 1 and maxUnavailable 0
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  minReadySeconds: 10  # the routers find a new worker by DNS (5 s TTL) before the next old one drains
+  selector:
+    matchLabels: {app: xinfer-worker}
+  template:
+    metadata:
+      labels: {app: xinfer-worker}
+    spec:
+      terminationGracePeriodSeconds: 30  # beyond --drain-timeout (10 s)
+      containers:
+        - name: xinfer-serve
+          image: xinfer:latest
+          imagePullPolicy: IfNotPresent
+          command: [xinfer-serve, --model, wallx2b, --checkpoint, /checkpoint, --port, "34000", --capacity, "15",
+                    --warmup, /assets/warmup.msgpack]
+          ports:
+            - {containerPort: 34000}
+          resources:
+            limits: {nvidia.com/gpu: 1}
+          startupProbe:  # loading and warmup
+            httpGet: {path: /ready, port: 34000}
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: {path: /ready, port: 34000}
+            periodSeconds: 1
+          livenessProbe:
+            httpGet: {path: /healthz, port: 34000}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: checkpoint, mountPath: /checkpoint, readOnly: true}
+            - {name: assets, mountPath: /assets, readOnly: true}
+            - {name: shm, mountPath: /dev/shm}  # the frontends' request buffers
+      volumes:
+        - {name: checkpoint, hostPath: {path: /srv/xinfer/wallx2b}}
+        - {name: assets, hostPath: {path: /srv/xinfer/assets}}
+        - {name: shm, emptyDir: {medium: Memory, sizeLimit: 2Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xinfer-workers
+spec:
+  clusterIP: None  # headless: the name resolves to the ready worker pods
+  selector: {app: xinfer-worker}
+  ports:
+    - {port: 34000}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: xinfer-worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: xinfer-worker}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xinfer-router
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: xinfer-router}
+  template:
+    metadata:
+      labels: {app: xinfer-router}
+    spec:
+      containers:
+        - name: xinfer-router
+          image: xinfer:latest
+          imagePullPolicy: IfNotPresent
+          command: [xinfer-router, --workers, "dns:xinfer-workers:34000", --port, "33985"]
+          ports:
+            - {containerPort: 33985}
+          readinessProbe:
+            httpGet: {path: /ready, port: 33985}
+            periodSeconds: 1
+          livenessProbe:
+            httpGet: {path: /healthz, port: 33985}
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xinfer-router
+spec:
+  type: NodePort
+  selector: {app: xinfer-router}
+  ports:
+    - {port: 33985, targetPort: 33985, nodePort: 30985}

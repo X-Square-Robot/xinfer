@@ -49,6 +49,7 @@ test = [
 
 [project.scripts]
 xinfer-serve = "xinfer.entrypoints.serve:main"
+xinfer-router = "xinfer.entrypoints.router:main"
 xinfer-profile = "xinfer.entrypoints.profile:main"
 
 [tool.setuptools.packages.find]

@@ -57,6 +57,7 @@
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
 | §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn，由 `cuda` 后端模块注册，与 `xinfer.ops` entry point 一起加载（§14.2）；`xinfer.ops.conformance` 未实现 |
 | §15 协议与前端 | 部分实现 | WebSocket + msgpack，兼容 x2robot 客户端；`xinfer.Policy` 进程内 API；Client SDK 与兼容适配未实现 |
+| §4 Router 与多卡服务 | 部分实现 | 设计见[集群服务](cluster_design.zh-CN.md)：每张 GPU 一个 `xinfer-serve`，前面是 `xinfer-router`（[router](router.zh-CN.md)：静态或 DNS 服务发现、逐请求路由或亲和、被动健康检查、重试、准入）；Kubernetes 示例部署文件和镜像（[router](router.zh-CN.md#kubernetes)）；worker 报告 `/info`，SIGTERM 时排空（[服务](serving.zh-CN.md)） |
 | §16 可观测性与基准工具 | 部分实现 | 服务通过 [/metrics](metrics.zh-CN.md) 导出 Prometheus 指标。使用[压测工具](benchmark.zh-CN.md)测单请求延迟和闭环容量，或用 [xinfer-profile](profiling.zh-CN.md) 分析算子、排队及各阶段执行时间。 |
 | §17 测试 | 部分实现 | CPU 单元与契约测试；GPU 与资产测试需要本地资产，手动运行；CI（GitHub Actions，`.github/workflows/ci.yml`）跑 ruff、仓库与文档检查和 CPU 测试 |
 | §18.1 仓库结构与命令行 | 与规划不同 | 目录以仓库为准；服务入口为 `xinfer-serve`（即 `python -m xinfer.entrypoints.serve`），profiling 入口为 `xinfer-profile`（`ops`）；统一的 `xinfer` 命令未实现 |
@@ -94,7 +95,7 @@
 
 - **SLO 调度器。** 核心只留策略插件接口（§7.5）。
 - **训练、RL、在线换权重。**
-- **多卡张量并行。** 首批模型单卡放得下；多卡用数据并行副本加 Router。
+- **多卡张量并行。** 首批模型单卡放得下；多卡用数据并行副本加 Router（[集群服务](cluster_design.zh-CN.md)）。
 - **GPU 阶段拆进程（`split`）。** v1 只实现 `colocated`，不实现阶段间 CUDA IPC、copy-ACK 或 MPS 生命周期；CPU Frontend 多进程仍在范围内。保留职责边界，不预建远程执行框架（§9.3）。
 - **默认开启改变数值的优化。** 例如近似阶段重叠（跨阶段复用近似 KV，会降低任务成功率）或减少去噪步数。量化作为显式配置提供，带精度门禁。
 - **自回归动作 token 模型**（FAST、OpenVLA 类）。阶段抽象为 decode 阶段预留接口，v1 不实现。
