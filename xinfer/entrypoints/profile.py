@@ -125,7 +125,7 @@ def _in_process(args) -> tuple[list[dict], dict, dict]:
     """Run the load in process; returns the rows, each request's ``(start, end)`` and meta fields."""
     from xinfer import ops
     from xinfer.config import apply_image_preprocess_device, resolve
-    from xinfer.entrypoints._factory import create_engine
+    from xinfer.engine import Engine
     from xinfer.frontend.protocol import read_requests
     from xinfer.models.registry import get_model_class
     from xinfer.observability import annotate, load_profile
@@ -143,8 +143,8 @@ def _in_process(args) -> tuple[list[dict], dict, dict]:
     quantization = options.get("quantization", "bf16")
     resolved = resolve(model, platform, model_name=args.model,
                        quantization=quantization if isinstance(quantization, str) else None)
-    engine = create_engine(platform, model, resolved.engine_config())
-    recorder = load_profile.SpanRecorder(platform.capabilities.cuda_interop)
+    engine = Engine(model, platform, resolved.engine_config())
+    recorder = load_profile.SpanRecorder(platform.is_cuda)
     try:
         engine.warmup(requests)
         annotate.configure(recorder)
@@ -291,7 +291,7 @@ def main(argv=None) -> int:
         return _load(args)
     from xinfer import ops
     from xinfer.config import ExplicitSettings, apply_image_preprocess_device, resolve
-    from xinfer.entrypoints._factory import create_engine
+    from xinfer.engine import Engine
     from xinfer.frontend.protocol import read_requests
     from xinfer.models.registry import get_model_class
     from xinfer.observability import annotate, op_profile
@@ -299,9 +299,8 @@ def main(argv=None) -> int:
     from xinfer.platforms import resolve_platform
 
     platform = resolve_platform(args.device)
-    if not platform.capabilities.cuda_interop:
-        raise SystemExit("xinfer-profile ops currently needs torch/Kineto profiling on a CUDA device")
-
+    if not platform.is_cuda:
+        raise SystemExit("xinfer-profile ops needs a CUDA device")
     args.out.mkdir(parents=True, exist_ok=True)
     options = apply_image_preprocess_device(json.loads(args.model_options), platform, default="cpu")
     ops.registry.load_plugins()
@@ -320,7 +319,7 @@ def main(argv=None) -> int:
         resolved = resolve(model, platform, model_name=args.model,
                            quantization=quantization if isinstance(quantization, str) else None,
                            explicit=ExplicitSettings(cudagraphs=cudagraphs))
-        engine = create_engine(platform, model, resolved.engine_config())
+        engine = Engine(model, platform, resolved.engine_config())
         try:
             for request in requests * 2:  # warmup: lazy initialization, autotuning, graph capture; costs if eager
                 engine.run(request)
