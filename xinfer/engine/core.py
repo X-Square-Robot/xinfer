@@ -48,7 +48,6 @@ from xinfer.engine.slots import PoolExhausted, SlotPool
 from xinfer.models.interface import DeviceImage, PreparedRequest, StageBatch, VLAModel
 from xinfer.observability.annotate import span
 from xinfer.observability.stats import RequestStats, StageStats
-from xinfer.platforms.devices import device_module_for
 from xinfer.platforms.interface import Platform
 
 logger = logging.getLogger(__name__)
@@ -147,6 +146,7 @@ def _timing_event(lane):
     return event
 
 
+
 class Engine:
     """Serves one model on one device: admission, per-stage queues and lanes, batching and chained dispatch.
 
@@ -184,6 +184,11 @@ class Engine:
                 of its consumer.
             RuntimeError: ``config.cudagraphs`` is set but the platform does not support graph capture.
         """
+        from xinfer.platforms.devices import device_module_for
+
+        if platform.capabilities.execution_model != "cuda-lanes":
+            raise ValueError("engine.core.Engine requires execution_model='cuda-lanes'; "
+                             f"got {platform.capabilities.execution_model!r} on {platform.name}")
         self.model = model
         self.platform = platform
         self.config = config = config or EngineConfig()
@@ -258,7 +263,7 @@ class Engine:
         # per device) with its own stream and a decoder created on first use. Requests in it are counted in
         # _device_inflight (engine thread only) and come back through _device_ready.
         self._device_stream = (self._device_module.Stream(device=platform.device)
-                               if platform.is_cuda or platform.capabilities.device_images else None)
+                               if self._device_module is not None else None)
         self._decoder = None
         self._device_requests: queue.Queue = queue.Queue()
         self._device_ready: list = []
@@ -366,7 +371,8 @@ class Engine:
                         "reserved %.2f GiB", variants, time.perf_counter() - started,
                         {stage: counters["graphs"] for stage, counters in stats.items()},
                         sum(counters["capture_ms"] for counters in stats.values()) / 1000,
-                        self._device_module.memory_reserved(self.platform.device) / 2 ** 30)
+                        (self._device_module.memory_reserved(self.platform.device) / 2 ** 30
+                         if self._device_module is not None else 0))
         return outputs
 
     def cudagraph_stats(self) -> dict:
@@ -427,16 +433,20 @@ class Engine:
         for lanes in self.lanes.values():
             for lane in lanes:
                 lane.cudagraphs = None
-        if self.platform.is_cuda:
-            torch.cuda.synchronize()
+        if self.platform.is_npu:
+            # TorchNPU's synchronize() and empty_cache() are per-device and need the device context.
+            with self._device_module.device(self.platform.device):
+                self._device_module.synchronize()
+                import gc
+
+                gc.collect()
+                self._device_module.empty_cache()
+        elif self._device_module is not None:
+            self._device_module.synchronize()
             import gc
 
             gc.collect()
-            torch.cuda.empty_cache()
-        elif self.platform.is_npu:
-            with self._device_module.device(self.platform.device):
-                self._device_module.synchronize()
-                self._device_module.empty_cache()
+            self._device_module.empty_cache()
 
     # ------------------------------------------------------------- engine loop
     def _bind_device(self) -> None:
@@ -524,7 +534,8 @@ class Engine:
                 self._waiting.popleft()
             request.admitted_at = time.perf_counter()
             stream = self._upload
-            stream_context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
+            stream_context = (self._device_module.stream(stream)
+                              if stream is not None else contextlib.nullcontext())
             admitted = True
             try:
                 with stream_context, span("admit", request=request.id, robot=request.robot):
@@ -577,7 +588,8 @@ class Engine:
             try:
                 if self._decoder is None:
                     self._decoder = DeviceImageDecoder(self.platform.device)
-                context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
+                context = (self._device_module.stream(stream)
+                           if stream is not None else contextlib.nullcontext())
                 with context, torch.inference_mode():
                     if stream is not None and request.inputs_ready is not None:
                         stream.wait_event(request.inputs_ready)

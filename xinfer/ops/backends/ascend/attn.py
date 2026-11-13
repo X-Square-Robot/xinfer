@@ -167,7 +167,8 @@ _SEGMENT_BOUNDS: dict[tuple[int, ...], torch.Tensor] = {}
 def _segment_supported(q, k, v, cu_seqlens, *, scale=None):
     """The check receives the operator's own parameter names, so a keyword call resolves here too."""
     return (_packed_supported(q, k, v)
-            and _varlen_accepts(q, k, v, cu_seqlens=_segment_bounds(cu_seqlens), max_seqlen=_segment_longest(cu_seqlens),
+            and _varlen_accepts(q, k, v, cu_seqlens=_segment_bounds(cu_seqlens),
+                                max_seqlen=_segment_longest(cu_seqlens),
                                 causal=False))
 
 

@@ -1,38 +1,55 @@
-"""Torch accelerator APIs used by the shared engine."""
+"""Torch accelerator APIs used by the shared engine.
+
+Each torch-vendor package mirrors the ``torch.cuda`` API (``torch.npu`` does). ``device_module_for``
+is the one lookup: the engine holds ``self._device_module`` and calls ``.Stream`` / ``.Event`` /
+``.stream(...)`` on it instead of writing ``torch.cuda.X`` directly, so a new vendor needs only
+this function plus its ``platforms/<device>.py``. Platforms whose numbering is not torch's (RPU)
+return ``None``.
+"""
 
 from __future__ import annotations
 
 from functools import partial
 from types import SimpleNamespace
 
-import torch
 
-
-def device_module_for(device: str | torch.device):
-    """Return the torch stream and event API for a device, or None on CPU."""
+def device_module_for(device):
+    """Return the torch stream and event API for a device, or None on CPU or a non-torch platform (RPU)."""
     kind = str(device).partition(":")[0]
     if kind == "cuda":
+        import torch
+
         return torch.cuda
     if kind == "npu":
+        import torch
         import torch_npu  # noqa: F401 - registers the npu device and torch.npu
 
         return torch.npu
     return None
 
 
-def graph_api_for(device: str | torch.device):
-    """Return the graph class, pool and capture context for an accelerator."""
+def graph_api_for(device):
+    """Return the graph class, pool and capture context for an accelerator.
+
+    CUDA answers with ``torch.cuda``. A vendor whose graph API is named differently
+    (``NPUGraph`` on Ascend) is adapted once here so the rest of the engine can keep
+    the same call shape as ``CUDAGraph``. Returns ``None`` on CPU / RPU where there is no graph.
+    """
     module = device_module_for(device)
-    if module is not None and module is not torch.cuda:
-        return SimpleNamespace(
-            CUDAGraph=module.NPUGraph,
-            graph_pool_handle=module.graph_pool_handle,
-            graph=partial(module.graph, auto_dispatch_capture=True),
-        )
-    return module
+    if module is None:
+        return None
+    import torch
+
+    if module is torch.cuda:
+        return module
+    return SimpleNamespace(
+        CUDAGraph=module.NPUGraph,
+        graph_pool_handle=module.graph_pool_handle,
+        graph=partial(module.graph, auto_dispatch_capture=True),
+    )
 
 
-def jpeg_decoder_for(device: str | torch.device):
+def jpeg_decoder_for(device):
     """Create the selected platform's JPEG decoder, loading no other platform's codec.
 
     The decoder has a canonical, indexed ``device``, is called with a list of CPU uint8 JPEG tensors,
@@ -43,6 +60,8 @@ def jpeg_decoder_for(device: str | torch.device):
     if module is None:
         raise ValueError('DeviceImage inputs (image_preprocess_device "gpu") '
                          f'need a CUDA or NPU device, not {device}')
+    import torch
+
     device = torch.device(device)
     if device.index is None:
         device = torch.device(device.type, module.current_device())

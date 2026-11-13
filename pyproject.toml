@@ -17,12 +17,15 @@ dependencies = [
 
 [project.optional-dependencies]
 # Tokenization, image processing, and pose conversion for Wall-OSS and Wall-X 2B.
+# Wall-X 2B on RPU shares the same stack (its CPU input pipeline needs transformers 5.2.0 and torchvision).
 models = [
     "tokenizers>=0.19",
     "opencv-python-headless>=4.10",
     "pyyaml>=6",
     "numba>=0.60",
     "pillow>=10",
+    "transformers==5.2.0",
+    "torchvision>=0.25",
 ]
 # image_preprocess_device = "gpu": JPEG decoding with nvJPEG (batched CUDA decode_jpeg).
 gpu-image = [
@@ -37,6 +40,8 @@ serve = [
 test = [
     "pytest>=7",
     "websockets>=12",
+    # The RPU host tests compare banded cameras against Torchvision on CPU.
+    "torchvision>=0.25",
     "prometheus_client>=0.20",
     "msgpack>=1.0",
     "msgpack-numpy>=0.4.8",

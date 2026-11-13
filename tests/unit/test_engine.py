@@ -67,7 +67,7 @@ def test_direct_engine_rejects_invalid_stream_priorities(priorities, message):
 
 def test_shutdown_after_initialization_still_drains_queued_requests():
     engine = Engine(Pipe(), CPU, start=False)
-    initialized, proceed = threading.Event(), threading.Event()
+    proceed = threading.Event()
     queued = engine.submit(_req(1))
     engine.start()
     shutdown = threading.Thread(target=engine.shutdown)

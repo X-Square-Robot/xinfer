@@ -9,7 +9,7 @@ Stream-K reductions may differ at rounding level across runs.
 
 import torch
 
-from xinfer.ops.backends.ascend._support import VERSION, bridge, canonical, has_functions, partial, xc
+from xinfer.ops.backends.ascend._support import VERSION, bridge, canonical, partial, xc
 from xinfer.ops.reference import gemm as reference
 from xinfer.ops.registry import register
 
