@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from concurrent.futures import wait
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -535,3 +536,36 @@ def test_device_images_fail_their_request_without_a_cuda_device():
         assert torch.equal(engine.run(_req(3))["y"], _expect(3))
     assert engine.slots.in_use() == 0
     engine.shutdown()
+
+
+def test_health_reports_an_admitted_request_that_does_not_finish():
+    gate = threading.Event()
+    engine = Engine(Pipe(gate=gate), CPU)
+    try:
+        future = engine.submit(_req(1))
+        time.sleep(0.3)
+        assert engine.health() is None  # no hang check without a timeout
+        assert "no progress" in engine.health(hang_timeout=0.2)
+        gate.set()
+        future.result(timeout=10)
+        assert engine.health(hang_timeout=0.2) is None
+    finally:
+        gate.set()
+        engine.shutdown()
+
+
+def test_health_reports_a_sticky_device_error(monkeypatch):
+    engine = Engine(Pipe(), CPU)
+    try:
+        assert engine.health() is None
+        engine.platform = replace(CPU, capabilities=replace(CPU.capabilities, device_type="cuda"))
+
+        class LostStream:  # after a sticky error every CUDA call raises it
+            def query(self):
+                raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+        monkeypatch.setattr(torch.cuda, "default_stream", lambda device: LostStream())
+        assert engine.health() == "device error: CUDA error: an illegal memory access was encountered"
+    finally:
+        engine.platform = CPU
+        engine.shutdown()

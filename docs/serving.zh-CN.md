@@ -74,9 +74,11 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkp
 | `--resolved-config`, `--dry-run` | 写出解析后的设置及其来源；打印这些设置后退出 |
 | `--profile-dir` | 记录引擎的 span，停止时把每个请求的引擎分段写到该目录；用于剖析运行（`xinfer-profile load --serve`，[剖析](profiling.zh-CN.md#经过-xinfer-serve--serve)），记录随请求数增长 |
 | `--disable-metrics` | 不记录 Prometheus 指标；`GET /metrics` 返回 404（[指标](metrics.zh-CN.md)） |
+| `--hang-timeout` | 已准入的请求最多可用的秒数，超过则认为引擎挂起（默认 30）；0 关闭该检查 |
+| `--drain-timeout` | 收到 SIGTERM 后前端回复已收到请求最多可用的秒数（默认 10） |
 | `--reference-ops`, `--op-backends` | 只使用 torch 参考算子；为每个算子按后端、库或两者固定实现（`op=cuda`、`op=xcompute`、`op=cuda:xcompute`、`op=reference`），固定的实现优先于 `--reference-ops` |
 
-SIGINT/SIGTERM 会停止前端，释放 graph 和锁页缓冲区，并以 0 退出。服务每 0.5 s 检查一次 `Engine.health()`；当引擎无法继续服务（引擎线程或完成线程已停止）时，它以同样的方式关闭并以 1 退出，以便其监管进程重启它。
+SIGTERM 让服务排空：前端停止接受连接（包括健康检查），对之后的消息返回 `unavailable`，回复已收到的每个请求后以代码 1001（going away）关闭连接；此后才到达前端的消息得不到响应。然后服务释放 graph 和锁页缓冲区并以 0 退出，若这些请求在 `--drain-timeout` 秒内没有回复完则以 1 退出。SIGINT 的处理相同，但终端里的 Ctrl-C 也会发给前端，使它们立即停止。服务每 0.5 s 检查一次 `Engine.health()`。当引擎无法继续服务（引擎线程或完成线程已停止、设备报告 CUDA 粘滞错误，或者有请求准入超过 `--hang-timeout` 秒仍未完成）时，服务停止前端并以 1 退出，不等待设备，以便其监管进程重启它。挂起的 kernel 在服务退出后仍会继续运行（GPU 会释放它的显存），因此重启后的服务与它共用 GPU，直到它结束或 GPU 被重置。
 
 ## 压测
 

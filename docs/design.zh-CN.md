@@ -39,7 +39,7 @@
 |---|---|---|
 | §4 包间依赖方向 | 已实现 | `tests/unit/test_layering.py` 检查（含 `frontend/`、`observability/`）；`engine/` 不依赖 `ops/`、`frontend/` 两条尚未加入检查 |
 | §4 设备边界 | 未实现 | `engine/` 直接调用 `torch.cuda`，并按 `Platform.is_cuda` 分支；`test_layering.py` 只检查 `platforms/interface.py`、`models/interface.py` 不 import torch |
-| §5 取消与单请求错误 | 部分实现 | 未发射的取消请求直接丢弃，已发射的跑完后丢弃结果；阶段执行、接纳时的上传或取批时出错，只让相应的请求失败，并释放其 slot。引擎线程或完成线程停止时 `xinfer-serve` 以状态 1 退出；设备粘滞错误的识别（`Platform.classify_error`）与 DRAINING 未实现 |
+| §5 取消与单请求错误 | 部分实现 | 未发射的取消请求直接丢弃，已发射的跑完后丢弃结果；阶段执行、接纳时的上传或取批时出错，只让相应的请求失败，并释放其 slot。引擎线程或完成线程停止、设备报告 CUDA 粘滞错误（由 `Engine.health` 查询），或有请求准入超过 `--hang-timeout` 仍未完成时，`xinfer-serve` 以状态 1 退出；收到 SIGTERM 时 `xinfer-serve` 排空（前端回复已收到的请求、拒绝新请求，上限为 `--drain-timeout`）；`Platform.classify_error` 未实现 |
 | §6.3 三条调度规则 | 已实现 | 上游发射后请求即进入下游队列，下游 lane 在 GPU 上等待事件；零等待组批；完成线程只等最终事件（`xinfer/engine/core.py`） |
 | §6.4 组批精度 | 已实现 | Wall-OSS 参考组合允许 action 阶段使用 B1、B2、B4 和 B8。优化组合、vision 和 prefill 只使用 B1。 |
 | §7.1 接纳 | 部分实现 | `submit` 返回 Future，拒绝时为 `AdmitError`（`queue_full`、`per_robot_limit`、`stopped`）；`admission_timeout` 未实现 |

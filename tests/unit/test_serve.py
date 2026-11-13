@@ -11,9 +11,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 pytest.importorskip("websockets")
 pytest.importorskip("msgpack_numpy")
+from websockets.exceptions import ConnectionClosedOK  # noqa: E402
 from websockets.sync.client import connect  # noqa: E402
 
 from xinfer.frontend.protocol import packb, unpackb  # noqa: E402
@@ -323,6 +325,73 @@ def test_metrics_can_be_disabled():
     finally:
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=30) == 0, "".join(lines[-20:])
+
+
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+
+
+@pytest.mark.parametrize("flag, options, reason", [
+    ("hang", (), "no progress"),  # the dispatch never returns
+    pytest.param("spin", ("--device", "cuda", "--enforce-eager"), "no progress", marks=CUDA),  # the device hangs
+])
+def test_an_engine_that_cannot_serve_makes_the_server_exit_1(flag, options, reason):
+    port, process, lines = _start("--hang-timeout", "1", *options)
+    try:
+        with connect(f"ws://127.0.0.1:{port}", max_size=None) as websocket:
+            websocket.recv()
+            websocket.send(packb({"x": np.arange(4, dtype=np.float32), flag: True}))
+            assert process.wait(timeout=15) == 1
+        assert any(reason in line for line in lines), "".join(lines[-20:])
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+
+def test_sigterm_answers_the_requests_received_then_exits_0():
+    port, process, lines = _start()
+    try:
+        with connect(f"ws://127.0.0.1:{port}", max_size=None) as websocket:
+            websocket.recv()
+            websocket.send(packb({"x": np.arange(4, dtype=np.float32), "slow": True}))
+            time.sleep(0.3)
+            process.send_signal(signal.SIGTERM)
+            websocket.send(packb({"x": np.arange(4, dtype=np.float32)}))  # read once the first is answered
+            assert unpackb(websocket.recv())["status"] == "ok"
+            assert unpackb(websocket.recv())["status"] == "unavailable"
+            with pytest.raises(OSError):  # no longer listening
+                connect(f"ws://127.0.0.1:{port}", open_timeout=2)
+            with pytest.raises(ConnectionClosedOK) as closed:
+                websocket.recv(timeout=10)
+            assert closed.value.rcvd.code == 1001  # going away
+        assert process.wait(timeout=30) == 0, "".join(lines[-20:])
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+
+def test_a_drain_that_does_not_finish_exits_1_and_the_frontends_still_clean_up():
+    def shm():
+        return {p for p in os.listdir("/dev/shm") if p.startswith("xinfer-")}
+
+    before = shm()
+    port, process, lines = _start("--drain-timeout", "1")
+    try:
+        frontend_buffers = shm() - before
+        assert frontend_buffers
+        with connect(f"ws://127.0.0.1:{port}", max_size=None) as websocket:
+            websocket.recv()
+            websocket.send(packb({"x": np.arange(4, dtype=np.float32), "hang": True}))
+            time.sleep(0.3)
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=15) == 1
+        assert any("not answered within --drain-timeout" in line for line in lines), "".join(lines[-20:])
+        deadline = time.time() + 10
+        while shm() & frontend_buffers:  # the frontends exited too
+            assert time.time() < deadline
+            time.sleep(0.1)
+    finally:
+        if process.poll() is None:
+            process.kill()
 
 
 def test_shutdown_is_clean(server):

@@ -36,7 +36,7 @@ dashboard against a local service.
 | `xinfer_connections` | gauge | | open WebSocket connections (robots) |
 | `xinfer_requests_waiting` | gauge | | requests waiting for admission (`--max-queued-requests` bounds them) |
 | `xinfer_requests_running` | gauge | | admitted requests not finished yet (`--max-running-requests` bounds them) |
-| `xinfer_engine_healthy` | gauge | | 1 while the engine's threads run, else 0 (the server then exits) |
+| `xinfer_engine_healthy` | gauge | | 1 while the engine's threads run and its device has no error, else 0 (the server then exits) |
 | `xinfer_admission_wait_seconds` | histogram | | submission to admission in the engine |
 | `xinfer_stage_wait_seconds` | histogram | `stage` | per request: from when the stage can start (the request's inputs on the device, or its upstream stages finished) to the start of its dispatch on the device |
 | `xinfer_stage_execution_seconds` | histogram | `stage` | per request: the device time of the stage dispatch that served it (CUDA timing events after the dispatch's waits and after the stage; host times on the CPU) |

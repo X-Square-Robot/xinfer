@@ -28,7 +28,7 @@ completion thread:
 
 `_select_batch` 把选中的请求从阶段队列中移除。`_execute_stage_batch` 提交异步 CUDA 工作并记录其事件；它返回并不代表 GPU 已执行完成。
 
-如果等待最终阶段事件时抛出异常，该批请求失败，完成线程继续运行。`Engine.health()` 返回引擎无法继续服务的原因（引擎线程或完成线程已停止），否则返回 None；`xinfer-serve` 会轮询它（[服务](serving.zh-CN.md)）。设置了 `Engine.stats_sink` 时，完成线程把每个完成请求的准入等待以及各阶段的等待和执行时间作为 `RequestStats` 报告给它（[指标](metrics.zh-CN.md#采集方式)）。
+如果等待最终阶段事件时抛出异常，该批请求失败，完成线程继续运行。`Engine.health(hang_timeout=None)` 返回引擎无法继续服务的原因，否则返回 None：引擎线程或完成线程已停止、设备报告 CUDA 粘滞错误（对默认 stream 做一次不等待的查询即可得到），或者在给出 `hang_timeout` 时，有已准入的请求超过这么多秒仍未完成。`xinfer-serve` 会轮询它（[服务](serving.zh-CN.md#运行)）。设置了 `Engine.stats_sink` 时，完成线程把每个完成请求的准入等待以及各阶段的等待和执行时间作为 `RequestStats` 报告给它（[指标](metrics.zh-CN.md#采集方式)）。
 
 ## 调度规则
 

@@ -92,12 +92,23 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkp
 | `--resolved-config`, `--dry-run` | write the resolved settings with their sources; print them and exit |
 | `--profile-dir` | record the engine's spans and write each request's engine segments to this directory at shutdown; for profiling runs (`xinfer-profile load --serve`, [profiling](profiling.md#through-xinfer-serve---serve)), the records grow with the requests |
 | `--disable-metrics` | record no Prometheus metrics; `GET /metrics` answers 404 ([metrics](metrics.md)) |
+| `--hang-timeout` | seconds an admitted request may take before the engine counts as hung (default 30); 0 disables the check |
+| `--drain-timeout` | seconds the frontends may take after SIGTERM to answer the requests they received (default 10) |
 | `--reference-ops`, `--op-backends` | use only torch reference operators; pin an implementation per operator by backend, library or both (`op=cuda`, `op=xcompute`, `op=cuda:xcompute`, `op=reference`), pins win over `--reference-ops` |
 
-SIGINT/SIGTERM stops the frontends, releases graphs and pinned buffers, and
-exits 0. The server checks `Engine.health()` every 0.5 s; when the engine can
-no longer serve (its engine or completion thread has stopped), it shuts down
-the same way and exits 1, so that its supervisor can restart it.
+SIGTERM drains the server: the frontends stop accepting connections (health
+checks included), answer further messages `unavailable`, answer every request
+they had received and then close the connections with code 1001 (going away);
+a message that reaches a frontend after that gets no response. The server then
+releases graphs and pinned buffers and exits 0, or exits 1 when the requests
+are not answered within `--drain-timeout` seconds. SIGINT does the same, but Ctrl-C in a terminal also reaches the
+frontends and stops them at once. The server checks `Engine.health()` every 0.5 s. When the engine can
+no longer serve (its engine or completion thread has stopped, the device
+reports a sticky CUDA error, or a request admitted more than `--hang-timeout`
+seconds ago has not finished), the server stops the frontends and exits 1
+without waiting for the device, so that its supervisor can restart it. A hung
+kernel keeps running after the server exits (the GPU frees its memory), so the
+restarted server shares the GPU with it until it ends or the GPU is reset.
 
 ## Load testing
 

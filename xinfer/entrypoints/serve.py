@@ -91,6 +91,12 @@ def parse_args(argv=None):
     p.add_argument("--frontends", type=int, default=None, help="frontend processes (default 2)")
     p.add_argument("--disable-metrics", action="store_true",
                    help="do not record Prometheus metrics; GET /metrics answers 404 (docs/metrics.md)")
+    p.add_argument("--hang-timeout", type=float, default=30.0,
+                   help="seconds an admitted request may take before the engine counts as hung and the server exits "
+                        "1 (default 30; 0 disables)")
+    p.add_argument("--drain-timeout", type=float, default=10.0,
+                   help="seconds the frontends may take on SIGTERM to answer the requests they received; then the "
+                        "server exits 1 (default 10)")
     p.add_argument("--frontend-workers", type=int, default=None, help="processing threads per frontend (default 4)")
     p.add_argument("--shm-buffers", type=int, default=None, help="shared-memory buffers per frontend")
     p.add_argument("--shm-buffer-mib", type=int, default=32)
@@ -180,10 +186,12 @@ def main(argv=None) -> None:
        (``run_frontend``), each with a pipe and its own shared-memory ring, and start one bridge thread per pipe;
        when every frontend reports that it listens, print ``XINFER READY <host>:<port> frontends=<N>``.
     6. Wait for SIGINT/SIGTERM, the exit of any frontend, or an engine that can no longer serve
-       (``Engine.health``, checked every 0.5 s, when the engine's sampled metrics are updated too); then terminate
-       and join the frontends, shut the engine down, unregister and unmap the shared memory, remove the temporary
-       metrics directory, and leave with ``os._exit`` (status 0 after a signal, 1 when a
-       frontend died or the engine stopped), skipping interpreter finalization so CUDA objects are not
+       (``Engine.health`` with ``--hang-timeout``, checked every 0.5 s, when the engine's sampled metrics are updated
+       too); then terminate the frontends and wait up to ``--drain-timeout`` while they answer the requests they
+       received (not when the engine failed: it answers none), shut the engine down and unregister and unmap the
+       shared memory (not when the engine failed or the drain timed out: both wait for the device), remove the
+       temporary metrics directory, and leave with ``os._exit`` (status 0 after a signal, 1 when a frontend died,
+       the engine failed or the drain timed out), skipping interpreter finalization so CUDA objects are not
        destroyed after the CUDA context.
 
     Args:
@@ -344,7 +352,7 @@ def main(argv=None) -> None:
         signal.signal(signal_number, lambda *_: stop.set())
     reason = None
     while not stop.is_set() and all(p.is_alive() for p in processes):
-        reason = engine.health()
+        reason = engine.health(hang_timeout=args.hang_timeout)
         if engine_metrics is not None:
             engine_metrics.sample(engine)
         if reason is not None:
@@ -352,15 +360,20 @@ def main(argv=None) -> None:
             break
         stop.wait(0.5)
     for process in processes:
-        process.terminate()
+        process.terminate()  # a frontend answers the requests it received, then exits
+    deadline = time.monotonic() + (args.drain_timeout if reason is None else 0)  # a failed engine answers none
     for process in processes:
-        process.join(timeout=10)
-    engine.shutdown()
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
+    if reason is None and any(p.is_alive() for p in processes):
+        reason = f"requests not answered within --drain-timeout {args.drain_timeout:g} s"
+        logger.error("%s; exiting", reason)
+    if reason is None:  # a failed device may never become idle, and both wait for it
+        engine.shutdown()
+        with reader_lock:
+            reader.close()
     if recorder is not None:
         logger.info("engine requests written to %s", load_profile.write_engine_requests(recorder, engine.stages,
                                                                                        args.profile_dir))
-    with reader_lock:
-        reader.close()
     if metrics_dir is not None:
         _stop_metrics(metrics_dir, metrics_temporary, [process.pid for process in processes] + [os.getpid()])
     logger.info("stopped; dispatches %s", dict(engine.stats))
