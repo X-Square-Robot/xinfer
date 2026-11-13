@@ -29,14 +29,14 @@
 
 ## 昇腾 950DT
 
-两行均于 2026-11-13 在独占预留的 Ascend 950DT（CANN 9.1.1、TorchNPU 2.10.0.post4）上测得：Wall-OSS 行在本分支版本 `f07d8d8`、walloss 交付版 `xcompute.so`（SHA-256 `fad3a6c1…`）及其组合 Python 包、AOT 工件与组合快路 flags（MX8 down prepack/split-K、G2112、SMALLM、COPYKILL、RMSFUSE）开启下测得；Wall-X 2B 行在本分支版本 `49ad6d5`、r5 交付版（SHA-256 `903ff6de…`，新增 2B qkv 尾融合核）上，均经 `XINFER_XCOMPUTE_LIBRARY` 与配套 Python 包加载。两模型均使用默认算子选择：两模型调用的每一个算子都解析到 `ascend:xcompute`，且对完整请求通过的逐 layout 分发审计确认每次调用都运行在 xcompute 入口上（Wall-X 2B：21/21 个算子、全部调用 layout 准入；Wall-OSS：11/11）。任一基准中都没有算子回退到 torch 参考实现。[昇腾指南](ascend950dt.zh-CN.md)列出每个算子的入口。
+两行均于 2026-11-14 在独占预留的 Ascend 950DT（CANN 9.1.1、TorchNPU 2.10.0.post4）上测得：Wall-OSS 行在本分支版本 `f07d8d8`、walloss 交付版 `xcompute.so`（SHA-256 `fad3a6c1…`）及其组合 Python 包、AOT 工件与组合快路 flags（MX8 down prepack/split-K、G2112、SMALLM、COPYKILL、RMSFUSE）开启下测得；Wall-X 2B 行在本分支版本 `49ad6d5`、r5 交付版（SHA-256 `903ff6de…`，新增 2B qkv 尾融合核）上，均经 `XINFER_XCOMPUTE_LIBRARY` 与配套 Python 包加载。两模型均使用默认算子选择：两模型调用的每一个算子都解析到 `ascend:xcompute`，且对完整请求通过的逐 layout 分发审计确认每次调用都运行在 xcompute 入口上（Wall-X 2B：21/21 个算子、全部调用 layout 准入；Wall-OSS：11/11）。任一基准中都没有算子回退到 torch 参考实现。[昇腾指南](ascend950dt.zh-CN.md)列出每个算子的入口。
 
 | 模型 | 精度与组合 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 最高实测吞吐 | 数值一致性 |
 |---|---|---|---|---|---|---|---|
-| Wall-OSS | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | **37.44 ms**（谱系组合栈，全部刀法开启） | 5 | 127 ms | 139 ms | 31.9 req/s | quick100 B1，对 BF16 参考 −6.45 %：PASS |
-| Wall-X 2B | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | **31.12 ms**（谱系组合栈，全部刀法开启） | 10 | 87 ms | 108 ms | 54.9 req/s | 固定噪声动作门，对参考组合 max_abs 0.0051：PASS |
+| Wall-OSS | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | **38.98 ms**（谱系组合栈，全部刀法开启） | 5 | 127 ms | 139 ms | 31.9 req/s | quick100 B1，对 BF16 参考 −6.45 %：PASS |
+| Wall-X 2B | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | **27.78 ms**（谱系组合栈，全部刀法开启） | 10 | 87 ms | 108 ms | 54.9 req/s | 固定噪声动作门，对参考组合 max_abs 0.0051：PASS |
 
-加粗延迟数字为迄今最强实测组合（谱系组合栈，含精度门：quick100 −6.45 % / 动作门 max_abs 0.0051）；Wall-OSS 容量列暂引集成分支口径。谱系栈向本分支的移植进行中，落地后将在分支组合上复测并更新本表。加粗的 Wall-X 2B 行最新一次实测含 xcompute 侧 adafast lib 刀（.so 不入仓，随库交付；重链库 SHA-256 `3c26927e…`）。同名分支组合在把提示宽度行数垫到 64 的倍数、使通用 GEMM 走 compact 计划后，实测 41.72 ms、单卡 8 台（服务端 P50/P95 93/108 ms、45.6 req/s），动作门逐位相同；输出行彼此独立，因此垫行调度是精确的。该实测取自垫行提交所在代码树，而非其后的文档提交。Wall-OSS 行的最新一次实测在组合栈之上含 SAMU 向量化与 vision bias-finish 融合两刀，设备时间 −1.08 ms。两行加粗数值均为全部刀法开启的谱系组合栈实测，包含 packed-row GEMM dispatch、witness-fused attention 与 layout-native projections 这些路径。容量列与延迟列来自不同口径：容量按 150 ms 规则阶梯，延迟按单请求 50×3 双序中位，两者不可互换。
+加粗延迟数字为迄今最强实测组合（谱系组合栈，全部刀法开启，含精度门：quick100 −6.45 % / 动作门 max_abs 0.0051）：Wall-OSS 38.98 ms、Wall-X 2B 27.78 ms，均为独占 950DT（卡 3，flock 全程）单请求 50×3 双序会话的 total P50。Wall-OSS 此前的单元格引用的是同一组合的引擎窗口中位（本轮 37.31 ms）；现改为 total 单请求口径，使两行同一口径——这部分差异来自口径切换而非回归。Wall-OSS 行在组合栈之上新增 decode-attention r4 核对与 layout-native o_projection（decode 族改为行主出口，投影只需一段连续 A，不再拼 16 段跨步 head slab；模型输出 6 轮 × 50 次逐位相同），引擎中位依次为 43.99（全关）→ 39.71（packed-row GEMM dispatch、copy kill、融合 RMS、小 M 投影）→ 38.22（SAMU 向量化 + vision bias-finish 融合）→ 37.65（decode attention）→ 37.31 ms（layout-native 投影），quick100 仍 PASS 于 −6.46 %。Wall-X 2B 行新增三把图像通路与搬运刀：三视图 DVPP 解码波（三次解码事务并成一波，取代三次串行 send/get）、YUV→RGB + resize 链图捕获（每个解码几何一张 NPU 图，服务期回放，像素逐字节相同）、视觉搬运三刀（一次 packed-qkv permute 取代三次 unbind 拷贝、merge 序记忆化、四角 gather 提升）。动作门与谱系内每个更早的臂逐位相同，对参考组合的余量未缩（0.0051 对 0.0062 带）；成对 50×3 双序会话把 total P50 从 31.15 降到 27.78 ms，三个候选轮全低于三个对照轮。Wall-X 2B 构建仍随库交付 adafast 动作核（SHA-256 `3c26927e…`，不入仓）。容量列刻意不改：本轮用的是吞吐轮协议（Wall-OSS 4 台 × 320 行/轮、Wall-X 2B 6 台 × 480 行/轮，各 8 轮、零错误零缺失；Wall-OSS 628 ms / 6.09 req/s，全关时 901 ms / 4.26 req/s），不是 150 ms 规则阶梯，故容量单元格保留此前的阶梯实测。同名分支组合在把提示宽度行数垫到 64 的倍数、使通用 GEMM 走 compact 计划后，实测 41.72 ms、单卡 8 台（服务端 P50/P95 93/108 ms、45.6 req/s），动作门逐位相同；输出行彼此独立，因此垫行调度是精确的。
 
 昇腾两行的测量条件：
 
