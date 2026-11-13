@@ -44,17 +44,21 @@ reference in either benchmark. The [Ascend guide](ascend950dt.md) lists each ope
 | Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 47.75 ms | 4 | 120.4 ms | 129.9 ms | 29.2 req/s | quick100 B1, DVPP −6.77 % against the BF16 reference: PASS |
 | Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 51.05 ms | 6 | 93 ms | 111 ms | 33.4 req/s | fixed-noise action gate against the reference composition: PASS |
 
-- **Wall-OSS** used a flow and an RTC request as the single-request set and service warmup, `image_preprocess_device` on the NPU (DVPP), and the synthetic desktop load with RTC at 4 and 6 robots — eight rounds per count, zero errors, zero missing responses. At four robots the server P50/P95 medians are 120.4/129.9 ms at 22.1 req/s; six robots measured 176.2/187.7 ms at 29.2 req/s, above the 150 ms rule, so the capacity is bounded at four robots while six robots set the highest measured rate. The single request splits into prepare 2.06 ms, engine 44.94 ms and output 0.15 ms.
-- **Wall-X 2B** used the 216-request latency capture as the single-request set (fixed noise seed 20261112), two requests as service warmup, and the synthetic desktop load with RTC at 4 and 6 robots — sixteen rounds, zero errors, zero missing responses. At four robots the server P50/P95 medians are 61.7/77.8 ms and at six robots 93/111 ms at 33.4 req/s, both below the 150 ms rule. Its single request splits into prepare 2.60 ms, engine 48.40 ms and output 0.15 ms.
+Conditions for the Ascend rows:
+
+| # | Model options | Single-request input set | Load | Server warmup | Validation |
+|---|---|---|---|---|---|
+| 3 | defaults, `image_preprocess_device` on the NPU (DVPP) | a flow and an RTC request | synthetic desktop observations with RTC | the same two | quick100 B1 ([precision gate](precision.md)) |
+| 4 | defaults, `image_preprocess_device` on the NPU (DVPP) | the 216 requests of the reference capture (fixed noise seed 20261112) | synthetic desktop observations with RTC | two of them | fixed-noise action gate |
 
 Both models' rows report one wiring: the xcompute package's own entries, which mix CANN ACLNN Matmul,
 FusedInferAttentionScore V5 and official operators with TileLang and AOT custom kernels inside xcompute. At the
 backend-selection level both models name xcompute by default; TorchNPU's own operators and the CANN bridge
 remain opt-in pins (`--op-backends linear=ascend:torch_npu`).
 
-Both checks are end to end. Wall-OSS passed the internal precision gate with image preprocessing on the NPU
-(DVPP), the same path the benchmark used. Wall-X 2B ran a fixed-noise action check: ten requests with injected
-deterministic initial noise through the default dispatch and through the reference composition of the same
-build, comparing the denormalized action predictions end to end.
+The precision gates for both rows are end-to-end and ran through the served model on the same path the
+benchmark used, with image preprocessing on the NPU (DVPP). The [precision gate doc](precision.md)
+defines the quick100 B1 gate; the Wall-X 2B gate compares fixed-noise action predictions against the
+reference composition of the same build.
 
 See the [Ascend guide](ascend950dt.md) for the operator and graph configuration.
