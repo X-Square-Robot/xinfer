@@ -282,24 +282,23 @@ def test_gemm_family_norms_quantize_the_bf16_norm():
     assert torch.equal(q.view(torch.uint8), expected[0].view(torch.uint8)) and torch.equal(s, expected[1])
 
 
-def test_packed_weight_reuse_and_release(monkeypatch):
+def test_mxfp8_packings_go_with_their_weight(monkeypatch):
+    """An MXFP8 weight is packed once per operator; its entries go when its values or scales are freed, so a weight
+    allocated later at the same address gets its own packing."""
+    import gc
     from types import SimpleNamespace
-    from weakref import ref
 
-    from xinfer.ops.backends.cuda import mxfp8 as cuda_mxfp8
+    from xinfer.ops.backends.cuda import gemm
 
-    def prepack(weight, **options):
-        # The SM120 tile layout also keeps a contiguous row-major weight for the generic GEMM.
-        return SimpleNamespace(tensors={"rows": weight.contiguous()})
-
-    monkeypatch.setattr(cuda_mxfp8, "xc", SimpleNamespace(prepack_weight=prepack))
+    packed = []
+    monkeypatch.setattr(gemm, "xc", SimpleNamespace(prepack_weight=lambda q, op, scale: packed.append(op) or op))
+    monkeypatch.setattr(gemm, "_packed", {})
     q, scales = mxfp8.quantize(torch.ones(32, 128, dtype=torch.bfloat16))
-    owner = ref(q)
-    packed = cuda_mxfp8._weight("gemm", (q, scales))
-    assert packed is cuda_mxfp8._weight("gemm", (q, scales))
-    assert packed.tensors["rows"].untyped_storage() is q.untyped_storage()
+    assert gemm._mxfp8_weight("gemm", (q, scales)) == "gemm" == gemm._mxfp8_weight("gemm", (q, scales))
+    assert gemm._mxfp8_weight("gemm_glu", (q, scales)) == "gemm_glu" and packed == ["gemm", "gemm_glu"]
     del q
-    assert owner() is None  # the packing can stay in use without retaining the tensor that owns the cache
+    gc.collect()
+    assert gemm._packed == {}
 
 
 @pytest.mark.gpu
