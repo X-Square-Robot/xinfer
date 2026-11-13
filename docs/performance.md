@@ -2,7 +2,20 @@
 
 English | [简体中文](performance.zh-CN.md)
 
-These upstream measurements from November 9, 2026 cover Wall-OSS and Wall-X 2B on one RTX 5090 with the optimized BF16 composition. Both models used `benchmarks/performance.py` and the [same benchmark protocol](benchmark.md#performance-table).
+## Capacity with the latency-knee protocol
+
+These BF16 measurements used an otherwise idle RTX 5090, PyTorch 2.10.0+cu130 and flash-attn 2.8.3.post1. A count fails if any round has errors or missing responses, or if median server P50 rises by more than 50% from the previous tested count. Host time is the sum of the median preparation and output times. The components may not add up exactly to the median total.
+
+| Model | Single request P50 (host + engine) | Robots | Server P50 / P95 at capacity | Peak req/s | Build and date |
+|---|---|---:|---|---:|---|
+| Wall-OSS | 47.1 ms (2.6 + 44.5) | 4 | 115 / 134 ms | 25.8 | xcompute `c0d03ca`, 2026-11-13 |
+| Wall-X 2B | 22.3 ms (3.5 + 18.8) | 14 | 84 / 108 ms | 81.5 | xcompute `24b678f`, 2026-11-12 |
+
+These upstream runs used the request sets described below. For new measurements follow the [benchmark protocol](benchmark.md#performance-table). The November 9 table and the Ascend results on this page used the fixed 150 ms limit.
+
+## RTX 5090 with the 150 ms latency limit
+
+These upstream measurements from November 9, 2026 cover Wall-OSS and Wall-X 2B on one RTX 5090 with the optimized BF16 composition. Both rows used the fixed 150 ms capacity rule documented below.
 
 | # | Model | Precision, composition | GPU | Single request P50 | Robots per GPU | Server P50 at capacity | Server P95 at capacity | Saturation | Numerical agreement |
 |---|---|---|---|---|---|---|---|---|---|
