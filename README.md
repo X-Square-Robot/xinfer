@@ -23,13 +23,14 @@ for robots, from onboard inference to shared fleet serving.
 
 ## Features at a glance
 
-| Capability | How XInfer delivers it | Details |
+| Feature | What it does | Details |
 |---|---|---|
-| Low observation-to-action latency | Each request encodes the images and runs prompt prefill once. Action denoising steps reuse the same key/value cache, and warmed CUDA graphs can replay each stage. Wall-X 2B in BF16 measured 22.3 ms median single-request latency on an RTX 5090. | [Stage split](docs/models/wall_oss_design.md#stage-split) · [Benchmark conditions](docs/performance.md) |
-| Multiple robots on one accelerator | While one robot's actions are being generated, the engine can start processing another robot's images. Requests share one set of weights. A ready request does not wait for another robot to form a batch. | [Scheduling](docs/engine.md#scheduling-rules) · [Capacity](docs/performance.md) |
-| Predict while the robot moves (RTC) | The robot can send a fresh observation while it executes the previous action chunk. Wall-OSS and Wall-X 2B keep the steps the robot will execute during inference and predict the rest of the new chunk. | [Wall-OSS](docs/models/wall_oss.md) · [Wall-X 2B](docs/models/wallx2b.md) |
-| Check actions against the original model | Feed the same inputs to each stage of the original and optimized models, then compare vision embeddings, prompt KV and predicted actions to see where their outputs start to differ. | [Precision checks](docs/precision.md) · [Wall-X 2B results](docs/models/wallx2b_validation.md) |
-| Deploy the same model on different chips | Wall-OSS and Wall-X 2B use the same model code on NVIDIA CUDA and Ascend 950DT. The runtime selects the underlying operators for each device. | [Models and hardware](#models-and-hardware) · [Operator backends](docs/kernels.md) |
+| Real-time chunking (RTC) | The robot can send a fresh observation while executing the previous action chunk. Wall-OSS and Wall-X 2B keep the actions already scheduled during inference and predict the rest of the new chunk. | [Wall-OSS](docs/models/wall_oss.md) · [Wall-X 2B](docs/models/wallx2b.md) |
+| Ultra-low latency for a single robot | Each request encodes the images and runs prompt prefill once. Every action denoising step reuses the same KV cache. Wall-X 2B in BF16 measured **22.3 ms** P50 from observation to action in process on an RTX 5090. | [Benchmark conditions](docs/performance.md) |
+| Multiple robots on one accelerator | Robots share one set of model weights. While the engine generates actions for one robot, it can process images for another. In the Nov 9 RTX 5090 benchmark, Wall-X 2B BF16 served 15 simulated robots with a 150 ms server P50 limit. | [Scheduling](docs/engine.md#scheduling-rules) · [Measured capacity](docs/performance.md) |
+| Quantization by layer group | Model authors can choose MXFP8 or NVFP4 for groups of linear layers and keep other layers in BF16. See the model table for the presets available in each model. | [Quantization](docs/quantization.md) · [Model support](#models-and-hardware) |
+| Multiple hardware backends | Wall-OSS and Wall-X 2B run on NVIDIA CUDA GPUs and the Ascend 950DT NPU. A CPU path is available for reference execution. | [Models and hardware](#models-and-hardware) |
+| xcompute and third-party kernel libraries | xcompute provides fused kernels for operations such as matrix multiplication and normalization. CUDA can also use FlashAttention. Other libraries can register implementations for individual operators through `xinfer.ops`. | [Kernels](docs/kernels.md) · [Registration](docs/design.md#142-backend-registration-and-selection) |
 
 ## Why XInfer
 

@@ -21,13 +21,14 @@
 
 ## 特性一览
 
-| 核心能力 | XInfer 如何实现 | 了解更多 |
+| 核心特性 | 说明 | 文档 |
 |---|---|---|
-| 缩短从观测到动作的时间 | 每次请求只做一次视觉编码和提示词预填充。各步动作去噪复用同一份键值缓存（KV），预热后可用 CUDA Graph 回放各阶段。在 RTX 5090 上，Wall-X 2B BF16 的单请求时延中位数为 22.3 ms。 | [阶段划分](docs/models/wall_oss_design.zh-CN.md#阶段划分) · [测量条件](docs/performance.zh-CN.md) |
-| 多台机器人共享一张卡 | 一台机器人生成动作时，引擎可以开始处理另一台机器人的图像。多台机器人用同一份权重；就绪请求无需等其他机器人凑批。 | [调度规则](docs/engine.zh-CN.md#调度规则) · [单卡容量](docs/performance.zh-CN.md) |
-| 边执行边预测（RTC） | 机器人还在执行上一段动作时，就可以用新观测请求下一段。Wall-OSS 和 Wall-X 2B 会保留推理期间仍要执行的那几步，再预测后续动作。 | [Wall-OSS](docs/models/wall_oss.zh-CN.md) · [Wall-X 2B](docs/models/wallx2b.zh-CN.md) |
-| 验证加速后的动作 | 给原模型和加速版的每个阶段喂入相同的输入，比较视觉特征、提示词 KV 和动作输出，定位误差最早出现在哪一步。 | [精度验证](docs/precision.zh-CN.md) · [Wall-X 2B 实测](docs/models/wallx2b_validation.zh-CN.md) |
-| 同一模型部署到不同芯片 | Wall-OSS 和 Wall-X 2B 的模型代码可用于 NVIDIA CUDA 和昇腾 950DT。更换设备时，引擎按设备选择底层算子。 | [模型与硬件](#模型与硬件) · [算子后端](docs/kernels.zh-CN.md) |
+| 实时分块（RTC） | 机器人执行上一段动作时即可用新观测请求下一段。Wall-OSS 和 Wall-X 2B 会保留推理期间已排定的动作，只预测后续部分。 | [Wall-OSS](docs/models/wall_oss.zh-CN.md) · [Wall-X 2B](docs/models/wallx2b.zh-CN.md) |
+| 单机器人极低时延推理 | 每次请求只做一次视觉编码和提示词预填充，各步动作去噪复用同一份 KV 缓存。Wall-X 2B BF16 在 RTX 5090 上从接收观测到返回动作的单请求 P50 为 **22.3 ms**（进程内测量）。 | [测量条件](docs/performance.zh-CN.md) |
+| 单卡服务多机器人 | 多台机器人共享一份模型权重，一台生成动作时，另一台可同时处理图像。11 月 9 日的 RTX 5090 压测中，以服务端 P50 低于 150 ms 为门槛，Wall-X 2B BF16 单卡可服务 15 台模拟机器人。 | [引擎调度](docs/engine.zh-CN.md#调度规则) · [容量实测](docs/performance.zh-CN.md) |
+| 按层组量化 | 接入模型时，可按层组为线性层选择 MXFP8 或 NVFP4，其余层保留 BF16。各内置模型可直接使用的精度配置见模型表。 | [量化方法](docs/quantization.zh-CN.md) · [模型与硬件](#模型与硬件) |
+| 多硬件后端 | Wall-OSS 和 Wall-X 2B 可在 NVIDIA CUDA GPU 和昇腾 950DT NPU 上运行，CPU 提供参考执行路径。 | [模型与硬件](#模型与硬件) |
+| 高性能算子库 xcompute 与第三方算子库 | xcompute 为矩阵乘法、归一化等操作提供融合算子。CUDA 上也可选用 FlashAttention；其他库可以通过 `xinfer.ops` 为单个算子注册实现。 | [算子库](docs/kernels.zh-CN.md) · [注册方式](docs/design.zh-CN.md#142-后端注册与选择) |
 
 ## 为什么选择 XInfer
 
