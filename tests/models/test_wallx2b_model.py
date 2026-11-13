@@ -134,17 +134,20 @@ def test_early_action_binding_failure_rebuilds_owners_without_native_recovery():
     assert closed == [retired] and rebuilt == [True]
 
 
-def test_serving_dispatch_preserves_operator_table_and_device(monkeypatch):
-    from xinfer.models.wallx2b import serving
+def test_device_dispatch_preserves_operator_table_and_device(monkeypatch):
+    """Wallx2b.from_checkpoint forwards the operator table and options unchanged to the device-selected backend."""
+    from xinfer.models.wallx.qwen35 import WallXQwen35
+    from xinfer.models.wallx2b.model import Wallx2b
+    from xinfer.models.wallx2b.rpu.model import WallX2B
 
     calls = []
-    gpu = SimpleNamespace(from_checkpoint=lambda path, **kwargs: calls.append(("gpu", path, kwargs)))
-    rpu = SimpleNamespace(from_checkpoint=lambda path, **kwargs: calls.append(("rpu", path, kwargs)))
-    monkeypatch.setattr("xinfer.models.wallx2b.model.Wallx2b", gpu)
-    monkeypatch.setattr("xinfer.models.wallx2b.rpu.model.WallX2B", rpu)
+    monkeypatch.setattr(WallXQwen35, "from_checkpoint",
+                        classmethod(lambda cls, path, **kwargs: calls.append(("gpu", path, kwargs))))
+    monkeypatch.setattr(WallX2B, "from_checkpoint",
+                        classmethod(lambda cls, path, **kwargs: calls.append(("rpu", path, kwargs))))
     table = object()
-    serving.Wallx2bServing.from_checkpoint("gpu-checkpoint", device="cuda:0", ops=table)
-    serving.Wallx2bServing.from_checkpoint("rpu-checkpoint", device="rpu:0", ops=table)
+    Wallx2b.from_checkpoint("gpu-checkpoint", device="cuda:0", ops=table)
+    Wallx2b.from_checkpoint("rpu-checkpoint", device="rpu:0", ops=table)
     assert calls == [
         ("gpu", "gpu-checkpoint", {"device": "cuda:0", "ops": table}),
         ("rpu", "rpu-checkpoint", {"device": "rpu:0", "ops": table}),
