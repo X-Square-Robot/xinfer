@@ -189,9 +189,6 @@ class LaneCUDAGraphs:
         self.stream = stream
         self.device = device
         self.policy = policy
-        # Vendor-agnostic handle (CUDA, NPU) delivered by ``graph_api_for``: its ``graph_pool_handle`` /
-        # ``CUDAGraph`` / ``graph(...)`` / ``stream(...)`` / ``synchronize`` match torch.cuda's surface.
-        # A None from the factory means the engine never calls into it (CPU path uses no graph).
         self._device_module = device_module_for(device)
         self._graph_api = graph_api_for(device)
         device_context = (self._device_module.device(device) if str(device).partition(":")[0] == "npu"
@@ -450,11 +447,8 @@ def capture_batch_sizes(lanes: Mapping[str, list], batch_sizes: Mapping[str, lis
                 batch = merge(stage, [inputs] * batch_size)
                 if not lane.cudagraphs.known(stage, batch_size, batch):
                     lane.cudagraphs.run(stage, batch_size, batch)
-    # Wait for the vendor runtime to finish capture work on all lanes used above.
-    # No CUDA graph vocabulary leaks beyond ``graph_api_for``; lane._device_module (torch.npu etc.)
-    # answers the same ``synchronize`` surface as torch.cuda.
-    module = next((lane._device_module for stage_lanes in lanes.values() for lane in stage_lanes
-                   if lane._device_module is not None), None)
-    if module is not None:
-        module.synchronize()
+    if str(device).partition(":")[0] == "npu":
+        device_module_for(device).synchronize(device)
+    else:
+        torch.cuda.synchronize()
 
