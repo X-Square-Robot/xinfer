@@ -242,6 +242,13 @@ def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, f
     return _sigmoid_gate(out, gate)
 
 
+# The same metadata scope the prefix entry carries: the Wall-X 2B action loop drives this operator
+# once per layer per flow step and opens the scope around the whole forward, so all of the loop's
+# calls share the one dense drop mask instead of each rebuilding it.
+if callable(_action_scope):
+    gated_kvcache_attention.action_scope = _action_scope
+
+
 def _sigmoid_gate(out, gate):
     """``bf16(bf16(out) * bf16(sigmoid(gate)))``: the two roundings ``gate_output`` performs."""
     native = getattr(xc, "sigmoid_gate_mul_inplace", None) if xc is not None else None
