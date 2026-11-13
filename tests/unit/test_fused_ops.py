@@ -231,6 +231,7 @@ def test_gated_kvcache_selects_an_available_kernel(monkeypatch, gated, ungated, 
                          attention_kvcache=lambda *args, **opts: "gated" if "out_gate" in opts else gate,
                          sigmoid_gate_mul_inplace=lambda *args, **opts: "separate")
     monkeypatch.setattr(cuda, "xc", xc)
+    monkeypatch.setattr(cuda, "_listed", {})
     monkeypatch.setattr(attn, "gated_kvcache_attention", lambda *args, **opts: "reference")
     q, cache = gate.view(1, 2, 2, 2), torch.zeros(1, 4, 1, 2)
     assert cuda.gated_kvcache_attention(q, cache, cache, torch.tensor([2]), 2, gate) == expected
@@ -249,6 +250,7 @@ def test_cuda_operators_use_reference_when_the_build_rejects_a_shape(monkeypatch
                          denoise_input_embed_backend=reject, denoise_input_embed=launch,
                          denoise_output_euler_backend=reject, denoise_output_euler=launch)
     monkeypatch.setattr(cuda_attn, "xc", xc)
+    monkeypatch.setattr(cuda_attn, "_listed", {})
     monkeypatch.setattr(cuda_flow, "xc", xc)
     monkeypatch.setattr(attn, "gated_delta_net", lambda *args: "delta reference")
     qkv, zba = torch.zeros(1, 3, 384, dtype=BF16), torch.zeros(1, 3, 130, dtype=BF16)
