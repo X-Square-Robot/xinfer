@@ -38,11 +38,15 @@
 | Wall-OSS | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 47.75 ms | 4 | 120.4 ms | 129.9 ms | 29.2 req/s | quick100 B1，DVPP 对 BF16 参考 −6.77 %：PASS |
 | Wall-X 2B | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 51.05 ms | 6 | 93 ms | 111 ms | 33.4 req/s | 固定噪声动作门，对参考组合：PASS |
 
-- **Wall-OSS** 的单请求集与服务端预热各用一个普通请求与一个 RTC 请求，`image_preprocess_device` 在 NPU（DVPP）上，合成桌面负载带 RTC 跑 4、6 台——每档八轮，零错误、零缺失响应。4 台时服务端 P50/P95 中位为 120.4/129.9 ms、22.1 req/s；6 台实测 176.2/187.7 ms、29.2 req/s，高于 150 ms 判定线，容量有界于 4 台，6 台给出最高实测吞吐。单请求分解为 prepare 2.06 ms、engine 44.94 ms、output 0.15 ms。
-- **Wall-X 2B** 的单请求集为 216 个请求的延迟采集（固定噪声种子 20261112），服务端预热用两个请求，合成桌面负载带 RTC 跑 4、6 台——共十六轮，零错误、零缺失响应。4 台时服务端 P50/P95 中位为 61.7/77.8 ms，6 台为 93/111 ms、33.4 req/s，均在 150 ms 判定线内。其单请求分解为 prepare 2.60 ms、engine 48.40 ms、output 0.15 ms。
+昇腾两行的测量条件：
+
+| # | 模型选项 | 单请求输入集 | 负载 | 服务端预热 | 验证 |
+|---|---|---|---|---|---|
+| 3 | 默认，`image_preprocess_device` 在 NPU（DVPP） | 一个普通请求与一个 RTC 请求 | 带 RTC 的合成桌面观测 | 同样的两个请求 | quick100 B1（[精度门禁](precision.zh-CN.md)） |
+| 4 | 默认，`image_preprocess_device` 在 NPU（DVPP） | 参考抓包中的 216 个请求（固定噪声种子 20261112） | 带 RTC 的合成桌面观测 | 其中两个 | 固定噪声动作门 |
 
 两模型的行都报告同一接线：xcompute 包自身的入口——其在 xcompute 内部混合使用 CANN ACLNN Matmul、FusedInferAttentionScore V5 与官方算子，以及 TileLang 和 AOT 自定义内核。在后端选择层面，两模型默认都指向 xcompute；TorchNPU 官方算子与 CANN 桥接保持为显式 pin（`--op-backends linear=ascend:torch_npu`）。
 
-两项检查都是端到端的。Wall-OSS 在图像预处理位于 NPU（DVPP）上、与基准同路径的条件下通过了内部精度门禁。Wall-X 2B 跑固定噪声动作检查：十个注入确定性初始噪声的请求分别过默认分发与同一构建的参考组合，端到端比较去归一化后的动作预测。
+两行的精度门禁都是端到端的，且与基准同路径（图像预处理在 NPU/DVPP 上）。[精度门禁文档](precision.zh-CN.md)定义了 quick100 B1 门；Wall-X 2B 的门为固定噪声动作预测对同一构建参考组合的端到端比较。
 
 算子与图的配置见[昇腾指南](ascend950dt.zh-CN.md)。
