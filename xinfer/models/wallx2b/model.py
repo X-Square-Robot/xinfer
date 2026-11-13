@@ -88,6 +88,19 @@ class Wallx2b(WallXQwen35):
 
     config_class = Wallx2bConfig
 
+    @classmethod
+    def from_checkpoint(cls, path, *, device, ops=None, **options):
+        """Load wallx2b onto ``device``; ``rpu``/``rpu:0`` selects the RPU profile instead of the GPU one.
+
+        The RPU profile carries its own FP16/TP8 execution and its own option set; the GPU profile
+        forwards the remaining options to :class:`WallXQwen35`.
+        """
+        if isinstance(device, str) and device.split(":", 1)[0] == "rpu":
+            from xinfer.models.wallx2b.rpu.model import WallX2B
+
+            return WallX2B.from_checkpoint(path, device=device, ops=ops, **options)
+        return super().from_checkpoint(path, device=device, ops=ops, **options)
+
     @property
     def geometry(self) -> ModelGeometry:
         return self.config.model

@@ -1,7 +1,14 @@
-"""The CUDA device's platform."""
+"""The CUDA device's platform: discovery and nvJPEG decoding.
+
+The CUDA-side ownership of NVJPEG used to sit in ``xinfer/engine/device_images.py``; it is kept
+here so every hardware family lives in exactly one place (``ops/backends/<family>/`` does the same
+for operators). The engine no longer constructs a CUDA stream, decoder or device object directly;
+it asks :func:`xinfer.platforms.devices.jpeg_decoder_for` for one, which dispatches by device kind.
+"""
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 
 from xinfer.platforms.interface import Platform, PlatformCapabilities
@@ -52,9 +59,29 @@ def cuda_platform(device: str) -> Platform:
         multiprocess_service=None,
         sm_count=props.multi_processor_count,
         total_memory_bytes=props.total_memory,
-        device_images=importlib.util.find_spec("torchvision") is not None,
+        device_images=_decodes_jpeg(index),
+        cuda_interop=True,
     )
     return Platform(name=f"cuda-{arch}", device=f"cuda:{index}", capabilities=capabilities)
+
+
+@functools.lru_cache(maxsize=None)
+def _decodes_jpeg(index: int) -> bool:
+    """Whether torchvision decodes JPEG on CUDA device ``index``: its build must have nvJPEG (Jetson's has not).
+
+    A build that ships torchvision without nvJPEG (Jetson, some distro builds) reports the
+    capability as False instead of letting the first request fail in ``CudaJpegDecoder``.
+    """
+    if importlib.util.find_spec("torchvision") is None:
+        return False
+    import torch
+    from torchvision.io import decode_jpeg, encode_jpeg
+
+    try:
+        decode_jpeg(encode_jpeg(torch.zeros(3, 8, 8, dtype=torch.uint8)), device=f"cuda:{index}")
+    except RuntimeError:
+        return False
+    return True
 
 
 class CudaJpegDecoder:
