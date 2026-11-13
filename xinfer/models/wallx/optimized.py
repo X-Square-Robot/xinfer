@@ -40,6 +40,43 @@ PREFILL_STAGE_OPS_MXFP8 = ("qkv_norm_split", "rope_full", "gated_causal_attentio
                            "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize")
 
 
+_SOUPKILL_PROJECTION = []
+
+
+def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
+    """ViT QKV projection + bias + RoPE in one pass over the FP32 accumulator.
+
+    Opt-in through ``XINFER_SOUPKILL=vrope`` (xcompute's soupkill mount). Every
+    path that is not a clean envelope hit -- flag off, absent knife library, a
+    shape or table mismatch, any error from the fused launch -- returns the
+    released operator's result, so the model never depends on the knife being
+    installed and this call site can be reverted on its own.
+    """
+    released = lambda: ops.qkv_rope_epilogue(  # noqa: E731 - the single fallback
+        normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d
+    )
+    try:
+        from xcompute.kernel import soupkill
+    except Exception:  # noqa: BLE001 - the mount is optional
+        return released()
+    if not soupkill.enabled("vrope") or normed.dim() != 2 or cos2 is None or cos2.shape[-1] != d:
+        return released()
+    if not _SOUPKILL_PROJECTION:
+        from xcompute.kernel.cann_projection import CannProjection
+
+        _SOUPKILL_PROJECTION.append(CannProjection())
+    projection = _SOUPKILL_PROJECTION[0]
+    try:
+        with projection.accumulator(normed, block.qkv_weight) as acc:
+            out = normed.new_empty((normed.shape[0], n), dtype=torch.bfloat16)
+            fused = soupkill.vision_qkv_rope(acc, block.qkv_bias, cos2, sin2, out, heads, d)
+        if fused is not None:
+            return fused
+    except Exception:  # noqa: BLE001 - a fused-path failure must not fail the model
+        pass
+    return released()
+
+
 class OptimizedVision(nn.Module):
     """The ViT and patch merger (BF16 weights, ``[out, in]`` as in the checkpoint).
 
@@ -81,13 +118,36 @@ class OptimizedVision(nn.Module):
             ``[N / merge², out_hidden_size]`` BF16.
         """
         c, ops = self.config, self.ops
+        n, h, heads, d = pixel_values.shape[0], c.hidden_size, c.num_heads, c.head_dim
         x = ops.gemm_epilogue(pixel_values.to(DTYPE), self.patch.weight, self.patch.bias)
         x = x + ops.pos_embed_interp(self.pos_embed, grids, c.spatial_merge_size)
         angles = ops.rot_pos(self.inv_freq, grids, c.spatial_merge_size)
         cos, sin = angles.cos(), angles.sin()
-        block_forward = self._block_mxfp8 if self.mxfp8 else self._block
+        # soupkill vrope: the rotary table duplicated to the head width, once per
+        # vision forward (the fused kernel reads the head's 64 lanes as [c | c]).
+        # Two cat kernels per request, not per block; None keeps the released op.
+        cos2 = sin2 = None
+        try:
+            from xcompute.kernel import soupkill
+
+            if soupkill.enabled("vrope") and cos.dim() == 2:
+                cos2 = torch.cat((cos, cos), dim=-1).contiguous()
+                sin2 = torch.cat((sin, sin), dim=-1).contiguous()
+        except Exception:  # noqa: BLE001 - the mount is optional
+            cos2 = sin2 = None
+        block_forward = self._block_mxfp8 if self.mxfp8 else None
         for block in self.blocks:
-            x = block_forward(block, x, cos, sin, cu_seqlens)
+            if block_forward is not None:  # MXFP8 vision (#20): their method path
+                x = block_forward(block, x, cos, sin, cu_seqlens)
+                continue
+            normed = ops.layer_norm_cast(x, block.norm1_weight, block.norm1_bias, c.eps)
+            qkv = _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, 3 * heads * d, heads, d)
+            q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+            o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
+            x = ops.gemm_epilogue(o, block.proj_weight, block.proj_bias, residual=x)
+            normed = ops.layer_norm_cast(x, block.norm2_weight, block.norm2_bias, c.eps)
+            hidden = ops.gemm_epilogue(normed, block.fc1_weight, block.fc1_bias, activation="gelu_tanh")
+            x = ops.gemm_epilogue(hidden, block.fc2_weight, block.fc2_bias, residual=x)
         merged = ops.layer_norm_cast(x, self.merger.norm_weight, self.merger.norm_bias, c.eps)
         merged = ops.gemm_epilogue(merged.reshape(-1, self.merger.fc1_weight.shape[1]), self.merger.fc1_weight,
                                    self.merger.fc1_bias, activation="gelu")
