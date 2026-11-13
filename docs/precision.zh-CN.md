@@ -1,72 +1,28 @@
-# 精度门禁
+# 精度
 
 [English](precision.md) | 简体中文
 
-Wall-X 2B 在 RTC 延迟为 0、3、6 步时进行开环评估，优化实现和参考实现的结果见 [Wall-X 2B 验证](models/wallx2b_validation.zh-CN.md)。
+XInfer 为每个模型提供两种组合。参考组合（`numerics="reference"`）在 PyTorch 算子上逐步复现原始模型实现。optimized 组合（默认）把多个步骤融合进 xcompute kernel，因此舍入位置不同，与参考组合并非逐位一致。XInfer 用两者之间的一致性来表述精度，由本仓库中的测试检查；模型本身的准确度取决于其 checkpoint。
 
-可能改变 Wall-OSS 输出的改动必须通过 embodied-serving 的 quick100 门禁，即 Wall-X 4B 服务上线时所用的门禁。
+## 如何检查一致性
 
-**规则。** 每个必选场景相对冻结的原始 BF16 模型，GT-MSE 的增幅不得超过 +1 %：`MSE_candidate / MSE_BF16 − 1 ≤ 0.01`。
+| 检查 | 测试 | 比较内容 |
+|---|---|---|
+| 参考组合对照原始实现 | `tests/models/test_wall_oss_parity.py` | 在录制的请求上，把 Wall-OSS 的参考组合与原始 eager BF16 模型比较：每个阶段从原始模型的输入出发，以及最终动作 |
+| optimized 对照参考，逐阶段 | `tests/models/test_wall_oss_optimized.py` | optimized 组合的每个阶段与参考组合在相同输入下的结果比较，在容差内；CUDA graph 回放与 eager 运行逐位一致 |
+| 两种组合的结构 | `tests/models/test_wall_oss_tiny.py`、`tests/models/test_wallx2b_tiny.py` | 在 CPU 上用很小的随机 checkpoint：权重映射完整，各阶段经由引擎运行，RTC 固定动作原样返回，optimized 组合接近参考组合 |
+| 端到端 | `tests/models/test_wallx2b_policy.py` | 用给定的 checkpoint 经 `Policy` 运行 Wall-X 2B，两种组合都覆盖 |
 
-**范围**（embodied-serving `docs/PRECISION_REGRESSION.md`）：
-- **输入**：5 个真实 episode，100 个窗口，随机种子 42，RTC 延迟 5。
-- **指标**：在归一化空间中对 18 个非夹爪维度计算 GT-MSE，不计每个窗口的前 `delay` 步。
-- **参考**：原始的全 BF16 Wall-X 模型，B1，已冻结。
+使用真实 checkpoint 的测试需要 GPU 和模型资产（各测试列出所需的环境变量），缺少时跳过。小随机 checkpoint 的测试在 CI 中运行。Wall-X 2B 的 optimized 组合还在完整 checkpoint 上与其 BF16 采样器逐阶段比较过（[Wall-X 2B 验证](models/wallx2b_validation.zh-CN.md#与-bf16-采样器的数值对齐)）。
 
-XInfer 通过一个对接 embodied-serving 测试框架（harness）的适配器运行该门禁（`scripts/check_precision.py`，配置 `quick100-batch32-v1`，范围 `model_batch`）。
+## 已知差异
 
-## 工具
+- **舍入。** optimized 组合在 FP32 累加结果上做 epilogue（bias、RoPE、激活、残差加），只舍入一次到 BF16；参考组合在每一步之后舍入。
+- **RTC 固定动作。** 服务的语义在每一步都切断 RTC 固定动作 token 对去噪 token 的注意力，而原始 eager 模型在第 0 步允许其注意（[Wall-OSS 设计](models/wall_oss_design.zh-CN.md)）。两种组合都按切断的形式服务。
+- **组批。** 批大小会改变浮点舍入；逐阶段的容差针对单请求。
 
-| 文件 | 作用 |
-|---|---|
-| `tools/precision/wall_oss_quick100_adapter.py` | 供测试框架使用的 `PRECISION_ADAPTER`（详见下文） |
-| `tools/precision/configs/optimized.example.json` | 候选配置：optimized 组合（默认） |
-| `tools/precision/quick100_b1_score.py` | 用 harness 自身的函数为保存的 harness 运行结果计算 B1 场景的分数 |
+## 内部验证
 
-适配器对每个请求组执行以下操作：
-- 对传输格式（wire）的观测运行 XInfer 的输入处理，使用该请求保存的 FP32 噪声（prompt 与服务时一样填充到 `processing.prompt_bucket`，默认 16 token）；在 `image_preprocess_device="gpu"`（其配置的顶层键）时，它与引擎一样在 vision 阶段之前于 GPU 上解码并 resize 各视图（`xinfer.engine.device_images`）；
-- 逐请求运行 vision 和 prefill；
-- 对整个组调用一次 action 阶段（B1 或该场景的 BN）。不同的 prompt 长度（例如 760 和 761 token）与引擎一样以左填充方式合并（`xinfer.engine.batching`）。optimized 组合每次 action 调用只接受一个请求：遇到组批的请求组时适配器报错，harness 在 B1 之后停止，用 `quick100_b1_score.py` 计算该运行的分数；
-- 报告该次调用实际的批和延迟。
+每个可能改变模型输出的改动，在发布前还要通过基于真实机器人数据的内部精度门禁。它的数据和工具不在本仓库中。
 
-## 运行
-
-测试框架、资产和 BF16 参考都不在本仓库中：
-
-| 输入 | 说明 |
-|---|---|
-| 测试框架 | 一个处于 `fa2e8af` 且无改动的 embodied-serving 检出 |
-| 资产 | quick100 导入包：manifest SHA `d2ec98c8…`，checkpoint `5_25000` 权重 SHA `37a4b2ea…` |
-| BF16 参考 | 冻结的原始 BF16 输出（导入包中的 `reference1`） |
-| 目标（target） | 旧 Wall-X 4B MXFP8 服务的运行结果，embodied-serving `54691d0` |
-
-```bash
-PYTHONPATH=/path/to/xinfer/tools/precision python scripts/check_precision.py \
-  --assets $ASSETS --reference $ASSETS/reference1 \
-  --target $TARGET_RUN --target-ref 54691d0e20b5745eae8ebb6c1f25cdf039067dff \
-  --require-scope model_batch --adapter wall_oss_quick100_adapter:Adapter \
-  --config optimized.json --device 0 --output /path/to/run
-python /path/to/xinfer/tools/precision/quick100_b1_score.py . $ASSETS $ASSETS/reference1 $TARGET_RUN /path/to/run
-```
-
-请在测试框架的检出目录中运行。checkpoint 会对照 manifest 中的哈希进行校验，因此要使用原始的 checkpoint 目录，而不是修改过 `config.yml` 的副本。
-
-## Wall-OSS quick100 门禁
-
-结果（2026-11-08，RTX 5090，torch 2.10.0+cu130）：`numerics="optimized"`，使用默认后端（xcompute `0c48a46`、flash-attn），B1：
-
-| 场景 | 相对 BF16 的 GT-MSE | episode 95 % CI | 相对旧服务（target） |
-|---|---|---|---|
-| quick100 B1，延迟 5（100 个窗口） | **−6.58 %：PASS** | [−12.48, −0.34] | +0.05 % |
-
-- 按同样方式计算：旧的 MXFP8 服务为 −6.62 %，XInfer 参考组合（使用 eager 模型的 kernel）为 −6.28 %（torch 2.9.1），optimized 组合在 torch 2.9.1 下为 −6.25 %（CI [−12.17, −0.25]；其动作与 2.10 下的并非逐位一致，因为 torch 算子的舍入不同）。
-- **原始 BF16 并不是服务的语义。** 服务和 XInfer 在每一步都切断 RTC 固定动作 token 对去噪 token 的注意力，而原始 eager 模型在第 0 步允许其注意（docs/models/wall_oss_design.md）。与原始 BF16 的差距主要来自这一差异。
-- 组批场景需要每次调用接受多个请求的 action 阶段；optimized 组合只接受一个。
-- GPU 测试把每个阶段与 eager BF16 模型比较，并逐位检查 graph；输出质量只由本门禁判断。
-
-证据：`xinfer-xcompute-prepack-20261108.tar.gz` 中的运行 `gates/q100-run`；之前的运行 `q100-wos210-run`（torch 2.10）和 `q100-wos-run`（2.9.1）在 `xinfer-wall-oss-optimized-20261107.tar.gz` 中（哈希见 docs/models/wall_oss_validation.zh-CN.md）。
-
-昇腾 950DT（2026-11-11，CANN 9.1.1、TorchNPU 2.10.0.post4，B1）使用[昇腾指南](ascend950dt.zh-CN.md)
-中的 8 个 xcompute 实现，通过同一 quick100 门禁：**CPU 图像处理为 −6.45 %**，**DVPP 设备图像为 −6.81 %**。
-两次运行都使用 100 个 delay-5 窗口与相同的冻结 BF16 参考；比较结果时应区分图像路径。
-动态库身份与证据包见[性能](performance.zh-CN.md#昇腾-950dt)。
+在昇腾 950DT 上，[昇腾指南](ascend950dt.zh-CN.md)列出的 xcompute 实现也通过了同一内部门禁，图像处理在 CPU 上和在设备上两种情况都通过。

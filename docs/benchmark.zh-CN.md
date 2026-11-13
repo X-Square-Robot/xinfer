@@ -15,7 +15,7 @@
 `request_latency.py` 用 `xinfer.Policy` 加载模型，因此与 `xinfer-serve` 一样，需要已安装 XInfer（`pip install -e '.[models]'`）以及模型的资产：
 
 ```bash
-python benchmarks/request_latency.py --model wall_oss --checkpoint /path/to/5_25000 \
+python benchmarks/request_latency.py --model wall_oss --checkpoint /path/to/checkpoint \
   --model-options '{"quantization": "bf16"}' --requests-file flow.msgpack rtc.msgpack \
   --runs 50 --warmup-runs 5 --out artifacts/wall-oss-latency.json
 ```
@@ -95,7 +95,7 @@ python benchmarks/robot_load.py --url ws://127.0.0.1:33985 --robots 7 --requests
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "Wall-OSS" --model wall_oss \
-  --checkpoint /path/to/5_25000 --latency-requests flow.msgpack rtc.msgpack \
+  --checkpoint /path/to/checkpoint --latency-requests flow.msgpack rtc.msgpack \
   --warmup flow.msgpack rtc.msgpack --robots 3 4 5 --out artifacts/perf-wall-oss
 ```
 

@@ -27,7 +27,7 @@ checkpoint 加载完成后，`process_weights(model)` 在权重被共享或 grap
 
 输入宽度必须是 32 的倍数。若配置把不支持的层映射到 `mxfp8`，构建模型时会失败。
 
-`nvfp4` 和 `nvfp4_mse` 是 embodied-serving Wall-X NVFP4 服务的两种方案（ViT 用 `nvfp4_1d1d_16bs`，expert 0 用 `nvfp4_mse_1d1d_16bs`）。它们是两个方法，而不是一个带选项的方法，因为选项按方法生效，而该方案在一个模型中同时使用两者。它们没有选项。激活始终使用 amax 缩放因子。输入和输出宽度必须是 16 的倍数。
+`nvfp4` 和 `nvfp4_mse` 是 Wall-X NVFP4 服务的两种方案（ViT 用 `nvfp4_1d1d_16bs`，expert 0 用 `nvfp4_mse_1d1d_16bs`）。它们是两个方法，而不是一个带选项的方法，因为选项按方法生效，而该方案在一个模型中同时使用两者。它们没有选项。激活始终使用 amax 缩放因子。输入和输出宽度必须是 16 的倍数。
 
 ## 可融合的层形式
 
@@ -73,7 +73,7 @@ GEMM 始终是输出 BF16 的 `nvfp4_gemm`。其余部分都在该输出上运�
 
 ## NVFP4 格式
 
-格式由 `xinfer/ops/reference/nvfp4.py` 中的 torch 参考实现定义，scale 布局在 `xinfer/ops/layout/nvfp4.py` 中，它遵循 embodied-serving `nvfp4_v2.patch` 中的 Wall-X NVFP4 kernel（`wall_x/infer/csrc/nvfp4/ops.cu`）及其下游的 GEMM：
+格式由 `xinfer/ops/reference/nvfp4.py` 中的 torch 参考实现定义，scale 布局在 `xinfer/ops/layout/nvfp4.py` 中，它遵循生产服务中的 Wall-X NVFP4 kernel 及其下游的 GEMM：
 - **元素**：E2M1（0、0.5、1、1.5、2、3、4、6 及其负值），每字节两个，存为 uint8 `[M, K/2]`：第 `2j` 列在低半字节，第 `2j + 1` 列在高半字节，bit 3 为符号位。
 - **缩放因子**：每 16 列一个 FP8 E4M3 缩放因子，以 `float8_e4m3fn` 按 SWIZZLE_32_4_4 布局存储（行填充到 128，16 列的块填充到 4，填充值为零）。
 - **全局缩放因子**：`nvfp4_mse` 权重带有一个逐张量的 FP32 缩放因子 `g = amax / (448 · 6)`，按整个权重计算（以双精度计算，舍入到 FP32；全零权重为 1）。一个值等于 `e2m1 · scale · g`；激活和 `nvfp4` 权重的 `g = 1`。
@@ -99,4 +99,4 @@ MXFP8 和 NVFP4 的框架算子使用 PyTorch 参考实现。内置的 xcompute 
 | `tests/unit/test_mxfp8.py` | 参考格式、误差界和融合参考实现（CPU）；可融合形式：BF16 与 eager 组合逐位一致，MXFP8 贴近 BF16（CPU） |
 | `tests/unit/test_nvfp4.py` | 参考格式对照手算的编码和缩放因子、MSE 缩放值搜索、融合参考实现、GEMM epilogue（CPU）；`nvfp4` 和 `nvfp4_mse` 层及其可融合形式（CPU）；参考 GEMM 对比 `torch._scaled_mm` NVFP4，即 Wall-X 服务在没有 CUTLASS kernel 的形状上所用的 GEMM（GPU，sm100 或更新） |
 
-量化改动的精度门禁是 quick100（[precision.md](precision.zh-CN.md)）。
+量化改动按[精度](precision.zh-CN.md)中的方式检查：与参考组合的一致性，以及内部精度门禁。

@@ -1,6 +1,0 @@
-{
-  "xinfer_src": "/path/to/xinfer",
-  "checkpoint": "/path/to/5_25000",
-  "numerics": "optimized",
-  "norm_key": "ex_normal"
-}

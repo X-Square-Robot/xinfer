@@ -34,7 +34,7 @@ presets (`quantization="<preset>"`), or take a `QuantConfig` or a dict with `gro
 The input width must be a multiple of 32. A config that maps an unsupported
 layer to `mxfp8` fails when the model is built.
 
-`nvfp4` and `nvfp4_mse` are the two recipes of the embodied-serving Wall-X
+`nvfp4` and `nvfp4_mse` are the two recipes of the Wall-X
 NVFP4 service (`nvfp4_1d1d_16bs` for the ViT, `nvfp4_mse_1d1d_16bs` for
 expert 0). They are two methods rather than one method with an option
 because options apply per method and that recipe uses both in one model. They
@@ -93,7 +93,7 @@ The fused references follow the kernels' arithmetic where it is specified:
 ## NVFP4 format
 
 The format is defined by the torch reference in `xinfer/ops/reference/nvfp4.py`, with the scale layout in `xinfer/ops/layout/nvfp4.py`, and follows the Wall-X NVFP4 kernels of
-the embodied-serving `nvfp4_v2.patch` (`wall_x/infer/csrc/nvfp4/ops.cu`) and the GEMMs they feed:
+the production service and the GEMMs they feed:
 - **Elements**: E2M1 (0, 0.5, 1, 1.5, 2, 3, 4, 6 and their negatives), two per byte as uint8 `[M, K/2]`: column `2j` in the low nibble, `2j + 1` in the high nibble, bit 3 the sign.
 - **Scales**: one FP8 E4M3 scale per 16 columns, stored as `float8_e4m3fn` in the SWIZZLE_32_4_4 layout (rows padded to 128, 16-column blocks to 4, padding zero).
 - **Global scale**: `nvfp4_mse` weights carry a per-tensor FP32 scale `g = amax / (448 · 6)` of the whole weight (computed in double precision, rounded to FP32; 1 for an all-zero weight). A value is `e2m1 · scale · g`; activations and `nvfp4` weights have `g = 1`.
@@ -121,4 +121,4 @@ The framework uses PyTorch reference implementations for MXFP8 and NVFP4. The bu
 | `tests/unit/test_mxfp8.py` | reference format, error bounds and fused references (CPU); fusable forms: BF16 equals the eager composition bitwise, MXFP8 tracks BF16 (CPU) |
 | `tests/unit/test_nvfp4.py` | reference format against hand-computed codes and scales, MSE scale search, fused references, GEMM epilogues (CPU); `nvfp4` and `nvfp4_mse` layers and their fusable forms (CPU); reference GEMM vs `torch._scaled_mm` NVFP4, the GEMM the Wall-X service ran for the shapes without a CUTLASS kernel (GPU, sm100 or newer) |
 
-The precision gate for quantization changes is quick100 ([precision.md](precision.md)).
+Quantization changes are checked as in [precision](precision.md): agreement with the reference composition, and the internal precision gate.

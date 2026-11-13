@@ -16,7 +16,7 @@ steps on xcompute's operators (``optimized.py``). ``"reference"`` follows the Wa
 (Wall-X 02c5351d): BF16 weights and activations, FP32 RMSNorm weights in the
 language stacks, FP32 action head and ODE state. RTC requests use the served attention
 semantics (pinned action tokens never attend to denoising tokens, at every
-step), which the embodied-serving and HarriX services implement; see
+step), which the production services implement; see
 docs/models/wall_oss.md.
 """
 

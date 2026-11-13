@@ -6,7 +6,7 @@
 
 ## 语义来源
 
-参考实现是 Wall-X `02c5351d`（加上 embodied-serving 独立补丁 `1e24f619`）中 eager `Qwen2_5_VLMoEForAction` 的 flow 路径；请求处理部分以 embodied-serving Wall-X 4B 服务（es `9633ffd`）为参考。HarriX 对该服务的逐位移植（`qwen2_5`、`mxfp8-sm120`）是第二个来源。文件：`xinfer/models/wall_oss/`（`config.py`、`model.py`、`processing.py`、`geometry.py`）以及 `xinfer/models/layers/` 中的共享层。
+参考实现是 Wall-X `02c5351d`（加上生产服务的独立补丁）中 eager `Qwen2_5_VLMoEForAction` 的 flow 路径；请求处理部分以生产 Wall-X 4B 服务为参考。文件：`xinfer/models/wall_oss/`（`config.py`、`model.py`、`processing.py`、`geometry.py`）以及 `xinfer/models/layers/` 中的共享层。
 
 ## 阶段划分
 
@@ -95,7 +95,7 @@ torch 参考实现精确复现 eager 模型的 SDPA 调用（相同的 mask 和�
 
 ## RTC 语义（决策）
 
-对于 RTC 请求，固定的 action token（`k < delay`）在**每一**步都不 attend 到正在去噪的 token。这是 embodied-serving 和 HarriX 服务实际运行的方式。Wall-X 的 eager 代码只在第 0 步不做这一截断（其第 0 步的联合 mask 在 action token 之间是对称的），因此对于 RTC 请求，eager 代码与服务所用模型在语义上就不同，而不只是精度不同。XInfer 遵循服务所用的模型；用于验证的 eager 参考也做了同样的修补。flow 请求（`delay = 0`）在两种方式下完全相同。
+对于 RTC 请求，固定的 action token（`k < delay`）在**每一**步都不 attend 到正在去噪的 token。这是生产服务实际运行的方式。Wall-X 的 eager 代码只在第 0 步不做这一截断（其第 0 步的联合 mask 在 action token 之间是对称的），因此对于 RTC 请求，eager 代码与服务所用模型在语义上就不同，而不只是精度不同。XInfer 遵循服务所用的模型；用于验证的 eager 参考也做了同样的修补。flow 请求（`delay = 0`）在两种方式下完全相同。
 
 ## 处理
 

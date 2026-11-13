@@ -6,10 +6,7 @@ English | [简体中文](design.zh-CN.md)
 
 Existing code and records this design draws on:
 
-- embodied-serving main `e910f50`: the FleetServe runtime, paper experiment records and model docs;
-- HarriX main `9e633ac`;
-- vla-engine prototype `a774bb0` (2026-04);
-- the pipeline-overlap-vla study;
+- earlier internal serving prototypes of these models and their measurements;
 - current main source of vLLM and SGLang.
 
 The [performance table](performance.md) lists measurement conditions for Wall-OSS and Wall-X 2B and links to their validation results.
@@ -21,7 +18,7 @@ The [performance table](performance.md) lists measurement conditions for Wall-OS
 | Item | Decision |
 |---|---|
 | Project name | XInfer |
-| Repository | X-Square-Robot/x2infer on GitHub. |
+| Repository | X-Square-Robot/xinfer on GitHub. |
 | Kernels | Stay in the existing xcompute repository, owned by the operator team; XInfer integrates through the xcompute binding in the ops layer |
 | Operator binding | xcompute uses TVM-FFI by default; where there is a concrete PyTorch compile or export need, `torch.library` adapters are added as needed and reuse the underlying implementation (§14.2) |
 | Deployment scenario | Each accelerator runs a model instance serving one or more robots. |
@@ -30,11 +27,11 @@ The [performance table](performance.md) lists measurement conditions for Wall-OS
 | GPU process layout | Default `colocated`: one Engine per GPU, with Vision / Prefill / Action in one process; v1 implements only this layout, `split` is not implemented for now |
 | Stage and deployment boundary | Logical stages are separate from the process mapping; StageGraph declares computation and dependencies, and the runtime decides which process a stage runs in (§9.3) |
 | Hardware direction | v1 implements only the first hardware; other chips connect through Platform plugins and operator backends (§13, §18.3). No graph-compiling execution backend (§9.4) |
-| Out of scope | SLO schedulers (FleetServe-T, central-ssbp, etc.); only the scheduling-policy plugin interface is kept |
+| Out of scope | SLO schedulers; only the scheduling-policy plugin interface is kept |
 
 ---
 
-## Implementation status (2026-11-04, main `b4f1ac8`)
+## Implementation status (2026-11-04)
 
 The other sections describe the target design. The table below shows how far each design item is implemented on main; items marked "not implemented" are still reviewed against the original text until they are implemented.
 
@@ -55,13 +52,13 @@ The other sections describe the target design. The table below shows how far eac
 | §9.2 Frontend processes | Implemented | 2 processes by default, SO_REUSEPORT, 4 processing threads per process; shared memory plus pipe notification (not ZMQ); does not initialize CUDA, but imports torch. In-process calls are provided by `Policy` |
 | §10 Configuration resolution | Partially implemented | Explicit value > tuning table > model / platform rules > default, with the source of each item printed at startup (docs/configuration.md); no tuning tables ship with the package yet; `xinfer tune`, memory-planner input to derivation, and `Platform.derive` / `validate` are not implemented |
 | §11 Model integration | Implemented | Models declare stages, handoff tensors, capabilities, input and output processing, and shape buckets. The frontend imports the model class's `build_processors`; the engine calls the model's `pad` hook for warmup. |
-| §11.4 Bundled models | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the quick100 gate. Wall-X 2B uses a Qwen3.5 backbone and supports RTC on the desktop dual-arm robot. |
+| §11.4 Bundled models | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the internal precision gate. Wall-X 2B uses a Qwen3.5 backbone and supports RTC on the desktop dual-arm robot. |
 | §12 Quantization | Partially implemented | The framework supports per-group `QuantConfig`. Wall-OSS runs in BF16. MXFP8 and NVFP4 have PyTorch reference operators. See [quantization](quantization.md). |
 | §13 Platform | Partially implemented | Only device capability descriptions and CUDA / CPU resolution (`xinfer/platforms/`); streams, events, copy primitives, `register_host` (`frontend/shm.py` currently calls `cudaHostRegister` directly), `classify_error`, `derive` / `validate` and plugin activation are not implemented; Thor (sm110) is unverified |
 | §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI) and flash-attn, registered by the `cuda` backend modules and loaded with the `xinfer.ops` entry points (§14.2); `xinfer.ops.conformance` is not implemented |
 | §15 Protocol and frontend | Partially implemented | WebSocket + msgpack, compatible with the x2robot client; `xinfer.Policy` in-process API; Client SDK and compatibility adapters not implemented |
 | §16 Observability and benchmark tools | Partially implemented | The service exposes [Prometheus metrics](metrics.md). Use the [benchmarks](benchmark.md) for single-request latency and closed-loop capacity, and [xinfer-profile](profiling.md) to measure operator, queue and stage times. |
-| §17 Testing | Partially implemented | CPU unit and contract tests; GPU and asset tests need local assets and are run manually; CI (`.gitlab-ci.yml`) runs only ruff and CPU tests |
+| §17 Testing | Partially implemented | CPU unit and contract tests; GPU and asset tests need local assets and are run manually; CI (GitHub Actions, `.github/workflows/ci.yml`) runs ruff, the repository and documentation checks and the CPU tests |
 | §18.1 Repository layout and command line | Differs from the plan | The repository is authoritative for directories; the service entry point is `xinfer-serve` (that is, `python -m xinfer.entrypoints.serve`) and the profiling entry point `xinfer-profile` (`ops`); the unified `xinfer` command is not implemented |
 
 ---
@@ -77,7 +74,7 @@ The other sections describe the target design. The table below shows how far eac
 | Bottleneck | Memory bandwidth, KV capacity | Low GPU utilization at small batch sizes; CPU preprocessing and dispatch overhead; large compute differences between stages |
 | Metrics | TTFT, TPOT, throughput | Single-request latency; per-GPU capacity N\* (the number of robots served under a given latency definition) |
 
-So VLA serving cannot simply reuse the token-level scheduling and paged KV of vLLM/SGLang. In measurements on RTX 5090 under the same conditions, FleetServe's capacity is well above SGLang and vLLM-Omni (Appendix A).
+So VLA serving cannot simply reuse the token-level scheduling and paged KV of vLLM/SGLang.
 
 ---
 
@@ -87,8 +84,8 @@ So VLA serving cannot simply reuse the token-level scheduling and paged KV of vL
 
 | Goal | Acceptance criterion | Existing reference |
 |---|---|---|
-| Thor single request | Wall-OSS on Thor, same input | No higher than HarriX `mxfp8-thor` |
-| Highest per-GPU capacity | 5090, uniform input, client P50 < 150 ms, three runs | Same-condition capacity of the FleetServe FIFO path (baseline numbers to be rechecked under §20 M1) |
+| Thor single request | Wall-OSS on Thor, same input | No higher than the earlier Thor port of the model |
+| Highest per-GPU capacity | 5090, uniform input, client P50 < 150 ms, three runs | Same-condition capacity of the earlier internal serving runtime (baseline numbers to be rechecked under §20 M1) |
 | Same results alone and under full load | The same input run alone and under full load | Both pass the model's precision gate; bitwise-equal outputs where the stages' operators are deterministic (§6.4) |
 | Easy to add new models | When the backbone and action-head building blocks exist | Write only the model file and weight mapping, no runtime changes |
 | Easy to add new hardware and quantization | A new platform or quantization method | Implement only the platform layer, an operator backend or a QuantMethod, no model-file changes |
@@ -99,7 +96,7 @@ So VLA serving cannot simply reuse the token-level scheduling and paged KV of vL
 - **Training, RL, online weight updates.**
 - **Multi-GPU tensor parallelism.** The first models fit on one GPU; multiple GPUs use data-parallel replicas plus a Router.
 - **GPU stages in separate processes (`split`).** v1 implements only `colocated`, with no inter-stage CUDA IPC, copy-ACK or MPS lifecycle; multi-process CPU Frontends remain in scope. The responsibility boundaries are kept, but no remote-execution framework is built in advance (§9.3).
-- **Numerics-changing optimizations enabled by default.** Examples are approximate stage overlap (pipeline-overlap-vla's proxy-KV scheme reaches about 95% vs 97% success on LIBERO) or fewer denoising steps. Quantization is offered as explicit configuration, with a precision gate.
+- **Numerics-changing optimizations enabled by default.** Examples are approximate stage overlap (reusing approximate KV across stages, which lowers task success) or fewer denoising steps. Quantization is offered as explicit configuration, with a precision gate.
 - **Autoregressive action-token models** (FAST, OpenVLA-style). The stage abstraction leaves room for a decode stage; v1 does not implement it.
 
 ---
@@ -253,7 +250,7 @@ The first two concern "how stages are linked" and the last two "at what granular
 
 **Effect:** with 1 robot, each request is dispatched from vision to action in one go, which is the fastest single-request path. With more robots, downstream queues form and execution becomes a pipeline with batching automatically. Each request is decided by the queue state at its dispatch time, so the transition from idle to full load is continuous.
 
-**No whole-chain graphs.** Every deployment serves multiple robots from one GPU, and capturing the whole chain as one graph would remove pipelining and batching between stages; the fastest single-request path comes from chained dispatch. HarriX's `mxfp8-thor` uses a whole-call graph, and Thor's CPU is also weaker; if M0 shows that "three stage graphs + events" on Thor is clearly slower than the whole-call graph (§6.5), a whole-chain graph used only when idle will be evaluated then.
+**No whole-chain graphs.** Every deployment serves multiple robots from one GPU, and capturing the whole chain as one graph would remove pipelining and batching between stages; the fastest single-request path comes from chained dispatch. The earlier Thor port of the model uses a whole-call graph, and Thor's CPU is also weaker; if M0 shows that "three stage graphs + events" on Thor is clearly slower than the whole-call graph (§6.5), a whole-chain graph used only when idle will be evaluated then.
 
 ### 6.4 Correctness contract: running alone and under full load
 
@@ -279,12 +276,12 @@ All measurements below use `colocated`; the capacity and batching risks are veri
 ### 7.1 Admission
 
 - In-flight requests never exceed the number of slots; by default each robot has at most one request in flight.
-- Admission and allocation happen in one step, returning `AdmitReady(slot)`, `AdmitDelay` or `AdmitFail(code)`, which avoids the race of "probe first, allocate later" (a lesson from vla-engine).
+- Admission and allocation happen in one step, returning `AdmitReady(slot)`, `AdmitDelay` or `AdmitFail(code)`, which avoids the race of "probe first, allocate later" (a lesson from an earlier prototype).
 - Queues are bounded. Error codes distinguish `queue_full`, `per_robot_limit` and `admission_timeout`.
 
 ### 7.2 Stage queues
 
-`q_vision → q_prefill → q_action`, all FIFO by arrival by default. This matches FleetServe's current `greedy-fair` behavior, which the paper calls the FIFO baseline.
+`q_vision → q_prefill → q_action`, all FIFO by arrival by default.
 
 ### 7.3 Batching
 
@@ -308,7 +305,7 @@ class StagePolicy(Protocol):
 
 - **Division of responsibility**: a policy decides only "which requests to dispatch, and whether to dispatch now or wait". Lane allocation, chained dispatch, batch assembly and recycling are all done by the runtime.
 - **Open-source edition**: ships only `fifo`.
-- **Internal SLO scheduler**: implemented as a plugin, without changing the core. This also avoids the problem in embodied-serving's `global_scheduler.py`, where SLO code is intertwined with generic code.
+- **SLO schedulers**: implemented as plugins, without changing the core, so SLO code does not get intertwined with generic scheduling.
 
 ---
 
@@ -316,7 +313,7 @@ class StagePolicy(Protocol):
 
 ### 8.1 Slot state machine
 
-Reuses the proven state machine of embodied-serving's `kv_cache/batch_manager.py`:
+Reuses the slot state machine proven in an earlier internal service:
 
 ```text
 FREE → WRITING → READY → READING → RELEASING(awaiting events) → FREE (generation+1)
@@ -369,7 +366,7 @@ v1 implements only `colocated`. Vision, Prefill and Action share one Engine proc
 - **Model boundary**: StageGraph declares only stages and dependencies, and HandoffSpec only cross-stage tensor layouts; model files are unaware of which process a stage runs in or how data is transferred.
 - **Runtime boundary**: stage queues, batching and lanes are managed per logical stage; slots are owned by requests, and their reads, writes and recycling follow stage dependencies. The runtime assembles execution resources and handles handoffs; v1 maps all GPU stages to one Engine and hands off through request slots and GPU events.
 - **Current scope**: no `split`, and no process-layout switch, remote StageExecutor, inter-stage IPC channel or MPS start/stop code. The shared memory and notification channels of the CPU Frontend are not affected by this restriction. Only the responsibility boundaries above are kept; no empty implementations are built in advance.
-- **Later extension**: if measurements show that colocated is still limited by CPU submission after blocking and hot-path overhead are removed, process splitting will be reviewed separately. FleetServe's two-group mapping, Vision + Prefill / Action, could be considered, reusing the logical stages and numerical contracts; this is not part of the implementation or acceptance commitments of the current M0–M3.
+- **Later extension**: if measurements show that colocated is still limited by CPU submission after blocking and hot-path overhead are removed, process splitting will be reviewed separately. A two-group mapping, Vision + Prefill / Action, could be considered, reusing the logical stages and numerical contracts; this is not part of the implementation or acceptance commitments of the current M0–M3.
 
 Colocating stages keeps request slots in one process and links dispatches using device events. Measure the latency and capacity of this layout under the intended load.
 
@@ -427,7 +424,7 @@ frontend_workers      4          default, frontends × workers ≤ cpus/2 = 12
 
 - Combinations multiply with "model × hardware × deployment" and easily go stale.
 - The source of a value is invisible.
-- Hardware-independent settings easily get hidden in hardware profiles. For example, embodied-serving's `rtx5090` profile sets `OMP_NUM_THREADS=1`, which should be the default on every platform.
+- Hardware-independent settings easily get hidden in hardware profiles. For example, an earlier service's `rtx5090` profile set `OMP_NUM_THREADS=1`, which should be the default on every platform.
 
 ---
 
@@ -562,8 +559,8 @@ A platform declares its capabilities at build time. The runtime derives the conf
 | Memory | 32 GB discrete GPU memory | Unified memory: H2D can be zero-copy or mapped |
 | CPU | Server CPU (24-core quota in the test container) | ARM, weaker: dispatch overhead is a larger share, and Frontend preprocessing is also more likely to become the bottleneck under fleet load |
 | MXFP8 GEMM | PyTorch reference | PyTorch reference |
-| MPS | Supported (used by FleetServe's split layout); v1 colocated does not depend on it | To be confirmed; v1 colocated does not depend on it |
-| Known references | FleetServe, HarriX `mxfp8-sm120` | HarriX `mxfp8-thor` (ViT BF16, whole-call graph, RTC off) |
+| MPS | Supported; v1 colocated does not depend on it | To be confirmed; v1 colocated does not depend on it |
+| Known references | Earlier internal serving runtimes | The earlier Thor port of the model (ViT BF16, whole-call graph, RTC off) |
 
 AMD GPUs are also a target platform; the timing and GPU models are to be decided (§22). The Platform interface is designed with HIP's differences in mind: HIP Graph, no MPS, CU masks; the available quantization formats depend on the GPU model and are expressed through `supported_quant`.
 
@@ -703,13 +700,13 @@ These tools decide whether others can reproduce "how many robots per GPU", and t
 ## 18. Repository and development process
 
 - XInfer integrates xcompute through the operator contracts, bindings and conformance checks in §14. External publication requires license and contribution-process approval.
-- **Conventions carried over from embodied-serving**:
+- **Conventions**:
   - MR descriptions must state the problem, changes, validation and limitations;
   - raw experiment data stays out of Git;
   - performance claims state their measurement conditions and evidence location;
   - defaults must be backed by same-condition evidence.
 - **Language**: code, comments and external docs in English; internal review documents may be in Chinese before going public.
-- **CI**: every MR and `main` run CPU checks (ruff, CPU tests, `.gitlab-ci.yml`); GPU runs (5090, Thor) are planned nightly but not set up yet.
+- **CI**: every pull request and `main` run CPU checks in GitHub Actions (`.github/workflows/ci.yml`: ruff, the repository and documentation checks, CPU tests); GPU tests are run manually.
 
 ### 18.1 XInfer repository layout
 
@@ -718,9 +715,9 @@ The following is the planned full directory layout, which differs from the direc
 ```text
 XInfer/
 ├── README.md
-├── CONTRIBUTING.md                 # MR conventions, evidence rules (from embodied-serving)
+├── CONTRIBUTING.md                 # contribution conventions, evidence rules
 ├── pyproject.toml                  # package name to be decided (§22); extras: test / bench / kernels
-├── .gitlab-ci.yml                  # CPU checks on every MR; nightly GPU runs on 5090 and Thor
+├── .github/workflows/ci.yml        # CPU checks on every pull request
 ├── docs/
 │   ├── design.md                   # this document
 │   ├── architecture/               # subsystem designs: scheduler, memory, ops contracts, config resolution
@@ -864,12 +861,12 @@ XInfer does not import external extensions directly; it discovers them at startu
 | Entry-point group | Purpose | Example |
 |---|---|---|
 | `xinfer.ops` | Register operator implementations | The xcompute binding and other vendors' operator packages |
-| `xinfer.models` | Out-of-tree models | Unpublished internal models |
-| `xinfer.policies` | Scheduling policies | The internal SLO scheduler |
+| `xinfer.models` | Out-of-tree models | Private or third-party models |
+| `xinfer.policies` | Scheduling policies | SLO-aware schedulers |
 | `xinfer.platforms` | Register a Platform | Vendor NPU packages; the built-in cuda and cpu platforms use the same mechanism |
 | `xinfer.quantization` | Register a QuantMethod | Vendor quantization formats |
 
-This way the internal SLO scheduler, unpublished models and NDA-bound chip SDK bindings all live in private packages, with no need to fork the open-source repository.
+This way SLO schedulers, private models and NDA-bound chip SDK bindings can live in separate packages, with no need to fork the repository.
 
 **Activation protocol** (the same approach as vLLM and SGLang):
 
@@ -889,36 +886,18 @@ M0–M3 all use `colocated` as the GPU execution layout and include no split exe
 | M2 | `models/layers/quantization/nvfp4.py`, precision gates and building blocks for model extensions |
 | M3 | Compatibility adapters, Router, docs, Docker images, GitHub release |
 
-### 18.5 Where key files are migrated from
-
-| XInfer file | Source |
-|---|---|
-| `engine/memory/slots.py` | The state machine of embodied-serving `kv_cache/batch_manager.py` |
-| `engine/scheduler/admission.py` | The generic admission part of embodied-serving `global_scheduler.py`; the three Admit states of vla-engine |
-| `engine/scheduler/batching.py` | embodied-serving `multiprocess/batching.py` (`BatchIssuer` rules) |
-| `frontend/shm.py`, `worker.py` | The shared-memory transport and frontend workers in embodied-serving |
-| `models/wall_oss/` | HarriX `mxfp8-sm120` / `mxfp8-thor`, split into shared layers and model files |
-| `ops/backends/_xcompute.py` | embodied-serving `adapters/wallx/mxfp8_ops.py`, the `ops.py` of each HarriX track |
-| `config/schema.py` | The strict loading approach of HarriX `launch_config.py` |
-
 ---
 
 ## 19. Relationship to existing code
 
-**A new repository instead of evolving an existing one:**
+**A new repository instead of evolving an existing one.** The earlier internal serving code mixed ported private code and SLO scheduling with generic scheduling, depended on undeclared builds, and ported kernels one by one for each model and GPU. XInfer keeps what proved itself there:
 
-- embodied-serving: the adapters contain ported private code, and SLO code is intertwined with generic scheduling.
-- HarriX: depends on `wall_x` and internal xcompute builds that are not declared in setup.py, and kernels are ported one by one for each "model × GPU".
+- generic admission, the queue chain, lane limits, slot allocation and recycling, draining on failure, and the slot state machine;
+- the batching rules, the frontend process pool and shared memory;
+- executor/engine separation (prepare → engine → decode), build-time capability checks, sealing graphs after warmup and strict configuration loading;
+- admission results (`AdmitReady` / `AdmitDelay` / `AdmitFail`), slot handle generations, and `/ready` returning 503 until warmup completes.
 
-### Migration sources
-
-| Source | What is migrated |
-|---|---|
-| embodied-serving | The generic parts of `global_scheduler` (admission, the queue chain, lane limits, slot allocation and recycling, draining on failure); the slot state machine; the `BatchIssuer` rules; the frontend process pool and shared memory; the cluster layer |
-| HarriX | Executor/Engine separation (prepare → engine → decode); build-time capability checks; sealing graphs after warmup; strict configuration loading; the 4B implementations of `mxfp8-sm120` / `mxfp8-thor` |
-| vla-engine | AdmitReady/Delay/Fail; slot handle generations; `/ready` returning 503 until warmup completes; layered precision-threshold configuration |
-
-What is migrated are the logical stages and the batching and ownership rules; this version does not migrate the GPU-stage ActionProcess, the CUDA IPC transfer or the private MPS start/stop implementation. The CPU Frontend process pool and shared memory are kept as originally planned.
+What is carried over are the logical stages and the batching and ownership rules; this version does not carry over the GPU-stage ActionProcess, the CUDA IPC transfer or the MPS start/stop implementation. The CPU Frontend process pool and shared memory are kept as originally planned.
 
 ### Coupling left behind
 
@@ -927,7 +906,7 @@ What is migrated are the logical stages and the batching and ownership rules; th
 - threads and environment variables named after Wall-X;
 - the hard-coded 5.6 Hz;
 - ablation gates imported on the hot path;
-- camera names and dual arms hard-coded in generic types (HarriX).
+- camera names and dual arms hard-coded in generic types.
 
 ---
 
@@ -935,7 +914,7 @@ What is migrated are the logical stages and the batching and ownership rules; th
 
 | Milestone | Content | Acceptance |
 |---|---|---|
-| M-1 Review and repository setup | Main repository kc/XInfer created (private), xcompute confirmed as the operator repository; review of this document and of the operator contracts pending; CPU CI set up | Repository arrangement decided; review and acceptance conclusions recorded once the other items of this milestone are done |
+| M-1 Review and repository setup | Main repository created, xcompute confirmed as the operator repository; review of this document and of the operator contracts pending; CPU CI set up | Repository arrangement decided; review and acceptance conclusions recorded once the other items of this milestone are done |
 | M0 Data plane | Platform, operator backends, layers, Wall-OSS, single-lane dispatch and benchmarks | Wall-OSS meets its precision gate and records latency and graph dispatch costs on the target platform. |
 | M1 Fleet runtime | Multi-lane dispatch, zero-wait batching, frontend workers, slot lifecycle and configuration resolution | Measure fleet capacity, batched precision and dispatch overhead under load. |
 | M2 Quantization and extension | NVFP4 and model extensions | Record numerical results for each model and quantization method. |
@@ -962,14 +941,3 @@ What is migrated are the logical stages and the batching and ownership rules; th
 5. **External stable surface and support tiers**: the starting API version number and the rules for breaking changes, and the admission criteria for Tier 2 (§13.3).
 6. **Timing and GPU models for AMD GPUs**: whether they enter v1; the GPU model determines the available quantization formats and kernel sources (§13.2).
 
----
-
-## Appendix A: Evidence index
-
-All on RTX 5090; "T-xxx" are records in embodied-serving `papers/fleetserve/experiments/`.
-
-| Data | Source | Notes |
-|---|---|---|
-| 4B whole-request concurrency saturates at 39.9 vs FIFO 42.8 req/s | G1c (T-37) | |
-| A 2nd ViT copy +25%, a 3rd copy no gain | T-76 | |
-| SM reservation gives no end-to-end gain | SM_SHARING_STUDY_20261013 | Old 4B |
