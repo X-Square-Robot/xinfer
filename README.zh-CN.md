@@ -1,53 +1,78 @@
 <p align="center">
-  <img src="docs/assets/xinfer-logo.webp" alt="XInfer" width="560">
+  <img src="docs/assets/xinfer-logo.webp" alt="XInfer — 面向机器人的推理" width="560">
+</p>
+
+<h3 align="center">快速、稳定、准确的 VLA 推理，从单台机器人到整个机队。</h3>
+
+<p align="center">
+  <a href="README.md">English</a> | <b>简体中文</b>
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <b>简体中文</b>
-</p>
-
-<p align="center">
+  <a href="#特性一览">特性</a> ·
   <a href="#快速开始">快速开始</a> ·
-  <a href="#模型与硬件">模型与硬件</a> ·
-  <a href="#基准测试">基准测试</a> ·
-  <a href="#文档">文档</a>
+  <a href="#模型与硬件">模型</a> ·
+  <a href="docs/benchmark.zh-CN.md">基准测试</a> ·
+  <a href="#文档">文档</a> ·
+  <a href="CONTRIBUTING.md">参与贡献</a>
 </p>
 
-**XInfer 为机器人运行视觉-语言-动作（VLA）模型。** 输入相机图像、机器人状态和指令，即可得到一段动作序列。你可以在 Python 中为单台机器人调用策略，也可以用一张加速卡通过 WebSocket 为多台机器人提供服务。两种方式共用同一个推理引擎。
+**XInfer 是面向视觉-语言-动作（VLA）模型的推理与服务框架。** 我们的目标是为机器人提供快速、稳定、准确的模型推理服务，覆盖从机载推理到机队共享服务的各种场景。
+
+## 特性一览
+
+| 特性 | 可以做什么 | 指南 |
+|---|---|---|
+| 本地推理与网络服务 | 在机器人进程中调用 `Policy.infer()`，或通过 WebSocket 向 `xinfer-serve` 发送观测。 | [服务](docs/serving.zh-CN.md) |
+| 实时分块（RTC） | 使用 Wall-OSS 或 Wall-X 2B 请求下一段动作时，传入上一段动作和推理延迟。 | [Wall-OSS](docs/models/wall_oss.zh-CN.md) · [Wall-X 2B](docs/models/wallx2b.zh-CN.md) |
+| 多机器人调度 | 多台机器人共享一份模型权重，可限制每台机器人的在途请求数，并在各阶段将兼容请求组批。 | [引擎](docs/engine.zh-CN.md) |
+| 算子后端 | 查看实际选择的 kernel，用 xcompute 或 PyTorch 参考实现运行支持的算子。 | [Kernel](docs/kernels.zh-CN.md) |
+| 压测与监控 | 测量单请求时延和单卡能服务的机器人数，通过 Prometheus 和 Grafana 查看队列和各阶段耗时。 | [基准测试](docs/benchmark.zh-CN.md) · [指标](docs/metrics.zh-CN.md) |
+
+## 为什么选择 XInfer
+
+- **快速。** 单请求时延低，每个加速器能服务更多机器人。异步阶段发射、设备事件以及（在支持的平台上）图回放降低了主机开销。阶段队列和零等待组批把排队中的兼容请求合并执行，共享权重，并让不同阶段的工作相互重叠。
+- **稳定。** 时延可预测，服务在机队负载下持续运行：服务前先预热，有准入限制，并对逐请求的故障进行隔离。
+- **准确。** 输出忠实于原始模型。不同批大小可能带来浮点舍入差异。Wall-OSS 和 Wall-X 2B 的验证标准见[精度门禁](docs/precision.zh-CN.md)。
+- **可扩展。** 可复用的层和阶段接口简化了模型接入。平台适配器和算子适配器把模型代码接到新芯片和优化过的 kernel 上。
 
 ## 快速开始
 
-准备 Python 3.10+ 和适配加速卡的 PyTorch，然后获取源码并安装：
+使用 Python 3.10+ 和与加速器匹配的 PyTorch 版本。下面的示例使用 NVIDIA CUDA。在当前检出的仓库中安装：
 
 ```bash
-git clone https://github.com/X-Square-Robot/xinfer.git
-cd xinfer
 python -m pip install -e ".[models,serve]"
 python -c "from xinfer.models import available_models; print(available_models())"
 ```
 
-全新安装会列出 `('wall_oss', 'wallx2b')`。这一步不需要模型权重。
+全新安装会列出 `('wall_oss', 'wallx2b')`，这一步不需要模型权重。
+
+Wall-OSS 默认的 BF16 优化路径使用 **xcompute**。在支持的 GPU 上安装与其架构匹配的构建后，按 [kernel 指南](docs/kernels.zh-CN.md)检查各算子的后端。缺少兼容构建时使用较慢的 PyTorch 实现。
+
+以下示例使用 BF16，需要[受支持的 Wall-OSS checkpoint 布局](docs/models/wall_oss.zh-CN.md#环境要求)，包括 tokenizer 和归一化文件。公开的 Wall-OSS-0.5 和 WALL-OSS-FLOW 权重布局不同，目前无法直接加载。
 
 ### 启动模型服务
 
-以下示例在 CUDA 上运行 Wall-X 2B。准备一份[兼容的 checkpoint](docs/models/wallx2b.zh-CN.md#checkpoint-要求) 和一条名为 `flow.msgpack` 的观测记录。记录按[请求格式](docs/models/wallx2b.zh-CN.md#请求与响应)包含三个相机视角、双臂位姿和指令。
-
 ```bash
-xinfer-serve --model wallx2b --checkpoint /path/to/wallx2b-checkpoint \
-  --device cuda --warmup flow.msgpack --port 33985
+xinfer-serve \
+  --model wall_oss \
+  --checkpoint /path/to/checkpoint \
+  --device cuda \
+  --warmup observation.msgpack \
+  --port 33985
 ```
 
-预热完成后，在另一个终端检查服务是否就绪：
+`observation.msgpack` 是一个符合[模型输入格式](docs/models/wall_oss.zh-CN.md#运行)的代表性请求。预热在服务开始接受连接之前运行。如有 RTC 流量，请在 `--warmup` 中同时提供一个普通请求和一个 RTC 请求。
+
+通过 WebSocket + msgpack 连接 `ws://127.0.0.1:33985`。协议、健康检查端点和部署选项见[服务指南](docs/serving.zh-CN.md)。
+
+预热结束后，在另一个终端检查服务是否返回 `ok`：
 
 ```bash
 curl -fsS http://127.0.0.1:33985/healthz
 ```
 
-服务会返回 `ok`。机器人可通过 WebSocket + msgpack 向 `ws://127.0.0.1:33985` 发送观测。使用实时分块（RTC）时，在 `--warmup` 中同时传入一条普通请求和一条有代表性的 RTC 请求。网络协议和部署选项见[服务指南](docs/serving.zh-CN.md)。
-
 ### 在 Python 中运行
-
-也可以用同一份 checkpoint 和观测，在进程内查看一次预测。下面的代码在 CPU 上解码相机图像、在 CUDA 上运行模型，与上面服务命令的默认行为一致。
 
 ```python
 from pathlib import Path
@@ -55,60 +80,82 @@ from pathlib import Path
 from xinfer import Policy
 from xinfer.frontend.protocol import unpackb
 
-observation = unpackb(Path("flow.msgpack").read_bytes())
-policy = Policy("wallx2b", "/path/to/wallx2b-checkpoint",
-                device="cuda", image_preprocess_device="cpu")
+observation = unpackb(Path("observation.msgpack").read_bytes())
+policy = Policy("wall_oss", "/path/to/checkpoint", device="cuda", image_preprocess_device="cpu")
+
 try:
     policy.warmup([observation])
     response = policy.infer(observation)
-    print(response["action_pred"].shape)
 finally:
     policy.engine.shutdown()
 ```
 
-对于 Wall-X 2B 的桌面双臂格式，输出形状为 `(16, 14)`，即 16 个动作步，每步每条手臂各有 7 个值。
+响应中包含模型输出的动作块（action chunk）。相机名称、状态字段和动作表示见各模型的指南。
 
 ## 模型与硬件
 
-两个模型都支持 BF16 推理和 RTC。权重需单独准备。
+| 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
+|---|---|---|---|---|
+| Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
+| Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
-| 模型 | 模型 ID | Checkpoint 和输入 |
+Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。两款模型在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)；昇腾 950DT 上的数据在同一张表内，各模型在该平台承接的算子见[昇腾指南](docs/ascend950dt.zh-CN.md)。
+
+| 硬件 | 设备 | 运行时 |
 |---|---|---|
-| Wall-X 2B | `wallx2b` | [Checkpoint 文件与桌面双臂观测格式](docs/models/wallx2b.zh-CN.md) |
-| Wall-OSS | `wall_oss` | [所需的内部 checkpoint 布局、tokenizer 和归一化文件](docs/models/wall_oss.zh-CN.md#环境要求)。公开的 Wall-OSS-0.5 和 WALL-OSS-FLOW 权重布局不同，目前无法直接加载。 |
+| NVIDIA GPU · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
+| Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
+| CPU | `cpu` | 参考实现与测试 |
 
-| 设备 | 运行时 | 配置 |
-|---|---|---|
-| NVIDIA GPU（`cuda`） | PyTorch + CUDA | [CUDA 算子与参考实现](docs/kernels.zh-CN.md)。优化的 BF16 算子需要与设备匹配的 **xcompute** 构建。 |
-| 昇腾 950DT（`npu`） | PyTorch + TorchNPU + CANN | [昇腾部署指南](docs/ascend950dt.zh-CN.md)，包括 NPU 图、xcompute 和 DVPP 图像预处理。 |
-| CPU（`cpu`） | PyTorch | 参考实现与测试。 |
+每个加速器运行各自的引擎（Engine）和权重。
 
-## 基准测试
-
-下表给出预热后单条 BF16 请求的中位时延，涵盖从输入处理到返回动作的全过程。
-
-| 模型 | NVIDIA RTX 5090 | 昇腾 950DT |
-|---|---:|---:|
-| Wall-X 2B | 22.3 ms | 79.7 ms |
-| Wall-OSS | 49.2 ms | 80.8 ms |
-
-数据对应特定构建和输入。Wall-X 2B 在 RTX 5090 上的测量使用了上游 xcompute 中可省去一次拷贝的权重布局。[完整结果与测量条件](docs/performance.zh-CN.md)还列出了每张卡能服务的机器人数和并发负载下的时延。复现步骤见[基准测试指南](docs/benchmark.zh-CN.md)。
+优化的 CUDA 执行路径使用 **xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 以同样的方式绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
 ## 工作原理
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.webp" alt="机器人经前端提交观测，引擎依次运行视觉、预填充和动作阶段。" width="100%">
+  <img src="docs/assets/xinfer-architecture.webp" alt="机器人客户端经负责输入处理和输出处理的前端（Frontend）连接到 XInfer 引擎（Engine），引擎运行 Vision、Prefill 和 Action。平台适配器分别连到以品牌标志标识的 NVIDIA GPU 和 Ascend 950DT NPU，以及 CPU 参考执行。虚线的 More chips 框表示更多硬件后端。" width="100%">
 </p>
 
-前端处理观测，并将模型输出转换为机器人动作。引擎按阶段将请求排队，把兼容的任务组批，在支持的平台上回放已捕获的图。每张加速卡运行一个引擎并持有一份模型权重。调度方式见[引擎指南](docs/engine.zh-CN.md)，部署参数见[配置指南](docs/configuration.zh-CN.md)。
+前端（Frontend）负责输入处理和输出处理。模型定义各阶段的计算和张量交接；引擎管理准入、队列、组批和资源生命周期。平台适配器提供设备执行，算子后端提供优化的 kernel。Python API 与网络服务共用同一个引擎和同一套配置规则。执行模型见[引擎指南](docs/engine.zh-CN.md)，默认值与覆盖方式见[配置](docs/configuration.zh-CN.md)。
+
+## 基准测试
+
+评估单请求时延，以及在给定响应时延目标内能服务的机器人数：
+
+| 单请求 P50（BF16） | RTX 5090 | 昇腾 950DT |
+|---|---:|---:|
+| Wall-OSS | 49.2 ms | 80.8 ms |
+| Wall-X 2B | 22.3 ms | 79.7 ms |
+
+Wall-X 2B 的 CUDA 测量使用了上游可省去一次拷贝的权重布局。完整配置和并发负载下的结果见[性能表](docs/performance.zh-CN.md)。
+
+| 工具 | 测量内容 |
+|---|---|
+| [单请求时延](benchmarks/request_latency.py) | 进程内的输入处理、引擎执行、输出处理耗时及总耗时 |
+| [机器人负载](benchmarks/robot_load.py) | 多台机器人并发流量下的客户端与服务端时延、吞吐、错误及动作队列下溢（underflow） |
+| [性能表测量脚本](benchmarks/performance.py) | 同一服务配置的单请求时延和单卡机器人数 |
+
+命令和测量口径见[基准测试指南](docs/benchmark.zh-CN.md)。各阶段耗时和精度结果见 [Wall-OSS 验证](docs/models/wall_oss_validation.zh-CN.md)和 [Wall-X 2B 验证](docs/models/wallx2b_validation.zh-CN.md)。
 
 ## 文档
 
-| 任务 | 指南 |
+| 主题 | 从这里开始 |
 |---|---|
-| 部署和监控服务 | [服务](docs/serving.zh-CN.md) · [指标与仪表盘](docs/metrics.zh-CN.md) |
-| 检查精度与数值格式 | [精度](docs/precision.zh-CN.md) · [量化](docs/quantization.zh-CN.md) · [Wall-X 2B 验证](docs/models/wallx2b_validation.zh-CN.md) · [Wall-OSS 验证](docs/models/wall_oss_validation.zh-CN.md) |
-| 分析时延 | [性能剖析](docs/profiling.zh-CN.md) · [基准测试方法](docs/benchmark.zh-CN.md) |
-| 接入模型或贡献算子 | [模型接口](xinfer/models/interface.py) · [架构设计](docs/design.zh-CN.md) · [参与贡献](CONTRIBUTING.md) |
+| 部署服务 | [服务](docs/serving.zh-CN.md) |
+| 了解调度与 CUDA graph | [引擎](docs/engine.zh-CN.md) |
+| 配置部署 | [配置](docs/configuration.zh-CN.md) |
+| 编译并启用优化 kernel | [Kernel](docs/kernels.zh-CN.md) |
+| 选择数值格式 | [量化](docs/quantization.zh-CN.md) |
+| 验证模型输出 | [精度](docs/precision.zh-CN.md) |
+| 分析算子性能 | [性能剖析](docs/profiling.zh-CN.md) |
+| 用 Prometheus 和 Grafana 监控服务 | [指标](docs/metrics.zh-CN.md) |
+| 扩展框架 | [模型接口](xinfer/models/interface.py) · [架构与设计](docs/design.zh-CN.md) |
+
+## 参与贡献
+
+代码规范、测试和性能证据要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+---
 
 此发行版尚未附带许可证。
