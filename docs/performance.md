@@ -30,8 +30,10 @@ See [Wall-OSS validation](models/wall_oss_validation.md) for the latency and mea
 ## Ascend 950DT
 
 Both rows were measured on 2026-11-13 on one exclusively reserved Ascend 950DT (CANN 9.1.1, TorchNPU
-2.10.0.post4), revision `0864476` of this branch, with the delivery `xcompute.so` (SHA-256
-`be3ee3e46e58…`) loaded through `XINFER_XCOMPUTE_LIBRARY` with its matching Python package. Both models ran
+2.10.0.post4): the Wall-OSS row at revision `3eacd03` of this branch with the r4 delivery `xcompute.so`
+(SHA-256 `a7db13d8…`), and the Wall-X 2B row at revision `7d95b98` with the r5 delivery
+(SHA-256 `903ff6de…`, which adds the 2B fused qkv tail kernel), each loaded through
+`XINFER_XCOMPUTE_LIBRARY` with its matching Python package. Both models ran
 with their default operator selection: every operator either model calls resolves to `ascend:xcompute`, and a
 per-layout dispatch audit of a full request pass confirmed every call ran on an xcompute entry (Wall-X 2B:
 21 of its 21 operators, all call layouts admitted; Wall-OSS: 11 of its 11). No operator ran on a torch
@@ -39,11 +41,11 @@ reference in either benchmark. The [Ascend guide](ascend950dt.md) lists each ope
 
 | Model | Precision and composition | Single request P50 | Robots per NPU | Server P50 at capacity | Server P95 at capacity | Highest measured rate | Numerical agreement |
 |---|---|---|---|---|---|---|---|
-| Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s | internal precision gate with DVPP images: PASS |
-| Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s | fixed-noise actions within max_abs 0.0472 of the reference composition: PASS |
+| Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 47.75 ms | 4 | 120.4 ms | 129.9 ms | 29.2 req/s | quick100 B1, DVPP −6.77 % against the BF16 reference: PASS |
+| Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 51.05 ms | 6 | 93 ms | 111 ms | 33.4 req/s | fixed-noise action gate against the reference composition: PASS |
 
-- **Wall-OSS** used a flow and an RTC request as the single-request set and service warmup, `image_preprocess_device` on the NPU (DVPP), and the synthetic desktop load with RTC at 2 and 3 robots — sixteen rounds, zero errors, zero missing responses, zero underflow. At two robots the per-round server P50 spans 118–121 ms with a median of 120.1 ms and a worst-round P95 of 130.2 ms; three robots measured 161–166 ms, above the 150 ms rule, so the capacity is bounded at two. The single request splits into prepare 2.23 ms, engine 78.42 ms and output 0.15 ms.
-- **Wall-X 2B** used the 216-request latency capture as the single-request set (fixed noise seed 20261112), two requests as service warmup, and the synthetic desktop load with RTC at 2 robots — 八 rounds, 零 errors, 零 missing responses. Its single request splits into prepare 2.80 ms, engine 76.76 ms and output 0.15 ms.
+- **Wall-OSS** used a flow and an RTC request as the single-request set and service warmup, `image_preprocess_device` on the NPU (DVPP), and the synthetic desktop load with RTC at 4 and 6 robots — eight rounds per count, zero errors, zero missing responses. At four robots the server P50/P95 medians are 120.4/129.9 ms at 22.1 req/s; six robots measured 176.2/187.7 ms at 29.2 req/s, above the 150 ms rule, so the capacity is bounded at four robots while six robots set the highest measured rate. The single request splits into prepare 2.06 ms, engine 44.94 ms and output 0.15 ms.
+- **Wall-X 2B** used the 216-request latency capture as the single-request set (fixed noise seed 20261112), two requests as service warmup, and the synthetic desktop load with RTC at 4 and 6 robots — sixteen rounds, zero errors, zero missing responses. At four robots the server P50/P95 medians are 61.7/77.8 ms and at six robots 93/111 ms at 33.4 req/s, both below the 150 ms rule. Its single request splits into prepare 2.60 ms, engine 48.40 ms and output 0.15 ms.
 
 Both models' rows report one wiring: the xcompute package's own entries, which mix CANN ACLNN Matmul,
 FusedInferAttentionScore V5 and official operators with TileLang and AOT custom kernels inside xcompute. At the
