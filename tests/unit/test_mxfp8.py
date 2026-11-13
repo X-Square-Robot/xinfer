@@ -282,6 +282,26 @@ def test_gemm_family_norms_quantize_the_bf16_norm():
     assert torch.equal(q.view(torch.uint8), expected[0].view(torch.uint8)) and torch.equal(s, expected[1])
 
 
+def test_packed_weight_reuse_and_release(monkeypatch):
+    from types import SimpleNamespace
+    from weakref import ref
+
+    from xinfer.ops.backends.cuda import mxfp8 as cuda_mxfp8
+
+    def prepack(weight, **options):
+        # The SM120 tile layout also keeps a contiguous row-major weight for the generic GEMM.
+        return SimpleNamespace(tensors={"rows": weight.contiguous()})
+
+    monkeypatch.setattr(cuda_mxfp8, "xc", SimpleNamespace(prepack_weight=prepack))
+    q, scales = mxfp8.quantize(torch.ones(32, 128, dtype=torch.bfloat16))
+    owner = ref(q)
+    packed = cuda_mxfp8._weight("gemm", (q, scales))
+    assert packed is cuda_mxfp8._weight("gemm", (q, scales))
+    assert packed.tensors["rows"].untyped_storage() is q.untyped_storage()
+    del q
+    assert owner() is None  # the packing can stay in use without retaining the tensor that owns the cache
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_xcompute_gemm_family_forms_match_the_references_at_wallx2b_shapes():

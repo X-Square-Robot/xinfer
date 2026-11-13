@@ -30,7 +30,9 @@ def _weight(op, weight, **heads):
     key = (op, tuple(heads.items()))
     cached = cache.get(key)
     if cached is None or cached[0] is not scales:
-        cached = (scales, xc.prepack_weight(q, op=op, scale=scales, **heads))
+        # A packing may keep its input tensor for generic GEMM. Give it a separate wrapper over the same storage
+        # so the cached value cannot retain q, the owner of this cache.
+        cached = (scales, xc.prepack_weight(q.detach(), op=op, scale=scales, **heads))
         cache[key] = cached
     return cached[1]
 
