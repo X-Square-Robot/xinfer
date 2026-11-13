@@ -128,7 +128,7 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 | Wall-OSS | 49.2 ms | 80.8 ms |
 | Wall-X 2B | 22.3 ms | 79.7 ms |
 
-Wall-X 2B 的 CUDA 测量使用了上游可省去一次拷贝的权重布局。完整配置和并发负载下的结果见[性能表](docs/performance.zh-CN.md)。
+RTX 5090 和昇腾数据分别测于 2026 年 11 月 9 日和 11 月 13 日。Wall-X 2B 的 CUDA 测量使用了上游可省去一次拷贝的权重布局。完整配置和并发负载下的结果见[性能表](docs/performance.zh-CN.md)。
 
 | 工具 | 测量内容 |
 |---|---|

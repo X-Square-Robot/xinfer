@@ -156,7 +156,7 @@ defined response-latency target:
 | Wall-OSS | 49.2 ms | 80.8 ms |
 | Wall-X 2B | 22.3 ms | 79.7 ms |
 
-The Wall-X 2B CUDA measurement used an upstream weight layout that can avoid a copy. See the [measurement conditions and results under load](docs/performance.md).
+The RTX 5090 rows were measured on November 9 and the Ascend rows on November 13, 2026. The Wall-X 2B CUDA measurement used an upstream weight layout that can avoid a copy. See the [measurement conditions and results under load](docs/performance.md).
 
 | Tool | Measures |
 |---|---|
