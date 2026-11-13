@@ -56,7 +56,7 @@ The reference composition (`numerics="reference"`) reproduces the Wall-X eager m
 ## Optimized composition
 
 `numerics="optimized"` (the default, `xinfer/models/wall_oss/optimized.py`) runs the reference composition's steps
-on operators of `xinfer/ops/reference/fused.py`, each one xcompute call (xcompute `7336b0d`) where xcompute lists a kernel for
+on operators of `xinfer/ops/reference/`, each one xcompute call (xcompute `7336b0d`) where xcompute lists a kernel for
 the shape, else the operator's torch reference. All BF16, like the reference.
 
 | Step | Operator | Kernel at this model's shapes |

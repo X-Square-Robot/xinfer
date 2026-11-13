@@ -1,10 +1,10 @@
 """Engine core: admission, stage queues, lanes, batching and chained dispatch.
 
-One ``Engine`` serves one GPU with all stages in the same process
+One ``Engine`` serves one device with all stages in the same process
 (docs/design.md §6–§9). Three threads:
 
 - the **engine thread** owns admission (up to ``max_running_requests``), the per-stage FIFO queues, batch
-  formation and every stage's CUDA submission (uploads, graph replays, events);
+  formation and every stage's device submission (uploads, graph replays, events);
 - the **completer** waits for final events and resolves the callers' futures;
 - the **device-image thread** decodes and resizes the ``DeviceImage`` inputs of the admitted requests that have
   them, on its own stream, so the blocking JPEG decode call never blocks the engine thread.
@@ -48,6 +48,7 @@ from xinfer.engine.slots import PoolExhausted, SlotPool
 from xinfer.models.interface import DeviceImage, PreparedRequest, StageBatch, VLAModel
 from xinfer.observability.annotate import span
 from xinfer.observability.stats import RequestStats, StageStats
+from xinfer.platforms.devices import device_module_for
 from xinfer.platforms.interface import Platform
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ class EngineConfig:
             ``AdmitError("per_robot_limit")``. Requests without a robot id are not limited.
         cudagraphs: capture and replay CUDA graphs per lane with these settings; None runs stages eagerly.
         poll_interval_s: longest time the idle engine thread sleeps before polling the lanes' events again.
-        stream_priorities: CUDA stream priority per stage (default 0); smaller integers have higher priority.
+        stream_priorities: accelerator stream priority per stage (default 0), within the platform's range.
     """
 
     lanes: Mapping[str, int] = field(default_factory=dict)  # per stage, default 1
@@ -138,10 +139,10 @@ class _Request:
 
 
 def _timing_event(lane):
-    """A timing CUDA event recorded on ``lane``'s stream, or None on the CPU."""
-    if lane.stream is None:
+    """A timing device event recorded on ``lane``'s stream, or None on the CPU."""
+    event = lane.make_event(enable_timing=True)
+    if event is None:
         return None
-    event = torch.cuda.Event(enable_timing=True)
     event.record(lane.stream)
     return event
 
@@ -170,7 +171,7 @@ class Engine:
         """Validate the model's handoffs, derive the batch sizes, create the lanes and start the threads.
 
         Each stage's allowed batch sizes are its ``Capabilities.batch_sizes`` plus 1, up to its ``max_batch``.
-        With CUDA every lane gets its own stream and admission uploads use one separate upload stream.
+        On an accelerator every lane gets its own stream and admission uploads use one separate stream.
 
         Args:
             model: the model to serve.
@@ -186,6 +187,7 @@ class Engine:
         self.model = model
         self.platform = platform
         self.config = config = config or EngineConfig()
+        self._device_module = device_module_for(platform.device)
         self.stages = model.stage_graph
         self.order = [stage.name for stage in self.stages]
         self.final_stages = [stage for stage in self.order if not self.stages.consumers(stage)]
@@ -231,11 +233,11 @@ class Engine:
                                                      self._reads)
                 lanes.append(lane)
             self.lanes[stage] = lanes
-        if platform.is_cuda:
+        if self._device_module is not None:
             for stage in self.final_stages:
                 for lane in self.lanes[stage]:
-                    lane.copy_stream = torch.cuda.Stream(device=platform.device)
-        self._upload = torch.cuda.Stream(device=platform.device) if platform.is_cuda else None
+                    lane.copy_stream = self._device_module.Stream(device=platform.device)
+        self._upload = self._device_module.Stream(device=platform.device) if self._device_module else None
 
         self.slots = SlotPool(config.max_running_requests)
         self._queues = {stage: deque() for stage in self.order}
@@ -255,7 +257,8 @@ class Engine:
         # DeviceImage inputs are decoded off the engine thread: on one thread (torchvision shares one nvJPEG decoder
         # per device) with its own stream and a decoder created on first use. Requests in it are counted in
         # _device_inflight (engine thread only) and come back through _device_ready.
-        self._device_stream = torch.cuda.Stream(device=platform.device) if platform.is_cuda else None
+        self._device_stream = (self._device_module.Stream(device=platform.device)
+                               if platform.is_cuda or platform.capabilities.device_images else None)
         self._decoder = None
         self._device_requests: queue.Queue = queue.Queue()
         self._device_ready: list = []
@@ -268,7 +271,8 @@ class Engine:
     def start(self) -> None:
         """Start the engine, completion and device-image threads (done by the constructor by default).
 
-        Call it once, and only for an engine built with ``start=False``.
+        Call it once, and only for an engine built with `start=False`. Each thread binds the device it uses when
+        it starts, so a worker created late still runs on the same device as the engine.
         """
         self._engine_thread.start()
         self._completer.start()
@@ -351,7 +355,7 @@ class Engine:
             outputs.append(results[0])
             variants += len(results)
         if graphs:
-            capture_batch_sizes(self.lanes, self._batch_sizes, self._merge)
+            capture_batch_sizes(self.lanes, self._batch_sizes, self._merge, device=self.platform.device)
         for lanes in self.lanes.values():
             for lane in lanes:
                 if lane.cudagraphs is not None:
@@ -362,7 +366,7 @@ class Engine:
                         "reserved %.2f GiB", variants, time.perf_counter() - started,
                         {stage: counters["graphs"] for stage, counters in stats.items()},
                         sum(counters["capture_ms"] for counters in stats.values()) / 1000,
-                        torch.cuda.memory_reserved(self.platform.device) / 2 ** 30)
+                        self._device_module.memory_reserved(self.platform.device) / 2 ** 30)
         return outputs
 
     def cudagraph_stats(self) -> dict:
@@ -429,8 +433,21 @@ class Engine:
 
             gc.collect()
             torch.cuda.empty_cache()
+        elif self.platform.is_npu:
+            with self._device_module.device(self.platform.device):
+                self._device_module.synchronize()
+                self._device_module.empty_cache()
 
     # ------------------------------------------------------------- engine loop
+    def _bind_device(self) -> None:
+        """Bind this thread to the engine's device; a no-op where the runtime does not need it.
+
+        TorchNPU keeps a current device per thread, so a worker that creates events or launches work has to set it
+        itself. Called at the top of each worker, before it touches the device.
+        """
+        if self.platform.is_npu:
+            self._device_module.set_device(self.platform.device)
+
     def _run_engine_loop(self) -> None:
         """Engine thread body: repeat ``_step`` until shutdown has drained the waiting, decoding and queued requests.
 
@@ -439,6 +456,7 @@ class Engine:
         ``poll_interval_s``, also while requests wait for a slot: ``submit`` and finishing requests (which releases
         their slots) wake it, and the timeout lets it poll the busy lanes' events.
         """
+        self._bind_device()
         while True:
             try:
                 progressed = self._step()
@@ -506,14 +524,14 @@ class Engine:
                 self._waiting.popleft()
             request.admitted_at = time.perf_counter()
             stream = self._upload
-            stream_context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+            stream_context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
             admitted = True
             try:
                 with stream_context, span("admit", request=request.id, robot=request.robot):
                     request.inputs = {name: _to_device(value, self.platform.device)
                                       for name, value in request.prepared.tensors.items()}
                     if stream is not None:
-                        request.inputs_ready = torch.cuda.Event(enable_timing=self.stats_sink is not None)
+                        request.inputs_ready = self._device_module.Event(enable_timing=self.stats_sink is not None)
                         request.inputs_ready.record(stream)
             except Exception as exc:  # noqa: BLE001 - only this request fails
                 self._fail_request(request, exc)
@@ -535,23 +553,31 @@ class Engine:
         """Device-image thread body: turn each handed-over request's ``DeviceImage`` values into views, in admission
         order.
 
-        The ``DeviceImageDecoder`` is created on first use; if that raises (no CUDA device, no torchvision), the
-        request fails and the next one tries again. On CUDA the work runs on the thread's stream after the request's
-        upload, and an event recorded after it becomes the request's ``inputs_ready`` event, which the lanes wait for on
-        the GPU: no host synchronization. The result, or the exception it raised, goes to ``_device_ready`` and the
+        The ``DeviceImageDecoder`` is created on first use. If initialization raises, the request fails and the next
+        one tries again. The work runs on the thread's stream after the request's upload, and an event recorded
+        after it becomes the request's ``inputs_ready`` event, which the lanes wait for on the device. The result,
+        or the exception it raised, goes to ``_device_ready`` and the
         engine thread is woken. The views are held by the request until it finishes, after its final stage, so no
-        stage reads freed memory. ``None`` ends the loop.
+        stage reads freed memory. ``None`` closes the decoder on its owning thread and ends the loop.
         """
+        self._bind_device()
         stream = self._device_stream
         while True:
             request = self._device_requests.get()
             if request is None:
+                if self._decoder is not None:
+                    try:
+                        self._decoder.close()
+                    except Exception:  # noqa: BLE001 - shutdown still joins this worker
+                        logger.exception("could not release the device image decoder")
+                    finally:
+                        self._decoder = None
                 return
             inputs = error = event = None
             try:
                 if self._decoder is None:
                     self._decoder = DeviceImageDecoder(self.platform.device)
-                context = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+                context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
                 with context, torch.inference_mode():
                     if stream is not None and request.inputs_ready is not None:
                         stream.wait_event(request.inputs_ready)
@@ -560,11 +586,13 @@ class Engine:
                 error = exc
             if stream is not None:
                 try:
-                    event = torch.cuda.Event(enable_timing=self.stats_sink is not None)
+                    event = self._device_module.Event(enable_timing=self.stats_sink is not None)
                     event.record(stream)
-                except Exception:  # noqa: BLE001 - the device is in an error state; the request still fails or runs
+                except Exception as exc:  # noqa: BLE001 - report a device error, keep the worker alive
                     logger.exception("could not record the device images' completion")
                     event = None
+                    if self.platform.is_npu and error is None:
+                        error = exc
             with self._lock:
                 self._device_ready.append((request, inputs, event, error))
                 self._wake.notify()
@@ -848,12 +876,12 @@ class Engine:
         if lane.copy_stream is None:
             return [self._to_host(stage, out, i, batch_size) for i in range(batch_size)], lane.record()
         ready = lane.record()
-        with torch.cuda.stream(lane.copy_stream):
+        with self._device_module.stream(lane.copy_stream):
             lane.copy_stream.wait_event(ready)
             for value in out.values():  # eager outputs must outlive the copies
                 value.record_stream(lane.copy_stream)
             hosts = [self._to_host(stage, out, i, batch_size) for i in range(batch_size)]
-            event = torch.cuda.Event()
+            event = self._device_module.Event()
             event.record(lane.copy_stream)
         return hosts, event
 
@@ -876,7 +904,7 @@ class Engine:
         host = {}
         for name, value in out.items():
             row = self._row(stage, name, value, i, batch_size)
-            if self.platform.is_cuda:
+            if self._device_module is not None:
                 host_buffer = torch.empty(row.shape, dtype=row.dtype, pin_memory=True)
                 host_buffer.copy_(row, non_blocking=True)
                 host[name] = host_buffer
@@ -915,6 +943,7 @@ class Engine:
         alone. If waiting on the event raises, the batch's requests fail with that exception and the loop goes on.
         A ``None`` item, queued by ``shutdown``, ends the loop.
         """
+        self._bind_device()
         while True:
             item = self._completions.get()
             if item is None:
@@ -947,10 +976,10 @@ class Engine:
         A stage waits from the moment it can start (the request's inputs are ready on the device, or its upstream
         stages have finished) to the start of its dispatch, then executes; along the request the waits and execution
         times add up to its inputs being ready to its final stage finishing. The times come from timing events on
-        CUDA (all complete once the final stage is) and from host times on the CPU.
+        the accelerator (all complete once the final stage is) and from host times on the CPU.
 
         Returns:
-            The stats, or None for a request admitted before the sink was set (it has no timing).
+            The stats, or None if the input completion or any stage has no timing.
         """
         if set(request.timing) != set(self.order):
             return None
@@ -962,7 +991,7 @@ class Engine:
                 since = request.inputs_ready.elapsed_time
                 times = {stage: (since(began) / 1000, since(ended) / 1000)
                          for stage, (began, ended, _) in request.timing.items()}
-        except RuntimeError:  # an event recorded without timing, before the sink was set
+        except (RuntimeError, ValueError):  # timing may be unavailable even for a timing-enabled event
             return None
         stages = {}
         for stage, (began, ended) in times.items():

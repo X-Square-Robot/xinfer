@@ -60,19 +60,20 @@ class Policy:
         Args:
             model: registered model name, entry point name, or import path ``"module:Class"``.
             checkpoint: checkpoint path for ``from_checkpoint`` and the processors.
-            device: ``"cuda"``, ``"cuda:N"``, ``"cpu"``, or ``None`` for the current CUDA device when
-                available, else CPU.
+            device: ``"cuda"``, ``"cuda:N"``, ``"npu"``, ``"npu:N"``, ``"cpu"``, or ``None`` for the current CUDA
+                device when available, else CPU.
             op_backends: operator name to backend name, pinning the selection; unpinned operators use the
                 highest-priority supported backend.
             reference_ops: select only the torch reference operators.
             cudagraphs: ``None`` uses the default (on where the platform supports capture); a bool sets
                 it explicitly; a ``CUDAGraphConfig`` turns graphs on with that policy.
-            stream_priorities: CUDA stream priority by stage; lower integers have higher priority. Omitted stages
-                use -1 for the final stage on CUDA and 0 otherwise. Nonzero priorities require platform support.
+            stream_priorities: accelerator stream priority by stage, within the platform's range. Omitted stages
+                use -1 bounded by the supported range for the final stage, and 0 otherwise or when unknown.
+                Nonzero priorities require platform support.
             image_preprocess_device: where the views are decoded and resized: ``"gpu"`` by the engine on the
                 device, ``"cpu"`` in the calling thread, or ``None`` for the platform's default (``"gpu"`` on a
-                CUDA device with torchvision; ``xinfer.config.apply_image_preprocess_device``). A model option
-                of the top level, as in ``xinfer serve --model-options``, not a ``processing`` field.
+                device with an available image backend, see ``xinfer.config.apply_image_preprocess_device``).
+                A top-level model option, as in ``xinfer serve --model-options``, not a ``processing`` field.
             **model_options: passed to ``from_checkpoint``. A string ``quantization`` (default ``"bf16"``)
                 also selects the tuned table. ``processing``, if given, is a dict.
 

@@ -33,7 +33,7 @@
 
 ## Optimized 组合
 
-`numerics="optimized"`（默认，`xinfer/models/wall_oss/optimized.py`）在 `xinfer/ops/reference/fused.py` 的算子上运行参考组合的步骤：xcompute 为该形状列出 kernel 时，每个算子是一次 xcompute 调用（xcompute `7336b0d`），否则用算子的 torch 参考实现。与参考组合一样全部为 BF16。
+`numerics="optimized"`（默认，`xinfer/models/wall_oss/optimized.py`）在 `xinfer/ops/reference/` 的算子上运行参考组合的步骤：xcompute 为该形状列出 kernel 时，每个算子是一次 xcompute 调用（xcompute `7336b0d`），否则用算子的 torch 参考实现。与参考组合一样全部为 BF16。
 
 | 步骤 | 算子 | 本模型形状下的 kernel |
 |---|---|---|

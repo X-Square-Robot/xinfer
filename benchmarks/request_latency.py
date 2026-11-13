@@ -8,7 +8,7 @@ Each run takes the next wire request through the three steps of serving it and t
 - ``total_ms``: the whole request, from the wire request to the response.
 
 No network and no other requests are involved. The requests are first run once for the warmup, which captures
-their CUDA graphs on every lane and batch size, then ``--warmup-runs`` more runs are discarded. Network latency
+their device graphs where enabled, then ``--warmup-runs`` more runs are discarded. Network latency
 with one robot is measured by ``robot_load.py --robots 1``. See docs/benchmark.md.
 """
 
@@ -38,9 +38,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--requests-file", nargs="+", required=True,
                         help="JSON or msgpack files with one wire request or a list, as for xinfer-serve --warmup")
     parser.add_argument("--model-options", default="{}", help="JSON options, as for xinfer-serve")
-    parser.add_argument("--device", default=None, help="cuda, cuda:N or cpu (default: cuda when available)")
+    parser.add_argument("--device", default=None, help="cuda, cuda:N, npu, npu:N or cpu (default: CUDA when available)")
     parser.add_argument("--runs", type=int, default=50)
     parser.add_argument("--warmup-runs", type=int, default=5)
+    parser.add_argument("--op-backends", default=None,
+                        help="comma-separated operator=pin items, as for xinfer-serve --op-backends")
     parser.add_argument("--out", type=Path, required=True, help="new JSON result file")
     args = parser.parse_args(argv)
     if args.runs < 1 or args.warmup_runs < 0:
@@ -50,15 +52,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+def _parse_pins(text: str | None) -> dict[str, str] | None:
+    """``"op=pin,op=pin"`` to a mapping, the same form ``xinfer-serve --op-backends`` takes."""
+    if not text:
+        return None
+    return {name.strip(): pin.strip() for name, _, pin in (item.partition("=") for item in text.split(","))
+            if name.strip()}
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     import torch
 
     from xinfer import Policy
     from xinfer.frontend.protocol import read_requests
+    from xinfer.platforms.devices import device_module_for
 
     requests = [request for path in args.requests_file for request in read_requests(path)]
-    policy = Policy(args.model, args.checkpoint, device=args.device, **json.loads(args.model_options))
+    policy = Policy(args.model, args.checkpoint, device=args.device,
+                    op_backends=_parse_pins(args.op_backends), **json.loads(args.model_options))
     try:
         policy.warmup(requests)
         warmed = policy.engine.cudagraph_stats()
@@ -85,10 +97,11 @@ def main(argv=None) -> int:
     except OSError:  # no git on this machine
         revision = None
     device = policy.platform.device
+    module = device_module_for(device)
     result = {"created_utc": datetime.now(timezone.utc).isoformat(), "command": sys.argv, "revision": revision,
               "inputs": [{"path": path, "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
                          for path in args.requests_file],
-              "device": torch.cuda.get_device_name(device) if policy.platform.is_cuda else "cpu",
+              "device": module.get_device_name(device) if module is not None else "cpu",
               "torch": torch.__version__, "policy": policy.describe(), "captures_after_warmup": captures,
               "runs": args.runs, **{name: statistics(values) for name, values in samples.items()},
               "samples": samples}

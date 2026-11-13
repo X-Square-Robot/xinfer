@@ -40,7 +40,7 @@ DEFAULT_FRONTENDS = 2
 # Processing threads per frontend: decode and resize release the GIL, so one frontend processes several
 # connections' requests at once (docs/configuration.md).
 DEFAULT_FRONTEND_WORKERS = 4
-DEFAULT_FINAL_STAGE_PRIORITY = -1  # final stages ahead of the rest, where the platform has stream priorities
+DEFAULT_FINAL_STAGE_PRIORITY = -1  # one level above ordinary streams, bounded by the runtime's reported range
 
 
 @dataclass(frozen=True)
@@ -74,7 +74,7 @@ class ExplicitSettings:
         frontends: frontend processes.
         frontend_workers: processing threads per frontend.
         shm_buffers: shared-memory buffers per frontend.
-        stream_priorities: explicit CUDA stream priorities per stage; lower integers have higher priority.
+        stream_priorities: explicit accelerator stream priorities per stage, within the platform's range.
     """
 
     lanes: Mapping[str, int] = field(default_factory=dict)
@@ -210,7 +210,7 @@ def apply_image_preprocess_device(model_options: Mapping[str, Any], platform,
         platform: the resolved ``Platform``.
         default: the entry point's default when the option is unset (``xinfer serve``: ``"cpu"``), or ``None`` for
             the platform's (``Policy``): ``"gpu"`` where the views can be decoded and resized on the device
-            (``device_images``: a CUDA device with torchvision), else ``"cpu"``.
+            (``device_images``), else ``"cpu"``.
 
     Returns:
         A copy of ``model_options`` without ``image_preprocess_device``, for ``from_checkpoint`` and
@@ -232,6 +232,8 @@ def apply_image_preprocess_device(model_options: Mapping[str, Any], platform,
     elif device not in ("cpu", "gpu"):
         raise ConfigError(f'image_preprocess_device must be "cpu" or "gpu", got {device!r}')
     elif device == "gpu" and not platform.capabilities.device_images:
+        if platform.device.partition(":")[0] == "npu":
+            raise ConfigError(f"platform {platform.name} cannot decode images on the device (needs CANN DVPP V2)")
         raise ConfigError(f"platform {platform.name} cannot decode images on the device (needs CUDA and torchvision)")
     if device == "gpu":
         options["processing"] = {**processing, "image_preprocess_device": "gpu"}
@@ -250,8 +252,8 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
     - ``per_robot_inflight``: explicit, else 1.
     - ``max_running_requests``: explicit, else 32; ``max_queued_requests``: explicit, else 256.
     - ``lanes.<stage>``: explicit, else the tuned value, else 2.
-    - ``stream_priorities.<stage>``: explicit, else -1 for a final stage (one without consumers) on a platform with
-      stream priorities, else 0; nonzero requires platform support.
+    - ``stream_priorities.<stage>``: explicit, else -1 bounded by the platform's reported range for a final
+      stage (one without consumers), else 0; unknown ranges keep default 0, and nonzero requires platform support.
     - ``batch_sizes.<stage>`` (allowed batch sizes, 1 always included): with an explicit ``max_batch``, the
       declared sizes up to it; else every declared size.
     - ``cudagraphs``: explicit, else whether the platform supports graph capture.
@@ -312,18 +314,27 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
         else:
             out[f"lanes.{stage}"] = Setting(DEFAULT_LANES, "default")
 
-    priorities = platform.is_cuda and platform.capabilities.stream_priorities
+    priorities = platform.capabilities.stream_priorities
+    bounds = platform.capabilities.stream_priority_range
+    if bounds is not None and bounds[0] > bounds[1]:
+        # The clamp below only ever yields a value inside a well-formed range, so this guards a platform that
+        # reports a reversed one instead of silently picking an out-of-range default.
+        raise ConfigError(f"platform {platform.name} declares a reversed stream priority range {bounds}")
     for stage in stages:
         if stage not in explicit.stream_priorities:
             final = priorities and not model.stage_graph.consumers(stage)
-            out[f"stream_priorities.{stage}"] = (Setting(DEFAULT_FINAL_STAGE_PRIORITY, "default:final stage") if final
-                                                 else Setting(0, "default"))
+            default_priority = (max(bounds[0], min(DEFAULT_FINAL_STAGE_PRIORITY, bounds[1]))
+                                if final and bounds is not None else 0)
+            out[f"stream_priorities.{stage}"] = Setting(
+                default_priority, "default:final stage" if final and default_priority != 0 else "default")
             continue
         priority = explicit.stream_priorities[stage]
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise ConfigError(f"stream_priorities.{stage} must be an integer, got {priority!r}")
         if priority != 0 and not priorities:
             raise ConfigError(f"platform {platform.name} does not support nonzero stream priorities")
+        if bounds is not None and not bounds[0] <= priority <= bounds[1]:
+            raise ConfigError(f"stream_priorities.{stage}={priority} is outside {platform.name}'s range {bounds}")
         out[f"stream_priorities.{stage}"] = Setting(priority, "explicit")
 
     for stage in stages:

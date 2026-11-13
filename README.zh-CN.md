@@ -78,7 +78,7 @@ finally:
 |---|---|---|---|---|
 | Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
-Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。Wall-X 2B 在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)。
+Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。Wall-X 2B 在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)；昇腾 950DT 上的数据在同一张表内，该模型在此平台的算子见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
 | 硬件 | 设备 | 运行时 |
 |---|---|---|
@@ -88,7 +88,7 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 
 每个加速器运行各自的引擎（Engine）和权重。
 
-优化的 CUDA 执行路径使用 **xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 通过 `torch_npu` 走 BF16 参考算子路径。
+优化的 CUDA 执行路径使用 **xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 以同样的方式绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
 ## 工作原理
 

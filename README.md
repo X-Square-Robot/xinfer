@@ -95,7 +95,7 @@ and action representations are documented in each model guide.
 |---|---|---|---|---|
 | Wall-X 2B | `wallx2b` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
 
-Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for Wall-X 2B on an RTX 5090.
+Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for Wall-X 2B on an RTX 5090 and on an Ascend 950DT; the [Ascend guide](docs/ascend950dt.md#wall-x-2b-operator-list) lists which operators the model runs there.
 
 | Hardware | Device | Runtime |
 |---|---|---|
@@ -107,7 +107,8 @@ Each accelerator runs its own Engine and weights.
 
 Optimized CUDA execution uses an **xcompute** build and the optional FlashAttention
 backend; see [kernels](docs/kernels.md).
-Ascend uses the BF16 reference-operator path through `torch_npu`.
+Ascend binds a prebuilt Ascend **xcompute** build the same way, with NPU graphs and
+DVPP device images; see the [Ascend guide](docs/ascend950dt.md).
 
 ## How it works
 
