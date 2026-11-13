@@ -73,7 +73,7 @@ the shape, else the operator's torch reference. All BF16, like the reference.
 | Expert-1 output and down projections (`[K, N]` weights); gate/up + SiLU-mul | `gemm_epilogue`; `gemm_glu_epilogue` | `gemm` → `smallm_bf16_sm120`; cuBLASLt and the SiLU-mul kernel |
 | Readout, velocity of the uncommanded dimensions, Euler step, pinned rows | `flow_velocity_euler` | `denoise_output_euler` → `fused_tail` |
 
-At this model's BF16 shapes xcompute lists no kernel faster than cuBLAS for the ViT and expert-0 GEMMs except the
+On RTX 5090, at this model's BF16 shapes xcompute lists no kernel faster than cuBLAS for the ViT and expert-0 GEMMs except the
 expert-0 gate/up; they are compute-bound (about 85 % of the vision and prefill stages). The gains are the fused
 residual adds and norms, the expert-0 gate/up kernel and the action stage's small-M kernels and cache attention.
 
@@ -87,6 +87,14 @@ Arithmetic that differs from the reference composition:
   and each other) are passed as per-column row ranges (FlashMask `LTS`/`UTE`). The velocity stays FP32.
 - **Prompt buckets**: the padding is masked in the action attention, so the actions of a padded prompt equal those
   of the exact prompt within rounding, not bit for bit.
+
+### Jetson Thor (SM110)
+
+With a compatible xcompute build, the vision stage can leave the rotated Q and K channels in the same paired order.
+Attention consumes them together and their dot products are unchanged. Vision projections can also accumulate the residual
+before rounding to BF16, then apply RMSNorm. Prefill selects a fused gate/up, SiLU, down and residual kernel for supported
+shapes. Action prefetches upcoming layer weights into L2 on a side stream and rejoins it before the stage finishes.
+These paths are selected at startup. Missing optional kernels use the existing stage operators.
 
 ## Action-stage batching
 

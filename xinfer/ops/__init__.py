@@ -60,6 +60,8 @@ for _spec in (
     OpSpec("layer_norm", "layer_norm(x, weight, bias, eps) -> fp32 Tensor  # in FP32", reference.layer_norm),
     OpSpec("ada_rms_norm", "ada_rms_norm(x[B, L, K], scale[B, 1, K], shift[B, 1, K], eps) -> Tensor"
            "  # x·rsqrt(mean(x²)+eps)·(1+scale)+shift in FP32, x.dtype out", reference.ada_rms_norm),
+    OpSpec("prefetch_weights", "prefetch_weights(weights) -> handle | None", reference.prefetch_weights),
+    OpSpec("join_prefetch", "join_prefetch(handle) -> None", reference.join_prefetch),
     OpSpec("conv2d", "conv2d(x[B, C, H, W], weight[O, C, kH, kW], bias, stride) -> Tensor  # no padding",
            reference.conv2d),
     OpSpec("causal_conv1d", "causal_conv1d(x[B, C, L], weight[C, 1, K]) -> silu(depthwise causal conv) [B, C, L]",
@@ -215,6 +217,14 @@ for _spec in (
            " eps)"
            " -> silu(x̂·W_gateᵀ)·(x̂·W_upᵀ)  # x̂ = AdaRMS(x), FP32",
            gemm.gemm_glu_epilogue),
+    OpSpec("gemm_add_rms_norm", "gemm_add_rms_norm(x[M, K], weight[N, K], residual, gamma[N], eps, *, bias=None)"
+           " -> (sum, normalized sum)", gemm.gemm_add_rms_norm),
+    OpSpec("mlp_add_rms_norm", "mlp_add_rms_norm(x[M, K], gate_up[2I, K], down[N, I], residual, gamma[N], eps)"
+           " -> (sum, normalized sum)  # residual may be updated in place", gemm.mlp_add_rms_norm),
+    OpSpec("qkv_rope_for_attention",
+           "qkv_rope_for_attention(x, weight, bias, cos, sin, num_heads, head_dim, *, table_cache=None)"
+           " -> [Q | K | V]  # Q/K may share a head-channel permutation; consume together in attention",
+           gemm.qkv_rope_for_attention),
     OpSpec("qkv_rope_epilogue",
            "qkv_rope_epilogue(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads, head_dim)"
            " -> [Q | K | V]  # RoPE on the FP32 accumulator", gemm.qkv_rope_epilogue),

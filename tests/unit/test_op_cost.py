@@ -69,6 +69,9 @@ FORMULA_CASES = {
     "nvfp4_gemm": ((A4, S4, W4, S4), OpCost(GEMM, 128 + 512 + 1024 + 512, 4 * 32 * 2, "nvfp4")),
     "gemm_epilogue": ((X, W, t(32)), OpCost(GEMM, 512 + 4096 + 64, 4 * 32 * 2, "bf16")),
     "gemm_glu_epilogue": ((X, W), OpCost(GEMM, 512 + 4096, 4 * 16 * 2, "bf16")),  # 16 gate and 16 up rows
+    "gemm_add_rms_norm": ((X, W, t(4, 32), t(32), 1e-6), OpCost(GEMM, 512 + 4096 + 256 + 64, 512, "bf16")),
+    "mlp_add_rms_norm": ((X, W, t(64, 16), t(4, 64), t(64), 1e-6),
+                         OpCost(GEMM + 2 * 4 * 64 * 16, 512 + 4096 + 2048 + 512 + 128, 1024, "bf16")),
     "qkv_rope_epilogue": ((X, W48, t(48), ROPE, ROPE, 2, 8),  # 2 heads of q, k and v, D = 8
                           OpCost(2 * 4 * 48 * 64, 512 + 6144 + 96 + 128, 4 * 48 * 2, "bf16")),
     # The caches are not read: Q goes to the output, K and V to 4 new cache rows, 4 x 32 values in all.
@@ -79,6 +82,8 @@ FORMULA_CASES = {
                                  OpCost(4 * 16 * 2 * 4 * 5 * 10, 1280 + 8 + 2 * 1280, 1280, "bf16")),
     "flow_velocity_euler": ((VALUES, STREAM, t(4, 32), 0.1), OpCost(2 * 6 * 4 * 32, 96 + 384 + 256, 96, "bf16")),
 }
+
+FORMULA_CASES["qkv_rope_for_attention"] = FORMULA_CASES["qkv_rope_epilogue"]
 
 
 def test_formulas_are_registered_operators_with_the_reference_parameters():

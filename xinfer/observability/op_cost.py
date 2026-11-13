@@ -186,9 +186,26 @@ def gemm_glu_epilogue(x, weight, *, bias=None, modulation=None, row_class=None, 
                  (modulation, row_class))
 
 
+def gemm_add_rms_norm(x, weight, residual, gamma, eps, *, bias=None) -> OpCost:
+    """Projection FLOPs, plus reads of the residual and norm weight and writes of both outputs."""
+    return OpCost(2 * x.shape[0] * weight.numel(), _bytes(x, weight, residual, gamma, bias),
+                  2 * _bytes(residual), _PIPES[x.dtype])
+
+
+def mlp_add_rms_norm(x, gate_up, down, residual, gamma, eps) -> OpCost:
+    """Count both projections of the gated MLP and both residual-shaped outputs."""
+    return OpCost(2 * x.shape[0] * (gate_up.numel() + down.numel()), _bytes(x, gate_up, down, residual, gamma),
+                  2 * _bytes(residual), _PIPES[x.dtype])
+
+
 def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim) -> OpCost:
     """``2·M·N·K`` on the pipe of ``x.dtype``, also reading the RoPE tables."""
     return _gemm(_PIPES[x.dtype], x, None, weight, None, bias, x.shape[1], weight.shape[0], (cos, sin))
+
+
+def qkv_rope_for_attention(x, weight, bias, cos, sin, num_heads, head_dim, *, table_cache=None) -> OpCost:
+    """The head permutation preserves QKV shape and product FLOPs."""
+    return qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim)
 
 
 def qkv_rope_kvcache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads,
@@ -216,6 +233,7 @@ def flow_velocity_euler(x, h, weight, dt, dof_mask=None, padding_velocity=None, 
 
 # Operator name -> formula, for the operators that do matrix products.
 FORMULAS: dict[str, Callable[..., OpCost]] = {formula.__name__: formula for formula in (
+    gemm_add_rms_norm, mlp_add_rms_norm, qkv_rope_for_attention,
     linear, conv2d, chunk_gated_delta_rule, causal_attention, action_attention, masked_joint_attention,
     kvcache_attention, prefix_attention, varlen_attention, mxfp8_gemm, mxfp8_gemm_rope, mxfp8_gemm_silu_mul,
     mxfp8_gemm_residual, nvfp4_gemm, gemm_epilogue, gemm_glu_epilogue, qkv_rope_epilogue, qkv_rope_kvcache,

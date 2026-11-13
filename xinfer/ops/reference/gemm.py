@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from xinfer.ops.reference.norm import _adarms
+from xinfer.ops.reference.norm import _adarms, add_rms_norm
 
 ACTIVATIONS = {"silu": F.silu, "gelu": F.gelu, "gelu_tanh": lambda y: F.gelu(y, approximate="tanh")}
 
@@ -215,3 +215,22 @@ def qkv_norm_rope_kvcache(x: torch.Tensor, weight: torch.Tensor, q_weight: torch
     """Project normalized rows, normalize and rotate Q/K, append K/V to the head-major cache, and return Q and gate."""
     return _qk_norm_rope_kvcache(x.float() @ weight.float().t(), x.dtype, q_weight, k_weight, cos, sin, k_cache,
                                  v_cache, start, num_heads, num_kv_heads, head_dim, eps)
+
+
+def qkv_rope_for_attention(x, weight, bias, cos, sin, num_heads, head_dim, *, table_cache=None):
+    """QKV for an attention consuming Q and K together. A backend may permute Q and K channels identically.
+
+    During one forward the caller may reuse table_cache across layers with the same immutable rotary tables.
+    """
+    return qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim)
+
+
+def gemm_add_rms_norm(x, weight, residual, gamma, eps, *, bias=None):
+    """Project x, add to the residual and return both the sum and its RMS normalization."""
+    projected = gemm_epilogue(x, weight, bias).view_as(residual)
+    return add_rms_norm(projected, residual, gamma, eps)
+
+
+def mlp_add_rms_norm(x, gate_up, down, residual, gamma, eps):
+    """Project with a gated MLP, add to the residual and return the sum and its RMS normalization."""
+    return gemm_add_rms_norm(gemm_glu_epilogue(x, gate_up), down, residual, gamma, eps)

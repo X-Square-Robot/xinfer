@@ -51,13 +51,19 @@
 | expert 1 的输出投影和 down 投影（`[K, N]` 权重）；gate/up + SiLU-mul | `gemm_epilogue`；`gemm_glu_epilogue` | `gemm` → `smallm_bf16_sm120`；cuBLASLt 加 SiLU-mul kernel |
 | 读出、未受控维度的速度、Euler 步、固定行 | `flow_velocity_euler` | `denoise_output_euler` → `fused_tail` |
 
-在本模型的 BF16 形状下，除 expert 0 的 gate/up 外，xcompute 没有为 ViT 和 expert 0 的 GEMM 列出比 cuBLAS 更快的 kernel；这些 GEMM 受算力限制（约占 vision 和 prefill 阶段的 85 %）。收益来自融合的残差加法与归一化、expert 0 的 gate/up kernel，以及 action 阶段的 small-M kernel 和缓存注意力。
+在 RTX 5090 上，对于本模型的 BF16 形状，除 expert 0 的 gate/up 外，xcompute 没有为 ViT 和 expert 0 的 GEMM 列出比 cuBLAS 更快的 kernel；这些 GEMM 受算力限制（约占 vision 和 prefill 阶段的 85 %）。收益来自融合的残差加法与归一化、expert 0 的 gate/up kernel，以及 action 阶段的 small-M kernel 和缓存注意力。
 
 与参考组合不同的算术：
 
 - **融合的尾处理**：QKV 的 bias 和 RoPE、GLU 的 SiLU-mul 以及 merger 的 GELU 作用在 FP32 累加器上，只舍入一次；参考组合先把 GEMM 输出舍入。残差和照旧舍入为 BF16。
 - **action 阶段**：每次派发一个请求。prompt K/V 和动作 key 共用一个头优先的缓存 `[layers, 2, 1, kv_heads, P + 16, head_dim]`；prompt 填充和 RTC 可见性（固定行能看到 prompt 和彼此）以逐列的行区间（FlashMask `LTS`/`UTE`）传入。速度保持 FP32。
 - **Prompt 桶**：填充在 action 注意力中被掩码，因此填充后 prompt 的动作与精确 prompt 的动作在舍入范围内一致，但不逐位一致。
+
+### Jetson Thor（SM110）
+
+安装支持对应算子的 xcompute 后，视觉阶段可以让旋转后的 Q、K 通道按相同的顺序成对排列，注意力计算中的点积保持不变。
+视觉投影还可以在累加器中加上残差，再舍入为 BF16 并计算 RMSNorm。对于支持的形状，prefill 将 gate/up、SiLU、down 和残差加法融合。
+action 在独立的流上把后续层权重预取到 L2，并在阶段结束前等待这条流。启动时会按可用的算子选择路径，缺少可选 kernel 时沿用原有阶段算子。
 
 ## Action 阶段组批
 

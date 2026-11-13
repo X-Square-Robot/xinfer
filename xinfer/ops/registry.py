@@ -35,7 +35,7 @@ BUILTIN_MODULES = ("xinfer.ops.backends.cuda.attn", "xinfer.ops.backends.cuda.ge
                    "xinfer.ops.backends.ascend.attn", "xinfer.ops.backends.ascend.norm",
                    "xinfer.ops.backends.ascend.rope", "xinfer.ops.backends.ascend.flow",
                    "xinfer.ops.backends.ascend.official",
-                   "xinfer.ops.backends.ascend.cann")
+                   "xinfer.ops.backends.ascend.cann", "xinfer.ops.backends.cuda.thor")
 STRICT_ENV = "XINFER_OPS_STRICT"
 
 
