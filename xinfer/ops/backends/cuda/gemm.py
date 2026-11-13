@@ -5,11 +5,13 @@ Stream-K GEMMs may differ at rounding level across runs (``deterministic=False``
 
 from __future__ import annotations
 
+from weakref import WeakKeyDictionary
+
 from xinfer.ops.backends._xcompute import XCOMPUTE, xc, xcompute_with
 from xinfer.ops.registry import register
 
 _supports_kn = True
-_packed = {}  # (op, weight data_ptr, weight shape) -> packed weight, or None when packing does not help
+_packed = WeakKeyDictionary()  # source storage -> its views and their packed weights
 
 
 def _listed_weight(op, x, weight, **options):
@@ -21,11 +23,17 @@ def _listed_weight(op, x, weight, **options):
     """
     if xc.selected_backend(op, x, weight, **options) != "generic":
         return weight
-    key = (op, weight.data_ptr(), tuple(weight.shape))
-    if key not in _packed:
+    storage = weight.untyped_storage()
+    views = _packed.setdefault(storage, {})
+    key = (op, weight.storage_offset(), weight.shape, weight.stride(), weight.dtype)
+    if key not in views:
         packed = xc.prepack_weight(weight, op=op)
-        _packed[key] = packed if xc.selected_backend(op, x, packed, **options) != "generic" else None
-    packed = _packed[key]
+        if xc.selected_backend(op, x, packed, **options) == "generic":
+            packed = None
+        elif packed.tensors["w"].untyped_storage() is storage:
+            return packed  # caching a zero-copy packing would keep the weak key alive
+        views[key] = packed
+    packed = views[key]
     return weight if packed is None or xc.selected_backend(op, x, packed, **options) == "generic" else packed
 
 
