@@ -38,32 +38,36 @@ class Lane:
     """
 
     def __init__(self, stage: str, index: int, platform: Platform, *, priority: int = 0):
-        """Create the lane; its accelerator stream first waits for work queued so far on the current stream.
+        """Create the lane; on an accelerator its stream first waits for work on the current stream.
 
         Args:
             stage: stage name.
             index: lane index within the stage.
-            platform: the platform; a stream is created on accelerators.
+            platform: the platform; a stream is created only when there's a torch-style device module
+                (``device_module_for`` returned one: CUDA, NPU, ...). CPU/RPU platforms leave ``stream`` None.
             priority: accelerator scheduling hint within the platform's declared range. Default 0.
 
         Raises:
             ValueError: priority is not an integer, is nonzero on an unsupported platform,
                 or the runtime cannot verify or honor the requested value without clamping.
         """
+        from xinfer.platforms.devices import device_module_for
+
+        if platform.capabilities.execution_model != "cuda-lanes":
+            raise ValueError("lane dispatch requires execution_model='cuda-lanes'; "
+                             f"got {platform.capabilities.execution_model!r}")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise ValueError(f"stream priority for {stage} must be an integer, got {priority!r}")
-        if priority != 0 and not platform.capabilities.stream_priorities:
+        self._device_module = device_module_for(platform.device)
+        if priority != 0 and (self._device_module is None or not platform.capabilities.stream_priorities):
             raise ValueError(f"platform {platform.name} does not support nonzero stream priorities")
         bounds = platform.capabilities.stream_priority_range
         if bounds is not None and not bounds[0] <= priority <= bounds[1]:
             raise ValueError(f"stream priority {priority} for {stage} is outside {platform.name}'s range {bounds}")
         self.stage = stage
         self.index = index
-        self._device_module = device_module_for(platform.device)
-        if self._device_module is None:
-            self.stream = None
-        else:
-            self.stream = self._device_module.Stream(device=platform.device, priority=priority)
+        self.stream = (self._device_module.Stream(device=platform.device, priority=priority)
+                       if self._device_module is not None else None)
         if self.stream is not None:
             if platform.capabilities.stream_priorities:
                 try:
@@ -77,12 +81,14 @@ class Lane:
             # Weights were loaded and converted on the current stream; order the lane after that work.
             self.stream.wait_stream(self._device_module.current_stream(platform.device))
         self.cudagraphs = None  # LaneCUDAGraphs when the engine uses CUDA graphs
-        self.copy_stream = None  # final stages on CUDA: copies results to the host
+        self.copy_stream = None  # final stages on an accelerator: copies results to the host
         self.event = None  # completion event of the lane's current dispatch
 
     def use_stream(self):
         """Context manager that makes the lane's stream current (a no-op on the CPU)."""
-        return self._device_module.stream(self.stream) if self.stream is not None else contextlib.nullcontext()
+        if self.stream is None:
+            return contextlib.nullcontext()
+        return self._device_module.stream(self.stream)
 
     def make_event(self, *, enable_timing: bool = False):
         """An event on the lane's device, not yet recorded; None on the CPU.
@@ -98,7 +104,7 @@ class Lane:
         """Record an event on the lane's stream after the work enqueued so far.
 
         Returns:
-            The recorded ``torch.cuda.Event``, or None on the CPU, where the work has already run.
+            The recorded device event, or None on the CPU, where the work has already run.
         """
         if self.stream is None:
             return None

@@ -220,6 +220,9 @@ def test_slow_fallbacks_warn_on_cuda_only(caplog):
     with caplog.at_level("WARNING", logger="xinfer.ops"):
         assert ops.warn_slow_fallbacks("tiny", table, stage_ops, "cpu") == []
         assert not caplog.records
+        # "rpu:0" is a platform device string, not a torch device; it must not be parsed.
+        assert ops.warn_slow_fallbacks("tiny", table, stage_ops, "rpu:0") == []
+        assert not caplog.records
         assert ops.warn_slow_fallbacks("tiny", table, stage_ops, "cuda") == ["gemm_epilogue", "qkv_rope_kvcache"]
     assert "tiny: 2 operators have no fast kernel loaded" in caplog.text and "XINFER_XCOMPUTE_LIBRARY" in caplog.text
 
