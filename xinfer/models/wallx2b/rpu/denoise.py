@@ -1,4 +1,4 @@
-"""Resident FP16 CES Action lowering over xcompute's public TP8 interface.
+"""Resident Wall-X 2B FP16 TP8 action lowering over xcompute's public TP8 interface.
 
 The sparse decoder has eighteen identity token mixers and six attention
 mixers; every layer retains its MLP. The fused down/reduce/gate/Ada boundary

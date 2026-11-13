@@ -1,4 +1,4 @@
-"""Prepared CES Action identity-mixer layer over public xcompute TP operations.
+"""Prepared Wall-X 2B FP16 TP8 action identity-mixer layer over public xcompute TP operations.
 
 This is one real B1/H16 component, not a full policy executor. All intermediate
 activations remain resident. Native xcompute retains its 48-collective limit,
@@ -50,7 +50,7 @@ class IdentityLayerWeights:
     """Model-prepared natural TP8 weights; down already contains source /4.
 
     ``prepare`` performs only xcompute packing/upload. The caller must use
-    ``WeightPreparer`` for source splitting and CES scaling; applying /4 here
+    ``WeightPreparer`` for source splitting and profile scaling; applying /4 here
     would silently double-scale already prepared checkpoint weights.
     """
 
@@ -202,7 +202,7 @@ def prepare_identity_layer(
         or not 0 <= layer_index < 24
         or layer_index in FULL_ATTENTION_LAYERS
     ):
-        raise ValueError("identity component accepts only the 18 CES identity-mixer layers")
+        raise ValueError("identity component accepts only the 18 Wall-X 2B identity-mixer layers")
     if not isinstance(make_batch, bool):
         raise TypeError("make_batch must be bool")
     _buffer(src, context, (16, 1024), "replicated", "src")

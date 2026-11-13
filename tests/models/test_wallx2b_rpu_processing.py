@@ -33,7 +33,7 @@ from xinfer.models.wallx2b.rpu.processing import (
 )
 
 
-def test_two_resize_geometry_preserves_ces_grids():
+def test_two_resize_geometry_preserves_rpu_profile_grids():
     first = [dataset_v2_size(size) for size in ((1280, 720), (640, 480), (640, 480))]
     assert first == [(128, 224), (160, 224), (160, 224)]
     second = [processor_size(h, w, min_pixels=65536, max_pixels=16777216) for h, w in first]

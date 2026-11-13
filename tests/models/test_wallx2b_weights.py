@@ -102,7 +102,7 @@ def test_zero_centered_norm_preserves_the_source_half_boundary():
     assert not torch.equal(gamma, (source + 1).half())
 
 
-def test_ces_io_and_down_scales_are_compensated_before_half_store():
+def test_rpu_profile_io_and_down_scales_are_compensated_before_half_store():
     packed = action_input_weight(torch.full((1024, 52), 4.0))
     assert tuple(packed.shape) == (1024, 64)
     assert torch.equal(packed[:, :52], torch.full((1024, 52), 1 / 16, dtype=torch.float16))

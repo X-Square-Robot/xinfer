@@ -1,4 +1,8 @@
-"""CPU evaluation geometry for CES relative26 (ported from the frozen runner)."""
+"""CPU evaluation geometry for the Wall-X 2B FP16 TP8 relative26 profile.
+
+Adapted from RhinoForge's evaluation helpers; public source links are listed
+in docs/models/wallx2b_rpu.md.
+"""
 
 from __future__ import annotations
 

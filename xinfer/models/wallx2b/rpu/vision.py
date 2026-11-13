@@ -1,4 +1,4 @@
-"""Prepared TP8 CES vision tower with three resident, phase-reused slots.
+"""Prepared Wall-X 2B FP16 TP8 vision tower with three resident, phase-reused slots.
 
 The model owns tensor placement and explicit reductions. xcompute owns all
 packing, device kernels, prepared DMA and completion. No Torch device tensor
@@ -97,7 +97,7 @@ class VisionPlan:
     def __init__(self, context, config, weights: Mapping, position_embedding, *, workspace=None,
                  fused=True, fused_reduce_norm=False, whole_stage=False, fused_stage=False):
         if config.action_horizon != 16 or config.max_prefix_length != 512:
-            raise ValueError("VisionPlan requires the admitted CES profile")
+            raise ValueError("VisionPlan requires the admitted Wall-X 2B FP16 TP8 profile")
         if not isinstance(fused, bool):
             raise TypeError("fused must be an explicit bool")
         if not isinstance(fused_reduce_norm, bool):

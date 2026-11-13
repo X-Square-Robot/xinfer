@@ -127,7 +127,7 @@ class PrefillPlan:
         if bucket is not None and bucket != expected_bucket:
             raise ValueError("prefill bucket must be ceil64 of real length")
         if config.max_prefix_length != 512:
-            raise ValueError("PrefillPlan requires the admitted CES configuration")
+            raise ValueError("PrefillPlan requires the admitted Wall-X 2B FP16 TP8 configuration")
         if (isinstance(collective_window, bool) or not isinstance(collective_window, int)
                 or not 1 <= collective_window <= 15):
             raise ValueError("Prefill supports collective_window in [1,15] "
@@ -183,7 +183,7 @@ class PrefillPlan:
                 raise ValueError("provide both image features and three image run starts")
             if image_features is not None:
                 if image_features.shape != (217, 2048) or len(image_starts) != 3:
-                    raise ValueError("CES image features require [217,2048] and three run starts")
+                    raise ValueError("Wall-X 2B FP16 TP8 image features require [217,2048] and three run starts")
                 offset, previous_end = 0, 0
                 for start, count in zip(image_starts, (77, 70, 70)):
                     if (isinstance(start, bool) or not isinstance(start, int)

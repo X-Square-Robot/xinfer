@@ -1,6 +1,6 @@
 """One-time model transforms into xcompute's *logical* TP8 weight inputs.
 
-This module chooses column/row partition, replicas, bias ownership and CES
+This module chooses column/row partition, replicas, bias ownership and profile
 scales. xcompute owns the subsequent physical ``tp8_nk16``/``nk16`` packing
 and device allocation. No RhinoForge, vendor binary or alternate FFI is used.
 """

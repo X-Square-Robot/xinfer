@@ -1,4 +1,4 @@
-"""CES action host preparation and independent FP16 flow diagnostics.
+"""Wall-X 2B FP16 TP8 action host preparation and independent FP16 flow diagnostics.
 
 Only time/Ada conditioning belongs on the host in the candidate path. The
 Euler function is a numerical oracle for device bring-up, never a fallback.

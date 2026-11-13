@@ -7,6 +7,9 @@ device is `rpu` or `rpu:0`. Other devices keep the GPU Wall-X 2B implementation
 and its checkpoint format. The RPU profile has no CPU, BF16 or MXFP8 execution
 fallback.
 
+This profile targets Rhino RPU (R1) through Rhino Launch SDK. Install the SDK
+and a compatible RPU xcompute build separately.
+
 Execution is experimental and requires both explicit candidate admission and
 a separately selected AOT xcompute library. Host-side model plans, processing
 and lifecycle contracts are implemented; board-level numerical, ABI and
@@ -24,9 +27,10 @@ latency acceptance remains required before production use.
 | Intermediates | Native resident buffers; the final output is copied to owned CPU storage |
 
 `torch.device` does not describe this device, and the RPU path does not use a
-CUDA graph, Torch stream/event or the generic CUDA `Engine`. The in-process
-`Policy` and the frozen-request entry point below are the supported interfaces;
-this profile does not add an RPU mode to `xinfer-serve`.
+CUDA graph, Torch stream/event or the generic CUDA `Engine`. Execution uses
+the in-process `Policy` interface. The frozen-request format below describes
+inputs for inspection, not an additional execution command; this profile does
+not add an RPU mode to `xinfer-serve`.
 
 ## Board-free checkpoint inspection
 
@@ -133,6 +137,15 @@ materialized as independent CPU storage and denormalized in the model's
 collection callback; the output processor returns that physical result.
 Geometry helpers for relative26 and absolute14 are
 available for evaluation; ground-truth scoring is not part of policy timing.
+
+## Upstream sources
+
+Checkpoint semantics, the banded image pipeline and evaluation geometry are
+adapted from the publicly available RhinoForge Wall Qwen3.5 implementation:
+
+- [Profile](https://github.com/HUIXI-AI/RhinoForge/blob/2535a27756486bdb139b06764975edbe00004d63/python/rpu_backend/adapters/wall_qwen35/profile.py) and [checkpoint admission](https://github.com/HUIXI-AI/RhinoForge/blob/2535a27756486bdb139b06764975edbe00004d63/python/rpu_backend/adapters/wall_qwen35/checkpoint.py).
+- [Camera preprocessing](https://github.com/HUIXI-AI/RhinoForge/blob/2535a27756486bdb139b06764975edbe00004d63/python/rpu_backend/adapters/wall_qwen35/preprocessing.py).
+- [Evaluation geometry helpers](https://github.com/HUIXI-AI/RhinoForge/blob/2535a27756486bdb139b06764975edbe00004d63/examples/wall_qwen35_openloop.py).
 
 ## Failure and lifecycle ownership
 

@@ -6,6 +6,9 @@
 其他设备继续使用 GPU Wall-X 2B 实现及其 checkpoint 格式。RPU 配置没有
 CPU、BF16 或 MXFP8 执行回退。
 
+此配置通过 Rhino Launch SDK 使用 Rhino RPU (R1)。SDK 和兼容的 RPU
+xcompute 构建需要单独安装。
+
 执行属于实验特性，同时需要显式的候选准入和单独选定的 AOT xcompute 库。
 主机侧模型计划、处理与生命周期契约已经实现；用于生产前仍需完成板级数值、
 ABI 和时延验收。
@@ -22,8 +25,9 @@ ABI 和时延验收。
 | 中间数据 | 原生常驻缓冲区；最终输出复制到独立拥有的 CPU 存储 |
 
 `torch.device` 不能描述此设备，RPU 路径不使用 CUDA graph、Torch
-stream/event 或通用 CUDA `Engine`。支持的接口是进程内 `Policy` 和下述
-冻结请求入口；此配置不为 `xinfer-serve` 增加 RPU 服务模式。
+stream/event 或通用 CUDA `Engine`。执行使用进程内 `Policy` 接口。
+下述冻结请求格式用于说明待检查的输入，不是额外的执行命令；此配置不为
+`xinfer-serve` 增加 RPU 服务模式。
 
 ## 无板卡的 checkpoint 检查
 
@@ -118,6 +122,15 @@ with Policy("wallx2b", checkpoint, device="rpu:0", quantization="fp16",
 相对 relative26 和 absolute14 的几何
 工具可供评估使用；ground-truth 评分不计入策略计时。
 
+## 上游来源
+
+checkpoint 语义、分带图像流水线和评估几何处理改编自公开可访问的
+RhinoForge Wall Qwen3.5 实现：
+
+- [配置](https://github.com/HUIXI-AI/RhinoForge/blob/2535a27756486bdb139b06764975edbe00004d63/python/rpu_backend/adapters/wall_qwen35/profile.py)及 [checkpoint 准入](https://github.com/HUIXI-AI/RhinoForge/blob/2535a27756486bdb139b06764975edbe00004d63/python/rpu_backend/adapters/wall_qwen35/checkpoint.py)。
+- [相机预处理](https://github.com/HUIXI-AI/RhinoForge/blob/2535a27756486bdb139b06764975edbe00004d63/python/rpu_backend/adapters/wall_qwen35/preprocessing.py)。
+- [评估几何辅助函数](https://github.com/HUIXI-AI/RhinoForge/blob/2535a27756486bdb139b06764975edbe00004d63/examples/wall_qwen35_openloop.py)。
+
 ## 失败与生命周期所有权
 
 RPU 引擎一次准入一个请求。工作线程开始前可以取消；设备提交后，关闭和结果
@@ -131,8 +144,8 @@ RPU 引擎一次准入一个请求。工作线程开始前可以取消；设备�
 `Policy.close()` 排空未完成的引擎工作，再关闭模型的执行资源和输入处理器。
 `RpuEngine.shutdown()` 执行相同的排空及模型/上下文清理；外部提供的执行
 上下文保留其原有资源。重复关闭是安全的。清理失败不会把释放失败的原生
-所有者标记为可用上下文。另一个的主体异常尚未结束时请求关闭，会在该异常
-上添加注释，而不是替换它。
+所有者标记为可用上下文。处理已有异常期间请求关闭时，关闭错误会以注释
+附加到原异常，而不会替换它。
 
 `max_cached_signatures` 限制 prefix 计划数量。请求拥有的资源在完成后释放，
 不可变权重和缓存的准备批次保留到模型关闭。返回的 CPU 数组在后续请求、

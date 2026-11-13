@@ -59,7 +59,7 @@ def _compute(reference, ids):
 
 
 @pytest.mark.parametrize("prefix_length", [319, 320, 321, 383, 384, 385, 447, 448, 449, 511, 512])
-def test_ces_positions_match_hf_across_physical_bucket_boundaries(prefix_length):
+def test_rpu_profile_positions_match_hf_across_physical_bucket_boundaries(prefix_length):
     ids = _request(prefix_length)
     reference = _reference()
     expected = _compute(reference, ids)

@@ -204,7 +204,7 @@ def test_serial_layers_share_scratch_and_preserve_previous_output(prepared):
 @pytest.mark.parametrize("layer", [3, 7, 11, 15, 19, 23, -1, 24, True])
 def test_identity_component_rejects_full_attention_and_invalid_layers(prepared, layer):
     context, plan = prepared
-    with pytest.raises(ValueError, match="18 CES identity"):
+    with pytest.raises(ValueError, match="18 Wall-X 2B identity"):
         prepare_identity_layer(
             context,
             layer_index=layer,

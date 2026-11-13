@@ -1,6 +1,8 @@
 """Admission for the single wallx2b Wall Qwen3.5 FP16 profile.
 
-The constants are frozen from RhinoForge 2535a277's accepted checkpoint.
+The constants describe the accepted Wall-X 2B FP16 TP8 checkpoint profile.
+Checkpoint semantics follow RhinoForge; public source links are listed in
+docs/models/wallx2b_rpu.md.
 Configuration inspection is board free. It does not imply that the operator
 backend can execute the model, or that the profile has passed task gates.
 """

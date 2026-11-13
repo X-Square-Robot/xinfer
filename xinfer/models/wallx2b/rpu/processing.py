@@ -1,5 +1,8 @@
 """Exact wallx2b CPU processing; no Wall-OSS or RhinoForge runtime dependency.
 
+The banded image pipeline is adapted from RhinoForge's Wall Qwen3.5 adapter;
+public source links are listed in docs/models/wallx2b_rpu.md.
+
 Two resizes are intentional: Dataset-V2 PIL BICUBIC, then the checkpoint's
 Torchvision uint8 bicubic/antialias resize. FP32 noise is retained before the
 once-only FP16 packing, with both byte hashes available for paired comparison.
@@ -678,7 +681,7 @@ class WallX2BInputProcessor:
         sizes2 = [processor_size(h, w, min_pixels=self._bounds[0], max_pixels=self._bounds[1]) for h, w in sizes1]
         grids = [(1, h // 16, w // 16) for h, w in sizes2]
         if tuple(grids) != IMAGE_GRIDS:
-            raise ValueError("CES camera grids must be 14x22,14x20,14x20 in canonical order")
+            raise ValueError("Wall-X 2B FP16 TP8 camera grids must be 14x22,14x20,14x20 in canonical order")
         jobs = []
         cameras = []
         patches = None
@@ -720,7 +723,7 @@ class WallX2BInputProcessor:
             image_id = self._image_id
             positions = mrope_position_ids(ids.numpy(), image_id, grids)
             action_positions = positions[..., length:].copy()
-            action_positions += 10  # CES non-RTC D0 still has the checkpoint gap.
+            action_positions += 10  # The non-RTC profile retains the checkpoint's action-position gap.
             noise, packed_noise, noise_info = prepare_noise(
                 observation.get("initial_noise"), observation.get("noise_seed")
             )
@@ -783,13 +786,13 @@ class WallX2BInputProcessor:
                 pixel_array = np.concatenate([part[0] for part in parts])
                 resized_images = [part[1] for part in parts]
             if pixel_array.shape != (868, 1536):
-                raise ValueError("invalid CES patch tensor")
+                raise ValueError("invalid Wall-X 2B FP16 TP8 patch tensor")
             if not cameras:
                 # Banded output is a clipped gather from the _UINT8_TO_FP16
                 # table (validated once at import), so the per-request
                 # exponent scan is vacuous there; keep it on the other paths.
                 if np.any((pixel_array.view(np.uint16) & 0x7c00) == 0x7c00):
-                    raise ValueError("invalid CES patch tensor")
+                    raise ValueError("invalid Wall-X 2B FP16 TP8 patch tensor")
             tensors["pixel_values"] = torch.from_numpy(pixel_array)
             manifests = (
                 {key: array_manifest(value) for key, value in tensors.items() if isinstance(value, torch.Tensor)}
