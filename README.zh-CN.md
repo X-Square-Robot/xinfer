@@ -14,10 +14,13 @@
   <a href="#模型与硬件">模型</a> ·
   <a href="docs/benchmark.zh-CN.md">基准测试</a> ·
   <a href="#文档">文档</a> ·
+  <a href="https://arxiv.org/abs/2611.14969">论文</a> ·
   <a href="CONTRIBUTING.md">参与贡献</a>
 </p>
 
 **XInfer 是面向视觉-语言-动作（VLA）模型的推理与服务框架。** 我们的目标是为机器人提供快速、稳定、准确的模型推理服务，覆盖从机载推理到机队共享服务的各种场景。
+
+XInfer 的设计与评测见我们的论文 [Scaling VLA Serving Under Robotic Execution Constraints](https://arxiv.org/abs/2611.14969)。
 
 ## 特性一览
 
@@ -145,6 +148,22 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 | 分析算子性能 | [性能剖析](docs/profiling.zh-CN.md) |
 | 用 Prometheus 和 Grafana 监控服务 | [指标](docs/metrics.zh-CN.md) |
 | 扩展框架 | [模型接口](xinfer/models/interface.py) · [架构与设计](docs/design.zh-CN.md) |
+
+## 引用
+
+如果你在研究中使用了 XInfer，请引用我们的论文：
+
+```bibtex
+@misc{zhang2026scalingvlaservingrobotic,
+      title={Scaling VLA Serving Under Robotic Execution Constraints},
+      author={Yue Zhang and Zicong Ye and Lufang Chen and Dance Yang and Mingyang Li and Zhenwei Duan and Michael Zhao and Ziye Deng and Starrick Liu and Ruizhi Chengze and YongHua Chen and SongAo Han and Yu Sun and Ran Yu and Xiaofan Li and Ruyi Gan and Hao Wang},
+      year={2026},
+      eprint={2611.14969},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2611.14969},
+}
+```
 
 ## 参与贡献
 
