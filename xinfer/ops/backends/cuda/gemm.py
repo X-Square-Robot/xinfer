@@ -5,11 +5,27 @@ Stream-K GEMMs may differ at rounding level across runs (``deterministic=False``
 
 from __future__ import annotations
 
+import weakref
+
 from xinfer.ops.backends._xcompute import XCOMPUTE, xc, xcompute_with
 from xinfer.ops.registry import register
 
 _supports_kn = True
-_packed = {}  # (op, weight data_ptr, weight shape) -> packed weight, or None when packing does not help
+_packed = {}  # (op, weight key) -> packed weight, or None when packing does not help
+
+
+def _key(weight):
+    return weight.data_ptr(), tuple(weight.shape), tuple(weight.stride())
+
+
+def _cached(cache, key, weights, make):
+    """``cache[key]``, made on the first call. The entry is dropped when the tensor owning any of ``weights``' storage
+    is freed, so a later weight allocated at the same address never gets another weight's packing."""
+    if key not in cache:
+        cache[key] = make()
+        for weight in weights:
+            weakref.finalize(weight if weight._base is None else weight._base, cache.pop, key, None)
+    return cache[key]
 
 
 def _listed_weight(op, x, weight, **options):
@@ -21,11 +37,12 @@ def _listed_weight(op, x, weight, **options):
     """
     if xc.selected_backend(op, x, weight, **options) != "generic":
         return weight
-    key = (op, weight.data_ptr(), tuple(weight.shape))
-    if key not in _packed:
+
+    def pack():
         packed = xc.prepack_weight(weight, op=op)
-        _packed[key] = packed if xc.selected_backend(op, x, packed, **options) != "generic" else None
-    packed = _packed[key]
+        return packed if xc.selected_backend(op, x, packed, **options) != "generic" else None
+
+    packed = _cached(_packed, (op, *_key(weight)), (weight,), pack)
     return weight if packed is None or xc.selected_backend(op, x, packed, **options) == "generic" else packed
 
 

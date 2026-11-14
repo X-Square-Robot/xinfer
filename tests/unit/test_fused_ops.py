@@ -59,6 +59,36 @@ def test_transposed_gemm_weight_on_an_xcompute_build_without_kn(monkeypatch):
     assert prepack.call_count == 1
 
 
+def test_a_packed_weight_is_not_reused_for_another_weight_at_the_same_address(monkeypatch):
+    """The packing cache is keyed by the weight's address; its entry goes when the weight is freed, so a weight
+    allocated later at that address (another model loaded in the same process) gets its own packing."""
+    import gc
+    import types
+    import weakref
+
+    from xinfer.ops.backends.cuda import gemm
+
+    packings = []
+
+    def prepack_weight(weight, op):  # a packing is a copy: it keeps no reference to the weight
+        packings.append(weakref.ref(weight))
+        return types.SimpleNamespace(source=weakref.ref(weight))
+
+    package = types.SimpleNamespace(
+        prepack_weight=prepack_weight,
+        selected_backend=lambda op, x, w, **options: "fast" if hasattr(w, "source") else "generic")
+    monkeypatch.setattr(gemm, "xc", package)
+    monkeypatch.setattr(gemm, "_packed", {})
+    x = torch.zeros(2, 8)
+    w = torch.ones(4, 8)
+    assert gemm._listed_weight("gemm", x, w).source() is w
+    assert gemm._listed_weight("gemm", x, w[:2]).source() is not w  # a view of another shape: its own packing
+    assert gemm._listed_weight("gemm", x, w).source() is w and len(packings) == 2  # cached
+    del w
+    gc.collect()
+    assert gemm._packed == {}  # the weight is gone: so are its entries
+
+
 def test_qkv_rope_epilogue_rotates_q_and_k_halves():
     g = torch.Generator().manual_seed(2)
     x, w, b = torch.randn(4, 16, generator=g), torch.randn(3 * 2 * 8, 16, generator=g), torch.randn(48, generator=g)
