@@ -41,10 +41,7 @@
 
 ```bash
 python -m pip install -e ".[models,serve]"
-python -c "from xinfer.models import available_models; print(available_models())"
 ```
-
-全新安装会列出 `('wall_oss', 'wallx2b')`，这一步不需要模型权重。
 
 Wall-OSS 默认的 BF16 优化路径使用 **xcompute**。在支持的 GPU 上安装与其架构匹配的构建后，按 [kernel 指南](docs/kernels.zh-CN.md)检查各算子的后端。缺少兼容构建时使用较慢的 PyTorch 实现。
 
@@ -80,7 +77,7 @@ from xinfer import Policy
 from xinfer.frontend.protocol import unpackb
 
 observation = unpackb(Path("observation.msgpack").read_bytes())
-policy = Policy("wall_oss", "/path/to/checkpoint", device="cuda", image_preprocess_device="cpu")
+policy = Policy("wall_oss", "/path/to/checkpoint", device="cuda")
 
 try:
     policy.warmup([observation])
@@ -110,6 +107,17 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 
 优化的 CUDA 执行路径使用 **xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 以同样的方式绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
+## 性能
+
+各服务配置的单请求时延和容量，用 `benchmarks/performance.py` 测得（[测量条件](docs/performance.zh-CN.md)）：
+
+| # | 模型 | 精度、组合 | 加速器 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 峰值吞吐 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Wall-OSS | BF16，优化组合 | RTX 5090 | 49.2 ms | 4 | 117 ms | 125 ms | 26.3 req/s |
+| 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 15 | 144 ms | 155 ms | 83.3 req/s |
+| 3 | Wall-OSS | BF16，优化组合 | 昇腾 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 4 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+
 ## 工作原理
 
 <p align="center">
@@ -121,13 +129,6 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 ## 基准测试
 
 评估单请求时延，以及在给定响应时延目标内能服务的机器人数：
-
-| 单请求 P50（BF16） | RTX 5090 | 昇腾 950DT |
-|---|---:|---:|
-| Wall-OSS | 49.2 ms | 80.8 ms |
-| Wall-X 2B | 22.3 ms | 79.7 ms |
-
-RTX 5090 和昇腾数据分别测于 2026 年 11 月 9 日和 11 月 13 日。Wall-X 2B 的 CUDA 测量使用了上游可省去一次拷贝的权重布局。完整配置和并发负载下的结果见[性能表](docs/performance.zh-CN.md)。
 
 | 工具 | 测量内容 |
 |---|---|

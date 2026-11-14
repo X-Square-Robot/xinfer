@@ -50,10 +50,7 @@ Use Python 3.10+ and a PyTorch build matched to your accelerator. These examples
 
 ```bash
 python -m pip install -e ".[models,serve]"
-python -c "from xinfer.models import available_models; print(available_models())"
 ```
-
-A fresh installation lists `('wall_oss', 'wallx2b')` before you supply weights.
 
 The default Wall-OSS BF16 path uses **xcompute**. Install a build for your CUDA GPU and
 check the selected backends in the [kernel guide](docs/kernels.md). If the build is unavailable,
@@ -97,7 +94,7 @@ from xinfer import Policy
 from xinfer.frontend.protocol import unpackb
 
 observation = unpackb(Path("observation.msgpack").read_bytes())
-policy = Policy("wall_oss", "/path/to/checkpoint", device="cuda", image_preprocess_device="cpu")
+policy = Policy("wall_oss", "/path/to/checkpoint", device="cuda")
 
 try:
     policy.warmup([observation])
@@ -131,6 +128,18 @@ backend; see [kernels](docs/kernels.md).
 Ascend binds a prebuilt Ascend **xcompute** build the same way, with NPU graphs and
 DVPP device images; see the [Ascend guide](docs/ascend950dt.md).
 
+## Performance
+
+Single-request latency and capacity of each serving configuration, measured with `benchmarks/performance.py`
+([conditions](docs/performance.md)):
+
+| # | Model | Precision, composition | Accelerator | Single request P50 | Robots per accelerator | Server P50 at capacity | Server P95 at capacity | Peak throughput |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Wall-OSS | BF16, optimized | RTX 5090 | 49.2 ms | 4 | 117 ms | 125 ms | 26.3 req/s |
+| 2 | Wall-X 2B | BF16, optimized | RTX 5090 | 22.3 ms | 15 | 144 ms | 155 ms | 83.3 req/s |
+| 3 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 4 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+
 ## How it works
 
 <p align="center">
@@ -149,13 +158,6 @@ service share the same Engine and configuration rules. See the
 
 Evaluate single-request latency and the number of robots served within a
 defined response-latency target:
-
-| Single-request P50 (BF16) | RTX 5090 | Ascend 950DT |
-|---|---:|---:|
-| Wall-OSS | 49.2 ms | 80.8 ms |
-| Wall-X 2B | 22.3 ms | 79.7 ms |
-
-The RTX 5090 rows were measured on November 9 and the Ascend rows on November 13, 2026. The Wall-X 2B CUDA measurement used an upstream weight layout that can avoid a copy. See the [measurement conditions and results under load](docs/performance.md).
 
 | Tool | Measures |
 |---|---|
