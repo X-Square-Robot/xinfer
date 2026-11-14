@@ -18,8 +18,9 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 ENV = "XINFER_XCOMPUTE_LIBRARY"
-UNIFIED = ("gemm", "gemm_glu", "qkv_proj_rope", "prepack_weight", "selected_backend", "pack_rope_table", "AdaRms",
-           "rmsnorm", "add_rmsnorm", "attention_kvcache", "attention_kvcache_backend", "denoise_output_euler")
+UNIFIED = ("gemm", "gemm_glu", "fused_mlp", "qkv_proj_rope", "prepack_weight", "selected_backend", "pack_rope_table",
+           "l2_prefetch", "AdaRms", "rmsnorm", "add_rmsnorm", "attention_kvcache", "attention_kvcache_backend",
+           "denoise_output_euler")
 LIBRARY_ENTRIES = ("build_target_archs", "gemm_envelope_table")
 
 
@@ -158,3 +159,13 @@ def xcompute_with(*entries, functions=()):
     available = (xc is not None and all(hasattr(xc, name) for name in entries)
                  and (not functions or library is not None and all(library.has_function(name) for name in functions)))
     return dict(XCOMPUTE, requires=xc if available else None)
+
+
+# Library functions of the builds with the MXFP8 GEMM family (and the norms' MXFP8 outputs).
+MXFP8_FUNCTIONS = ("quantize_mxfp8_into", "layernorm_quant_mxfp8")
+
+
+def mxfp8_registration() -> dict:
+    """``register`` arguments of an operator on the MXFP8 GEMM family: ``XCOMPUTE`` when the library has the family,
+    else nothing registers (the operators run on their references)."""
+    return xcompute_with(functions=MXFP8_FUNCTIONS)

@@ -6,6 +6,8 @@ Use the model ID `wallx2b` to serve a BF16 Wall-X 2B checkpoint on a CUDA GPU or
 
 See the [validation results](wallx2b_validation.md) for latency, single-GPU capacity and open-loop accuracy on the RTX 5090.
 
+For lower-precision inference on CUDA, add `--model-options '{"quantization":"mxfp8"}'` to the serving command below, or pass `quantization="mxfp8"` to `Policy`. This uses the same checkpoint and quantizes the vision blocks and prompt projections at load time. The action stage retains its BF16 composition. See [model design and MXFP8](wallx2b_design.md) for stage selection, operator requirements and validation.
+
 ## Checkpoint requirements
 
 Provide a compatible checkpoint directory obtained separately. This repository ships the inference code. Start with the following files from the same training export:

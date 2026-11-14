@@ -10,7 +10,7 @@ from xinfer.models.layers.quantization import QuantConfig
 QuantConfig(groups={"vision.blocks": "mxfp8", "vision.merger": "mxfp8", "prefill": "mxfp8"})
 ```
 
-checkpoint 加载完成后，`process_weights(model)` 在权重被共享或 graph 被捕获之前，把每一层转换一次。模型可以定义预设（`quantization="<preset>"`），也可以接受一个 `QuantConfig`，或一个包含 `groups`、`default` 和 `options` 的 dict；内置模型目前都没有定义预设（Wall-OSS 只跑 BF16）。目前还没有模型预设使用 `nvfp4` 或 `nvfp4_mse`。
+checkpoint 加载完成后，`process_weights(model)` 在权重被共享或 graph 被捕获之前，把每一层转换一次。模型可以定义预设（`quantization="<preset>"`），也可以接受一个 `QuantConfig`，或一个包含 `groups`、`default` 和 `options` 的 dict；Wall-X 2B 提供 `"bf16"`（默认）和 `"mxfp8"` 两种预设。MXFP8 对视觉块和提示词路径使用固定的 1×128 缩放。单独启用其中一个阶段可用 `{"groups":{"vision":"mxfp8"}}` 或 `{"groups":{"prefill":"mxfp8"}}`。详见 [Wall-X 2B 设计](models/wallx2b_design.zh-CN.md)。Wall-OSS 使用 BF16。目前没有模型预设使用 `nvfp4` 或 `nvfp4_mse`。
 
 ## 方法
 
@@ -90,7 +90,7 @@ GEMM 始终是输出 BF16 的 `nvfp4_gemm`。其余部分都在该输出上运�
 
 ## 后端
 
-MXFP8 和 NVFP4 的框架算子使用 PyTorch 参考实现。内置的 xcompute 后端为 Wall-OSS 提供 BF16 算子。详见[kernel 指南](kernels.zh-CN.md)。
+PyTorch 提供 MXFP8 和 NVFP4 的参考算子。在 CUDA 上，包含 MXFP8 GEMM 和归一化入口的 xcompute 构建可以加速 Wall-X 2B 的 MXFP8 预设。构建和所选算子的检查方法见 [kernel 指南](kernels.zh-CN.md)。
 
 ## 测试
 

@@ -19,8 +19,8 @@ Wall-OSS 是这一架构的开源名称（[X-Square-Robot/wall-x](https://github
 | 精度 | 仅 BF16 |
 | Attention | 安装 flash-attn 时，ViT 和 prompt 的 attention 使用 flash-attn 后端；action 的 attention 使用 xcompute 的 `attention_kvcache`（optimized 组合）或 flash-attn（参考组合） |
 | 数值一致性 | 与参考组合一致，由 `tests/models/test_wall_oss_optimized.py` 和 `tests/models/test_wall_oss_parity.py` 检查；optimized 组合还通过了内部精度门禁（[精度](../precision.zh-CN.md#如何检查一致性)） |
-| 速度 | RTX 5090，optimized 组合：阶段 graph vision 15.6、prefill 21.3、action 7.3 ms（768 token 的桶、5 步，共 44.2 ms）；`Policy.infer` 47.3 ms（P50）。参考组合：50.9 ms 和 54.1 ms（[验证](wall_oss_validation.zh-CN.md#延迟)）。视图在设备上处理时的单请求时延和单卡机器人数见[性能](../performance.zh-CN.md) |
-| 尚未支持 | optimized 组合 action 阶段的组批、静态 prompt 的 KV 复用（实测收益约 0.2 ms，不计划实现）、MXFP8、NVFP4、Thor |
+| 速度 | RTX 5090，optimized 组合：阶段 graph vision 15.6、prefill 21.3、action 7.3 ms（768 token 的桶、5 步，共 44.2 ms）；`Policy.infer` 47.3 ms（P50）。参考组合：50.9 ms 和 54.1 ms（[验证](wall_oss_validation.zh-CN.md#延迟)）。视图在设备上处理时的单请求时延和单卡机器人数见[性能](../performance.zh-CN.md)。Jetson Thor（xcompute `c0d03ca` 为 SM110 构建，默认时钟，视图在设备上处理）：三轮单请求 P50 为 94.6–96.0 ms（引擎 89.1–91.1 ms），不用 SM110 算子时为 132–145 ms（引擎 127–142 ms）（[设计](wall_oss_design.zh-CN.md#optimized-组合)） |
+| 尚未支持 | optimized 组合 action 阶段的组批、静态 prompt 的 KV 复用（实测收益约 0.2 ms，不计划实现）、MXFP8、NVFP4 |
 
 ## 环境要求
 

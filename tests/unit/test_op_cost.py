@@ -66,9 +66,22 @@ FORMULA_CASES = {
                         OpCost(GEMM, 256 + 512 + 2048 + 512 + 64 + 256, 4 * 32 * 2, "mxfp8")),
     "mxfp8_gemm_silu_mul": ((A8, S, W8, S), OpCost(GEMM, 256 + 512 + 2048 + 512, 4 * 16 * 2, "mxfp8")),
     "mxfp8_gemm_residual": ((A8, S, W8, S, t(4, 32)), OpCost(GEMM, 256 + 512 + 2048 + 512 + 256, 4 * 32 * 2, "mxfp8")),
+    "mxfp8_gemm_epilogue": (((A8, S), (W8, S), t(32)), OpCost(GEMM, 256 + 512 + 2048 + 512 + 64, 4 * 32 * 2, "mxfp8")),
+    "mxfp8_gemm_glu_quantize": (((A8, S), (t(64, 64, dtype=E4M3), S)),
+                                OpCost(2 * GEMM, 256 + 512 + 4096 + 512, 4 * 32 + 512, "mxfp8")),
+    "mxfp8_qkv_rope_epilogue": (((A8, S), (W8, S), t(32), t(4, 2, dtype=F32), t(4, 2, dtype=F32), 2, 4),
+                                OpCost(GEMM, 256 + 512 + 2048 + 512 + 64 + 64, 4 * 32 * 2, "mxfp8")),
     "nvfp4_gemm": ((A4, S4, W4, S4), OpCost(GEMM, 128 + 512 + 1024 + 512, 4 * 32 * 2, "nvfp4")),
     "gemm_epilogue": ((X, W, t(32)), OpCost(GEMM, 512 + 4096 + 64, 4 * 32 * 2, "bf16")),
     "gemm_glu_epilogue": ((X, W), OpCost(GEMM, 512 + 4096, 4 * 16 * 2, "bf16")),  # 16 gate and 16 up rows
+    # bias [32] (64 bytes), residual [1, 4, 32] (256 bytes), FP32 norm weight [32] (128 bytes); writes the sum and
+    # its norm
+    "gemm_add_rms_norm": ((X, W, t(1, 4, 32), t(32, dtype=F32), 1e-6, t(32)),
+                          OpCost(GEMM, 512 + 4096 + 64 + 256 + 128, 2 * 2 * 4 * 32, "bf16")),
+    # 16 gate and 16 up rows, down [64, 16], residual [1, 4, 64] (512 bytes), FP32 norm weight [64] (256 bytes);
+    # writes the sum and its norm
+    "mlp_add_rms_norm": ((X, W, t(64, 16), t(1, 4, 64), t(64, dtype=F32), 1e-6),
+                         OpCost(GEMM + 2 * 4 * 16 * 64, 512 + 4096 + 2048 + 512 + 256, 2 * 2 * 4 * 64, "bf16")),
     "qkv_rope_epilogue": ((X, W48, t(48), ROPE, ROPE, 2, 8),  # 2 heads of q, k and v, D = 8
                           OpCost(2 * 4 * 48 * 64, 512 + 6144 + 96 + 128, 4 * 48 * 2, "bf16")),
     # The caches are not read: Q goes to the output, K and V to 4 new cache rows, 4 x 32 values in all.
@@ -101,6 +114,7 @@ def test_formula_variants():
     assert action.read_bytes == 1280 + 640 + 640 + 896 + 896 + 16  # no prompt lengths
     cu_seqlens = torch.tensor([0, 7])  # a host tensor, read like the reference reads it
     assert op_cost("varlen_attention", (t(7, 4, 16),) * 3, {"cu_seqlens": cu_seqlens}, None).flops == 4 * 16 * 4 * 49
+    assert op_cost("mxfp8_gemm_epilogue", ((A8, S), (W8, S)), {"out_quant": True}, None).write_bytes == 4 * 32 + 512
     assert OpCost(1, 2, 3, "bf16").bytes == 5
 
 
