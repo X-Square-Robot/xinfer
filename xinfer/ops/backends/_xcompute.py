@@ -18,8 +18,9 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 ENV = "XINFER_XCOMPUTE_LIBRARY"
-UNIFIED = ("gemm", "gemm_glu", "qkv_proj_rope", "prepack_weight", "selected_backend", "pack_rope_table", "AdaRms",
-           "rmsnorm", "add_rmsnorm", "attention_kvcache", "attention_kvcache_backend", "denoise_output_euler")
+UNIFIED = ("gemm", "gemm_glu", "fused_mlp", "qkv_proj_rope", "prepack_weight", "selected_backend", "pack_rope_table",
+           "l2_prefetch", "AdaRms", "rmsnorm", "add_rmsnorm", "attention_kvcache", "attention_kvcache_backend",
+           "denoise_output_euler")
 LIBRARY_ENTRIES = ("build_target_archs", "gemm_envelope_table")
 
 

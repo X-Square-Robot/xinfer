@@ -27,8 +27,8 @@ yet.
 | Precision | BF16 only |
 | Attention | flash-attn backend for the ViT and prompt attention when installed; the action attention on xcompute's `attention_kvcache` (optimized composition) or flash-attn (reference composition) |
 | Numerical agreement | Agreement with the reference composition, checked by `tests/models/test_wall_oss_optimized.py` and `tests/models/test_wall_oss_parity.py`; the optimized composition also passes the internal precision gate ([precision](../precision.md#how-agreement-is-checked)) |
-| Speed | RTX 5090, optimized composition: stage graphs vision 15.6, prefill 21.3, action 7.3 ms (44.2 ms at the 768-token bucket, 5 steps); `Policy.infer` 47.3 ms (P50). Reference composition: 50.9 ms and 54.1 ms ([validation](wall_oss_validation.md#latency)). Single request with the views on the device and robots per GPU: [performance](../performance.md) |
-| Not yet | batching in the optimized action stage, static-prompt KV reuse (measured gain about 0.2 ms, not planned), MXFP8, NVFP4, Thor |
+| Speed | RTX 5090, optimized composition: stage graphs vision 15.6, prefill 21.3, action 7.3 ms (44.2 ms at the 768-token bucket, 5 steps); `Policy.infer` 47.3 ms (P50). Reference composition: 50.9 ms and 54.1 ms ([validation](wall_oss_validation.md#latency)). Single request with the views on the device and robots per GPU: [performance](../performance.md). Jetson Thor (xcompute `c0d03ca` built for SM110, default clocks, the views on the device): single request P50 94.6–96.0 ms (engine 89.1–91.1 ms) over three rounds, against 132–145 ms (engine 127–142 ms) without the SM110 operators ([design](wall_oss_design.md#optimized-composition)) |
+| Not yet | batching in the optimized action stage, static-prompt KV reuse (measured gain about 0.2 ms, not planned), MXFP8, NVFP4 |
 
 ## Requirements
 

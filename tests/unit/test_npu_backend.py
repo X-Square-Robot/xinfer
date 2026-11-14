@@ -48,8 +48,8 @@ def test_shared_loader_accepts_an_ascend_build_with_no_cuda_architectures(monkey
 def isolated_backend(monkeypatch):
     """Reload Ascend modules into an isolated registry and restore production bindings afterwards."""
     registry_module = importlib.import_module("xinfer.ops.registry")
-    module_names = ("xinfer.ops.backends.ascend._torch_attn", "xinfer.ops.backends.ascend.gemm",
-                    "xinfer.ops.backends.ascend.attn", "xinfer.ops.backends.ascend.norm",
+    module_names = ("xinfer.ops.backends.ascend._torch_attn", "xinfer.ops.backends.ascend.norm",
+                    "xinfer.ops.backends.ascend.gemm", "xinfer.ops.backends.ascend.attn",
                     "xinfer.ops.backends.ascend.rope", "xinfer.ops.backends.ascend.flow",
                     "xinfer.ops.backends.ascend.official")
     registry = OpRegistry()
@@ -499,6 +499,13 @@ def test_explicit_operator_exports_run_without_optional_cann_dependencies(isolat
         for actual, expected_input in zip(args, copied):
             if torch.is_tensor(actual):
                 torch.testing.assert_close(actual, expected_input, atol=0, rtol=0)
+    # the projections joined with the residual norm call the exports above in turn
+    composed = {"gemm_add_rms_norm": ((x, weight, tensor(1, 2, 4), torch.ones(4), 1e-6), {"bias": tensor(4)}),
+                "mlp_add_rms_norm": ((x, tensor(8, 3), tensor(4, 4), tensor(1, 2, 4), torch.ones(4), 1e-6), {})}
+    for name, (args, options) in composed.items():
+        assert table.selection(name).name == "ascend:xcompute"
+        torch.testing.assert_close(getattr(table, name)(*args, **options),
+                                   ops.registry.spec(name).reference(*args, **options), atol=0, rtol=0)
     assert called == set(names)
 
 

@@ -345,7 +345,8 @@ gpu = pytest.mark.skipif(not (XCOMPUTE and torch.cuda.is_available()
                               and torch.cuda.get_device_capability() == (12, 0)),
                          reason="xcompute + an SM120 GPU required")
 FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm",
-         "add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler")
+         "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler",
+         "prefetch_weights", "join_prefetch")
 
 
 @pytest.fixture(scope="module")
@@ -622,3 +623,192 @@ def test_xcompute_matches_the_references_at_wallx2b_shapes(xc):
     _check(xc, "flow_velocity_euler", (z, h, r(26, a, scale=1 / 32, dtype=torch.float32), 0.1, dof,
                                        r(1, m, 26, dtype=torch.float32), rows, r(1, m, 26, dtype=torch.float32)),
            relative=1e-4)
+
+
+def test_qkv_rope_epilogue_writes_pair_order_only_when_asked_and_listed(monkeypatch):
+    """qk_order="any" runs the rotary-pair weight and output where packing gives that layout and the call selects
+    a kernel for it; the default order, a GPU without such a kernel, or a call outside its table run as before."""
+    import types
+
+    from xinfer.ops.backends.cuda import gemm
+
+    calls = []
+    packed = types.SimpleNamespace(layout="nk_rope_pairs")
+    package = types.SimpleNamespace(
+        pack_rope_table=lambda cos, sin: "table",
+        prepack_weight=lambda w, **kwargs: calls.append(("prepack", kwargs["num_heads"])) or packed,
+        selected_backend=lambda op, x, w, **kwargs: "tcgen05_bf16_sm110",
+        qkv_proj_rope=lambda x, w, *args, **kwargs: calls.append(
+            ("qkv", "packed" if w is packed else "raw", kwargs.get("out_layout"))))
+    monkeypatch.setattr(gemm, "xc", package)
+    monkeypatch.setattr(gemm, "_pair_weights", {})
+    x, w, b, cs = torch.zeros(4, 8), torch.zeros(24, 8), torch.zeros(24), torch.zeros(4, 2)
+
+    gemm.qkv_rope_epilogue(x, w, b, cs, cs, 2, 4)
+    gemm.qkv_rope_epilogue(x, w, b, cs, cs, 2, 4, qk_order="any")
+    assert calls == [("qkv", "raw", None), ("prepack", 2), ("qkv", "packed", "rope_pairs")]
+
+    calls.clear()  # a call the pair kernel's table does not take
+    package.selected_backend = lambda op, x, w, **kwargs: "generic"
+    gemm.qkv_rope_epilogue(x, w, b, cs, cs, 2, 4, qk_order="any")
+    assert calls == [("qkv", "raw", None)]
+
+    calls.clear()  # no pair-order kernel on this GPU: packing picks another layout, the raw weight runs
+    monkeypatch.setattr(gemm, "_pair_weights", {})
+    packed.layout = "nk"
+    gemm.qkv_rope_epilogue(x, w, b, cs, cs, 2, 4, qk_order="any")
+    assert calls == [("prepack", 2), ("qkv", "raw", None)]
+
+
+@pytest.mark.parametrize("integrated", [True, False])
+def test_gemm_add_rms_norm_adds_the_residual_in_the_gemm_on_integrated_gpus(monkeypatch, integrated):
+    """On an integrated GPU the CUDA gemm_add_rms_norm runs xcompute's gemm with the bias and the residual, then
+    rmsnorm; on a discrete GPU gemm_epilogue and add_rms_norm, so their results are unchanged."""
+    import types
+
+    from xinfer.ops.backends.cuda import gemm
+
+    calls = []
+    package = types.SimpleNamespace(
+        gemm=lambda x, w, **kwargs: calls.append(("gemm", kwargs["bias"] is not None, kwargs["residual"].shape))
+        or torch.zeros(4, 8),
+        rmsnorm=lambda x, w, eps, inference: calls.append(("rmsnorm",)) or "normed")
+    monkeypatch.setattr(gemm, "xc", package)
+    monkeypatch.setattr(gemm.torch.cuda, "get_device_properties",
+                        lambda device: types.SimpleNamespace(is_integrated=integrated))
+    monkeypatch.setattr(gemm, "_integrated", {})
+    monkeypatch.setattr(gemm, "_listed_weight", lambda op, x, w, **kwargs: w)
+    monkeypatch.setattr(gemm, "gemm_epilogue", lambda x, w, b: calls.append(("gemm_epilogue", b is not None)) or x)
+    monkeypatch.setattr(gemm, "add_rms_norm", lambda y, r, w, eps: calls.append(("add_rms_norm",)) or (r, "normed"))
+    x, projection, bias, residual = torch.zeros(4, 6), torch.zeros(8, 6), torch.zeros(8), torch.zeros(1, 4, 8)
+
+    out, normed = gemm.gemm_add_rms_norm(torch.zeros(4, 8) if not integrated else x, projection, residual,
+                                         torch.ones(8), 1e-6, bias=bias)
+    if integrated:
+        assert calls == [("gemm", True, (4, 8)), ("rmsnorm",)] and out.shape == residual.shape
+    else:
+        assert calls == [("gemm_epilogue", True), ("add_rms_norm",)]
+    assert normed == "normed"
+
+
+def test_gemm_add_rms_norm_reference_is_the_unfused_composition():
+    torch.manual_seed(0)
+    x, projection, bias = torch.randn(5, 16), torch.randn(12, 16) * 0.2, torch.randn(12) * 0.1
+    residual, weight = torch.randn(1, 5, 12), torch.rand(12) + 0.5
+    s, normed = gemm.gemm_add_rms_norm(x, projection, residual, weight, 1e-6, bias=bias)
+    s_ref, normed_ref = norm.add_rms_norm(gemm.gemm_epilogue(x, projection, bias).view(residual.shape), residual,
+                                           weight, 1e-6)
+    assert torch.equal(s, s_ref) and torch.equal(normed, normed_ref)
+
+
+def test_the_rope_table_is_packed_once_per_cos_and_sin(monkeypatch):
+    """qkv_rope_epilogue packs xcompute's RoPE table on the first call with a cos / sin pair and reuses it while the
+    tensors live; new tensors at the same address get their own table."""
+    import gc
+    import types
+
+    from xinfer.ops.backends.cuda import gemm
+
+    packs = []
+    package = types.SimpleNamespace(pack_rope_table=lambda cos, sin: packs.append(cos) or ("table", len(packs)),
+                                    qkv_proj_rope=lambda x, w, b, **kwargs: kwargs["rope_table"])
+    monkeypatch.setattr(gemm, "xc", package)
+    monkeypatch.setattr(gemm, "_rope_tables", {})
+    x, weight, bias = torch.zeros(4, 8), torch.zeros(24, 8), torch.zeros(24)
+    cos, sin = torch.zeros(4, 2), torch.zeros(4, 2)
+    tables = [gemm.qkv_rope_epilogue(x, weight, bias, cos, sin, 2, 4) for _ in range(3)]
+    assert tables == [("table", 1)] * 3 and len(packs) == 1
+    del cos, sin, packs[:]
+    gc.collect()
+    assert gemm._rope_tables == {}  # the tensors are gone: so is their table
+    assert gemm.qkv_rope_epilogue(x, weight, bias, torch.ones(4, 2), torch.ones(4, 2), 2, 4) == ("table", 1)
+
+
+def test_mlp_add_rms_norm_runs_the_fused_mlp_only_where_xcompute_lists_it(monkeypatch):
+    """The CUDA mlp_add_rms_norm runs xcompute's fused MLP (adding into the residual in place) and rmsnorm where
+    packing finds a fused kernel layout and the call selects it; elsewhere gate/up and gemm_add_rms_norm (the unfused
+    operators with their bits on discrete GPUs, the residual in the down projection on integrated ones)."""
+    import types
+
+    from xinfer.ops.backends.cuda import gemm
+
+    calls = []
+    packed = types.SimpleNamespace(layout="nk")
+
+    def prepack_weight(w, **kwargs):
+        calls.append(("prepack", kwargs.get("op"), kwargs.get("layout"), kwargs.get("pad_n"), kwargs.get("pad_k")))
+        return packed if kwargs.get("op") == "fused_mlp" else types.SimpleNamespace(layout=kwargs.get("layout"))
+
+    package = types.SimpleNamespace(
+        prepack_weight=prepack_weight,
+        selected_backend=lambda op, *args, **kwargs: "mcast_bf16_sm110",
+        fused_mlp=lambda *args, **kwargs: calls.append(("fused_mlp", kwargs["activation"],
+                                                        kwargs["out"].data_ptr() == kwargs["residual"].data_ptr())),
+        rmsnorm=lambda x, w, eps, inference: calls.append(("rmsnorm",)) or "normed")
+    monkeypatch.setattr(gemm, "xc", package)
+    monkeypatch.setattr(gemm, "_fused_mlp", {})
+    monkeypatch.setattr(gemm, "gemm_glu_epilogue", lambda x, w: calls.append(("gemm_glu_epilogue",)) or x)
+    monkeypatch.setattr(gemm, "gemm_add_rms_norm",
+                        lambda h, w, r, nw, eps: calls.append(("gemm_add_rms_norm",)) or (r, "normed"))
+    x, residual = torch.zeros(4, 8), torch.zeros(1, 4, 8)
+    gate_up, down = torch.zeros(12, 8), torch.zeros(8, 6)
+
+    gemm.mlp_add_rms_norm(x, gate_up, down, residual, torch.ones(8), 1e-6)  # packing picks the generic layout
+    assert [c[0] for c in calls] == ["prepack", "gemm_glu_epilogue", "gemm_add_rms_norm"]
+
+    calls.clear()
+    monkeypatch.setattr(gemm, "_fused_mlp", {})
+    packed.layout = "nk_glu_blocked128_k64"
+    out, normed = gemm.mlp_add_rms_norm(x, gate_up, down, residual, torch.ones(8), 1e-6)
+    assert calls == [("prepack", "fused_mlp", None, gemm.FUSED_MLP_PAD, None),
+                     ("prepack", None, "nk_k64blk", None, gemm.FUSED_MLP_PAD), ("fused_mlp", "silu", True),
+                     ("rmsnorm",)]
+    assert out is residual and normed == "normed"  # the residual is added in place, not copied
+
+    calls.clear()  # a call the fused kernel's table does not take (another M): the unfused operators
+    package.selected_backend = lambda op, *args, **kwargs: "generic"
+    gemm.mlp_add_rms_norm(x, gate_up, down, residual, torch.ones(8), 1e-6)
+    assert [c[0] for c in calls] == ["gemm_glu_epilogue", "gemm_add_rms_norm"]
+
+
+def test_mlp_add_rms_norm_reference_is_the_unfused_composition():
+    torch.manual_seed(0)
+    x, gate_up, down = torch.randn(5, 16), torch.randn(24, 16) * 0.2, torch.randn(16, 12) * 0.2
+    residual, weight = torch.randn(1, 5, 16), torch.rand(16) + 0.5
+    s, normed = gemm.mlp_add_rms_norm(x, gate_up, down, residual, weight, 1e-6)
+    y = gemm.gemm_epilogue(gemm.gemm_glu_epilogue(x, gate_up), down)
+    s_ref, normed_ref = norm.add_rms_norm(y.view(residual.shape), residual, weight, 1e-6)
+    assert torch.equal(s, s_ref) and torch.equal(normed, normed_ref)
+
+
+@gpu
+@pytest.mark.gpu
+def test_prefetch_weights_leaves_results_and_graph_capture_intact(xc, monkeypatch):
+    """prefetch_weights forks a side stream and join_prefetch joins it: eager and under CUDA graph capture (which
+    fails on an unjoined stream), the GEMM after it gives the same bits as without the prefetch."""
+    from xinfer.ops.backends.cuda import gemm
+
+    torch.manual_seed(0)
+    x = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
+    weights = [torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16) * 0.03 for _ in range(3)]
+    want = gemm.gemm_epilogue(x, weights[1])
+    monkeypatch.setattr(gemm, "_integrated", {torch.cuda.current_device(): True})  # prefetch on any GPU here
+
+    def step():
+        gemm.prefetch_weights(weights)
+        y = gemm.gemm_epilogue(x, weights[1])
+        gemm.join_prefetch()
+        return y
+
+    assert torch.equal(step(), want)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step()  # warm up on the capture stream
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        y = step()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(y, want)

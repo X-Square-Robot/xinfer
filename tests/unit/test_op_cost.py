@@ -74,6 +74,14 @@ FORMULA_CASES = {
     "nvfp4_gemm": ((A4, S4, W4, S4), OpCost(GEMM, 128 + 512 + 1024 + 512, 4 * 32 * 2, "nvfp4")),
     "gemm_epilogue": ((X, W, t(32)), OpCost(GEMM, 512 + 4096 + 64, 4 * 32 * 2, "bf16")),
     "gemm_glu_epilogue": ((X, W), OpCost(GEMM, 512 + 4096, 4 * 16 * 2, "bf16")),  # 16 gate and 16 up rows
+    # bias [32] (64 bytes), residual [1, 4, 32] (256 bytes), FP32 norm weight [32] (128 bytes); writes the sum and
+    # its norm
+    "gemm_add_rms_norm": ((X, W, t(1, 4, 32), t(32, dtype=F32), 1e-6, t(32)),
+                          OpCost(GEMM, 512 + 4096 + 64 + 256 + 128, 2 * 2 * 4 * 32, "bf16")),
+    # 16 gate and 16 up rows, down [64, 16], residual [1, 4, 64] (512 bytes), FP32 norm weight [64] (256 bytes);
+    # writes the sum and its norm
+    "mlp_add_rms_norm": ((X, W, t(64, 16), t(1, 4, 64), t(64, dtype=F32), 1e-6),
+                         OpCost(GEMM + 2 * 4 * 16 * 64, 512 + 4096 + 2048 + 512 + 256, 2 * 2 * 4 * 64, "bf16")),
     "qkv_rope_epilogue": ((X, W48, t(48), ROPE, ROPE, 2, 8),  # 2 heads of q, k and v, D = 8
                           OpCost(2 * 4 * 48 * 64, 512 + 6144 + 96 + 128, 4 * 48 * 2, "bf16")),
     # The caches are not read: Q goes to the output, K and V to 4 new cache rows, 4 x 32 values in all.
