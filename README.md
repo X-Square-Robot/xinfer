@@ -14,12 +14,15 @@
   <a href="#models-and-hardware">Models</a> ·
   <a href="docs/benchmark.md">Benchmarks</a> ·
   <a href="#documentation">Documentation</a> ·
+  <a href="https://arxiv.org/abs/2611.14969">Paper</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 **XInfer is an inference and serving framework for vision-language-action
 (VLA) models.** Our goal is fast, stable, and accurate model inference serving
 for robots, from onboard inference to shared fleet serving.
+
+The design and its evaluation are described in our paper, [Scaling VLA Serving Under Robotic Execution Constraints](https://arxiv.org/abs/2611.14969).
 
 ## Features at a glance
 
@@ -170,6 +173,22 @@ For commands and measurement definitions, see the [benchmark guide](docs/benchma
 | Profile operators | [Profiling](docs/profiling.md) |
 | Monitor a service with Prometheus and Grafana | [Metrics](docs/metrics.md) |
 | Extend the framework | [Model interface](xinfer/models/interface.py) · [Architecture and design](docs/design.md) |
+
+## Citation
+
+If you use XInfer in your research, please cite our paper:
+
+```bibtex
+@misc{zhang2026scalingvlaservingrobotic,
+      title={Scaling VLA Serving Under Robotic Execution Constraints},
+      author={Yue Zhang and Zicong Ye and Lufang Chen and Dance Yang and Mingyang Li and Zhenwei Duan and Michael Zhao and Ziye Deng and Starrick Liu and Ruizhi Chengze and YongHua Chen and SongAo Han and Yu Sun and Ran Yu and Xiaofan Li and Ruyi Gan and Hao Wang},
+      year={2026},
+      eprint={2611.14969},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2611.14969},
+}
+```
 
 ## Contributing
 
