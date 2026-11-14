@@ -35,16 +35,18 @@ class Observations:
     """Seeded synthetic observations in the desktop robot wire schema: two JPEG wrist views, a raw head view and
     random arm poses.
 
-    Each arm's pose is a random xyz position within 0.5 m of the origin, roll/pitch/yaw within pi and a gripper
-    value within 0..1, from a stream of its own, so the views stay those of the x2robot client's synthetic
-    observations. Wall-OSS writes the state into its prompt as text, so random poses vary the prompt length as real
-    robots do.
+    Generate the camera views once per robot so JPEG encoding does not delay each request. Each
+    arm's pose is a random xyz position within 0.5 m of the origin, roll/pitch/yaw within pi and a gripper value
+    within 0..1, new for every request. Wall-OSS writes the state into its prompt as text, so random poses vary the
+    prompt length as real robots do.
     """
 
     def __init__(self, machine_id: str):
         seed = sum((i + 1) * ord(c) for i, c in enumerate(machine_id)) % 997
         self.rng = np.random.default_rng(seed)
         self.pose_rng = np.random.default_rng([seed, 1])
+        self.views = {"camera_left": self._jpeg(), "camera_right": self._jpeg(),
+                      "camera_front": self.rng.integers(0, 255, (720, 1280, 3), dtype=np.uint8)}
 
     def _pose(self) -> list[float]:
         uniform = self.pose_rng.uniform
@@ -59,10 +61,8 @@ class Observations:
         return base64.b64encode(encoded.tobytes()).decode("ascii")
 
     def make(self, rtc_fields: dict | None, num_flow_steps: int) -> dict:
-        head = self.rng.integers(0, 255, (720, 1280, 3), dtype=np.uint8)
-        views = {"camera_left": self._jpeg(), "camera_right": self._jpeg(), "camera_front": head}
-        observation = {"state": {"follow1_pos": self._pose(), "follow2_pos": self._pose()}, "views": views,
-                       "instruction": INSTRUCTION}
+        observation = {"state": {"follow1_pos": self._pose(), "follow2_pos": self._pose()},
+                       "views": dict(self.views), "instruction": INSTRUCTION}
         if rtc_fields is not None:
             observation.update(rtc_fields)
             observation["num_flow_steps"] = num_flow_steps
