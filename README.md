@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="#features-at-a-glance">Features</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#models-and-hardware">Models</a> ·
   <a href="docs/benchmark.md">Benchmarks</a> ·
@@ -19,6 +20,15 @@
 **XInfer is an inference and serving framework for vision-language-action
 (VLA) models.** Our goal is fast, stable, and accurate model inference serving
 for robots, from onboard inference to shared fleet serving.
+
+## Features at a glance
+
+- **Real-time chunking (RTC).** Predict the next action chunk from a new observation while the robot executes the current one.
+- **Ultra-low single-robot latency.** Wall-X 2B in BF16 measured 22.3 ms P50 per request on an RTX 5090.
+- **Multi-robot serving on one accelerator.** Robots share model weights, and vision encoding can overlap with action generation across requests.
+- **Low-precision quantization.** Apply MXFP8 or NVFP4 to selected groups of linear layers.
+- **Hardware backends.** NVIDIA RTX 5090, Jetson Thor, Ascend 950DT, and Huixi Rhino RPU (R1) support in development.
+- **High-performance kernels.** Use xcompute fused kernels and FlashAttention, or plug in another kernel library.
 
 ## Why XInfer
 
@@ -111,6 +121,18 @@ Optimized CUDA execution uses an **xcompute** build and the optional FlashAttent
 backend; see [kernels](docs/kernels.md).
 Ascend binds a prebuilt Ascend **xcompute** build the same way, with NPU graphs and
 DVPP device images; see the [Ascend guide](docs/ascend950dt.md).
+
+## Performance
+
+Single-request latency and capacity of each serving configuration, measured with `benchmarks/performance.py`
+([conditions](docs/performance.md)):
+
+| # | Model | Precision, composition | Accelerator | Single request P50 | Robots per accelerator | Server P50 at capacity | Server P95 at capacity | Peak throughput |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Wall-OSS | BF16, optimized | RTX 5090 | 49.2 ms | 4 | 117 ms | 125 ms | 26.3 req/s |
+| 2 | Wall-X 2B | BF16, optimized | RTX 5090 | 22.3 ms | 15 | 144 ms | 155 ms | 83.3 req/s |
+| 3 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 4 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## How it works
 
