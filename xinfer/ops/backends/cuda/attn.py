@@ -32,8 +32,8 @@ call); the other calls run on the reference:
 | ``prefix_kvcache_attention`` | ``attention_kvcache`` | reference |
 | ``segment_attention`` | ``attention_varlen`` (segment layout on the host) | reference |
 | ``gated_causal_attention`` | ``attention_varlen`` with the gate | reference |
-| ``gated_kvcache_attention`` | ``attention_kvcache`` with the gate | ``attention_kvcache``, then ``sigmoid_gate_mul_inplace`` |
-| ``gated_delta_net`` | ``gated_delta_rule_prefill`` | one sequence with heads of 128 only (ValueError) |
+| ``gated_kvcache_attention`` | ``attention_kvcache`` with the gate | ungated kernel and separate sigmoid gate when listed, otherwise reference |
+| ``gated_delta_net`` | ``gated_delta_rule_prefill`` | reference for unlisted lengths; one sequence with heads of 128 only (ValueError) |
 
 Contracts against the torch references: tolerance.
 """
@@ -289,16 +289,24 @@ def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, f
     if _takes("kvcache_gated", xc.attention_kvcache_backend, key, q, k_cache, v_cache, out_gate=gate,
               gate_act="sigmoid", **options):
         return xc.attention_kvcache(q, k_cache, v_cache, out_gate=gate, gate_act="sigmoid", **options)
+    if not _takes("kvcache", xc.attention_kvcache_backend, key, q, k_cache, v_cache, **options):
+        return reference_attn.gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate,
+                                                      flash_mask=flash_mask, scale=scale)  # no kernel for these heads
     o = xc.attention_kvcache(q, k_cache, v_cache, **options)  # no gated kernel for these heads
     return xc.sigmoid_gate_mul_inplace(o.reshape(gate.shape), gate, round_sigmoid=True)
 
 
-@register("gated_delta_net", backend="cuda", **xcompute_with("gated_delta_rule_prefill"))
+@register("gated_delta_net", backend="cuda", **xcompute_with("gated_delta_rule_prefill", "gated_delta_rule_prefill_backend"))
 def gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim,
                     head_v_dim, eps):
     b, n, _ = qkv.shape
     if b != 1 or head_k_dim != 128 or head_v_dim != 128 or zba.shape[-1] != num_v_heads * (head_v_dim + 2):
         raise ValueError("xcompute gated_delta_rule_prefill takes one sequence with heads of 128")
-    out = xc.gated_delta_rule_prefill(qkv.reshape(n, -1), zba.reshape(n, -1), conv_weight, A_log, dt_bias,
-                                      norm_weight, num_k_heads=num_k_heads, eps=float(eps))
+    rows = (qkv.reshape(n, -1), zba.reshape(n, -1))
+    if not _takes("gated_delta_rule", xc.gated_delta_rule_prefill_backend, (n, num_k_heads, num_v_heads), *rows,
+                  num_k_heads=num_k_heads):  # no kernel listed for this length, these heads or this GPU
+        return reference_attn.gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads,
+                                              num_v_heads, head_k_dim, head_v_dim, eps)
+    out = xc.gated_delta_rule_prefill(*rows, conv_weight, A_log, dt_bias, norm_weight, num_k_heads=num_k_heads,
+                                      eps=float(eps))
     return out.view(1, n, -1)

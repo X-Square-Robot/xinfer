@@ -226,6 +226,7 @@ def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(
         return registry
 
     package = types.ModuleType("xcompute")
+    package.denoise_output_euler_backend = object()
     try:
         registry = registered(dict(requires=package, platforms=("sm120",), version="sha256:0"))
         names = registry.backend_ops("cuda:xcompute")
@@ -242,6 +243,73 @@ def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(
         monkeypatch.undo()
         for module in BUILTIN_MODULES:  # register the modules as imported into the process-wide registry again
             importlib.reload(importlib.import_module(module))
+
+
+@pytest.mark.parametrize("gated,ungated,expected", [(True, True, "gated"), (False, True, "separate"),
+                                                    (False, False, "reference")])
+def test_gated_kvcache_selects_an_available_kernel(monkeypatch, gated, ungated, expected):
+    from types import SimpleNamespace
+
+    from xinfer.ops.backends.cuda import attn as cuda
+
+    def probe(*args, **options):
+        if not (gated if "out_gate" in options else ungated):
+            raise ValueError("no listed kernel")
+
+    gate = torch.zeros(1, 2, 4)
+    xc = SimpleNamespace(attention_kvcache_backend=probe,
+                         attention_kvcache=lambda *args, **opts: "gated" if "out_gate" in opts else gate,
+                         sigmoid_gate_mul_inplace=lambda *args, **opts: "separate")
+    monkeypatch.setattr(cuda, "xc", xc)
+    monkeypatch.setattr(cuda, "_listed", {})
+    monkeypatch.setattr(attn, "gated_kvcache_attention", lambda *args, **opts: "reference")
+    q, cache = gate.view(1, 2, 2, 2), torch.zeros(1, 4, 1, 2)
+    assert cuda.gated_kvcache_attention(q, cache, cache, torch.tensor([2]), 2, gate) == expected
+
+
+def test_cuda_operators_use_reference_when_the_build_rejects_a_shape(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from xinfer.ops.backends.cuda import attn as cuda_attn
+    from xinfer.ops.backends.cuda import flow as cuda_flow
+
+    reject = Mock(side_effect=ValueError("no listed kernel"))
+    launch = Mock(side_effect=AssertionError("kernel was not admitted"))
+    xc = SimpleNamespace(gated_delta_rule_prefill_backend=reject, gated_delta_rule_prefill=launch,
+                         denoise_input_embed_backend=reject, denoise_input_embed=launch,
+                         denoise_output_euler_backend=reject, denoise_output_euler=launch)
+    monkeypatch.setattr(cuda_attn, "xc", xc)
+    monkeypatch.setattr(cuda_attn, "_listed", {})
+    monkeypatch.setattr(cuda_flow, "xc", xc)
+    monkeypatch.setattr(attn, "gated_delta_net", lambda *args: "delta reference")
+    qkv, zba = torch.zeros(1, 3, 384, dtype=BF16), torch.zeros(1, 3, 130, dtype=BF16)
+    assert cuda_attn.gated_delta_net(qkv, zba, None, None, None, None, 1, 1, 128, 128, 1e-6) == "delta reference"
+    x, h = torch.arange(6.).reshape(1, 3, 2), torch.ones(1, 3, 4, dtype=BF16)
+    embed, readout = torch.ones(1, 4, 2), torch.ones(2, 4)
+    for _ in range(2):
+        assert torch.equal(cuda_flow.flow_input_embed(x, embed), flow.flow_input_embed(x, embed))
+        assert torch.equal(cuda_flow.flow_velocity_euler(x, h, readout, 0.25),
+                           flow.flow_velocity_euler(x, h, readout, 0.25))
+    assert reject.call_count == 3
+    launch.assert_not_called()
+
+
+def test_flow_embed_on_a_build_without_a_capability_query(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from xinfer.ops.backends.cuda import flow as cuda
+
+    launch = Mock(return_value="native")
+    monkeypatch.setattr(cuda, "xc", SimpleNamespace(denoise_input_embed=launch))
+    x, weight = torch.ones(1, 2, 2), torch.ones(1, 4, 2)
+    assert cuda.flow_input_embed(x, weight) == "native"
+    launch.side_effect = ValueError("denoise_input_embed: no white-list entry accepts this shape")
+    assert torch.equal(cuda.flow_input_embed(x, weight), flow.flow_input_embed(x, weight))
+    launch.side_effect = ValueError("invalid weights")
+    with pytest.raises(ValueError, match="invalid weights"):
+        cuda.flow_input_embed(x, weight)
 
 
 def test_the_xcompute_library_comes_from_the_installed_package(monkeypatch, tmp_path):
