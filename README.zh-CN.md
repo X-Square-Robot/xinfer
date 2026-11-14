@@ -113,8 +113,9 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 |---|---|---|---|---|---|---|---|---|
 | 1 | Wall-OSS | BF16，优化组合 | RTX 5090 | 49.0 ms | 4 | 128 ms | 142 ms | 25.6 req/s |
 | 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
-| 3 | Wall-OSS | BF16，优化组合 | 昇腾 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
-| 4 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+| 3 | Wall-OSS | BF16，优化组合 | Jetson AGX Thor | 95.4 ms | 2 | 123 ms | 141 ms | 11.5 req/s |
+| 4 | Wall-OSS | BF16，优化组合 | 昇腾 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 5 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## 工作原理
 
