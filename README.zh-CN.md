@@ -62,12 +62,6 @@ xinfer-serve \
 
 通过 WebSocket + msgpack 连接 `ws://127.0.0.1:33985`。协议、健康检查端点和部署选项见[服务指南](docs/serving.zh-CN.md)。
 
-预热结束后，在另一个终端检查服务是否返回 `ok`：
-
-```bash
-curl -fsS http://127.0.0.1:33985/healthz
-```
-
 ### 在 Python 中运行
 
 ```python

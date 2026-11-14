@@ -79,12 +79,6 @@ Connect at `ws://127.0.0.1:33985` using WebSocket + msgpack. See the
 [serving guide](docs/serving.md) for the protocol, health endpoint, and
 deployment options.
 
-From a second terminal, check that the warmed-up service responds with `ok`:
-
-```bash
-curl -fsS http://127.0.0.1:33985/healthz
-```
-
 ### Run in Python
 
 ```python
