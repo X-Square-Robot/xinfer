@@ -38,17 +38,20 @@
 | 步骤 | 算子 | 本模型形状下的 kernel |
 |---|---|---|
 | ViT 和语言模型的残差加法 + RMSNorm | `add_rms_norm`（第一个归一化用 `rms_norm`） | xcompute `add_rmsnorm` / `rmsnorm` |
-| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` | `qkv_proj_rope` → cuBLASLt 加一个 RoPE kernel |
+| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue`（`qk_order="any"`：Q 和 K 只给注意力用） | `qkv_proj_rope` → cuBLASLt 加一个 RoPE kernel；SM110 上 `tcgen05_bf16_sm110`（Q、K 为旋转对顺序） |
 | ViT 注意力（窗口、全注意力块） | `varlen_attention` | flash-attention 2 |
-| ViT 投影、MLP down、merger（+ bias；merger fc1 + GELU） | `gemm_epilogue` | `gemm` → cuBLASLt |
+| ViT 投影和 MLP down（+ bias）+ 残差加法 + 下一层 RMSNorm | `gemm_add_rms_norm` | `gemm` → cuBLASLt、`add_rmsnorm`；集成显卡（Jetson Thor）上 `gemm` 带残差 → cuBLASLt（β·C）加 `rmsnorm` |
+| merger（+ bias；fc1 + GELU） | `gemm_epilogue` | `gemm` → cuBLASLt |
 | ViT gate/up + bias + SiLU-mul | `gemm_glu_epilogue`（`bias`） | `gemm_glu` → cuBLASLt 加 SiLU-mul kernel |
 | expert 0 的 QKV + bias + M-RoPE，K/V 写入 prompt K/V | `qkv_rope_kvcache` | `qkv_proj_rope`（`kv_cache`）→ cuBLASLt 加一个 RoPE kernel |
 | expert 0 的因果注意力 | `causal_attention` | flash-attention 2 |
-| expert 0 的输出投影和 down 投影；gate/up + SiLU-mul | `gemm_epilogue`；`gemm_glu_epilogue` | cuBLASLt；`tma_streamk_bf16_sm120` |
+| expert 0 的输出投影 | `gemm_epilogue` | cuBLASLt |
+| expert 0 的 MLP（gate/up + SiLU-mul、down）+ 残差加法 + 下一层 RMSNorm | `mlp_add_rms_norm` | `gemm_glu` → `tma_streamk_bf16_sm120`、`gemm` → cuBLASLt、`add_rmsnorm`；SM110 上 M 513–768 时 `fused_mlp` → `mcast_bf16_sm110` 加 `rmsnorm`，其他 M 时 `gemm_glu` → `mcast_bf16_sm110`、带残差的 `gemm` → `mcast_bf16_sm110` 加 `rmsnorm` |
 | 动作嵌入（`ActionHead`，FP32） | `linear`、`silu` | cuBLAS（FP32） |
 | expert 1 的 QKV + bias + M-RoPE + 追加 K/V | `qkv_rope_kvcache` | `qkv_proj_rope`（`kv_cache`）→ cuBLASLt 加一个 RoPE kernel |
 | expert 1 对 prompt K/V 和动作 key 的注意力 | `prefix_kvcache_attention` | `attention_kvcache` → `splitkv` |
 | expert 1 的输出投影和 down 投影（`[K, N]` 权重）；gate/up + SiLU-mul | `gemm_epilogue`；`gemm_glu_epilogue` | `gemm` → `smallm_bf16_sm120`；cuBLASLt 加 SiLU-mul kernel |
+| 提前读 expert 1 的权重：在每层的 QKV 和注意力期间读该层的输出、gate/up、down 投影和下一层的 QKV | `prefetch_weights`、`join_prefetch`（所有步之后） | 集成显卡（Jetson Thor）上为旁路 stream 上的 `l2_prefetch`；独立显卡上不做（会变慢） |
 | 读出、未受控维度的速度、Euler 步、固定行 | `flow_velocity_euler` | `denoise_output_euler` → `fused_tail` |
 
 在本模型的 BF16 形状下，除 expert 0 的 gate/up 外，xcompute 没有为 ViT 和 expert 0 的 GEMM 列出比 cuBLAS 更快的 kernel；这些 GEMM 受算力限制（约占 vision 和 prefill 阶段的 85 %）。收益来自融合的残差加法与归一化、expert 0 的 gate/up kernel，以及 action 阶段的 small-M kernel 和缓存注意力。
@@ -58,6 +61,7 @@
 - **融合的尾处理**：QKV 的 bias 和 RoPE、GLU 的 SiLU-mul 以及 merger 的 GELU 作用在 FP32 累加器上，只舍入一次；参考组合先把 GEMM 输出舍入。残差和照旧舍入为 BF16。
 - **action 阶段**：每次派发一个请求。prompt K/V 和动作 key 共用一个头优先的缓存 `[layers, 2, 1, kv_heads, P + 16, head_dim]`；prompt 填充和 RTC 可见性（固定行能看到 prompt 和彼此）以逐列的行区间（FlashMask `LTS`/`UTE`）传入。速度保持 FP32。
 - **Prompt 桶**：填充在 action 注意力中被掩码，因此填充后 prompt 的动作与精确 prompt 的动作在舍入范围内一致，但不逐位一致。
+- **Jetson Thor**：集成显卡上，ViT 的投影把残差加到 FP32 乘积上、只舍入一次；融合的 expert 0 MLP 不固定归约顺序，两次运行可能有舍入级差异。独立显卡上 `gemm_add_rms_norm` 和 `mlp_add_rms_norm` 与它们合并的那几个算子逐位相同。
 
 ## Action 阶段组批
 

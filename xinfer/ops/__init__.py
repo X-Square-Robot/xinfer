@@ -43,12 +43,17 @@ logger = logging.getLogger(__name__)
 # The operators whose references compose torch code in place of a backend kernel (the fused families of
 # xinfer/ops/reference/); ``warn_slow_fallbacks`` reports these when they run on the reference.
 FUSED_OPS = frozenset({"gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache",
-                       "prefix_kvcache_attention", "add_rms_norm", "flow_velocity_euler", "mxfp8_gemm_epilogue",
-                       "mxfp8_gemm_glu_quantize", "mxfp8_qkv_rope_epilogue"})
+                       "prefix_kvcache_attention", "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm",
+                       "flow_velocity_euler", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
+                       "mxfp8_qkv_rope_epilogue"})
 
 for _spec in (
     OpSpec("linear", "linear(x, weight, bias=None) -> Tensor", reference.linear),
     OpSpec("rms_norm", "rms_norm(x, weight, eps) -> Tensor", reference.rms_norm),
+    OpSpec("prefetch_weights", "prefetch_weights(weights) -> None  # hint: tensors read soon, no effect on results",
+           reference.prefetch_weights),
+    OpSpec("join_prefetch", "join_prefetch() -> None  # the stream waits for prefetch_weights' work",
+           reference.join_prefetch),
     OpSpec("silu_and_mul", "silu_and_mul(gate, up) -> Tensor", reference.silu_and_mul),
     OpSpec("silu", "silu(x) -> Tensor", reference.silu),
     OpSpec("gelu", "gelu(x) -> Tensor  # exact erf", reference.gelu),
@@ -235,8 +240,9 @@ for _spec in (
            " -> silu(x̂·W_gateᵀ)·(x̂·W_upᵀ)  # x̂ = AdaRMS(x), FP32",
            gemm.gemm_glu_epilogue),
     OpSpec("qkv_rope_epilogue",
-           "qkv_rope_epilogue(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads, head_dim)"
-           " -> [Q | K | V]  # RoPE on the FP32 accumulator", gemm.qkv_rope_epilogue),
+           "qkv_rope_epilogue(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads, head_dim, *,"
+           " qk_order='standard') -> [Q | K | V]  # RoPE on the FP32 accumulator; 'any': Q/K channels may come in"
+           " pair order", gemm.qkv_rope_epilogue),
     OpSpec("prefix_kvcache_attention",
            "prefix_kvcache_attention(q[B, M, H, D], k_cache[B, L, KV, D], v_cache, prefix_len[B], new_pos, *,"
            " flash_mask=None, scale=None) -> [B, M, HD]  # keys [0, prefix) ∪ [new_pos, new_pos + M)",
@@ -246,6 +252,13 @@ for _spec in (
            " start, H, KV, D) -> [M, HD]  # K/V written in place", gemm.qkv_rope_kvcache),
     OpSpec("add_rms_norm", "add_rms_norm(x, residual, weight[K], eps) -> (residual + x, rms_norm(sum))",
            norm.add_rms_norm),
+    OpSpec("gemm_add_rms_norm",
+           "gemm_add_rms_norm(x[M, K], projection[N, K], residual[..., M, N], weight[N], eps, bias=None)"
+           " -> (residual + x·projectionᵀ + bias, rms_norm(sum))", gemm.gemm_add_rms_norm),
+    OpSpec("mlp_add_rms_norm",
+           "mlp_add_rms_norm(x[M, K], gate_up[2I, K], down[N, I], residual[..., M, N], weight[N], eps)"
+           " -> (residual + down(silu(gate)·up), rms_norm(sum))  # the sum may be written into residual",
+           gemm.mlp_add_rms_norm),
     OpSpec("flow_velocity_euler",
            "flow_velocity_euler(x[B, M, A] fp32, h[B, M, K] (normed), weight[A, K], dt, dof_mask=None,"
            " padding_velocity=None, pinned=None, pinned_values=None) -> fp32[B, M, A]  # flow velocity",

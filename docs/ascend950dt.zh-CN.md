@@ -72,7 +72,8 @@ XInfer 的 `gemm_epilogue`，既有 `xcompute.gemm` 则保留自身接口。不�
 
 ### Wall-OSS 算子清单
 
-默认接线下，Wall-OSS 调用的每一个算子都选择 `ascend:xcompute`：共 11 项算子绑定，且对完整请求通过的
+默认接线下，除不做任何事的 `prefetch_weights` 和 `join_prefetch` 外，Wall-OSS 调用的每一个算子都选择
+`ascend:xcompute`：共 11 项算子绑定，另有 2 个算子依次调用它们，且对完整请求通过的
 逐 layout 分发审计确认全部调用 layout 准入（没有任何算子运行在 torch 参考上）。这不代表 11 个独立的
 自定义内核；下表列出实测构建中的实际路由与计算实现。可用性取决于配套的包和动态库。实现须同时支持
 eager 执行和图捕获。旧的仅支持 eager 的裸 GEMM、GLU 和 varlen 入口不注册。
@@ -88,6 +89,7 @@ eager 执行和图捕获。旧的仅支持 eager 的裸 GEMM、GLU 和 varlen �
 | `causal_attention` | prefill | `CannAttention.causal_attention` | CANN FIA V5（BNSD）+ Torch mask/布局处理 |
 | `prefix_kvcache_attention` | action | `CannAttention.prefix_kvcache_attention` | CANN FIA V5（BNSD）+ Torch mask/布局处理 |
 | `add_rms_norm` | vision、prefill、action | `xcompute.add_rmsnorm` | 自定义 AOT 内核；包入口服务任意行数，并直接接受 vision 存储的 BF16 权重 |
+| `gemm_add_rms_norm`、`mlp_add_rms_norm` | vision；prefill | 依次调用上面的 `gemm_epilogue`、`gemm_glu_epilogue` 和 `add_rms_norm` 绑定 | 与这些算子的调用相同 |
 | `rms_norm` | vision、prefill、action | `xcompute.rmsnorm` | 自定义 AOT 内核；三个流的输入归一化 |
 | `linear` | action | `xcompute.gemm` | 统一 GEMM 入口（这些形状走 CANN Mm）；其算子要求秩匹配，因此压平前导维 |
 | `flow_velocity_euler` | action | `xcompute.denoise_output_euler` | 自定义 AOT 内核；auto 表不收的包络用命名 `ascend_tilelang` 域重试 |
@@ -97,6 +99,8 @@ epilogue 仅支持 action 的 16 token、hidden width 1024、16 个 query head�
 cache 写入位置 768，以及符合条件的连续缓冲区。其他 prompt 宽度与 prefill 使用 Torch/TorchNPU epilogue，
 两种情况的矩阵乘均由 CANN 执行。时延记录未包含条件内核的命中次数，也未给出 CANN、自定义内核和参考算子
 各自的耗时占比。动态库导出了其他入口，不代表实测模型选择了这些入口。
+
+`prefetch_weights` 和 `join_prefetch`（action）在 NPU 上不做任何事（使用参考实现）。名为 `qkv_rope_epilogue` 的 xcompute 导出须接受算子的 `qk_order` 关键字参数；标准顺序对两个取值都适用。
 
 Wall-OSS action 使用普通 RMSNorm、带 bias 的 QKV 和无调制的 GLU。
 切换动态库后，应使用相同请求和图像路径重跑[精度](precision.zh-CN.md)与

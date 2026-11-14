@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from xinfer.ops.reference.norm import _adarms
+from xinfer.ops.reference.norm import _adarms, add_rms_norm
 
 ACTIVATIONS = {"silu": F.silu, "gelu": F.gelu, "gelu_tanh": lambda y: F.gelu(y, approximate="tanh")}
 
@@ -95,11 +95,15 @@ def gemm_glu_epilogue(x: torch.Tensor, weight: torch.Tensor, *, bias: torch.Tens
 
 
 def qkv_rope_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, cos: torch.Tensor,
-                      sin: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+                      sin: torch.Tensor, num_heads: int, head_dim: int, *, qk_order: str = "standard") -> torch.Tensor:
     """``[Q | K | V] = x·Wᵀ + bias`` with rotate-half RoPE on every Q and K head (xcompute ``qkv_proj_rope``).
 
     Equal numbers of Q, K and V heads (a ViT); the rotation covers ``2·cos.shape[-1]`` channels of each head and
     is applied to the FP32 accumulator, so the output rounds once.
+
+    ``qk_order="any"``: the caller only feeds Q and K to attention, which does not change when Q and K reorder their
+    head channels the same way; an implementation may then return the rotated channels of each Q and K head in pair
+    order (``x_0, x_{R/2}, x_1, x_{R/2+1}, ...``). V keeps its order. The reference returns the standard order.
 
     Args:
         x: ``[M, K]`` BF16.
@@ -109,10 +113,13 @@ def qkv_rope_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
         sin: FP32 ``[M, R/2]``.
         num_heads: Heads ``H``.
         head_dim: Head dimension ``D``.
+        qk_order: ``"standard"``, or ``"any"`` (see above).
 
     Returns:
         ``[M, 3·H·D]`` in ``x.dtype``.
     """
+    if qk_order not in ("standard", "any"):
+        raise ValueError(f"qkv_rope_epilogue: qk_order must be 'standard' or 'any', got {qk_order!r}")
     m, half = x.shape[0], cos.shape[-1]
     y = (x.float() @ weight.float().t() + bias.float()).view(m, 3, num_heads, head_dim)
     c, s = cos[:, None, None, :], sin[:, None, None, :]
@@ -120,6 +127,62 @@ def qkv_rope_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
     a, b = qk[..., :half], qk[..., half:2 * half]
     rotated = torch.cat((a * c - b * s, b * c + a * s, qk[..., 2 * half:]), dim=-1)
     return torch.cat((rotated, y[:, 2:]), dim=1).reshape(m, -1).to(x.dtype)
+
+
+
+def gemm_add_rms_norm(x: torch.Tensor, projection: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+                      eps: float, bias: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """A projection with the residual add and the next RMSNorm: ``s = residual + (x·projectionᵀ + bias)``, then
+    ``rms_norm(s)``: ``gemm_epilogue`` and ``add_rms_norm``.
+
+    Args:
+        x: ``[M, K]`` BF16.
+        projection: ``[N, K]`` BF16.
+        residual: ``[..., M, N]`` BF16 residual stream.
+        weight: ``[N]`` of the RMSNorm.
+        eps: Added to the mean square.
+        bias: ``[N]`` BF16, or None.
+
+    Returns:
+        ``(s, normed)`` shaped as ``residual``.
+    """
+    return add_rms_norm(gemm_epilogue(x, projection, bias).view(residual.shape), residual, weight, eps)
+
+
+def mlp_add_rms_norm(x: torch.Tensor, gate_up: torch.Tensor, down: torch.Tensor, residual: torch.Tensor,
+                     weight: torch.Tensor, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """A decoder MLP with the residual add and the next RMSNorm: ``s = residual + (silu(x·W_gateᵀ)·(x·W_upᵀ))·W_downᵀ``,
+    then ``rms_norm(s)``: ``gemm_glu_epilogue``, ``gemm_epilogue`` and ``add_rms_norm``. A backend may write ``s`` into
+    ``residual``'s memory (the caller does not read ``residual`` afterwards); this reference does not.
+
+    Args:
+        x: ``[M, K]`` BF16, the normed input.
+        gate_up: ``[2I, K]`` BF16, gate rows first.
+        down: ``[N, I]`` BF16.
+        residual: ``[..., M, N]`` BF16 residual stream.
+        weight: ``[N]`` of the RMSNorm.
+        eps: Added to the mean square.
+
+    Returns:
+        ``(s, normed)`` shaped as ``residual``.
+    """
+    y = gemm_epilogue(gemm_glu_epilogue(x, gate_up), down)
+    return add_rms_norm(y.view(residual.shape), residual, weight, eps)
+
+
+def prefetch_weights(weights) -> None:
+    """A hint that ``weights`` (a sequence of tensors) are read soon: implementations may start moving them closer to
+    the compute units (for example into L2) without delaying the caller. No effect on results; the reference does
+    nothing.
+
+    Args:
+        weights: Tensors about to be read.
+    """
+
+
+def join_prefetch() -> None:
+    """The caller's stream waits for the work ``prefetch_weights`` started, which must happen before a CUDA graph
+    capture ends; the reference does nothing."""
 
 
 def _qk_norm_rope_kvcache(y, dtype, q_weight, k_weight, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads,

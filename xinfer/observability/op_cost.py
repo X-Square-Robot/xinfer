@@ -208,7 +208,23 @@ def gemm_glu_epilogue(x, weight, *, bias=None, modulation=None, row_class=None, 
                  (modulation, row_class))
 
 
-def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim) -> OpCost:
+def gemm_add_rms_norm(x, projection, residual, weight, eps, bias=None) -> OpCost:
+    """``2·M·N·K`` on the pipe of ``x.dtype``; reads ``x``, the projection, the bias, the residual and the norm weight,
+    writes the sum and its norm."""
+    m, n = x.shape[0], projection.shape[0]
+    return OpCost(2 * m * n * x.shape[1], _bytes(x, projection, bias, residual, weight), 2 * 2 * m * n,
+                  _PIPES[x.dtype])
+
+
+def mlp_add_rms_norm(x, gate_up, down, residual, weight, eps) -> OpCost:
+    """``2·M·K·2I`` (gate and up) plus ``2·M·I·N`` (down) on the pipe of ``x.dtype``; reads the weights, ``x`` and
+    the residual, writes the sum and its norm. The intermediate is not counted as traffic (fused: in L2)."""
+    m, i, n = x.shape[0], down.shape[1], down.shape[0]
+    flops = 2 * m * x.shape[1] * gate_up.shape[0] + 2 * m * i * n
+    return OpCost(flops, _bytes(x, gate_up, down, residual, weight), 2 * 2 * m * n, _PIPES[x.dtype])
+
+
+def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard") -> OpCost:
     """``2·M·N·K`` on the pipe of ``x.dtype``, also reading the RoPE tables."""
     return _gemm(_PIPES[x.dtype], x, None, weight, None, bias, x.shape[1], weight.shape[0], (cos, sin))
 
@@ -241,8 +257,8 @@ FORMULAS: dict[str, Callable[..., OpCost]] = {formula.__name__: formula for form
     linear, conv2d, chunk_gated_delta_rule, causal_attention, action_attention, masked_joint_attention,
     kvcache_attention, prefix_attention, varlen_attention, mxfp8_gemm, mxfp8_gemm_rope, mxfp8_gemm_silu_mul,
     mxfp8_gemm_residual, mxfp8_gemm_epilogue, mxfp8_gemm_glu_quantize, mxfp8_qkv_rope_epilogue,
-    nvfp4_gemm, gemm_epilogue, gemm_glu_epilogue, qkv_rope_epilogue, qkv_rope_kvcache,
-    prefix_kvcache_attention, flow_velocity_euler)}
+    nvfp4_gemm, gemm_epilogue, gemm_glu_epilogue, gemm_add_rms_norm, mlp_add_rms_norm, qkv_rope_epilogue,
+    qkv_rope_kvcache, prefix_kvcache_attention, flow_velocity_euler)}
 
 
 def op_cost(name: str, args: tuple, kwargs: Mapping[str, object], outputs) -> OpCost:

@@ -8,7 +8,7 @@ Wall-OSS 和 Wall-X 2B 默认的 BF16 组合在 CUDA 上使用 xcompute 融合�
 
 ## GPU 支持
 
-xcompute 构建必须支持服务所用 GPU 的架构。可通过 `xcompute.build_target_archs()` 检查。[Wall-OSS 和 Wall-X 2B 的性能测试](performance.zh-CN.md)均使用 RTX 5090 和 xcompute `7336b0d`。
+xcompute 构建必须支持服务所用 GPU 的架构。可通过 `xcompute.build_target_archs()` 检查。[Wall-OSS 和 Wall-X 2B 的性能测试](performance.zh-CN.md)均使用 RTX 5090 和 xcompute `7336b0d`。为 Jetson Thor 构建（`--arch 110`）时，xcompute `c0d03ca` 及之后的版本还带有 Wall-OSS optimized 组合在 Thor 上选用的 SM110 kernel：融合的 prefill MLP、权重组播 GEMM，以及按旋转对顺序输出 Q、K 的 QKV 投影（[Wall-OSS 设计](models/wall_oss_design.zh-CN.md)）。
 
 ## 安装与选择构建
 
