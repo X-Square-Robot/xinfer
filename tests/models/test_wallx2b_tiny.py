@@ -50,9 +50,17 @@ def tiny_optimized(tiny):
         return Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu")
 
 
-@pytest.fixture(params=["reference", "optimized"])
-def composition(request, tiny, tiny_optimized):
-    return {"reference": tiny, "optimized": tiny_optimized}[request.param]
+@pytest.fixture(scope="module")
+def tiny_mxfp8(tiny):
+    from xinfer.models.wallx2b.model import Wallx2b
+
+    with ops.use_ops(ops.registry.build_table(resolve_platform("cpu"))):
+        return Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu", quantization="mxfp8")
+
+
+@pytest.fixture(params=["reference", "optimized", "mxfp8"])
+def composition(request, tiny, tiny_optimized, tiny_mxfp8):
+    return {"reference": tiny, "optimized": tiny_optimized, "mxfp8": tiny_mxfp8}[request.param]
 
 
 def _run(model, stage, inputs):
@@ -108,6 +116,27 @@ def test_the_optimized_composition_is_the_default(tiny_optimized):
     assert tiny_optimized.numerics == "optimized"
 
 
+def test_quantization_selects_only_the_requested_stage(tiny):
+    from xinfer.models.wallx2b.model import Wallx2b
+
+    with ops.use_ops(ops.registry.build_table(resolve_platform("cpu"))):
+        model = Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu",
+                                        quantization={"groups": {"prefill": "mxfp8"}})
+    declared = model.capabilities().stage_ops
+    assert model.prefill_stack.mxfp8 and not model.vision.mxfp8
+    assert "mxfp8_gemm_epilogue" in declared["prefill"]
+    assert not any(op.startswith("mxfp8") for stage in ("vision", "action") for op in declared[stage])
+    assert not hasattr(model.prefill_stack.layers[0], "qkv_zba")
+    assert model.prefill_stack.layers[0].qkv_zba_q.dtype == torch.float8_e4m3fn
+
+
+@pytest.mark.parametrize("quantization", ["nvfp4", {"groups": {"action": "mxfp8"}},
+                                          {"options": {"mxfp8": {"share_scale_128": False}}}])
+def test_incompatible_quantization_is_rejected(tiny, quantization):
+    with pytest.raises(ValueError, match="quantization"):
+        type(tiny).from_checkpoint(tiny.checkpoint, device="cpu", quantization=quantization)
+
+
 def test_stages_run_and_are_deterministic(composition):
     inputs = _inputs(composition)
     first = _sample(composition, inputs)
@@ -135,21 +164,25 @@ def test_uncommanded_dimensions_move_to_the_normalized_zero_action(composition):
     np.testing.assert_allclose(out[..., 20:].numpy(), expected, rtol=0, atol=1e-6)
 
 
+@pytest.mark.parametrize("name", ["optimized", "mxfp8"])
 @pytest.mark.parametrize("rtc_delay", [0, 3])
-def test_optimized_composition_stays_close_to_the_reference(tiny, tiny_optimized, rtc_delay):
-    """The same model with other rounding steps: each stage from the same inputs, relative error."""
+def test_optimized_composition_stays_close_to_the_reference(tiny, tiny_optimized, tiny_mxfp8, rtc_delay, name):
+    """The same model with other rounding steps (``mxfp8``: also MXFP8 GEMMs in the ViT blocks and the prompt stream,
+    whose E4M3 rounding the random layers amplify in the K/V; a wrong row order or scale gives errors near 1): each
+    stage from the same inputs, relative error."""
     def relative(a, b):
         return float((a.float() - b.float()).norm() / b.float().norm())
 
+    model = {"optimized": tiny_optimized, "mxfp8": tiny_mxfp8}[name]
     inputs = _inputs(tiny, rtc_delay=rtc_delay)
     with torch.no_grad():
         image = _run(tiny, "vision", inputs)["image_embeds"]
-        assert relative(_run(tiny_optimized, "vision", inputs)["image_embeds"], image) < 0.05
+        assert relative(_run(model, "vision", inputs)["image_embeds"], image) < 0.05
         inputs["image_embeds"] = image
         kv = _run(tiny, "prefill", inputs)["prompt_kv"]
-        assert relative(_run(tiny_optimized, "prefill", inputs)["prompt_kv"], kv) < 0.05
+        assert relative(_run(model, "prefill", inputs)["prompt_kv"], kv) < (0.3 if name == "mxfp8" else 0.05)
         inputs["prompt_kv"] = kv
-        out = _run(tiny_optimized, "action", inputs)["predict_action_norm"]
+        out = _run(model, "action", inputs)["predict_action_norm"]
         assert relative(out, _run(tiny, "action", inputs)["predict_action_norm"]) < 0.05
 
 

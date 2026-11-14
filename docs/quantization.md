@@ -15,8 +15,7 @@ QuantConfig(groups={"vision.blocks": "mxfp8", "vision.merger": "mxfp8", "prefill
 After the checkpoint is loaded, `process_weights(model)` converts each
 layer once, before weights are shared or graphs captured. Models may define
 presets (`quantization="<preset>"`), or take a `QuantConfig` or a dict with `groups`, `default` and
-`options`; the bundled models define no preset now (Wall-OSS runs BF16 only). No model preset uses `nvfp4` or
-`nvfp4_mse` yet.
+`options`; Wall-X 2B defines `"bf16"` (default) and `"mxfp8"`. Its MXFP8 preset covers the vision blocks and the prompt stream with a fixed 1×128 scale recipe. For individual stages, use `{"groups":{"vision":"mxfp8"}}` or `{"groups":{"prefill":"mxfp8"}}`. See the [Wall-X 2B design](models/wallx2b_design.md). Wall-OSS uses BF16. No model preset uses `nvfp4` or `nvfp4_mse`.
 
 ## Methods
 
@@ -112,7 +111,7 @@ scale or element.
 
 ## Backends
 
-The framework uses PyTorch reference implementations for MXFP8 and NVFP4. The built-in xcompute backend provides BF16 operators for Wall-OSS. See the [kernel guide](kernels.md).
+PyTorch provides reference operators for MXFP8 and NVFP4. On CUDA, an xcompute build with the MXFP8 GEMM and norm entries can accelerate the Wall-X 2B preset. See the [kernel guide](kernels.md) to check the build and the selected operators.
 
 ## Tests
 

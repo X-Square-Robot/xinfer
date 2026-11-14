@@ -158,3 +158,13 @@ def xcompute_with(*entries, functions=()):
     available = (xc is not None and all(hasattr(xc, name) for name in entries)
                  and (not functions or library is not None and all(library.has_function(name) for name in functions)))
     return dict(XCOMPUTE, requires=xc if available else None)
+
+
+# Library functions of the builds with the MXFP8 GEMM family (and the norms' MXFP8 outputs).
+MXFP8_FUNCTIONS = ("quantize_mxfp8_into", "layernorm_quant_mxfp8")
+
+
+def mxfp8_registration() -> dict:
+    """``register`` arguments of an operator on the MXFP8 GEMM family: ``XCOMPUTE`` when the library has the family,
+    else nothing registers (the operators run on their references)."""
+    return xcompute_with(functions=MXFP8_FUNCTIONS)

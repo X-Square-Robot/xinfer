@@ -143,7 +143,9 @@ class Wallx2b(WallXQwen35):
 
     def capabilities(self) -> Capabilities:
         """One request per dispatch in every stage; ``config.num_steps`` Euler steps."""
-        stage_ops = OPTIMIZED_STAGE_OPS if self.numerics == "optimized" else self.stage_ops
+        stage_ops = self.stage_ops
+        if self.numerics == "optimized":
+            stage_ops = dict(OPTIMIZED_STAGE_OPS, vision=self.vision.stage_ops, prefill=self.prefill_stack.stage_ops)
         return Capabilities(batch_sizes={"vision": (1,), "prefill": (1,), "action": (1,)},
                             num_steps=self.config.num_steps, stage_ops=stage_ops)
 

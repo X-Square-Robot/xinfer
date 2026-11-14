@@ -106,7 +106,7 @@ and action representations are documented in each model guide.
 
 | Model | Model ID | Precision | Real-time chunking | Guide |
 |---|---|---|---|---|
-| Wall-X 2B | `wallx2b` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
+| Wall-X 2B | `wallx2b` | BF16; optional MXFP8 for vision and prefill (action stays BF16) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
 
 Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for Wall-X 2B on an RTX 5090 and on an Ascend 950DT; the [Ascend guide](docs/ascend950dt.md#wall-x-2b-operator-list) lists which operators the model runs there.
 

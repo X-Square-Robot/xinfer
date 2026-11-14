@@ -17,8 +17,9 @@ from xinfer.models.layers.quantization.base import (
     active_quant,
     make_method,
     process_weights,
+    quant_config,
     use_quant,
 )
 
 __all__ = ["METHODS", "GatedLayout", "QKVLayout", "QuantConfig", "QuantMethod", "Unquantized", "active_quant",
-           "make_method", "process_weights", "use_quant"]
+           "make_method", "process_weights", "quant_config", "use_quant"]
