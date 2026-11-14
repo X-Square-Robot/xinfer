@@ -229,6 +229,26 @@ class Unquantized(QuantMethod):
         return self._linear(x, layer.weight, layer.bias)
 
 
+def quant_config(value, presets: Mapping[str, QuantConfig]) -> QuantConfig:
+    """Resolve a ``quantization`` model option: None (``presets["bf16"]``), a preset name, a ``QuantConfig`` or a
+    dict with ``groups``, ``default`` and ``options``.
+
+    Raises:
+        ValueError: an unknown preset name.
+    """
+    if value is None:
+        return presets["bf16"]
+    if isinstance(value, QuantConfig):
+        return value
+    if isinstance(value, str):
+        if value not in presets:
+            raise ValueError(f"unknown quantization preset {value!r}; supported: {', '.join(presets)}")
+        return presets[value]
+    if isinstance(value, Mapping):
+        return QuantConfig(**value)
+    raise TypeError("quantization must be a preset name, QuantConfig or mapping")
+
+
 METHODS: dict[str, type] = {"bf16": Unquantized}
 # Modules imported on first use of their methods; they add themselves to METHODS.
 _MODULES = {"mxfp8": "mxfp8", "nvfp4": "nvfp4", "nvfp4_mse": "nvfp4"}

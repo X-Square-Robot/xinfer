@@ -21,7 +21,7 @@ TEXT = {
     "rope_parameters": {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25,
                         "mrope_section": [1, 1, 0], "mrope_interleaved": True},
 }
-VISION = {"model_type": "qwen3_5", "depth": 2, "hidden_size": 32, "intermediate_size": 48, "num_heads": 2,
+VISION = {"model_type": "qwen3_5", "depth": 2, "hidden_size": 32, "intermediate_size": 64, "num_heads": 2,
           "in_channels": 3, "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2, "out_hidden_size": 64,
           "num_position_embeddings": 16, "hidden_act": "gelu_pytorch_tanh", "deepstack_visual_indexes": []}
 VLA = {"dim_inputs": [64, 32], "action_hidden_size": 32, "adarms_cond_dim": 32, "action_mlp_intermediate_size": 48,

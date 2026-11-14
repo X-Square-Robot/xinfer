@@ -9,16 +9,29 @@
 </p>
 
 <p align="center">
+  <a href="#features-at-a-glance">Features</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#models-and-hardware">Models</a> ·
   <a href="docs/benchmark.md">Benchmarks</a> ·
   <a href="#documentation">Documentation</a> ·
+  <a href="https://arxiv.org/abs/2611.14969">Paper</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 **XInfer is an inference and serving framework for vision-language-action
 (VLA) models.** Our goal is fast, stable, and accurate model inference serving
 for robots, from onboard inference to shared fleet serving.
+
+The design and its evaluation are described in our paper, [Scaling VLA Serving Under Robotic Execution Constraints](https://arxiv.org/abs/2611.14969).
+
+## Features at a glance
+
+- **Real-time chunking (RTC).** Predict the next action chunk from a new observation while the robot executes the current one.
+- **Ultra-low single-robot latency.** Wall-X 2B in BF16 measured 22.3 ms P50 per request on an RTX 5090.
+- **Multi-robot serving on one accelerator.** Robots share model weights, and vision encoding can overlap with action generation across requests.
+- **Low-precision quantization.** Apply MXFP8 or NVFP4 to selected groups of linear layers.
+- **Hardware backends.** NVIDIA RTX 5090, Jetson Thor, Ascend 950DT, and Huixi Rhino RPU (R1) support in development.
+- **High-performance kernels.** Use xcompute fused kernels and FlashAttention, or plug in another kernel library.
 
 ## Why XInfer
 
@@ -95,7 +108,7 @@ and action representations are documented in each model guide.
 | Model | Model ID | Precision | Real-time chunking | Guide |
 |---|---|---|---|---|
 | Wall-OSS · internal checkpoints | `wall_oss` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wall_oss.md) |
-| Wall-X 2B | `wallx2b` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
+| Wall-X 2B | `wallx2b` | BF16; optional MXFP8 for vision and prefill (action stays BF16) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
 
 Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for both models on an RTX 5090 and on an Ascend 950DT; the [Ascend guide](docs/ascend950dt.md#wall-x-2b-operator-list) lists which operators each model runs there.
 
@@ -112,6 +125,18 @@ Optimized CUDA execution uses an **xcompute** build and the optional FlashAttent
 backend; see [kernels](docs/kernels.md).
 Ascend binds a prebuilt Ascend **xcompute** build the same way, with NPU graphs and
 DVPP device images; see the [Ascend guide](docs/ascend950dt.md).
+
+## Performance
+
+Single-request latency and capacity of each serving configuration, measured with `benchmarks/performance.py`
+([conditions](docs/performance.md)):
+
+| # | Model | Precision, composition | Accelerator | Single request P50 | Robots per accelerator | Server P50 at capacity | Server P95 at capacity | Peak throughput |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Wall-OSS | BF16, optimized | RTX 5090 | 49.2 ms | 4 | 117 ms | 125 ms | 26.3 req/s |
+| 2 | Wall-X 2B | BF16, optimized | RTX 5090 | 22.3 ms | 15 | 144 ms | 155 ms | 83.3 req/s |
+| 3 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 4 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## How it works
 
@@ -153,6 +178,22 @@ For commands and measurement definitions, see the [benchmark guide](docs/benchma
 | Profile operators | [Profiling](docs/profiling.md) |
 | Monitor a service with Prometheus and Grafana | [Metrics](docs/metrics.md) |
 | Extend the framework | [Model interface](xinfer/models/interface.py) · [Architecture and design](docs/design.md) |
+
+## Citation
+
+If you use XInfer in your research, please cite our paper:
+
+```bibtex
+@misc{zhang2026scalingvlaservingrobotic,
+      title={Scaling VLA Serving Under Robotic Execution Constraints},
+      author={Yue Zhang and Zicong Ye and Lufang Chen and Dance Yang and Mingyang Li and Zhenwei Duan and Michael Zhao and Ziye Deng and Starrick Liu and Ruizhi Chengze and YongHua Chen and SongAo Han and Yu Sun and Ran Yu and Xiaofan Li and Ruyi Gan and Hao Wang},
+      year={2026},
+      eprint={2611.14969},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2611.14969},
+}
+```
 
 ## Contributing
 

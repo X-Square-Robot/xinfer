@@ -6,6 +6,8 @@
 
 RTX 5090 上的延迟、单卡服务容量和开环精度见[验证结果](wallx2b_validation.zh-CN.md)。
 
+在 CUDA 上使用低精度推理时，在下方的服务命令中加入 `--model-options '{"quantization":"mxfp8"}'`，或者向 `Policy` 传入 `quantization="mxfp8"`。引擎读取同一份 checkpoint，在加载时量化视觉块和提示词投影层。动作阶段继续使用 BF16 计算组合。各阶段的选项、算子要求和验证方式见[模型设计与 MXFP8](wallx2b_design.zh-CN.md)。
+
 ## Checkpoint 要求
 
 请自行准备兼容的 checkpoint 目录。仓库提供推理代码。下列文件应来自同一次训练导出：

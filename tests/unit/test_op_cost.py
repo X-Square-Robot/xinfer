@@ -66,6 +66,11 @@ FORMULA_CASES = {
                         OpCost(GEMM, 256 + 512 + 2048 + 512 + 64 + 256, 4 * 32 * 2, "mxfp8")),
     "mxfp8_gemm_silu_mul": ((A8, S, W8, S), OpCost(GEMM, 256 + 512 + 2048 + 512, 4 * 16 * 2, "mxfp8")),
     "mxfp8_gemm_residual": ((A8, S, W8, S, t(4, 32)), OpCost(GEMM, 256 + 512 + 2048 + 512 + 256, 4 * 32 * 2, "mxfp8")),
+    "mxfp8_gemm_epilogue": (((A8, S), (W8, S), t(32)), OpCost(GEMM, 256 + 512 + 2048 + 512 + 64, 4 * 32 * 2, "mxfp8")),
+    "mxfp8_gemm_glu_quantize": (((A8, S), (t(64, 64, dtype=E4M3), S)),
+                                OpCost(2 * GEMM, 256 + 512 + 4096 + 512, 4 * 32 + 512, "mxfp8")),
+    "mxfp8_qkv_rope_epilogue": (((A8, S), (W8, S), t(32), t(4, 2, dtype=F32), t(4, 2, dtype=F32), 2, 4),
+                                OpCost(GEMM, 256 + 512 + 2048 + 512 + 64 + 64, 4 * 32 * 2, "mxfp8")),
     "nvfp4_gemm": ((A4, S4, W4, S4), OpCost(GEMM, 128 + 512 + 1024 + 512, 4 * 32 * 2, "nvfp4")),
     "gemm_epilogue": ((X, W, t(32)), OpCost(GEMM, 512 + 4096 + 64, 4 * 32 * 2, "bf16")),
     "gemm_glu_epilogue": ((X, W), OpCost(GEMM, 512 + 4096, 4 * 16 * 2, "bf16")),  # 16 gate and 16 up rows
@@ -109,6 +114,7 @@ def test_formula_variants():
     assert action.read_bytes == 1280 + 640 + 640 + 896 + 896 + 16  # no prompt lengths
     cu_seqlens = torch.tensor([0, 7])  # a host tensor, read like the reference reads it
     assert op_cost("varlen_attention", (t(7, 4, 16),) * 3, {"cu_seqlens": cu_seqlens}, None).flops == 4 * 16 * 4 * 49
+    assert op_cost("mxfp8_gemm_epilogue", ((A8, S), (W8, S)), {"out_quant": True}, None).write_bytes == 4 * 32 + 512
     assert OpCost(1, 2, 3, "bf16").bytes == 5
 
 

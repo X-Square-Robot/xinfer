@@ -12,20 +12,39 @@ from __future__ import annotations
 
 import torch
 
-from xinfer.ops.backends._xcompute import XCOMPUTE, xc, xcompute_with
+from xinfer.ops.backends._xcompute import xc, xcompute_with
+from xinfer.ops.backends.cuda.attn import _takes
+from xinfer.ops.reference import flow as reference_flow
 from xinfer.ops.registry import register
 
 
 @register("flow_input_embed", backend="cuda", **xcompute_with("denoise_input_embed"))
 def flow_input_embed(x, weight, head_index=None, extra=None, input_mask=None, addends=(), override=None,
                      override_mask=None):
-    return xc.denoise_input_embed(x, weight, head_index=head_index, extra=extra, input_mask=input_mask,
-                                  addends=tuple(addends), override=override, override_mask=override_mask)
+    options = dict(head_index=head_index, extra=extra, input_mask=input_mask, addends=tuple(addends),
+                   override=override, override_mask=override_mask)
+    probe = getattr(xc, "denoise_input_embed_backend", None)
+    if probe is None:
+        # Older packages select before launching but expose no separate query.
+        try:
+            return xc.denoise_input_embed(x, weight, **options)
+        except ValueError as exc:
+            if not str(exc).startswith("denoise_input_embed: no white-list entry accepts "):
+                raise
+    else:
+        key = (x.shape, weight.shape, head_index is not None, extra is not None, len(options["addends"]),
+               input_mask is not None, override is not None)
+        if _takes("input_embed", probe, key, x, weight, **options):
+            return xc.denoise_input_embed(x, weight, **options)
+    return reference_flow.flow_input_embed(x, weight, **options)
 
 
-@register("flow_velocity_euler", backend="cuda", **XCOMPUTE)
+@register("flow_velocity_euler", backend="cuda", **xcompute_with("denoise_output_euler_backend"))
 def flow_velocity_euler(x, h, weight, dt, dof_mask=None, padding_velocity=None, pinned=None, pinned_values=None):
-    return xc.denoise_output_euler(x, h, weight, dt=float(dt), dof_mask=dof_mask,
-                                   padding_velocity=padding_velocity,
-                                   pinned=None if pinned is None else pinned.to(torch.int32),
-                                   pinned_values=pinned_values, out=torch.empty_like(x))
+    options = dict(dt=float(dt), dof_mask=dof_mask, padding_velocity=padding_velocity,
+                   pinned=None if pinned is None else pinned.to(torch.int32), pinned_values=pinned_values)
+    key = ("flow", x.shape, h.shape, weight.shape, dof_mask is not None, padding_velocity is not None,
+           pinned is not None)
+    if _takes("output_euler", xc.denoise_output_euler_backend, key, x, h, weight, **options):
+        return xc.denoise_output_euler(x, h, weight, **options, out=torch.empty_like(x))
+    return reference_flow.flow_velocity_euler(x, h, weight, dt, dof_mask, padding_velocity, pinned, pinned_values)

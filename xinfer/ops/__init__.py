@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 # xinfer/ops/reference/); ``warn_slow_fallbacks`` reports these when they run on the reference.
 FUSED_OPS = frozenset({"gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache",
                        "prefix_kvcache_attention", "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm",
-                       "flow_velocity_euler"})
+                       "flow_velocity_euler", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
+                       "mxfp8_qkv_rope_epilogue"})
 
 for _spec in (
     OpSpec("linear", "linear(x, weight, bias=None) -> Tensor", reference.linear),
@@ -157,6 +158,24 @@ for _spec in (
         "mxfp8_gemm_residual(a_q, a_scales, w_q, w_scales, residual_bf16[M, N], bias=None) -> bf16[M, N]",
         mxfp8.gemm_residual,
     ),
+    # Forms of xcompute's GEMM family (xinfer/ops/reference/mxfp8.py): MXFP8 pairs (q, scales), weights in the
+    # checkpoint's row order, quantized outputs with one scale per 128 columns.
+    OpSpec("mxfp8_layer_norm_quantize", "mxfp8_layer_norm_quantize(x[..., K], weight, bias, eps) -> (q[M, K], scales)"
+           "  # the BF16 LayerNorm, quantized", mxfp8.layer_norm_quantize),
+    OpSpec("mxfp8_zero_centered_rms_norm_quantize",
+           "mxfp8_zero_centered_rms_norm_quantize(x[..., K], w, eps) -> (q[M, K], scales)  # the BF16 norm, quantized",
+           mxfp8.zero_centered_rms_norm_quantize),
+    OpSpec("mxfp8_add_zero_centered_rms_norm_quantize",
+           "mxfp8_add_zero_centered_rms_norm_quantize(x, residual, w, eps) -> (residual + x, (q, scales))"
+           "  # norm of the FP32 sum", mxfp8.add_zero_centered_rms_norm_quantize),
+    OpSpec("mxfp8_gemm_epilogue",
+           "mxfp8_gemm_epilogue(x(q, s), weight(q[N, K], s), bias=None, *, activation=None, residual=None,"
+           " row_mask=None, out_quant=False) -> bf16[M, N] | (q, s)", mxfp8.gemm_epilogue),
+    OpSpec("mxfp8_gemm_glu_quantize", "mxfp8_gemm_glu_quantize(x(q, s), weight(q[2N, K], s)) -> (q[M, N], s)"
+           "  # silu(gate)·up in FP32, quantized", mxfp8.gemm_glu_quantize),
+    OpSpec("mxfp8_qkv_rope_epilogue",
+           "mxfp8_qkv_rope_epilogue(x(q, s), weight(q[3HD, K], s), bias, cos[M, R/2], sin, num_heads, head_dim)"
+           " -> bf16[M, 3HD]", mxfp8.qkv_rope_epilogue),
     # Fused vision, language and action operators for Wall-X 2B.
     OpSpec("layer_norm_cast", "layer_norm_cast(x, weight, bias, eps) -> x.dtype  # FP32 inside",
            norm.layer_norm_cast),

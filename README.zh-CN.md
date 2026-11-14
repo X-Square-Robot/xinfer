@@ -9,14 +9,27 @@
 </p>
 
 <p align="center">
+  <a href="#特性一览">特性</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#模型与硬件">模型</a> ·
   <a href="docs/benchmark.zh-CN.md">基准测试</a> ·
   <a href="#文档">文档</a> ·
+  <a href="https://arxiv.org/abs/2611.14969">论文</a> ·
   <a href="CONTRIBUTING.md">参与贡献</a>
 </p>
 
 **XInfer 是面向视觉-语言-动作（VLA）模型的推理与服务框架。** 我们的目标是为机器人提供快速、稳定、准确的模型推理服务，覆盖从机载推理到机队共享服务的各种场景。
+
+XInfer 的设计与评测见我们的论文 [Scaling VLA Serving Under Robotic Execution Constraints](https://arxiv.org/abs/2611.14969)。
+
+## 特性一览
+
+- **实时分块（RTC）**　机器人执行当前动作段时，即可根据新观测预测下一段。
+- **单机器人极低时延**　Wall-X 2B BF16 在 RTX 5090 上的单请求 P50 为 22.3 ms。
+- **单卡服务多机器人**　多台机器人共享模型权重，不同请求的视觉编码与动作生成可重叠执行。
+- **低精度量化**　支持按层组对线性层使用 MXFP8 或 NVFP4。
+- **多硬件后端**　NVIDIA RTX 5090、Jetson Thor、昇腾 950DT、Huixi Rhino RPU（R1，适配中）。
+- **高性能算子库**　使用 xcompute 融合算子，支持 FlashAttention，也可接入其他算子库。
 
 ## 为什么选择 XInfer
 
@@ -77,7 +90,7 @@ finally:
 | 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
 |---|---|---|---|---|
 | Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
-| Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
+| Wall-X 2B | `wallx2b` | BF16；视觉和预填充可选 MXFP8，动作阶段保留 BF16 | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
 Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。两款模型在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)；昇腾 950DT 上的数据在同一张表内，各模型在该平台承接的算子见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
@@ -91,6 +104,17 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 每个加速器运行各自的引擎（Engine）和权重。
 
 优化的 CUDA 执行路径使用 **xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 以同样的方式绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
+
+## 性能
+
+各服务配置的单请求时延和容量，用 `benchmarks/performance.py` 测得（[测量条件](docs/performance.zh-CN.md)）：
+
+| # | 模型 | 精度、组合 | 加速器 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 峰值吞吐 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Wall-OSS | BF16，优化组合 | RTX 5090 | 49.2 ms | 4 | 117 ms | 125 ms | 26.3 req/s |
+| 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 15 | 144 ms | 155 ms | 83.3 req/s |
+| 3 | Wall-OSS | BF16，优化组合 | 昇腾 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 4 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## 工作原理
 
@@ -125,6 +149,22 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 | 分析算子性能 | [性能剖析](docs/profiling.zh-CN.md) |
 | 用 Prometheus 和 Grafana 监控服务 | [指标](docs/metrics.zh-CN.md) |
 | 扩展框架 | [模型接口](xinfer/models/interface.py) · [架构与设计](docs/design.zh-CN.md) |
+
+## 引用
+
+如果你在研究中使用了 XInfer，请引用我们的论文：
+
+```bibtex
+@misc{zhang2026scalingvlaservingrobotic,
+      title={Scaling VLA Serving Under Robotic Execution Constraints},
+      author={Yue Zhang and Zicong Ye and Lufang Chen and Dance Yang and Mingyang Li and Zhenwei Duan and Michael Zhao and Ziye Deng and Starrick Liu and Ruizhi Chengze and YongHua Chen and SongAo Han and Yu Sun and Ran Yu and Xiaofan Li and Ruyi Gan and Hao Wang},
+      year={2026},
+      eprint={2611.14969},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2611.14969},
+}
+```
 
 ## 参与贡献
 

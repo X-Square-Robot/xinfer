@@ -31,6 +31,13 @@ VISION_STAGE_OPS = ("gemm_epilogue", "qkv_rope_epilogue", "layer_norm_cast", "po
 PREFILL_STAGE_OPS = ("gemm_epilogue", "gemm_glu_epilogue", "linear", "zero_centered_rms_norm",
                      "add_zero_centered_rms_norm", "qkv_norm_split", "rope_full", "gated_causal_attention",
                      "gated_delta_net")
+# With MXFP8 GEMMs (``mxfp8=True``): the patch embedding and the merger stay BF16
+VISION_STAGE_OPS_MXFP8 = ("gemm_epilogue", "layer_norm_cast", "pos_embed_interp", "rot_pos", "segment_attention",
+                          "mxfp8_quantize", "mxfp8_layer_norm_quantize", "mxfp8_qkv_rope_epilogue",
+                          "mxfp8_gemm_epilogue")
+PREFILL_STAGE_OPS_MXFP8 = ("qkv_norm_split", "rope_full", "gated_causal_attention", "gated_delta_net", "mxfp8_quantize",
+                           "mxfp8_zero_centered_rms_norm_quantize", "mxfp8_add_zero_centered_rms_norm_quantize",
+                           "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize")
 
 
 class OptimizedVision(nn.Module):
@@ -38,11 +45,14 @@ class OptimizedVision(nn.Module):
 
     Args:
         config: ``Qwen35VisionConfig`` of the checkpoint.
+        mxfp8: run the blocks' GEMMs in MXFP8 (``quantize_weights`` after loading).
     """
 
-    def __init__(self, config):
+    def __init__(self, config, mxfp8: bool = False):
         super().__init__()
         self.config = c = config
+        self.mxfp8 = mxfp8
+        self.stage_ops = VISION_STAGE_OPS_MXFP8 if mxfp8 else VISION_STAGE_OPS
         h, i = c.hidden_size, c.intermediate_size
         self.patch = ParamGroup(weight=(h, c.in_features), bias=(h,))
         self.pos_embed = _meta_param(c.num_position_embeddings, h)
@@ -71,24 +81,49 @@ class OptimizedVision(nn.Module):
             ``[N / merge², out_hidden_size]`` BF16.
         """
         c, ops = self.config, self.ops
-        n, h, heads, d = pixel_values.shape[0], c.hidden_size, c.num_heads, c.head_dim
         x = ops.gemm_epilogue(pixel_values.to(DTYPE), self.patch.weight, self.patch.bias)
         x = x + ops.pos_embed_interp(self.pos_embed, grids, c.spatial_merge_size)
         angles = ops.rot_pos(self.inv_freq, grids, c.spatial_merge_size)
         cos, sin = angles.cos(), angles.sin()
+        block_forward = self._block_mxfp8 if self.mxfp8 else self._block
         for block in self.blocks:
-            normed = ops.layer_norm_cast(x, block.norm1_weight, block.norm1_bias, c.eps)
-            qkv = ops.qkv_rope_epilogue(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d)
-            q, k, v = qkv.view(n, 3, heads, d).unbind(1)
-            o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
-            x = ops.gemm_epilogue(o, block.proj_weight, block.proj_bias, residual=x)
-            normed = ops.layer_norm_cast(x, block.norm2_weight, block.norm2_bias, c.eps)
-            hidden = ops.gemm_epilogue(normed, block.fc1_weight, block.fc1_bias, activation="gelu_tanh")
-            x = ops.gemm_epilogue(hidden, block.fc2_weight, block.fc2_bias, residual=x)
+            x = block_forward(block, x, cos, sin, cu_seqlens)
         merged = ops.layer_norm_cast(x, self.merger.norm_weight, self.merger.norm_bias, c.eps)
         merged = ops.gemm_epilogue(merged.reshape(-1, self.merger.fc1_weight.shape[1]), self.merger.fc1_weight,
                                    self.merger.fc1_bias, activation="gelu")
         return ops.gemm_epilogue(merged, self.merger.fc2_weight, self.merger.fc2_bias)
+
+    def _block(self, block, x, cos, sin, cu_seqlens):
+        """One ViT block in BF16."""
+        c, ops = self.config, self.ops
+        n, h, heads, d = x.shape[0], c.hidden_size, c.num_heads, c.head_dim
+        normed = ops.layer_norm_cast(x, block.norm1_weight, block.norm1_bias, c.eps)
+        qkv = ops.qkv_rope_epilogue(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d)
+        q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+        o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
+        x = ops.gemm_epilogue(o, block.proj_weight, block.proj_bias, residual=x)
+        normed = ops.layer_norm_cast(x, block.norm2_weight, block.norm2_bias, c.eps)
+        hidden = ops.gemm_epilogue(normed, block.fc1_weight, block.fc1_bias, activation="gelu_tanh")
+        return ops.gemm_epilogue(hidden, block.fc2_weight, block.fc2_bias, residual=x)
+
+    def _block_mxfp8(self, block, x, cos, sin, cu_seqlens):
+        """One ViT block with MXFP8 GEMMs: the LayerNorms and fc1 write the next GEMM's quantized input."""
+        c, ops = self.config, self.ops
+        n, h, heads, d = x.shape[0], c.hidden_size, c.num_heads, c.head_dim
+        normed = ops.mxfp8_layer_norm_quantize(x, block.norm1_weight, block.norm1_bias, c.eps)
+        qkv = ops.mxfp8_qkv_rope_epilogue(normed, block.mxfp8("qkv_weight"), block.qkv_bias, cos, sin, heads, d)
+        q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+        o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
+        x = ops.mxfp8_gemm_epilogue(ops.mxfp8_quantize(o), block.mxfp8("proj_weight"), block.proj_bias, residual=x)
+        normed = ops.mxfp8_layer_norm_quantize(x, block.norm2_weight, block.norm2_bias, c.eps)
+        hidden = ops.mxfp8_gemm_epilogue(normed, block.mxfp8("fc1_weight"), block.fc1_bias, activation="gelu_tanh",
+                                         out_quant=True)
+        return ops.mxfp8_gemm_epilogue(hidden, block.mxfp8("fc2_weight"), block.fc2_bias, residual=x)
+
+    def quantize_weights(self) -> None:
+        """After loading, with ``mxfp8``: the blocks' GEMM weights to MXFP8 (1x128 scales along K)."""
+        for block in self.blocks:
+            block.to_mxfp8(self.ops.mxfp8_quantize, "qkv_weight", "proj_weight", "fc1_weight", "fc2_weight")
 
 
 class OptimizedPrefill(nn.Module):
@@ -98,11 +133,14 @@ class OptimizedPrefill(nn.Module):
         config: The checkpoint's text configuration: ``hidden_size``, ``intermediate_size``, the attention and
             DeltaNet geometry (``num_attention_heads``, ``num_key_value_heads``, ``head_dim``, ``rotary_dim``,
             ``linear_heads``), ``layer_types``, ``full_attention_layers`` and ``rms_norm_eps``.
+        mxfp8: run the GEMMs in MXFP8 (``quantize_weights`` after loading).
     """
 
-    def __init__(self, config):
+    def __init__(self, config, mxfp8: bool = False):
         super().__init__()
         self.config = c = config
+        self.mxfp8 = mxfp8
+        self.stage_ops = PREFILL_STAGE_OPS_MXFP8 if mxfp8 else PREFILL_STAGE_OPS
         hk, hv, dk, dv, kernel = c.linear_heads
         d, heads, kv = c.hidden_size, c.num_attention_heads, c.num_key_value_heads
         conv = 2 * hk * dk + hv * dv
@@ -129,6 +167,9 @@ class OptimizedPrefill(nn.Module):
             prompt_kv: ``[full-attention layers, 2, 1, kv_heads, P, head_dim]`` output.
             keep: FP32 ``[P]``, 1 for the real tokens and 0 for the padding.
         """
+        if self.mxfp8:
+            self._forward_mxfp8(h, cos, sin, prompt_kv, keep)
+            return
         c, ops = self.config, self.ops
         hk, hv, dk, dv, _ = c.linear_heads
         heads, kv_heads, d = c.num_attention_heads, c.num_key_value_heads, c.head_dim
@@ -159,6 +200,44 @@ class OptimizedPrefill(nn.Module):
             # torch's GEMM: no xcompute kernel is listed for this shape, and its cuBLASLt fallback is slower here
             h, normed = ops.add_zero_centered_rms_norm(ops.linear(hidden, layer.down).view(1, p, -1), h,
                                                        self.layers[i + 1].input_norm, eps)
+
+    def _forward_mxfp8(self, h, cos, sin, prompt_kv, keep):
+        """``forward`` with MXFP8 GEMMs: the norms and the gate/up GEMM write the next GEMM's quantized input; the
+        DeltaNet input projection zeroes the padding rows of its input."""
+        c, ops = self.config, self.ops
+        hk, hv, dk, dv, _ = c.linear_heads
+        heads, kv_heads, d = c.num_attention_heads, c.num_key_value_heads, c.head_dim
+        eps, full = c.rms_norm_eps, c.full_attention_layers
+        p, conv = h.shape[1], 2 * hk * dk + hv * dv
+        normed = ops.mxfp8_zero_centered_rms_norm_quantize(h, self.layers[0].input_norm, eps)
+        for i, layer in enumerate(self.layers):
+            if c.layer_types[i] == "full_attention":
+                packed = ops.mxfp8_gemm_epilogue(normed, layer.mxfp8("qkv")).view(1, p, -1)
+                q, k, v, gate = ops.qkv_norm_split(packed, layer.q_norm, layer.k_norm, heads, kv_heads, d, eps)
+                q, k = ops.rope_full(q, k, cos, sin, c.rotary_dim)
+                slot = full.index(i)
+                prompt_kv[slot, 0].copy_(k.transpose(1, 2))
+                prompt_kv[slot, 1].copy_(v.transpose(1, 2))
+                if i == full[-1]:
+                    return
+                o = ops.gated_causal_attention(q[0], k[0], v[0], gate.reshape(p, -1), scale=d ** -0.5)
+                mixed = ops.mxfp8_gemm_epilogue(ops.mxfp8_quantize(o.reshape(p, -1)), layer.mxfp8("o"))
+            else:
+                qkv_zba = ops.mxfp8_gemm_epilogue(normed, layer.mxfp8("qkv_zba"), row_mask=keep)
+                o = ops.gated_delta_net(qkv_zba[:, :conv].view(1, p, -1), qkv_zba[:, conv:].view(1, p, -1),
+                                        layer.conv_weight, layer.A_log, layer.dt_bias, layer.norm_weight, hk, hv,
+                                        dk, dv, eps)
+                mixed = ops.mxfp8_gemm_epilogue(ops.mxfp8_quantize(o.view(p, -1)), layer.mxfp8("out"))
+            h, normed = ops.mxfp8_add_zero_centered_rms_norm_quantize(mixed.view(1, p, -1), h, layer.post_norm, eps)
+            hidden = ops.mxfp8_gemm_glu_quantize(normed, layer.mxfp8("gate_up"))
+            down = ops.mxfp8_gemm_epilogue(hidden, layer.mxfp8("down")).view(1, p, -1)
+            h, normed = ops.mxfp8_add_zero_centered_rms_norm_quantize(down, h, self.layers[i + 1].input_norm, eps)
+
+    def quantize_weights(self) -> None:
+        """After loading, with ``mxfp8``: every GEMM weight to MXFP8 (1x128 scales along K)."""
+        for i, layer in enumerate(self.layers):
+            mixer = ("qkv", "o") if self.config.layer_types[i] == "full_attention" else ("qkv_zba", "out")
+            layer.to_mxfp8(self.ops.mxfp8_quantize, *mixer, "gate_up", "down")
 
 
 def column_ranges(mask: torch.Tensor) -> torch.Tensor:

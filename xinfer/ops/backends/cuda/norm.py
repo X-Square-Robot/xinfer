@@ -9,16 +9,20 @@
 | ``modulated_rms_norm``, ``gated_residual_modulated_rms_norm`` | ``adarmsnorm`` (with ``residual``) |
 | ``identity_layer_norms_`` | ``double_adarmsnorm_gated_residual_inplace`` |
 | ``qkv_norm_split`` | ``qwen35_vla_qkv_norm_replace_forward`` (no action rows; reduction order) |
+| ``mxfp8_layer_norm_quantize`` | ``layernorm`` (``quant="mxfp8"``) |
+| ``mxfp8_zero_centered_rms_norm_quantize`` | ``rmsnorm`` (``zero_centered``, ``quant="mxfp8"``, ``round_to_bf16``) |
+| ``mxfp8_add_zero_centered_rms_norm_quantize`` | the same with ``residual`` |
 
 Contracts against the torch references: tolerance. The empty action-row tensors of ``qkv_norm_split`` are created on
-the first call for a batch size, which must therefore be eager (before a capture).
+the first call for a batch size, which must therefore be eager (before a capture). The MXFP8 operators register with a
+build that has the MXFP8 GEMM family (``mxfp8_registration``) and write one scale per 128 columns.
 """
 
 from __future__ import annotations
 
 import torch
 
-from xinfer.ops.backends._xcompute import XCOMPUTE, library, xc, xcompute_with
+from xinfer.ops.backends._xcompute import XCOMPUTE, library, mxfp8_registration, xc, xcompute_with
 from xinfer.ops.registry import register
 
 
@@ -99,3 +103,25 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
     library.call("qwen35_vla_qkv_norm_replace_forward", q, k, v, gate, packed, packed, rows, rows, offsets, q_weight,
                  k_weight, q_weight, k_weight, int(num_heads), int(num_kv_heads), int(head_dim), float(eps))
     return q, k, v, gate
+
+
+MXFP8 = mxfp8_registration()
+
+
+@register("mxfp8_layer_norm_quantize", backend="cuda", **MXFP8)
+def mxfp8_layer_norm_quantize(x, weight, bias, eps):
+    return xc.layernorm(x.reshape(-1, x.shape[-1]), weight, bias, float(eps), quant="mxfp8", scale_block=128)
+
+
+@register("mxfp8_zero_centered_rms_norm_quantize", backend="cuda", **MXFP8)
+def mxfp8_zero_centered_rms_norm_quantize(x, weight, eps):
+    return xc.rmsnorm(x.reshape(-1, x.shape[-1]), weight, float(eps), zero_centered=True, quant="mxfp8",
+                      scale_block=128, round_to_bf16=True)
+
+
+@register("mxfp8_add_zero_centered_rms_norm_quantize", backend="cuda", **MXFP8)
+def mxfp8_add_zero_centered_rms_norm_quantize(x, residual, weight, eps):
+    k = x.shape[-1]
+    summed, q, scales = xc.rmsnorm(x.reshape(-1, k), weight, float(eps), residual=residual.reshape(-1, k),
+                                   zero_centered=True, quant="mxfp8", scale_block=128, round_to_bf16=True)
+    return summed.view(x.shape), (q, scales)
