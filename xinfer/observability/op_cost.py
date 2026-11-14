@@ -23,6 +23,8 @@ from dataclasses import dataclass
 
 import torch
 
+from xinfer.ops.layout.mxfp8 import scale_elements
+
 _PIPES = {torch.bfloat16: "bf16", torch.float16: "fp16", torch.float32: "fp32"}
 
 
@@ -166,6 +168,26 @@ def mxfp8_gemm_residual(a_q, a_scales, w_q, w_scales, residual, bias=None) -> Op
     return _gemm("mxfp8", a_q, a_scales, w_q, w_scales, bias, a_q.shape[1], w_q.shape[0], (residual,))
 
 
+def mxfp8_gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, row_mask=None,
+                        out_quant=False) -> OpCost:
+    """MXFP8 product with a BF16 output or E4M3 values and padded E8M0 scales."""
+    m, n = x[0].shape[0], weight[0].shape[0]
+    cost = _gemm("mxfp8", *x, *weight, bias, x[0].shape[1], n, (residual, row_mask))
+    return OpCost(cost.flops, cost.read_bytes, m * n + scale_elements(m, n), "mxfp8") if out_quant else cost
+
+
+def mxfp8_gemm_glu_quantize(x, weight) -> OpCost:
+    """Count both gate and up products and write one quantized output pair of half the width."""
+    m, n = x[0].shape[0], weight[0].shape[0] // 2
+    cost = _gemm("mxfp8", *x, *weight, None, x[0].shape[1], n)
+    return OpCost(cost.flops, cost.read_bytes, m * n + scale_elements(m, n), "mxfp8")
+
+
+def mxfp8_qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim) -> OpCost:
+    """``2·M·N·K`` on the MXFP8 pipe, also reading the RoPE tables."""
+    return _gemm("mxfp8", *x, *weight, bias, x[0].shape[1], weight[0].shape[0], (cos, sin))
+
+
 def nvfp4_gemm(a_q, a_scales, w_q, w_scales, bias=None, *, alpha=1.0) -> OpCost:
     """``2·M·N·K`` with ``K = 2·a_q.shape[1]`` on the NVFP4 pipe; reads packed E2M1 operands and E4M3 scales."""
     return _gemm("nvfp4", a_q, a_scales, w_q, w_scales, bias, 2 * a_q.shape[1], w_q.shape[0])
@@ -218,7 +240,8 @@ def flow_velocity_euler(x, h, weight, dt, dof_mask=None, padding_velocity=None, 
 FORMULAS: dict[str, Callable[..., OpCost]] = {formula.__name__: formula for formula in (
     linear, conv2d, chunk_gated_delta_rule, causal_attention, action_attention, masked_joint_attention,
     kvcache_attention, prefix_attention, varlen_attention, mxfp8_gemm, mxfp8_gemm_rope, mxfp8_gemm_silu_mul,
-    mxfp8_gemm_residual, nvfp4_gemm, gemm_epilogue, gemm_glu_epilogue, qkv_rope_epilogue, qkv_rope_kvcache,
+    mxfp8_gemm_residual, mxfp8_gemm_epilogue, mxfp8_gemm_glu_quantize, mxfp8_qkv_rope_epilogue,
+    nvfp4_gemm, gemm_epilogue, gemm_glu_epilogue, qkv_rope_epilogue, qkv_rope_kvcache,
     prefix_kvcache_attention, flow_velocity_euler)}
 
 

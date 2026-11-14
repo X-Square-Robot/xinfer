@@ -26,6 +26,18 @@ class ParamGroup(nn.Module):
         for name, shape in shapes.items():
             setattr(self, name, _meta_param(*shape))
 
+    def to_mxfp8(self, quantize, *names) -> None:
+        """Replace the loaded BF16 ``[N, K]`` weights ``names`` by their MXFP8 ``(q, scales)`` from ``quantize``."""
+        for name in names:
+            q, scales = quantize(getattr(self, name))
+            delattr(self, name)
+            self.register_buffer(f"{name}_q", q, persistent=False)
+            self.register_buffer(f"{name}_scales", scales, persistent=False)
+
+    def mxfp8(self, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """The MXFP8 weight ``(q, scales)`` that ``to_mxfp8`` made of ``name``."""
+        return getattr(self, f"{name}_q"), getattr(self, f"{name}_scales")
+
 
 class Linear(nn.Module):
     """A linear layer whose method (unquantized, MXFP8, ...) comes from the active QuantConfig.

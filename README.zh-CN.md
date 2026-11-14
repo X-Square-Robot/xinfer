@@ -90,7 +90,7 @@ finally:
 | 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
 |---|---|---|---|---|
 | Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
-| Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
+| Wall-X 2B | `wallx2b` | BF16；视觉和预填充可选 MXFP8，动作阶段保留 BF16 | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
 Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。两款模型在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)；昇腾 950DT 上的数据在同一张表内，各模型在该平台承接的算子见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
