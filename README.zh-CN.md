@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="#特性一览">特性</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#模型与硬件">模型</a> ·
   <a href="docs/benchmark.zh-CN.md">基准测试</a> ·
@@ -17,6 +18,15 @@
 </p>
 
 **XInfer 是面向视觉-语言-动作（VLA）模型的推理与服务框架。** 我们的目标是为机器人提供快速、稳定、准确的模型推理服务，覆盖从机载推理到机队共享服务的各种场景。
+
+## 特性一览
+
+- **实时分块（RTC）**　机器人执行当前动作段时，即可根据新观测预测下一段。
+- **单机器人极低时延**　Wall-X 2B BF16 在 RTX 5090 上的单请求 P50 为 22.3 ms。
+- **单卡服务多机器人**　多台机器人共享模型权重，不同请求的视觉编码与动作生成可重叠执行。
+- **低精度量化**　支持按层组对线性层使用 MXFP8 或 NVFP4。
+- **多硬件后端**　NVIDIA RTX 5090、Jetson Thor、昇腾 950DT、Huixi Rhino RPU（R1，适配中）。
+- **高性能算子库**　使用 xcompute 融合算子，支持 FlashAttention，也可接入其他算子库。
 
 ## 为什么选择 XInfer
 
@@ -89,6 +99,15 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 每个加速器运行各自的引擎（Engine）和权重。
 
 优化的 CUDA 执行路径使用 **xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 以同样的方式绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
+
+## 性能
+
+各服务配置的单请求时延和容量，用 `benchmarks/performance.py` 测得（[测量条件](docs/performance.zh-CN.md)）：
+
+| # | 模型 | 精度、组合 | 加速器 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 峰值吞吐 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 15 | 144 ms | 155 ms | 83.3 req/s |
+| 2 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## 工作原理
 
