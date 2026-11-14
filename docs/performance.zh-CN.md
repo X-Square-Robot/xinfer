@@ -2,43 +2,26 @@
 
 [English](performance.md) | 简体中文
 
-## 按时延拐点测量容量
-
-以下数据来自独占的 RTX 5090，使用 PyTorch 2.10.0+cu130 和 flash-attn 2.8.3.post1。任意一轮有错误或缺失响应，或一档负载的服务端 P50 中位数比上一档上升超过 50%，该档即不通过。主机耗时取输入处理和输出处理各自的中位数之和，分项相加可能与总时延的中位数略有出入。
-
-| 模型 | 单请求 P50（主机 + 引擎） | 机器人数 | 容量点服务端 P50 / P95 | 峰值 req/s | 构建与测量日期 |
-|---|---|---:|---|---:|---|
-| Wall-OSS BF16 | 49.0 ms (2.8 + 45.8) | 4 | 128 / 142 ms | 25.6 | xcompute `7336b0d`（`layout="kn"`），2026-11-13 |
-| Wall-X 2B BF16 | 22.3 ms (3.5 + 18.8) | 14 | 85 / 107 ms | 81.3 | xcompute `7336b0d`（`layout="kn"`），2026-11-13 |
-
-Wall-OSS 在 3、4、5 台时服务端 P50 中位数为 86、128、186 ms，每档涨幅都没有超过上一档的 1.5 倍；本表取 4 台。
-
-这些测量使用下文所列的各模型请求集。新的测量请参照[基准测试方法](benchmark.zh-CN.md#性能表)。本页 11 月 9 日的 RTX 5090 表和昇腾数据均使用 150 ms 固定门槛。
-
-## 按 150 ms 时延门槛测量的 RTX 5090 数据
-
-2026 年 11 月 9 日，上游使用 `benchmarks/performance.py`，按下文的 150 ms 固定容量门槛在单张 RTX 5090 上测量了 Wall-OSS 和 Wall-X 2B 的 BF16 优化组合。
+2026 年 11 月 13 日，使用 `benchmarks/performance.py`，按[同一测试口径](benchmark.zh-CN.md#性能表)在单张 RTX 5090 上测量了 Wall-OSS 和 Wall-X 2B 的 BF16 优化组合。
 
 | # | 模型 | 精度、组合 | GPU | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 饱和吞吐 | 数值一致性 |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | Wall-OSS | BF16，优化组合 | RTX 5090 | 49.2 ms | 4 | 117 ms | 125 ms | 26.3 req/s | 在参考组合的逐阶段容差内（`tests/models/test_wall_oss_optimized.py`） |
-| 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 15 | 144 ms | 155 ms | 83.3 req/s | 动作与 checkpoint 的 BF16 采样器的相对 L2 中位数为 0.15–0.25 %（[验证](models/wallx2b_validation.zh-CN.md#与-bf16-采样器的数值对齐)） |
+| 1 | Wall-OSS | BF16，优化组合 | RTX 5090 | 49.0 ms | 4 | 128 ms | 142 ms | 25.6 req/s | 在参考组合的逐阶段容差内（`tests/models/test_wall_oss_optimized.py`） |
+| 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s | 动作与 checkpoint 的 BF16 采样器的相对 L2 中位数为 0.15–0.25 %（[验证](models/wallx2b_validation.zh-CN.md#与-bf16-采样器的数值对齐)） |
 
 - **单请求 P50** 包括进程内从请求处理、GPU 图像解码与缩放、模型推理到生成响应的时间。图预热后依次运行输入集中的请求，丢弃前 5 次，对随后 50 次计时取中位数。
-- **单卡机器人数**是通过容量测试的最大实测机器人数。每档运行 8 轮，机器人随机起步，服务在 CPU 上处理图像。所有轮都须无错误、无缺失响应，且各轮服务端 P50 的中位数低于 150 ms。表中 P50 和 P95 分别是该档各轮对应分位数的中位数。
+- **单卡机器人数**是通过[容量测试](benchmark.zh-CN.md#性能表)的最大实测机器人数。每档运行 8 轮，机器人随机起步，服务在 CPU 上处理图像。表中 P50 和 P95 分别是该档各轮对应分位数的中位数。
 - **饱和吞吐**是所有实测机器人数和轮次中最高的稳态请求完成率。
 - **数值一致性**是 optimized 组合与参考的比较结果，参考为参考组合或原始 BF16 模型（[精度](precision.zh-CN.md)）。两行也都通过了内部精度门禁。
 
 ## 条件
 
-所有行：RTX 5090（SM120），torch 2.10.0+cu130，flash-attn 2.8.3.post1，xcompute `7336b0d`，于 2026-11-09 测量，GPU 上没有其他任务。
+所有行：RTX 5090（SM120），torch 2.10.0+cu130，flash-attn 2.8.3.post1，xcompute `7336b0d`（`layout="kn"`），于 2026-11-13 测量，GPU 上没有其他任务。
 
 | # | 模型选项 | 单请求输入集 | 压测负载 | 服务预热 | 验证 |
 |---|---|---|---|---|---|
 | 1 | 默认 | x2robot dummy 客户端的一个普通请求和一个 RTC 请求（一路 1280×720 原始前视图、两路 640×480 JPEG 腕部视图） | 带 RTC 的合成桌面观测 | 同样的两个请求 | [Wall-OSS](models/wall_oss_validation.zh-CN.md) |
 | 2 | 默认 | 参考抓包中的 216 个请求（三路机器人相机 JPEG） | 带 RTC 的合成桌面观测 | 其中两个请求 | [Wall-X 2B](models/wallx2b_validation.zh-CN.md) |
-
-上游测试 Wall-X 2B 时，通过 xcompute 的 SM120 专用接口直接复用了转置的 GEMM 权重。GitHub 移植版使用新版 `layout="kn"` 接口，在 xcompute `7336b0d` 上会复制这些权重；测量的是模型实际运行的那一调用。
 
 另见 [Wall-OSS 验证](models/wall_oss_validation.zh-CN.md)，其中记录了延迟及测量条件。
 

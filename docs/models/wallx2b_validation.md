@@ -2,19 +2,19 @@
 
 English | [简体中文](wallx2b_validation.zh-CN.md)
 
-These upstream BF16 measurements used one Wall-X 2B checkpoint on an NVIDIA GeForce RTX 5090. The November 9 benchmark measured single-request latency and serving capacity. The earlier runs below measured individual stages and compared predicted actions with the checkpoint's BF16 sampler. The public port copies transposed GEMM weights on xcompute `7336b0d`. The upstream build reused them without a copy. Latency and capacity have yet to be remeasured on the public port. See the [performance table](../performance.md) and [model guide](wallx2b.md).
+These BF16 measurements used one Wall-X 2B checkpoint on an NVIDIA GeForce RTX 5090. The November 13 benchmark measured single-request latency and serving capacity with this repository. The earlier upstream runs below measured individual stages and compared predicted actions with the checkpoint's BF16 sampler. See the [performance table](../performance.md) and [model guide](wallx2b.md).
 
 ## Single request and serving capacity
 
-On November 9, 2026, the optimized composition ran on an otherwise idle RTX 5090 (SM120) with PyTorch 2.10.0+cu130, flash-attn 2.8.3.post1 and xcompute `7336b0d`.
+On November 13, 2026, the optimized composition ran on an otherwise idle RTX 5090 (SM120) with PyTorch 2.10.0+cu130, flash-attn 2.8.3.post1 and xcompute `7336b0d` with `layout="kn"`.
 
 | In-process request P50 | Robots per GPU | Server P50 at capacity | Server P95 at capacity | Highest measured throughput |
 |---|---|---|---|---|
-| 22.3 ms | 15 | 144 ms | 155 ms | 83.3 requests/s |
+| 22.3 ms | 14 | 85 ms | 107 ms | 81.3 requests/s |
 
 For single-request latency, the benchmark processed captured requests in process, each with three camera JPEGs. Image decoding and resizing ran on the GPU. It called `Policy.warmup` with the full 216-request capture, then cycled through the requests in order, discarded the first five calls and timed the next 50.
 
-For capacity, the service warmed up on two captured requests. Simulated robots then sent desktop observations with real-time chunking (RTC) to the service, which used CPU image preprocessing. Each robot sent 80 requests per round, with the first 20 excluded from steady-state latency. Capacity required zero errors or missing responses in all eight rounds, randomized robot start times and a median of the round P50s below 150 ms. The median round P50 rose from 76.4 ms at 14 robots to 143.6 ms at 15. At 16 robots, every round had a P50 of 160–164 ms and exceeded the limit. The 155 ms P95 describes tail latency at 15 robots. Saturation is the highest completed request rate across measured robot counts. See the [benchmark protocol](../benchmark.md).
+For capacity, the service warmed up on two captured requests. Simulated robots then sent desktop observations with real-time chunking (RTC) to the service, which used CPU image preprocessing. Each robot sent 80 requests per round, with the first 20 excluded from steady-state latency, over eight rounds with randomized robot start times. The median round P50 was 85 ms at 14 robots and 170 ms at 15. The 107 ms P95 describes tail latency at 14 robots. Saturation is the highest completed request rate across measured robot counts. See the [benchmark protocol](../benchmark.md).
 
 ## Stage and end-to-end latency
 
