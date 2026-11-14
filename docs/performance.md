@@ -8,12 +8,12 @@ These measurements used an otherwise idle RTX 5090, PyTorch 2.10.0+cu130 and fla
 
 | Model | Single request P50 (host + engine) | Robots | Server P50 / P95 at capacity | Peak req/s | Build and date |
 |---|---|---:|---|---:|---|
-| Wall-OSS BF16 | 47.1 ms (2.6 + 44.5) | 4 | 115 / 134 ms | 25.8 | xcompute `c0d03ca`, 2026-11-13 |
-| Wall-X 2B BF16 | 22.3 ms (3.5 + 18.8) | 14 | 84 / 108 ms | 81.5 | xcompute `24b678f`, 2026-11-12 |
+| Wall-OSS BF16 | 49.0 ms (2.8 + 45.8) | 4 | 128 / 142 ms | 25.6 | xcompute `7336b0d` with `layout="kn"`, 2026-11-13 |
+| Wall-X 2B BF16 | 22.3 ms (3.5 + 18.8) | 14 | 85 / 107 ms | 81.3 | xcompute `7336b0d` with `layout="kn"`, 2026-11-13 |
 
-The upstream runs have yet to be reproduced with this port on an RTX 5090.
+For Wall-OSS the median server P50 was 86, 128 and 186 ms at 3, 4 and 5 robots, with no step above 1.5 times the previous one; the row reports 4 robots.
 
-These upstream runs used the request sets described below. For new measurements follow the [benchmark protocol](benchmark.md#performance-table). The November 9 table and the Ascend results on this page used the fixed 150 ms limit.
+These runs used the request sets described below. For new measurements follow the [benchmark protocol](benchmark.md#performance-table). The November 9 table and the Ascend results on this page used the fixed 150 ms limit.
 
 ## RTX 5090 with the 150 ms latency limit
 
