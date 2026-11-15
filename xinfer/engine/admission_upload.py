@@ -9,13 +9,15 @@ produced, so the stage inputs are bitwise unchanged.
 
 Races and ownership (see R/admission-gap/RACE-ANALYSIS.md §2 AG2):
 
-- One ring slot (pinned host slab + device slab + cached views) belongs to at most one in-flight
-  request. The engine returns it when the request finishes, after its final event (or the failed
-  dispatch's lane event) completed, so no stage reads a slab a later request overwrites -- the
-  same lifetime the per-tensor device tensors had.
-- The device views are cached per (ring slot, layout signature); ``copy_`` refreshes the device
-  slab in place, so cached views always see the current request's bytes. A distinct shape builds a
-  fresh signature once and then reuses its views.
+- One ring slot (its pinned host slab) belongs to at most one in-flight request. The engine
+  returns it when the request finishes, after its final event (or the failed dispatch's lane
+  event) completed, so no H2D copy reads host bytes a later request overwrites. The device
+  views are per-upload tensors over a fresh device buffer; the request holds them (so the
+  buffer) until it finishes, and the allocator reuses the buffer only through its
+  stream-ordered free after the final event -- the same lifetime the per-tensor device
+  tensors had (FIA-FIX: a device slab at one fixed address, rewritten in place per request,
+  interacted with NPUGraph capture and made AOT MixedKernel launches silently drop; see
+  _RingSlot).
 - Everything runs on the engine thread inside the admission upload-stream context: one writer
   thread, the same stream and the same non-blocking copy primitive as before, just one call.
   No host-synchronous device memcpy is ever issued (DVPP-PARALLEL §4 discipline).
@@ -48,16 +50,27 @@ def upload_batch_enabled() -> bool:
 
 
 class _RingSlot:
-    """One pinned host slab, its device copy and the device views built over it."""
+    """One pinned host slab of the upload ring (the H2D copy's source bytes).
 
-    __slots__ = ("host", "host_np", "device", "views", "signature")
+    FIA-FIX: the ring owns only the host side. The device destination is a
+    fresh caching-allocator buffer per upload, so a *live* device tensor is
+    never rewritten in place as the next request's stage inputs: reusing one
+    fixed device address that way made unrelated AOT kernel launches (the
+    fia-fuse MixedKernel pair) silently not execute -- rc 0, output buffer
+    unwritten -- both eager and inside NPUGraph capture, where the dropped
+    launch bakes non-finite output into the replayed graph (fia-fix run,
+    2026-11-16: ring-reuse NaN 10/10 arms incl. blocking/big12/syncup/
+    slab256/views-rebuild; fresh-device-buffer clean 3/3, host-ring reuse
+    kept). The freed buffer is handed back by the allocator after the
+    request's final event, the same stream-ordered lifecycle the per-tensor
+    ``_to_device`` path always had.
+    """
+
+    __slots__ = ("host", "host_np")
 
     def __init__(self, slab_bytes: int, device: str) -> None:
         self.host = torch.empty(slab_bytes, dtype=torch.uint8).pin_memory()
         self.host_np = self.host.numpy()
-        self.device = torch.empty(slab_bytes, dtype=torch.uint8, device=device)
-        self.views: dict[str, torch.Tensor] = {}
-        self.signature: tuple | None = None
 
 
 class UploadBatcher:
@@ -127,15 +140,16 @@ class UploadBatcher:
             host_np = slot.host_np
             for off, source, nbytes in sources:
                 host_np[off:off + nbytes] = source
-            signature = tuple(layout)
-            if slot.signature != signature:
-                device = slot.device
-                views = {}
-                for name, off, nbytes, dtype, shape, count in layout:
-                    views[name] = device.narrow(0, off, nbytes).view(dtype).view(shape)
-                slot.views, slot.signature = views, signature
-            slot.device.copy_(slot.host, non_blocking=True)
-            return dict(slot.views), slot
+            # FIA-FIX: fresh device destination per upload (see _RingSlot).
+            # One 1 MiB allocation from the caching allocator (a freed-block
+            # hit after the first requests) plus 12 narrow/view constructions
+            # replace the persistent slab; bytes and shapes are unchanged.
+            device = torch.empty(self._slab_bytes, dtype=torch.uint8, device=self._device)
+            device.copy_(slot.host, non_blocking=True)
+            views = {}
+            for name, off, nbytes, dtype, shape, count in layout:
+                views[name] = device.narrow(0, off, nbytes).view(dtype).view(shape)
+            return views, slot
         except Exception:  # noqa: BLE001 - the caller falls back to the per-tensor path
             self.release(slot)
             return None
