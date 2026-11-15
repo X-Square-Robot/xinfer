@@ -105,11 +105,12 @@ def device_image(image, sizes, resize) -> DeviceImage:
         resize: the model's resize recipe, ``(mode, antialias)`` per step.
     """
     if isinstance(image, (bytes, bytearray)):
-        if isinstance(image, bytearray):
-            data = torch.frombuffer(image, dtype=torch.uint8)
-        else:
-            buffer = _wirefast.to_bytearray(image) if _wirefast is not None else None
-            data = torch.frombuffer(buffer if buffer is not None else bytearray(image), dtype=torch.uint8)
+        # HOST-GAP K1: the JPEG bytes are only ever read from here (the engine uploads them
+        # to the device decoder), so the immutable ``bytes`` of the wire decode goes straight
+        # into a read-only tensor. The previous writeable copy (``to_bytearray``, one GIL-held
+        # pass over every JPEG on the prepare thread, ~0.2 ms per view) is gone; torch emits
+        # its non-writable-buffer UserWarning once per process and nothing writes this tensor.
+        data = torch.frombuffer(image, dtype=torch.uint8)
     elif (_wirefast is not None and isinstance(image, np.ndarray) and image.dtype == np.uint8
           and image.flags.c_contiguous and not image.flags.writeable):
         # a read-only wire frame: np.require's multi-MB copy holds the GIL (probe-timeline-r10);

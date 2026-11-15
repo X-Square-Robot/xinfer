@@ -110,9 +110,18 @@ class Lane:
         """Make the lane's stream wait for ``event`` on the device, without blocking the host.
 
         Args:
-            event: a CUDA event, typically recorded on another stream; None is a no-op, as is the CPU.
+            event: a CUDA event, typically recorded on another stream, or a tuple of such events
+                (ADMISSION-GAP AG1: a request admitted from ready prefetch slots carries its
+                upload event and the device stream's fence together); None entries and None
+                itself are no-ops, as is the CPU.
         """
-        if self.stream is not None and event is not None:
+        if self.stream is None or event is None:
+            return
+        if type(event) is tuple:
+            for one in event:
+                if one is not None:
+                    self.stream.wait_event(one)
+        else:
             self.stream.wait_event(event)
 
 

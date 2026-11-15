@@ -132,8 +132,14 @@ def vision_layout(grids, config: Qwen35VisionConfig) -> dict:
     """
     cached = _vision_layout_compute(tuple(tuple(grid) for grid in grids), int(config.spatial_merge_size),
                                      int(config.grid_side))
-    return {"positions": cached["positions"].clone(), "pos_index": cached["pos_index"].clone(),
-            "pos_weight": cached["pos_weight"].clone(), "cu_seqlens": list(cached["cu_seqlens"])}
+    # HOST-GAP K2: the cached tensors are returned without the per-call clone (~0.3 ms of
+    # Tensor.clone per request). Every consumer only reads them: the engine's upload
+    # (``_to_device``), the batching merge (``torch.cat`` / right-aligned ``copy_`` from the
+    # device copies) and ``pad_prompt`` (which never touches the vision fields). Concurrent
+    # requests sharing one cached layout therefore race on nothing; the ``cu_seqlens`` host
+    # list stays a fresh object per call exactly as before.
+    return {"positions": cached["positions"], "pos_index": cached["pos_index"],
+            "pos_weight": cached["pos_weight"], "cu_seqlens": list(cached["cu_seqlens"])}
 
 
 class LayerNorm(nn.Module):

@@ -26,6 +26,35 @@ from xinfer.loader import Source
 from xinfer.ops import active_ops
 
 DTYPE = torch.bfloat16
+def _SOUPUNLOCK_LN(x, weight, bias, eps):
+    """soupunlock visionln: the vision LayerNorm site as ONE fused two-pass
+    kernel (fp32 vector-tree stats + Newton rsqrt, band-witnessed); any
+    envelope miss returns None so the caller keeps the released chain."""
+    try:
+        from xcompute.kernel import soupunlock
+
+        if soupunlock.enabled("visionln"):
+            return soupunlock.layernorm_c1024(x, weight, bias, eps)
+    except Exception:  # noqa: BLE001 - the mount is optional
+        pass
+    return None
+
+
+def _SOUPUNLOCK_RMSFULL(x, residual, weight, eps, layer_idx):
+    """soupunlock rmsfull: the whole add_zero_centered_rms_norm site in ONE
+    launch (deterministic fp32 vector-tree stats + Newton rsqrt, band-witnessed
+    vs the fp64 oracle). Armed only for layer_idx >= the configured floor;
+    any miss returns None so the caller keeps the released chain."""
+    try:
+        from xcompute.kernel import soupunlock
+
+        if soupunlock.enabled("rmsfull") and layer_idx >= soupunlock.from_layer():
+            return soupunlock.rmsnorm_full(x, residual, weight, eps)
+    except Exception:  # noqa: BLE001 - the mount is optional
+        pass
+    return None
+
+
 VISION_STAGE_OPS = ("gemm_epilogue", "qkv_rope_epilogue", "layer_norm_cast", "pos_embed_interp", "rot_pos",
                     "segment_attention")
 PREFILL_STAGE_OPS = ("gemm_epilogue", "gemm_glu_epilogue", "linear", "zero_centered_rms_norm",
@@ -233,7 +262,10 @@ class OptimizedVision(_FormatStage):
         for block in self.blocks:
             x = self._block(block, x, cos, sin, cu_seqlens, cos2, sin2)
         m = self.merger
-        merged = ops.layer_norm_cast(x, m.norm_weight, m.norm_bias, c.eps).reshape(-1, self.merge_width)
+        ln = _SOUPUNLOCK_LN(x, m.norm_weight, m.norm_bias, c.eps)
+        if ln is None:
+            ln = ops.layer_norm_cast(x, m.norm_weight, m.norm_bias, c.eps)
+        merged = ln.reshape(-1, self.merge_width)
         if self.fmt == "nvfp4":  # the merger's GEMMs are NVFP4 with NVFP4 blocks, else BF16
             hidden = ops.nvfp4_gemm_epilogue(ops.nvfp4_quantize(merged), m.quantized("fc1_weight"), m.fc1_bias,
                                              activation="gelu", out_quant=True)
@@ -248,7 +280,15 @@ class OptimizedVision(_FormatStage):
         mount is enabled; every miss falls back to the released operator."""
         c, ops = self.config, self.ops
         n, h, heads, d = x.shape[0], c.hidden_size, c.num_heads, c.head_dim
-        norm = ops.layer_norm_cast if self.fmt is None else self._op("layer_norm_quantize")
+        if self.fmt is None:
+            def norm(t, w, b, eps):
+                # soupunlock visionln: the vision LayerNorm site as ONE fused two-pass kernel
+                # (fp32 vector-tree stats + Newton rsqrt, band-witnessed); any envelope miss
+                # keeps the released chain.
+                fused = _SOUPUNLOCK_LN(t, w, b, eps)
+                return ops.layer_norm_cast(t, w, b, eps) if fused is None else fused
+        else:
+            norm = self._op("layer_norm_quantize")
         normed = norm(x, block.norm1_weight, block.norm1_bias, c.eps)
         if self.fmt is None:
             qkv, qkv_is_packed = _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, 3 * heads * d, heads, d)
@@ -347,10 +387,11 @@ class OptimizedPrefill(_FormatStage):
                 o = ops.gated_delta_net(qkv.view(1, p, -1), zba.view(1, p, -1), layer.conv_weight, layer.A_log,
                                         layer.dt_bias, layer.norm_weight, hk, hv, dk, dv, eps)
                 mixed = self._gemm(o.view(p, -1), layer, "out")
-            h, x = self._norm(h, layer.post_norm, "mlp", mixed)
-            h, x = self._norm(h, self.layers[i + 1].input_norm, c.layer_types[i + 1], self._mlp(x, layer))
+            h, x = self._norm(h, layer.post_norm, "mlp", mixed, layer_idx=i)
+            h, x = self._norm(h, self.layers[i + 1].input_norm, c.layer_types[i + 1], self._mlp(x, layer),
+                              layer_idx=i)
 
-    def _norm(self, h, weight, consumer: str, branch=None):
+    def _norm(self, h, weight, consumer: str, branch=None, layer_idx=-1):
         """Add ``branch`` (``[P, hidden]``, None for the first layer) to the stream ``h`` (``[1, P, hidden]``) and
         give the zero-centered RMSNorm of the sum in the form ``consumer`` (a layer type or ``"mlp"``) takes: BF16
         ``[P, hidden]``, or its MXFP8 or NVFP4. NVFP4 gives a DeltaNet layer the BF16 norm (``_delta_input``).
@@ -361,6 +402,14 @@ class OptimizedPrefill(_FormatStage):
             branch = branch.view(h.shape)
             if quantized:
                 return self._op("add_zero_centered_rms_norm_quantize")(branch, h, weight, eps)
+            if self.fmt is None:
+                # soupunlock rmsfull: the whole add_zero_centered_rms_norm site in ONE launch
+                # (deterministic fp32 vector-tree stats + Newton rsqrt, band-witnessed vs the
+                # fp64 oracle); armed only for layer_idx >= the configured floor, any miss
+                # keeps the released chain.
+                _fused = _SOUPUNLOCK_RMSFULL(branch, h, weight, eps, layer_idx)
+                if _fused is not None:
+                    return _fused[0], _fused[1].view(h.shape[1], -1)
             h, normed = ops.add_zero_centered_rms_norm(branch, h, weight, eps)
         elif quantized and self.fmt == "mxfp8":
             return h, ops.mxfp8_zero_centered_rms_norm_quantize(h, weight, eps)
