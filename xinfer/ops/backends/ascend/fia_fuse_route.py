@@ -1,7 +1,9 @@
-"""FIA-FUSE opt-in route: specialized split-K scan+reduce cache-attention pair
+"""FIA-FUSE route: specialized split-K scan+reduce cache-attention pair
 for the wall-x 2B decode family, fusing the FIA call AND the gated pack tail.
 
-Off by default (XINFER_FIA_FUSE=off). Replaces the per-call decode chain
+On by default since the FIA-FIX landing (XINFER_FIA_FUSE=off opts out per
+process; an unset XINFER_FIA_FUSE_LIB still keeps the route off).
+Replaces the per-call decode chain
 (_r6b_prefix_kvcache_bnsd FusedInferAttentionScore + gated_attn_bnsd_pack_pow2,
 17.2us measured) by libfia_fuse.so scan + reduce (TileLang AOT, bisheng
 9.3.0 / cann 9.1.1 runtime) which merge the split-K partials, round the
@@ -41,7 +43,7 @@ _SEEN = set()
 
 def _parse():
     global _ENABLED
-    raw = os.environ.get("XINFER_FIA_FUSE", "off").strip().lower()
+    raw = os.environ.get("XINFER_FIA_FUSE", "on").strip().lower()
     _ENABLED = raw not in ("off", "", "0")
 
 
