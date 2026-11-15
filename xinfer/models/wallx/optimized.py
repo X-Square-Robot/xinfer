@@ -26,6 +26,35 @@ from xinfer.loader import Source
 from xinfer.ops import active_ops
 
 DTYPE = torch.bfloat16
+def _SOUPUNLOCK_LN(x, weight, bias, eps):
+    """soupunlock visionln: the vision LayerNorm site as ONE fused two-pass
+    kernel (fp32 vector-tree stats + Newton rsqrt, band-witnessed); any
+    envelope miss returns None so the caller keeps the released chain."""
+    try:
+        from xcompute.kernel import soupunlock
+
+        if soupunlock.enabled("visionln"):
+            return soupunlock.layernorm_c1024(x, weight, bias, eps)
+    except Exception:  # noqa: BLE001 - the mount is optional
+        pass
+    return None
+
+
+def _SOUPUNLOCK_RMSFULL(x, residual, weight, eps, layer_idx):
+    """soupunlock rmsfull: the whole add_zero_centered_rms_norm site in ONE
+    launch (deterministic fp32 vector-tree stats + Newton rsqrt, band-witnessed
+    vs the fp64 oracle). Armed only for layer_idx >= the configured floor;
+    any miss returns None so the caller keeps the released chain."""
+    try:
+        from xcompute.kernel import soupunlock
+
+        if soupunlock.enabled("rmsfull") and layer_idx >= soupunlock.from_layer():
+            return soupunlock.rmsnorm_full(x, residual, weight, eps)
+    except Exception:  # noqa: BLE001 - the mount is optional
+        pass
+    return None
+
+
 VISION_STAGE_OPS = ("gemm_epilogue", "qkv_rope_epilogue", "layer_norm_cast", "pos_embed_interp", "rot_pos",
                     "segment_attention")
 PREFILL_STAGE_OPS = ("gemm_epilogue", "gemm_glu_epilogue", "linear", "zero_centered_rms_norm",
@@ -198,7 +227,9 @@ class OptimizedVision(nn.Module):
             if block_forward is not None:  # MXFP8 vision (#20): their method path
                 x = block_forward(block, x, cos, sin, cu_seqlens)
                 continue
-            normed = ops.layer_norm_cast(x, block.norm1_weight, block.norm1_bias, c.eps)
+            normed = _SOUPUNLOCK_LN(x, block.norm1_weight, block.norm1_bias, c.eps)
+            if normed is None:
+                normed = ops.layer_norm_cast(x, block.norm1_weight, block.norm1_bias, c.eps)
             qkv, qkv_is_packed = _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, 3 * heads * d, heads, d)
             # SOUP-FORM vropepack: the finish kernel already stored the packed
             # [3, n, heads, dim] layout, so the model-side permute copy of the
@@ -209,10 +240,14 @@ class OptimizedVision(nn.Module):
                 q, k, v = qkv.view(n, 3, heads, d).unbind(1)
             o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
             x = ops.gemm_epilogue(o, block.proj_weight, block.proj_bias, residual=x)
-            normed = ops.layer_norm_cast(x, block.norm2_weight, block.norm2_bias, c.eps)
+            normed = _SOUPUNLOCK_LN(x, block.norm2_weight, block.norm2_bias, c.eps)
+            if normed is None:
+                normed = ops.layer_norm_cast(x, block.norm2_weight, block.norm2_bias, c.eps)
             hidden = ops.gemm_epilogue(normed, block.fc1_weight, block.fc1_bias, activation="gelu_tanh")
             x = ops.gemm_epilogue(hidden, block.fc2_weight, block.fc2_bias, residual=x)
-        merged = ops.layer_norm_cast(x, self.merger.norm_weight, self.merger.norm_bias, c.eps)
+        merged = _SOUPUNLOCK_LN(x, self.merger.norm_weight, self.merger.norm_bias, c.eps)
+        if merged is None:
+            merged = ops.layer_norm_cast(x, self.merger.norm_weight, self.merger.norm_bias, c.eps)
         merged = ops.gemm_epilogue(merged.reshape(-1, self.merger.fc1_weight.shape[1]), self.merger.fc1_weight,
                                    self.merger.fc1_bias, activation="gelu")
         return ops.gemm_epilogue(merged, self.merger.fc2_weight, self.merger.fc2_bias)
@@ -328,11 +363,20 @@ class OptimizedPrefill(nn.Module):
                                             layer.conv_weight, layer.A_log, layer.dt_bias, layer.norm_weight, hk, hv,
                                             dk, dv, eps)
                 mixed = ops.gemm_epilogue(o.view(p, -1), layer.out)
-            h, normed = ops.add_zero_centered_rms_norm(mixed.view(1, p, -1), h, layer.post_norm, eps)
+            _fused = _SOUPUNLOCK_RMSFULL(mixed.view(1, p, -1), h, layer.post_norm, eps, i)
+            if _fused is not None:
+                h, normed = _fused
+            else:
+                h, normed = ops.add_zero_centered_rms_norm(mixed.view(1, p, -1), h, layer.post_norm, eps)
             hidden = ops.gemm_glu_epilogue(normed.view(p, -1), layer.gate_up)
             # torch's GEMM: no xcompute kernel is listed for this shape, and its cuBLASLt fallback is slower here
-            h, normed = ops.add_zero_centered_rms_norm(ops.linear(hidden, layer.down).view(1, p, -1), h,
-                                                       self.layers[i + 1].input_norm, eps)
+            _down = ops.linear(hidden, layer.down).view(1, p, -1)
+            _fused = _SOUPUNLOCK_RMSFULL(_down, h, self.layers[i + 1].input_norm, eps, i)
+            if _fused is not None:
+                h, normed = _fused
+            else:
+                h, normed = ops.add_zero_centered_rms_norm(_down, h,
+                                                           self.layers[i + 1].input_norm, eps)
 
     def _forward_mxfp8(self, h, cos, sin, prompt_kv, keep):
         """``forward`` with MXFP8 GEMMs: the norms and the gate/up GEMM write the next GEMM's quantized input; the

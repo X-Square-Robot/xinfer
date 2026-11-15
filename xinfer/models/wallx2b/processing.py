@@ -415,6 +415,13 @@ class Wallx2bInputProcessor:
             if key in _DESKTOP_MASKED_DOF:
                 self.dof_mask[:, :, start:start + dim] = 0.0
             start += dim
+        # HOST-GAP K5 hotfix: pinning the prepared tensors needs an accelerator in THIS
+        # process (frontend processes under ``xinfer serve`` have none; capacity cap6
+        # crash 2026-11-15). Probe once and fall back to plain tensors when absent.
+        try:
+            self._pin_prepared = torch.zeros(1).pin_memory() is not None
+        except Exception:  # noqa: BLE001 - any deviceless or pinned-alloc failure disables it
+            self._pin_prepared = False
 
     def _normalize_state(self, x: np.ndarray) -> np.ndarray:
         """``(x - min) / delta · 2 - 1`` in float64, clamped to ``[-1, 1]`` when the checkpoint clamps."""
@@ -533,15 +540,27 @@ class Wallx2bInputProcessor:
             # the remaining host prepare (state, prompt, tokenizer, positions) instead of
             # running after it. Same decodes, same sizes, same values, camera order.
             pool = _view_pool()
-            futures = [pool.submit(_wire_view_fast, wire(camera)) for camera in c.cameras]
-            images, shapes = [], []
-            for future, camera in zip(futures, c.cameras):
-                image = future.result()
+            # HOST-GAP K6: the whole per-view chain (wire decode, size, device_image, prefetch
+            # ticket) runs inside the pool worker. The ticket used to be claimed after the main
+            # thread waited for the view (ticket0 ~0.6 ms into prepare, timeline probe
+            # 2026-11-15), serializing the DVPP wave behind the main thread GIL bursts; from
+            # the worker the ticket goes out as soon as that view bytes exist, the wave starts
+            # ~0.4 ms earlier and its tail no longer pokes into the engine window. claim and
+            # submit are lock-guarded, every helper in the chain is a pure function, and the
+            # results are still consumed in camera order with the same values.
+            def handoff(camera):
+                image = _wire_view_fast(wire(camera))
                 if not (isinstance(image, np.ndarray) or is_jpeg(image)):
                     image = decode_image(image)
                 size = resize_sizes(*source_size(image), c.resolution.get(camera.view, -1), c)
-                images.append(device_image(image, size, DEVICE_RESIZE))
-                shapes.append(size[-1])
+                return device_image(image, size, DEVICE_RESIZE), size[-1]
+
+            futures = [pool.submit(handoff, camera) for camera in c.cameras]
+            images, shapes = [], []
+            for future in futures:
+                image, shape = future.result()
+                images.append(image)
+                shapes.append(shape)
         else:
             images = [torch.from_numpy(image) for image in map_views(
                 lambda camera: resize_view(decode_view(wire(camera)), c.resolution.get(camera.view, -1), c), c.cameras)]
@@ -609,7 +628,18 @@ class Wallx2bInputProcessor:
         # The -1 sentinel shares its sign with the separator token; only digit tokens vary.
         length_range = text_length_range(p, sum(len(str(abs(v))) for v in values), len(values),
                                           max_tokens=len(str(c.state_bins - 1)), max_length=self.bucket.max_length)
-        return PreparedRequest(pad_prompt(tensors, self.bucket.width(p)),
+        # HOST-GAP K5: pin the prepared CPU tensors here, inside the DVPP wave window the
+        # prefetch tickets opened (prepare overlaps the device decode), instead of at engine
+        # admission where _to_device pinned them one by one on the engine thread (~0.2 ms of
+        # GIL bursts between the wave end and the vision dispatch; timeline probe 2026-11-15).
+        # pin_memory returns fresh pinned tensors, so the shared cached vision_layout tensors
+        # are copied, never mutated; admission then uploads with non_blocking copies only.
+        padded = pad_prompt(tensors, self.bucket.width(p))
+        prepared_tensors = (
+            {name: (value.pin_memory() if torch.is_tensor(value)
+                    and value.device.type == "cpu" and not value.is_pinned() else value)
+             for name, value in padded.items()} if self._pin_prepared else padded)
+        return PreparedRequest(prepared_tensors,
                                dict(arms=arms, inference_delay=delay, prompt_len_range=length_range))
 
 

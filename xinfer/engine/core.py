@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import logging
+import os
 import queue
 import threading
 import time
@@ -41,6 +42,7 @@ from typing import Any
 import torch
 
 from xinfer.engine import batching
+from xinfer.engine.admission_upload import UploadBatcher, upload_batch_enabled
 from xinfer.engine import image_prefetch
 from xinfer.engine.device_images import DeviceImageDecoder
 from xinfer.engine.executor import Lane, _to_device, allocate_outputs
@@ -125,7 +127,7 @@ class _Request:
     """
 
     __slots__ = ("id", "robot", "prepared", "future", "handle", "inputs", "inputs_ready", "events", "outputs",
-                 "dispatched", "submitted_at", "admitted_at", "ready_at", "timing")
+                 "dispatched", "submitted_at", "admitted_at", "ready_at", "timing", "upload_slab")
 
     def __init__(self, request_id, robot, prepared, future):
         self.id, self.robot, self.prepared, self.future = request_id, robot, prepared, future
@@ -137,6 +139,7 @@ class _Request:
         self.admitted_at = None
         self.ready_at = None
         self.timing: dict[str, tuple] = {}
+        self.upload_slab = None  # ADMISSION-GAP AG2: the UploadBatcher ring slot this request holds
 
 
 def _timing_event(lane):
@@ -239,6 +242,18 @@ class Engine:
                 for lane in self.lanes[stage]:
                     lane.copy_stream = self._device_module.Stream(device=platform.device)
         self._upload = self._device_module.Stream(device=platform.device) if self._device_module else None
+        # ADMISSION-GAP AG3: one cached stream context per producer thread (admission on the engine
+        # thread, the decode chain on the device-image thread) instead of a fresh
+        # ``torch.npu.stream(...)`` object per admission / per queue item (15 us of enter/exit plus
+        # 4 us of construction per item, P0 probe 2026-11-16). Both uses are single-threaded and
+        # never nested, so re-entering one context object is safe.
+        self._upload_ctx = (self._device_module.stream(self._upload) if self._device_module is not None
+                            and self._upload is not None else contextlib.nullcontext())
+        # ADMISSION-GAP AG1/AG2 admission knives; both off switch to the pre-AG paths exactly.
+        self._fast_admission = os.environ.get("XINFER_ADMISSION_FAST", "1") not in ("0", "false", "False")
+        self._upload_batcher = (UploadBatcher(platform.device, slots=config.max_running_requests)
+                                if self._device_module is not None and upload_batch_enabled() else None)
+        self._prefetch_device = None  # resolved lazily: the device the device-image thread decodes for
 
         self.slots = SlotPool(config.max_running_requests)
         self._queues = {stage: deque() for stage in self.order}
@@ -260,6 +275,12 @@ class Engine:
         # counted in _device_inflight (engine thread only) and come back through _device_ready.
         self._device_stream = (self._device_module.Stream(device=platform.device)
                                if platform.is_cuda or platform.capabilities.device_images else None)
+        # ADMISSION-GAP AG3: the device-image thread's one cached stream context (its uses --
+        # _device_images_loop and _prefetch_view -- all run on that single thread and never
+        # nest), instead of a fresh context object per queue item / per view.
+        self._device_ctx = (self._device_module.stream(self._device_stream)
+                            if self._device_module is not None and self._device_stream is not None
+                            else contextlib.nullcontext())
         self._decoder = None
         self._device_requests: queue.Queue = queue.Queue()
         self._device_ready: list = []
@@ -544,23 +565,131 @@ class Engine:
                 self._waiting.popleft()
             request.admitted_at = time.perf_counter()
             stream = self._upload
-            stream_context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
             admitted = True
             try:
+                if self._admit_prefetched(request, stream):
+                    continue
+            except Exception as exc:  # noqa: BLE001 - only this request fails
+                self._fail_request(request, exc, after=self._upload_fence(stream))
+                continue
+            stream_context = self._upload_ctx if stream is not None else contextlib.nullcontext()
+            try:
                 with stream_context, span("admit", request=request.id, robot=request.robot):
-                    request.inputs = {name: _to_device(value, self.platform.device)
-                                      for name, value in request.prepared.tensors.items()}
+                    request.inputs = self._upload_prepared(request)
                     if stream is not None:
                         request.inputs_ready = self._device_module.Event(enable_timing=self.stats_sink is not None)
                         request.inputs_ready.record(stream)
             except Exception as exc:  # noqa: BLE001 - only this request fails
-                self._fail_request(request, exc)
+                self._fail_request(request, exc, after=self._upload_fence(stream))
                 continue
             if any(isinstance(value, DeviceImage) for value in request.inputs.values()):
                 self._device_inflight += 1
                 self._device_requests.put(request)
             else:
                 self._queue_for_first_stages(request)
+
+    def _upload_fence(self, stream):
+        """An event recorded at the upload stream's tail, or None: fences in-flight copies of a failed admission.
+
+        ADMISSION-GAP AG2: a failed request's pinned upload slab may still be read by its async host-to-device
+        copy; releasing the slab's ring slot must wait for this event (the pre-AG path had the same exposure
+        through caller-held pinned tensors; this closes it structurally on the failure path).
+        """
+        if stream is None or self._device_module is None:
+            return None
+        try:
+            event = self._device_module.Event()
+            event.record(stream)
+            return event
+        except Exception:  # noqa: BLE001 - the device is in an error state; the request still fails
+            logger.exception("could not fence the admission uploads of a failed request")
+            return None
+
+    def _admit_prefetched(self, request: _Request, stream) -> bool:
+        """Assemble a fully prefetched request on the engine thread (ADMISSION-GAP AG1); False = use the queue.
+
+        Returns True, with ``request.inputs``/``inputs_ready`` set and the request queued for its first stages,
+        when every ``DeviceImage`` of the request has a completed, error-free prefetch slot decoded for this
+        engine's device (a request without ``DeviceImage`` values takes this path with a single ready event, as
+        before); False, with nothing done, when any view still needs the device-image thread, which then runs
+        today's queue handover unchanged.
+
+        Race analysis (R/admission-gap/RACE-ANALYSIS.md §2 AG1): ``slot.view`` is written by the device-image
+        thread only after that view's whole decode was enqueued on the device stream, so reading it here under
+        the GIL means the work is enqueued; the fence event this records at the device stream's *tail* can
+        therefore only complete after it (a concurrent enqueue by the device-image thread makes it later, never
+        earlier). ``inputs_ready`` becomes ``(upload event, fence)`` for such a request; the only consumer that
+        accepts tuples is ``Lane.wait``, and the device-image thread never sees these requests at all.
+        """
+        if not self._fast_admission or self._device_module is None:
+            return False
+        tensors = request.prepared.tensors
+        views = None
+        for name, value in tensors.items():
+            if isinstance(value, DeviceImage):
+                slot = value.prefetch
+                if slot is None or slot.view is None or slot.error is not None:
+                    return False
+                device = slot.device
+                if device is None:
+                    return False
+                if self._prefetch_device is None:
+                    expected = torch.device(self.platform.device)
+                    if expected.index is None:
+                        expected = torch.device(expected.type, self._device_module.current_device())
+                    self._prefetch_device = expected
+                if device != self._prefetch_device:
+                    return False
+                if views is None:
+                    views = {}
+                views[name] = slot.view
+        images = views is not None
+        stream_context = self._upload_ctx if stream is not None else contextlib.nullcontext()
+        with stream_context:
+            inputs = self._upload_prepared(request)
+            if images:
+                for name, view in views.items():
+                    inputs[name] = view
+            if stream is None:
+                request.inputs, request.inputs_ready = inputs, None
+            else:
+                ready = self._device_module.Event()
+                ready.record(stream)
+                if images and self._device_stream is not None:
+                    fence = self._device_module.Event()
+                    fence.record(self._device_stream)
+                    request.inputs, request.inputs_ready = inputs, (ready, fence)
+                else:
+                    request.inputs, request.inputs_ready = inputs, ready
+        self.stats["admission_fast" if images else "admission_no_images"] += 1
+        self._queue_for_first_stages(request)
+        return True
+
+    def _upload_prepared(self, request: _Request) -> dict:
+        """The request's tensors on the device (ADMISSION-GAP AG2: batched when possible).
+
+        The batcher packs every CPU tensor of ``prepared.tensors`` into one pinned slab and issues a single
+        stream-ordered host-to-device copy, returning byte-identical device views (bitwise equal to the per-tensor
+        uploads); it declines -- non-viewable inputs, an oversized set, an exhausted ring, any internal failure --
+        and this falls back to the pre-AG2 per-tensor ``_to_device`` loop. The ring slot is held on the request
+        until it finishes (``_finish_request``), fencing the async copy's reads of the host slab.
+        """
+        tensors = request.prepared.tensors
+        batcher = self._upload_batcher
+        if batcher is not None:
+            names = [name for name, value in tensors.items()
+                     if torch.is_tensor(value) and value.device.type == "cpu"]
+            if names:
+                packed = batcher.upload(tensors, names)
+                if packed is not None:
+                    inputs, slot = packed
+                    request.upload_slab = slot
+                    merged = dict(tensors)
+                    merged.update(inputs)
+                    self.stats["upload_batched"] += 1
+                    return merged
+                self.stats["upload_batch_declined"] += 1
+        return {name: _to_device(value, self.platform.device) for name, value in tensors.items()}
 
     def _queue_for_first_stages(self, request: _Request) -> None:
         """Append ``request`` to the queue of every stage without dependencies (engine thread)."""
@@ -600,7 +729,7 @@ class Engine:
             try:
                 if self._decoder is None:
                     self._decoder = DeviceImageDecoder(self.platform.device)
-                context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
+                context = self._device_ctx  # ADMISSION-GAP AG3: cached on this thread, never nested
                 with context, torch.inference_mode():
                     if stream is not None and request.inputs_ready is not None:
                         stream.wait_event(request.inputs_ready)
@@ -634,9 +763,7 @@ class Engine:
         try:
             if self._decoder is None:
                 self._decoder = DeviceImageDecoder(self.platform.device)
-            context = (self._device_module.stream(self._device_stream) if self._device_stream is not None
-                       else contextlib.nullcontext())
-            with context, torch.inference_mode():
+            with self._device_ctx, torch.inference_mode():  # ADMISSION-GAP AG3: cached context
                 view = self._decoder.decode_one(image)
             slot.device = self._decoder.device
             slot.view = view
@@ -1071,6 +1198,18 @@ class Engine:
                 self.slots.tensors(request.handle)["failed_dispatch"] = (request.inputs, dict(request.outputs))
             self.slots.release(request.handle, after=after)
             request.handle = None
+        slab, request.upload_slab = request.upload_slab, None
+        if slab is not None and self._upload_batcher is not None:
+            # ADMISSION-GAP AG2: the request's batched upload slab returns to the ring here. On the
+            # success path the completer waited for the final event (every stage read the slab); on
+            # a failure with an ``after`` event still pending, wait for it first so the async
+            # host-to-device copy is never still reading the host slab a later request overwrites.
+            if after is not None:
+                try:
+                    after.synchronize()
+                except Exception:  # noqa: BLE001 - the device errored; retire the slab anyway
+                    logger.exception("could not wait out a failed request's upload slab")
+            self._upload_batcher.release(slab)
         request.inputs = None
         request.outputs.clear()
         if locked:
