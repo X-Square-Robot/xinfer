@@ -22,6 +22,11 @@ import torch
 import torch.nn.functional as F
 
 from xinfer.platforms.devices import device_module_for
+
+try:  # HOST-TAIL HT1: GIL-releasing wrappers for the hot acl host calls
+    from xinfer import _aclfast
+except ImportError:  # not built / frontend never imports this module
+    _aclfast = None
 from xinfer.platforms.interface import Platform, PlatformCapabilities
 
 _MEDIA_APIS = (
@@ -182,12 +187,58 @@ class NpuJpegDecoder:
         # send/get/release transaction; a channel that fails mid-transaction is dropped and
         # recreated by the next decode, and ``close`` tears them all down.
         self._channels: dict[tuple[int, int, int], int] = {}
+        # HOST-TAIL HT1: the compiled acl binding holds the interpreter lock for
+        # every himpi/rt call (~0.4 ms per request across the decode chain); when
+        # _aclfast resolved the same native symbols it runs the identical call
+        # chain under Py_BEGIN_ALLOW_THREADS. Any miss -> binding path below.
+        self._fast = _aclfast is not None and bool(_aclfast.init())
+        # Frames are copied out of DVPP memory with a stream-ordered copy, so a
+        # transaction's DVPP buffers cannot be freed before that copy ran: they
+        # wait in ``_deferred`` until the recorded copy event completed.
+        self._async_copy = callable(getattr(self.acl.rt, "memcpy_async", None))
+        self._deferred: list[tuple[int, int]] = []
+        self._copy_event = None
+        # WAVE-TAIL WT2b: this decoder's hot paths enter the device context once
+        # per call on one thread; the cached context object skips its rebuild.
+        self._device_ctx = None
+
+    def _on_device(self):
+        """The cached device context of this decoder (single thread; entered and exited in pairs)."""
+        if self._device_ctx is None:
+            self._device_ctx = torch.npu.device(self.device)
+        return self._device_ctx
+
+    def _flush_deferred(self) -> None:
+        """Free the DVPP buffers of finished frames once their copies completed."""
+        if not self._deferred:
+            return
+        if self._copy_event is not None:
+            if not self._copy_event.query():
+                self._copy_event.synchronize()
+            self._copy_event = None
+        if self._fast and self._deferred:
+            pointers = [pointer for pair in self._deferred for pointer in pair]
+            if _aclfast.free_batch(pointers) != len(pointers):
+                raise RuntimeError("CANN JPEGD dvpp_free failed")
+        else:
+            media = self.acl.himpi
+            for source, output in self._deferred:
+                _call(media.dvpp_free, source)
+                _call(media.dvpp_free, output)
+        self._deferred.clear()
+
+    def _record_copy_event(self) -> None:
+        """Mark the point after the frame copies on the caller's stream."""
+        event = torch.npu.Event()
+        event.record(torch.npu.current_stream())
+        self._copy_event = event
 
     def __call__(self, jpegs):
         with _MEDIA_LOCK:
             if self._closed:
                 raise RuntimeError("CANN JPEGD decoder is closed")
-            with torch.npu.device(self.device):
+            with self._on_device():
+                self._flush_deferred()
                 if not self._leased:
                     users = _MEDIA_USERS.get(self.device, 0)
                     # Repeated sys_init/sys_exit cycles exhaust HDC descriptors on CANN 9.1.1.
@@ -205,6 +256,7 @@ class NpuJpegDecoder:
                 return
             self._leased = False
             with torch.npu.device(self.device):
+                self._flush_deferred()
                 self._close_channels()
             users = _MEDIA_USERS[self.device] - 1
             if users:
@@ -230,6 +282,27 @@ class NpuJpegDecoder:
         media, runtime = self.acl.himpi, self.acl.rt
         size = jpeg.numel()
         stream = dict(end_of_frame=1, end_of_stream=0, need_display=1, pts=0, len=size, addr=jpeg.data_ptr())
+        # HOST-TAIL HT1: the probe, the start chain (2x dvpp_malloc + H2D copy +
+        # vdec_send_stream) and the finish chain (get_frame + stream-ordered copy
+        # + vdec_release_frame) each run under one released GIL through the
+        # built _aclfast extension; every miss falls to the binding chain below,
+        # which is unchanged.
+        if self._fast:
+            probed = _aclfast.probe(_JPEG, jpeg.data_ptr(), size)
+            if probed is not None:
+                status, width, height, wstride, hstride, buf_size, _fmt = probed
+                info = dict(width=width, height=height, width_stride=wstride,
+                            height_stride=hstride, img_buf_size=buf_size)
+                if status & 0xFFFFFFFF == _FORMAT_UNSUPPORTED:
+                    return self._decode_on_host(jpeg)
+                _check(status, "dvpp_get_image_info")
+                if not (32 <= width <= 16384 and 32 <= height <= 16384):
+                    return self._decode_on_host(jpeg)
+                if self._async_copy:
+                    fast = self._decode_fast(jpeg, info, size, width, height)
+                    if fast is not None:
+                        return fast
+                return self._decode_binding(jpeg, info, stream, size, width, height, media, runtime)
         info, status = media.dvpp_get_image_info(_JPEG, stream)
         if status & 0xFFFFFFFF == _FORMAT_UNSUPPORTED:
             return self._decode_on_host(jpeg)
@@ -237,14 +310,69 @@ class NpuJpegDecoder:
         width, height = info["width"], info["height"]
         if not (32 <= width <= 16384 and 32 <= height <= 16384):
             return self._decode_on_host(jpeg)
+        return self._decode_binding(jpeg, info, stream, size, width, height, media, runtime)
 
+    def _decode_fast(self, jpeg, info, size, width, height):
+        """One JPEG's DVPP transaction through _aclfast (None = the binding chain).
+
+        The start chain frees exactly what the binding chain's excepts free on
+        each phase; the finish chain releases the frame exactly once whenever
+        get_frame succeeded. The source/output buffers join ``_deferred`` and
+        free once the stream-ordered frame copy completed (the next call's
+        flush), matching the binding chain's post-copy frees.
+        """
+        out_size = info["img_buf_size"]
+        channel = self._channel_for(width, height, size)
+        started = _aclfast.start(self.device.index, channel, jpeg.data_ptr(), size,
+                                 out_size, width, height, info["width_stride"],
+                                 info["height_stride"], _SOURCE_FORMAT, _TIMEOUT_MS)
+        if started is None:
+            return None
+        status, phase, source, output = started
+        if status != 0:
+            operation = ("dvpp_malloc input", "memcpy", "dvpp_malloc output", "vdec_send_stream")[phase]
+            if phase == 3:
+                self._drop_channel(self._channel_key(width, height, size))
+                _aclfast.free_batch([source, output])
+            raise RuntimeError(f"CANN JPEGD {operation} failed (0x{status & 0xFFFFFFFF:08x})")
+        data = torch.empty(out_size, dtype=torch.uint8, device=self.device)
+        fetched = _aclfast.finish(channel, out_size, data.data_ptr(),
+                                  torch.npu.current_stream().npu_stream, _TIMEOUT_MS)
+        if fetched is None:
+            return None
+        (status, phase, pixel_format, frame_flag, va0, va1, va2,
+         ws0, ws1, ws2, hs0, hs1, hs2) = fetched
+        if phase == 0:
+            self._drop_channel(self._channel_key(width, height, size))
+            _aclfast.free_batch([source, output])
+            raise RuntimeError(f"CANN JPEGD vdec_get_frame failed (0x{status & 0xFFFFFFFF:08x})")
+        if phase == 1:
+            _aclfast.free_batch([source, output])
+            raise RuntimeError(f"CANN JPEGD memcpy_async failed (0x{status & 0xFFFFFFFF:08x})")
+        if phase == 2:
+            raise RuntimeError(f"CANN JPEGD vdec_release_frame failed (0x{status & 0xFFFFFFFF:08x})")
+        if frame_flag != 0:
+            _aclfast.free_batch([source, output])
+            raise RuntimeError(f"CANN JPEGD rejected an image (frame_flag={frame_flag})")
+        frame = dict(pixel_format=pixel_format, frame_flag=frame_flag,
+                     virt_addr=[va0, va1, va2], width_stride=[ws0, ws1, ws2],
+                     height_stride=[hs0, hs1, hs2])
+        view = self._frame_view(frame, output, out_size, height, width, data)
+        # each failure phase above freed exactly what the binding chain's excepts
+        # free (phase 2 leaves the channel holding the frame, like the campaign)
+        self._deferred.append((source, output))
+        self._record_copy_event()
+        return view
+
+    def _decode_binding(self, jpeg, info, stream, size, width, height, media, runtime):
+        """The released binding transaction, unchanged."""
+        out_size = info["img_buf_size"]
         with ExitStack() as stack:
             source, status = media.dvpp_malloc(self.device.index, size)
             _check(status, "dvpp_malloc input")
             stack.callback(_call, media.dvpp_free, source)
             _call(runtime.memcpy, source, size, jpeg.data_ptr(), size, _HOST_TO_DEVICE)
             stream["addr"] = source
-            out_size = info["img_buf_size"]
             output, status = media.dvpp_malloc(self.device.index, out_size)
             _check(status, "dvpp_malloc output")
             stack.callback(_call, media.dvpp_free, output)
@@ -329,13 +457,17 @@ class NpuJpegDecoder:
             self._drop_channel(key)
 
     def _copy_frame(self, frame, output, out_size, height, width):
+        data = torch.empty(out_size, dtype=torch.uint8, device=self.device)
+        _call(self.acl.rt.memcpy, data.data_ptr(), out_size, output, out_size, _DEVICE_TO_DEVICE)
+        return self._frame_view(frame, output, out_size, height, width, data)
+
+    def _frame_view(self, frame, output, out_size, height, width, data):
+        """Validate one frame's JPEGD output layout and return the RGB view inside ``data``."""
         fmt, addresses = frame["pixel_format"], frame["virt_addr"]
         height_stride, width_stride = frame["height_stride"][0], frame["width_stride"][0]
         luma_size = height_stride * width_stride
         if addresses[0] != output or height > height_stride or width > width_stride or luma_size > out_size:
             raise RuntimeError("unexpected CANN JPEGD luma buffer layout")
-        data = torch.empty(out_size, dtype=torch.uint8, device=self.device)
-        _call(self.acl.rt.memcpy, data.data_ptr(), out_size, output, out_size, _DEVICE_TO_DEVICE)
         luma = data[:luma_size].view(height_stride, width_stride)[:height, :width]
         if fmt == 0:  # YUV400
             return _rgb(luma, None, fmt)

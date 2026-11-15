@@ -236,6 +236,18 @@ def gated_causal_attention(q, k, v, gate, *, scale=None):
          and gate.dtype == torch.bfloat16 and gate.device == q.device
          and gate.shape == (q.shape[0], q.shape[1], q.shape[2] * q.shape[3]))
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
+    # FIA-FUSE (env XINFER_FIA_FUSE, default off): the 2B decode family takes the
+    # specialized scan+reduce pair that fuses the cache attention call and the
+    # gated pack tail; every other shape falls through unchanged.
+    try:
+        from xinfer.ops.backends.ascend import fia_fuse_route as _fia_fuse
+
+        _fused = _fia_fuse.try_route(
+            q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask, scale)
+    except ImportError:
+        _fused = None
+    if _fused is not None:
+        return _fused
     # The same two steps as the reference — the cache attention, then the BF16 gated product — with the attention
     # served by the native entry above instead of SDPA.
     out = prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
