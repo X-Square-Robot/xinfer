@@ -43,6 +43,11 @@ from xinfer.models.wallx.processing import (
 )
 from xinfer.models.wallx2b.config import ACTION_TOKEN, ACTION_TOKEN_ID, PROPRI_TOKEN, PROPRI_TOKEN_ID, Wallx2bConfig
 
+try:  # PREPARE-C PC1/PC2: built GIL-releasing prepare pack (pure CPython+NumPy C API).
+    from xinfer import _preparefast  # built for this platform; every user falls back below
+except Exception:  # noqa: BLE001 - the pack is an optimization; prepare must not fail without it
+    _preparefast = None
+
 IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
@@ -422,6 +427,27 @@ class Wallx2bInputProcessor:
             self._pin_prepared = torch.zeros(1).pin_memory() is not None
         except Exception:  # noqa: BLE001 - any deviceless or pinned-alloc failure disables it
             self._pin_prepared = False
+        # PREPARE-C PC3: the built _pincpp pins the prepared tensors with the GIL
+        # released (the python pin loop held it ~0.5 ms per request, the largest
+        # main-thread GIL item left on the K1-K6 arm; probe start.gilphase
+        # 2026-11-15). Probed once on the same K5 guard: an unpinned tensor must
+        # come back pinned and a non-tensor must pass through, else python pins.
+        self._pin_cpp = None
+        if self._pin_prepared:
+            try:
+                from xinfer import _pincpp
+
+                out = _pincpp.pin_batch({"probe": torch.zeros(1), "host": "x"})
+                if out["probe"].is_pinned() and out["host"] == "x":
+                    self._pin_cpp = _pincpp.pin_batch
+            except Exception:  # noqa: BLE001 - any ABI or probe failure falls back to python pin
+                self._pin_cpp = None
+        # PREPARE-C PC2: the state digitize bins and the float64 normalization
+        # statistics are frozen per config; precompute them once instead of per
+        # request (same values numpy recomputed every call).
+        self._state_bins = np.linspace(-1, 1, model_config.state_bins + 1)[:-1]
+        self._state_min64 = model_config.state_norm.min.astype(np.float64)
+        self._state_delta64 = model_config.state_norm.delta.astype(np.float64)
 
     def _normalize_state(self, x: np.ndarray) -> np.ndarray:
         """``(x - min) / delta · 2 - 1`` in float64, clamped to ``[-1, 1]`` when the checkpoint clamps."""
@@ -549,7 +575,24 @@ class Wallx2bInputProcessor:
             # submit are lock-guarded, every helper in the chain is a pure function, and the
             # results are still consumed in camera order with the same values.
             def handoff(camera):
-                image = _wire_view_fast(wire(camera))
+                value = wire(camera)
+                # PREPARE-C PC4: the wire decode, the JPEG header scan and both
+                # smart_resize calls of this worker chain in one GIL-releasing C
+                # call (b64 already ran GIL-released via _wirefast; this also
+                # removes the python wrapper, is_jpeg, jpeg_size's python marker
+                # walk and resize_sizes' arithmetic from the pool worker, whose
+                # GIL slices serialize the wave's ticket handoffs). device_image
+                # (frombuffer + prefetch ticket) stays python. None = the python
+                # chain below unchanged, byte for byte.
+                if _preparefast is not None:
+                    fast = _preparefast.handoff(value, c.resolution.get(camera.view, -1),
+                                                c.resize_factor, c.resize_min_pixels,
+                                                c.resize_max_pixels, c.patch_size * c.merge_size,
+                                                c.min_pixels, c.max_pixels)
+                    if fast is not None:
+                        data, _src, size = fast
+                        return device_image(data, size, DEVICE_RESIZE), size[-1]
+                image = _wire_view_fast(value)
                 if not (isinstance(image, np.ndarray) or is_jpeg(image)):
                     image = decode_image(image)
                 size = resize_sizes(*source_size(image), c.resolution.get(camera.view, -1), c)
@@ -569,10 +612,24 @@ class Wallx2bInputProcessor:
 
         # State: normalized, then binned into the prompt.
         agent_pos, agent_mask, arms = build_state(state, c)
-        proprio = self._normalize_state(agent_pos)[None]  # [1, 1, state_dim]
-        digits = np.digitize(proprio, np.linspace(-1, 1, c.state_bins + 1)[:-1]) - 1
-        values = digits[0, 0][agent_mask[0] != 0]
-        state_text = " ".join(map(str, values))
+        # PREPARE-C PC2: normalize + digitize + state_text in one GIL-releasing C
+        # call (same float64 arithmetic in numpy's op order, digitize's
+        # searchsorted-'right' semantics, str()'s digits). None = run the python
+        # path below unchanged.
+        state_fast = None
+        if _preparefast is not None:
+            state_fast = _preparefast.state_text(agent_pos, agent_mask, self._state_min64,
+                                                 self._state_delta64, self._state_bins,
+                                                 c.clamp_normalized)
+        if state_fast is not None:
+            state_text, values, n_values, sum_digits = state_fast
+        else:
+            proprio = self._normalize_state(agent_pos)[None]  # [1, 1, state_dim]
+            digits = np.digitize(proprio, self._state_bins) - 1
+            values = digits[0, 0][agent_mask[0] != 0]
+            state_text = " ".join(map(str, values))
+            n_values = len(values)
+            sum_digits = sum(len(str(abs(v))) for v in values)
 
         token_ids = np.asarray(self._tokenize(self._prompt(" ".join(words), state_text, grids)), dtype=np.int64)[None]
         if token_ids.shape[1] > c.max_seq_length:
@@ -587,7 +644,6 @@ class Wallx2bInputProcessor:
         else:
             noise = torch.randn((1, h, d), generator=self._noise)
         p, h = prompt_len, c.action_horizon
-        positions = mrope_position_ids(token_ids, grids, c.image_token_id, c.merge_size)  # [3, 1, P + H]
         delay = 0
         rtc_actions = None
         if rtc is not None:
@@ -595,38 +651,73 @@ class Wallx2bInputProcessor:
             # The reference state of the prefix is the float32 wire pose, unlike the float64 prompt state.
             reference = np.concatenate([arms["left"], arms["right"]]).astype(np.float32)
             rtc_actions = self._normalize_prefix(rtc_prefix(poses, reference, c))
-        # Action rows after the pinned RTC rows (all rows without RTC) skip rtc_rope_gap positions; pinned rows do
-        # not see the other action rows.
-        action_positions = positions[..., p:].copy()
-        action_positions[..., delay:] += c.rtc_rope_gap
-        action_mask = np.ones((1, 1, h, p + h), dtype=bool)
-        action_mask[0, 0, :delay, p + delay:] = False
         layout = vision_layout(grids, c.model.vision)
-        tensors = dict(
-            input_ids=torch.from_numpy(token_ids[:, :p]),
-            position_ids=torch.from_numpy(positions[..., :p].copy()),
-            **{f"image_{i}": image for i, image in enumerate(images)},
-            vision_positions=layout["positions"],
-            vision_pos_index=layout["pos_index"],
-            vision_pos_weight=layout["pos_weight"],
-            vision_cu_seqlens=layout["cu_seqlens"],
-            image_token_index=torch.from_numpy(np.flatnonzero(token_ids[0, :p] == c.image_token_id)),
-            prompt_len=p,
-            prompt_valid=torch.tensor([p]),
-            dof_mask=torch.from_numpy(self.dof_mask.astype(np.float32)),
-            dof_mask_all=bool(self.dof_mask.all()),
-            padding_action=torch.from_numpy(self.padding_action.copy()),
-            noise=noise,
-            action_positions=torch.from_numpy(action_positions),
-            action_mask=torch.from_numpy(action_mask),
-        )
-        if rtc_actions is not None:
-            padded = np.zeros((1, h, c.action_dim), dtype=np.float32)
-            padded[0, :delay] = rtc_actions
-            tensors["rtc_actions"] = torch.from_numpy(padded)
-            tensors["inference_delay"] = torch.tensor([delay], dtype=torch.int64)
+        # PREPARE-C PC1: mrope + action positions/mask + pad_prompt + rtc zero-pad
+        # + image_token_index in one GIL-releasing C call that returns the FINAL
+        # padded arrays (K4's integer walk, K3's padding values, the RTC pattern),
+        # fresh per request exactly as the python path built them. None = the
+        # python path below runs unchanged (and pads after building the dict).
+        tail = None
+        if _preparefast is not None:
+            tail = _preparefast.tail(token_ids, c.image_token_id, c.merge_size, grids, delay,
+                                     c.rtc_rope_gap, self.bucket.width(p), rtc_actions, p, h)
+        if tail is not None:
+            tensors = dict(
+                input_ids=torch.from_numpy(tail["input_ids"]),
+                position_ids=torch.from_numpy(tail["position_ids"]),
+                **{f"image_{i}": image for i, image in enumerate(images)},
+                vision_positions=layout["positions"],
+                vision_pos_index=layout["pos_index"],
+                vision_pos_weight=layout["pos_weight"],
+                vision_cu_seqlens=layout["cu_seqlens"],
+                image_token_index=torch.from_numpy(tail["image_token_index"]),
+                prompt_len=self.bucket.width(p),
+                prompt_valid=torch.from_numpy(tail["prompt_valid"]),
+                dof_mask=torch.from_numpy(self.dof_mask.astype(np.float32)),
+                dof_mask_all=bool(self.dof_mask.all()),
+                padding_action=torch.from_numpy(self.padding_action.copy()),
+                noise=noise,
+                action_positions=torch.from_numpy(tail["action_positions"]),
+                action_mask=torch.from_numpy(tail["action_mask"]),
+            )
+            if "rtc_actions" in tail:
+                tensors["rtc_actions"] = torch.from_numpy(tail["rtc_actions"])
+                tensors["inference_delay"] = torch.tensor([delay], dtype=torch.int64)
+            padded = tensors  # already padded to the bucket width
+        else:
+            positions = mrope_position_ids(token_ids, grids, c.image_token_id, c.merge_size)  # [3, 1, P + H]
+            # Action rows after the pinned RTC rows (all rows without RTC) skip rtc_rope_gap positions; pinned rows do
+            # not see the other action rows.
+            action_positions = positions[..., p:].copy()
+            action_positions[..., delay:] += c.rtc_rope_gap
+            action_mask = np.ones((1, 1, h, p + h), dtype=bool)
+            action_mask[0, 0, :delay, p + delay:] = False
+            tensors = dict(
+                input_ids=torch.from_numpy(token_ids[:, :p]),
+                position_ids=torch.from_numpy(positions[..., :p].copy()),
+                **{f"image_{i}": image for i, image in enumerate(images)},
+                vision_positions=layout["positions"],
+                vision_pos_index=layout["pos_index"],
+                vision_pos_weight=layout["pos_weight"],
+                vision_cu_seqlens=layout["cu_seqlens"],
+                image_token_index=torch.from_numpy(np.flatnonzero(token_ids[0, :p] == c.image_token_id)),
+                prompt_len=p,
+                prompt_valid=torch.tensor([p]),
+                dof_mask=torch.from_numpy(self.dof_mask.astype(np.float32)),
+                dof_mask_all=bool(self.dof_mask.all()),
+                padding_action=torch.from_numpy(self.padding_action.copy()),
+                noise=noise,
+                action_positions=torch.from_numpy(action_positions),
+                action_mask=torch.from_numpy(action_mask),
+            )
+            if rtc_actions is not None:
+                padded = np.zeros((1, h, c.action_dim), dtype=np.float32)
+                padded[0, :delay] = rtc_actions
+                tensors["rtc_actions"] = torch.from_numpy(padded)
+                tensors["inference_delay"] = torch.tensor([delay], dtype=torch.int64)
+            padded = pad_prompt(tensors, self.bucket.width(p))
         # The -1 sentinel shares its sign with the separator token; only digit tokens vary.
-        length_range = text_length_range(p, sum(len(str(abs(v))) for v in values), len(values),
+        length_range = text_length_range(p, sum_digits, n_values,
                                           max_tokens=len(str(c.state_bins - 1)), max_length=self.bucket.max_length)
         # HOST-GAP K5: pin the prepared CPU tensors here, inside the DVPP wave window the
         # prefetch tickets opened (prepare overlaps the device decode), instead of at engine
@@ -634,11 +725,19 @@ class Wallx2bInputProcessor:
         # GIL bursts between the wave end and the vision dispatch; timeline probe 2026-11-15).
         # pin_memory returns fresh pinned tensors, so the shared cached vision_layout tensors
         # are copied, never mutated; admission then uploads with non_blocking copies only.
-        padded = pad_prompt(tensors, self.bucket.width(p))
-        prepared_tensors = (
-            {name: (value.pin_memory() if torch.is_tensor(value)
-                    and value.device.type == "cpu" and not value.is_pinned() else value)
-             for name, value in padded.items()} if self._pin_prepared else padded)
+        # PREPARE-C PC3: _pincpp.pin_batch runs the same ATen pin_memory() per
+        # tensor with the GIL released (the python loop held it ~0.5 ms/request,
+        # probe start.gilphase 2026-11-15); probed at construction, python loop
+        # as the fallback.
+        if self._pin_prepared:
+            if self._pin_cpp is not None:
+                prepared_tensors = self._pin_cpp(padded)
+            else:
+                prepared_tensors = {name: (value.pin_memory() if torch.is_tensor(value)
+                                           and value.device.type == "cpu" and not value.is_pinned() else value)
+                                    for name, value in padded.items()}
+        else:
+            prepared_tensors = padded
         return PreparedRequest(prepared_tensors,
                                dict(arms=arms, inference_delay=delay, prompt_len_range=length_range))
 
