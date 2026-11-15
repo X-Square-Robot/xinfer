@@ -343,6 +343,41 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
         split = _qkv_2b_split(packed, q_weight, k_weight, tail)
         if split is not None:
             return split
+    # 2B-COVERAGE: the vectorized split/apply kernel rides the AOT launcher (ctypes; the internal
+    # xcompute_aot_* launcher precedent) with the torch-chain FP32 statistics and the (weight + 1)
+    # factors mirrored verbatim from the reference's _zero_centered_heads chain — the library's
+    # scalar qkv_split_rstd measured slower than the reference tail at the prefill shapes (149 us
+    # per call at 464 rows), and this kernel is bitwise to the composition on identical statistics.
+    # The module is absent without the delivered package and the guard falls through below.
+    try:
+        from xcompute.kernel.qkv_split_vec import qkv_split_vec as _qkv_vec
+    except (ImportError, OSError):
+        _qkv_vec = None
+    if (_qkv_vec is not None
+            and packed.dim() == 3 and packed.shape[0] == 1 and packed.shape[2] == 5120
+            and num_heads == 8 and num_kv_heads == 2 and head_dim == 256
+            and float(eps) == 1e-6
+            and packed.dtype == torch.bfloat16 and packed.is_contiguous()
+            and packed.device.type == "npu"
+            and torch.is_tensor(q_weight) and tuple(q_weight.shape) == (256,)
+            and q_weight.device == packed.device
+            and q_weight.dtype in (torch.float32, torch.bfloat16)
+            and torch.is_tensor(k_weight) and tuple(k_weight.shape) == (256,)
+            and k_weight.device == packed.device
+            and k_weight.dtype in (torch.float32, torch.bfloat16)):
+        try:
+            b, n = packed.shape[0], packed.shape[1]
+            query = packed[..., :4096].reshape(b, n, 8, 2, 256)
+            kview = packed[..., 4096:4608].reshape(b, n, 2, 256)
+            q32 = query[..., 0, :].float()
+            k32 = kview.float()
+            rq = torch.rsqrt(q32.pow(2).mean(-1, keepdim=True) + float(eps)).reshape(-1)
+            rk = torch.rsqrt(k32.pow(2).mean(-1, keepdim=True) + float(eps)).reshape(-1)
+            qf = q_weight.float() + 1
+            kf = k_weight.float() + 1
+            return _qkv_vec(packed, rq, rk, qf, kf)
+        except (ValueError, RuntimeError):
+            pass
     b, n = packed.shape[:2]
     key = (b, packed.device)
     if key not in _no_action_rows:  # every row is a text row

@@ -31,6 +31,34 @@ _full = _rope().full if callable(_rope) else None
          and cos.device == q.device and sin.device == q.device
          and 0 < rotary_dim <= q.shape[-1] and cos.shape[-1] * 2 >= rotary_dim)
 def rope_full(q, k, cos, sin, rotary_dim):
+    # 2B-COVERAGE: the rotary_dim-64 partial rotation rides the d64 AOT launcher (ctypes; the
+    # internal xcompute_aot_* launcher precedent) on the exact 2B prefill envelope — q [1, P, 8, 256]
+    # and k [1, P, 2, 256] BF16 contiguous with compact FP32 [1, P, 32] tables and P a multiple of 4.
+    # Bitwise to the torch composition (the only bit-level deviations are signed zeros, +0 vs -0);
+    # the angle tables are duplicated to 64 columns with a fresh concat per call, so a graph capture
+    # always bakes the duplication into the graph. Every miss keeps the paths below.
+    try:
+        from xcompute.kernel.rope_d64 import rope_half_d64 as _rope_d64
+    except (ImportError, OSError):
+        _rope_d64 = None
+    if (_rope_d64 is not None
+            and int(rotary_dim) == 64
+            and q.ndim == 4 and k.ndim == 4
+            and q.shape[2] == 8 and q.shape[-1] == 256
+            and tuple(k.shape) == (q.shape[0], q.shape[1], 2, 256)
+            and q.dtype == k.dtype == torch.bfloat16
+            and q.device.type == "npu" and k.device == q.device
+            and q.is_contiguous() and k.is_contiguous()
+            and torch.is_tensor(cos) and cos.dtype == torch.float32
+            and cos.dim() == 3 and cos.shape[-1] == 32
+            and cos.shape[-2] == q.shape[1] and cos.is_contiguous()
+            and cos.device == q.device
+            and torch.is_tensor(sin) and sin.dtype == torch.float32
+            and sin.shape == cos.shape and sin.is_contiguous()):
+        try:
+            return _rope_d64(q, k, cos, sin)
+        except (ValueError, RuntimeError):
+            pass
     # The 2B prefill heads are 256 wide with a 64-dim rotary prefix: the affine fast
     # kernels take full rotations of 64/128-wide heads only, so this shape falls to the
     # generic scalar pair program (~264us per call). Gather the rotary prefix into a

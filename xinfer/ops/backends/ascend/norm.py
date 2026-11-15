@@ -43,6 +43,35 @@ def _supported(x, residual, weight, eps):
           version=VERSION)
 @partial(reference_add_rms_norm, check=_supported)
 def add_rms_norm(x, residual, weight, eps):
+    # SIMD-EPILOGUE R1 fused-after route (default off): the released ubv plans with buf2/f32direct
+    # scheduling, launched back-to-back with the GEMM in the same stream (probe-se1: sum+norm bitwise,
+    # the family-O chain 36.78 -> 34.82 us). XINFER_SIMDEPI selects the families (v1280: the vision
+    # and merger [rows, 1280] rows, p2048: the prompt [1, P, 2048] rows) and XINFER_SIMDEPI_LIB the
+    # library; the module is absent without that delivery and these guards fall through to the entries
+    # below, so the composition is unchanged.
+    try:
+        from xcompute.kernel import simdepi_r1
+        if (simdepi_r1.enabled("v1280")
+                and x.dim() == 2 and x.shape[-1] == 1280
+                and x.dtype == residual.dtype == torch.bfloat16
+                and residual.shape == x.shape and residual.device == x.device
+                and x.is_contiguous() and residual.is_contiguous()
+                and weight.dtype in (torch.float32, torch.bfloat16)
+                and weight.device == x.device
+                and tuple(weight.shape) == (1280,) and 0 < eps <= torch.finfo(torch.float32).max):
+            return simdepi_r1.add_rms_v1280(x, residual, weight, eps)
+        if (simdepi_r1.enabled("p2048")
+                and x.dim() == 3 and x.shape[0] == 1 and x.shape[-1] == 2048
+                and x.shape[1] % 4 == 0
+                and x.dtype == residual.dtype == torch.bfloat16
+                and residual.shape == x.shape and residual.device == x.device
+                and x.is_contiguous() and residual.is_contiguous()
+                and weight.dtype in (torch.float32, torch.bfloat16)
+                and weight.device == x.device
+                and tuple(weight.shape) == (2048,) and 0 < eps <= torch.finfo(torch.float32).max):
+            return simdepi_r1.add_rms_p2048(x, residual, weight, eps)
+    except (ImportError, OSError):
+        pass
     # RMSFUSE-r4 RF1 (the [1, 16, 1024] action norm and the wide [1, T, 2048] prompt norm) rides the
     # delivered package's AOT kernels; the module is absent without that delivery and these guards
     # fall through to the entries below, so the composition is unchanged.
