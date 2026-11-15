@@ -114,6 +114,64 @@ def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
     return released()
 
 
+def _SOUPFORM_ENABLED(family):
+    try:
+        from xcompute.kernel import soupform
+
+        return soupform.enabled(family)
+    except Exception:  # noqa: BLE001 - the mount is optional
+        return False
+
+
+def _zba_soupform(flat, weight, keep, conv, p):
+    """soupform zbasplit: rne(acc*keep) into contiguous conv/zba buffers.
+
+    Opt-in through ``XINFER_SOUPFORM=zbasplit`` (xcompute's soupform mount,
+    default off). Any miss -- flag off, absent knife library, wrong rank or a
+    fused-path error -- returns None and the caller keeps the released chain.
+    """
+    if not _SOUPFORM_ENABLED("zbasplit") or flat.dim() != 2:
+        return None
+    if not _SOUPKILL_PROJECTION:
+        from xcompute.kernel.cann_projection import CannProjection
+
+        _SOUPKILL_PROJECTION.append(CannProjection())
+    proj = _SOUPKILL_PROJECTION[0]
+    try:
+        from xcompute.kernel import soupform
+
+        with proj.accumulator(flat, weight) as acc:
+            return soupform.zbasplit(acc, keep, conv)
+    except (ValueError, RuntimeError):
+        return None
+
+
+def _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
+    """(qkv, packed): the soupform packed [3, rows, heads, dim] store first.
+
+    Opt-in through ``XINFER_SOUPFORM=vropepack`` (default off): the fused
+    finish stores the packed layout directly, so the model-side pack transpose
+    disappears (same values, different addresses). Every miss falls through to
+    the soupkill vrope knife and then the released operator.
+    """
+    if _SOUPFORM_ENABLED("vropepack") and normed.dim() == 2 and cos2 is not None and cos2.shape[-1] == d:
+        if not _SOUPKILL_PROJECTION:
+            from xcompute.kernel.cann_projection import CannProjection
+
+            _SOUPKILL_PROJECTION.append(CannProjection())
+        proj = _SOUPKILL_PROJECTION[0]
+        try:
+            from xcompute.kernel import soupform
+
+            with proj.accumulator(normed, block.qkv_weight) as acc:
+                packed = soupform.vision_qkv_rope_packed(acc, block.qkv_bias, cos2, sin2, heads, d)
+            if packed is not None:
+                return packed, True
+        except (ValueError, RuntimeError):
+            pass
+    return _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d), False
+
+
 class OptimizedVision(_FormatStage):
     """The ViT and patch merger (BF16 weights, ``[out, in]`` as in the checkpoint).
 
@@ -193,11 +251,18 @@ class OptimizedVision(_FormatStage):
         norm = ops.layer_norm_cast if self.fmt is None else self._op("layer_norm_quantize")
         normed = norm(x, block.norm1_weight, block.norm1_bias, c.eps)
         if self.fmt is None:
-            qkv = _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, 3 * heads * d, heads, d)
+            qkv, qkv_is_packed = _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, 3 * heads * d, heads, d)
+            if qkv_is_packed:
+                # SOUP-FORM vropepack: the finish kernel already stored the packed
+                # [3, n, heads, dim] layout, so the model-side permute copy of the
+                # released chain disappears (same bytes, packed addresses).
+                q, k, v = qkv.unbind(0)
+            else:
+                q, k, v = qkv.view(n, 3, heads, d).unbind(1)
         else:
             qkv = self._op("qkv_rope_epilogue")(normed, self._weight(block, "qkv_weight"), block.qkv_bias, cos, sin,
                                                 heads, d)
-        q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+            q, k, v = qkv.view(n, 3, heads, d).unbind(1)
         o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
         x = self._gemm(o, block, "proj_weight", block.proj_bias, residual=x)
         normed = norm(x, block.norm2_weight, block.norm2_bias, c.eps)
@@ -317,7 +382,14 @@ class OptimizedPrefill(_FormatStage):
         if self.fmt == "nvfp4":
             masked = x * rows
             return self._gemm(masked, layer, "qkv"), self.ops.gemm_epilogue(masked, layer.zba)
-        # BF16 scales the output rows by keep, MXFP8 masks the quantized input's rows
+        # BF16 scales the output rows by keep, MXFP8 masks the quantized input's rows.
+        # In BF16 the soupform zbasplit knife (rne(acc*keep) into contiguous conv/zba buffers, no
+        # Mul/Cast/Slice/Slice tail) takes the projection when its mount is enabled; every miss falls
+        # back to the released GEMM + split.
+        if self.fmt is None:
+            split = _zba_soupform(x, layer.qkv_zba, rows, self.conv_dim, x.shape[0])
+            if split is not None:
+                return split
         padding = dict(row_scale=rows) if self.fmt is None else dict(row_mask=rows)
         qkv_zba = self._gemm(x, layer, "qkv_zba", **padding)
         return qkv_zba[:, :self.conv_dim], qkv_zba[:, self.conv_dim:]

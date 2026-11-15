@@ -177,6 +177,21 @@ def _add_zero_centered_supported(x, residual, weight, eps):
 @partial(reference_add_zero_centered_rms_norm, check=_add_zero_centered_supported)
 def add_zero_centered_rms_norm(x, residual, weight, eps):
     # (residual, input) order, as the entry documents, and the tuple is (sum, normalized).
+    # SOUP-FORM normprep: one pass computes s = rne(res+x) and sq = f32(s)^2,
+    # the aclnn statistics chain runs over the identical sq values, and the
+    # apply is the elementwise (s*rstd)*(1+w) with a single RNE. Opt-in through
+    # ``XINFER_SOUPFORM=normprep`` (xcompute's soupform mount, default off);
+    # every miss -- flag off, absent knife library, an envelope mismatch or a
+    # fused-path error -- falls back to the entry chain below.
+    try:
+        from xcompute.kernel import soupform
+
+        if soupform.enabled("normprep"):
+            fused = soupform.normprep_norm(x, residual, weight, eps)
+            if fused is not None:
+                return fused
+    except Exception:  # noqa: BLE001 - the mount is optional
+        pass
     return _add_rms(residual, x, weight, float(eps), True, True)
 
 
