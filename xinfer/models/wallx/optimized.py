@@ -77,6 +77,64 @@ def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
     return released()
 
 
+def _SOUPFORM_ENABLED(family):
+    try:
+        from xcompute.kernel import soupform
+
+        return soupform.enabled(family)
+    except Exception:  # noqa: BLE001 - the mount is optional
+        return False
+
+
+def _zba_soupform(flat, weight, keep, conv, p):
+    """soupform zbasplit: rne(acc*keep) into contiguous conv/zba buffers.
+
+    Opt-in through ``XINFER_SOUPFORM=zbasplit`` (xcompute's soupform mount,
+    default off). Any miss -- flag off, absent knife library, wrong rank or a
+    fused-path error -- returns None and the caller keeps the released chain.
+    """
+    if not _SOUPFORM_ENABLED("zbasplit") or flat.dim() != 2:
+        return None
+    if not _SOUPKILL_PROJECTION:
+        from xcompute.kernel.cann_projection import CannProjection
+
+        _SOUPKILL_PROJECTION.append(CannProjection())
+    proj = _SOUPKILL_PROJECTION[0]
+    try:
+        from xcompute.kernel import soupform
+
+        with proj.accumulator(flat, weight) as acc:
+            return soupform.zbasplit(acc, keep, conv)
+    except (ValueError, RuntimeError):
+        return None
+
+
+def _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
+    """(qkv, packed): the soupform packed [3, rows, heads, dim] store first.
+
+    Opt-in through ``XINFER_SOUPFORM=vropepack`` (default off): the fused
+    finish stores the packed layout directly, so the model-side pack transpose
+    disappears (same values, different addresses). Every miss falls through to
+    the soupkill vrope knife and then the released operator.
+    """
+    if _SOUPFORM_ENABLED("vropepack") and normed.dim() == 2 and cos2 is not None and cos2.shape[-1] == d:
+        if not _SOUPKILL_PROJECTION:
+            from xcompute.kernel.cann_projection import CannProjection
+
+            _SOUPKILL_PROJECTION.append(CannProjection())
+        proj = _SOUPKILL_PROJECTION[0]
+        try:
+            from xcompute.kernel import soupform
+
+            with proj.accumulator(normed, block.qkv_weight) as acc:
+                packed = soupform.vision_qkv_rope_packed(acc, block.qkv_bias, cos2, sin2, heads, d)
+            if packed is not None:
+                return packed, True
+        except (ValueError, RuntimeError):
+            pass
+    return _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d), False
+
+
 class OptimizedVision(nn.Module):
     """The ViT and patch merger (BF16 weights, ``[out, in]`` as in the checkpoint).
 
@@ -141,8 +199,14 @@ class OptimizedVision(nn.Module):
                 x = block_forward(block, x, cos, sin, cu_seqlens)
                 continue
             normed = ops.layer_norm_cast(x, block.norm1_weight, block.norm1_bias, c.eps)
-            qkv = _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, 3 * heads * d, heads, d)
-            q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+            qkv, qkv_is_packed = _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, 3 * heads * d, heads, d)
+            # SOUP-FORM vropepack: the finish kernel already stored the packed
+            # [3, n, heads, dim] layout, so the model-side permute copy of the
+            # released chain disappears (same bytes, packed addresses).
+            if qkv_is_packed:
+                q, k, v = qkv.unbind(0)
+            else:
+                q, k, v = qkv.view(n, 3, heads, d).unbind(1)
             o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
             x = ops.gemm_epilogue(o, block.proj_weight, block.proj_bias, residual=x)
             normed = ops.layer_norm_cast(x, block.norm2_weight, block.norm2_bias, c.eps)
@@ -250,10 +314,19 @@ class OptimizedPrefill(nn.Module):
                 o = ops.gated_causal_attention(q[0], k[0], v[0], gate.reshape(p, -1), scale=d ** -0.5)
                 mixed = ops.gemm_epilogue(o, layer.o)
             else:
-                qkv_zba = ops.gemm_epilogue(flat, layer.qkv_zba, row_scale=keep)
-                o = ops.gated_delta_net(qkv_zba[:, :conv].view(1, p, -1), qkv_zba[:, conv:].view(1, p, -1),
-                                        layer.conv_weight, layer.A_log, layer.dt_bias, layer.norm_weight, hk, hv,
-                                        dk, dv, eps)
+                # SOUP-FORM zbasplit: rne(acc*keep) lands in contiguous conv/zba
+                # buffers (no Mul/Cast/Slice/Slice tail); identical values.
+                zba_split = _zba_soupform(flat, layer.qkv_zba, keep, conv, p)
+                if zba_split is not None:
+                    conv_buf, zba_buf = zba_split
+                    o = ops.gated_delta_net(conv_buf.view(1, p, -1), zba_buf.view(1, p, -1),
+                                            layer.conv_weight, layer.A_log, layer.dt_bias, layer.norm_weight, hk, hv,
+                                            dk, dv, eps)
+                else:
+                    qkv_zba = ops.gemm_epilogue(flat, layer.qkv_zba, row_scale=keep)
+                    o = ops.gated_delta_net(qkv_zba[:, :conv].view(1, p, -1), qkv_zba[:, conv:].view(1, p, -1),
+                                            layer.conv_weight, layer.A_log, layer.dt_bias, layer.norm_weight, hk, hv,
+                                            dk, dv, eps)
                 mixed = ops.gemm_epilogue(o.view(p, -1), layer.out)
             h, normed = ops.add_zero_centered_rms_norm(mixed.view(1, p, -1), h, layer.post_norm, eps)
             hidden = ops.gemm_glu_epilogue(normed.view(p, -1), layer.gate_up)
