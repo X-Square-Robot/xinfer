@@ -410,7 +410,7 @@ class RawBridge:
             return None
         try:
             query = lib.xinfer_gdr_cann_chunk_workspace_size
-            launch = lib.xinfer_gdr_cann_chunk
+            launch = lib.xinfer_gdr_cann_chunk_launch
             error = lib.xinfer_gdr_cann_chunk_get_last_error
         except AttributeError:
             return None

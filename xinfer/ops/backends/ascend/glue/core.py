@@ -332,15 +332,20 @@ def double_adarmsnorm_gated_residual_inplace(residual, branch, gate, previous_ga
     _require(branch.dtype == torch.bfloat16 and branch.is_contiguous(),
              "the action kernel requires contiguous BF16 activations")
     stream = torch.npu.current_stream(branch.device).npu_stream
+    # The kernel ABI is (residual, branch, previous_gate, residual_out,
+    # branch_out, next_gate, modulation1, modulation2[, pinned mods, rows]);
+    # the v22 .cc's DoubleContinue passes the caller's buffers through both
+    # in/out pairs (residual -> residual_out, branch -> branch_out) with the
+    # previous gate at slot 3 and the next gate at slot 6.
     if pinned:
         _launch(lib, "adarmsnorm_action_double_bf16_f32_pinned",
-                (branch, branch, gate, branch, branch, previous_gate,
+                (residual, branch, previous_gate, residual, branch, gate,
                  first_modulation, second_modulation, pinned_modulation,
                  pinned_modulation, pinned_rows),
                 (_bits(epsilon),))
     else:
         _launch(lib, "adarmsnorm_action_double_bf16_f32",
-                (branch, branch, gate, branch, branch, previous_gate,
+                (residual, branch, previous_gate, residual, branch, gate,
                  first_modulation, second_modulation),
                 (_bits(epsilon),))
 
@@ -445,12 +450,36 @@ def denoise_output_euler(x, h, weight, *, dt, bias=None, prenorm="none", norm_we
     if norm_weight is not None:
         _require(prenorm == "rms" and norm_weight.dtype == torch.float32
                  and ada_shift is not None, "rms prenorm needs the FP32 weight and shift")
+    # The flag encoding and scalar tail follow the v22 bridge
+    # (src/denoise_output/npu/denoise_output.cc) exactly: bias 1, row_mask 2,
+    # dof_mask 4 (+8 when the dof mask is FP32), pinned 16, pinned_values 32,
+    # tensor dt 64; scalars (b, m, a, hidden span, hidden batch/row strides,
+    # row-mask batch/row strides, dof batch/row strides, flags, prenorm,
+    # dt bits, eps bits, beta bits).
+    if row_mask is not None:
+        flags |= 2
+        _require(row_mask.dtype == torch.uint8 and tuple(row_mask.shape) == (b, m),
+                 "row_mask must be uint8 [B, M]")
+    rmb, rmt = ((int(row_mask.stride(0)), int(row_mask.stride(1)))
+                if row_mask is not None else (0, 0))
+    if dof_mask is not None:
         flags |= 4
-    if row_mask is not None or dof_mask is not None:
-        flags |= 8
+        if dof_mask.dtype == torch.float32:
+            flags |= 8
+        elif dof_mask.dtype != torch.uint8:
+            raise ValueError("dof_mask must be FP32 or uint8")
+        if dof_mask.ndim == 2:
+            _require(tuple(dof_mask.shape) == (b, a), "a 2-D dof mask must be [B, A]")
+            db, drow = int(dof_mask.stride(0)), 0
+        else:
+            _require(dof_mask.ndim == 3 and tuple(dof_mask.shape) == (b, m, a),
+                     "a 3-D dof mask must be [B, M, A]")
+            db, drow = int(dof_mask.stride(0)), int(dof_mask.stride(1))
+    else:
+        db, drow = 0, 0
     if pinned is not None:
         flags |= 16
-    if round_normed:
+    if pinned_values is not None:
         flags |= 32
     if isinstance(dt, torch.Tensor):
         flags |= 64
@@ -471,9 +500,9 @@ def denoise_output_euler(x, h, weight, *, dt, bias=None, prenorm="none", norm_we
              pinned if pinned is not None else null,
              pinned_values if pinned_values is not None else null,
              dt if isinstance(dt, torch.Tensor) else null),
-            (b, m, a, b * m * 1024, m * 1024, 1024, 0, 0, 0,
+            (b, m, a, b * m * 1024, m * 1024, 1024, rmb, rmt, db, drow,
+             flags, pn,
              _bits(dt) if not isinstance(dt, torch.Tensor) else _bits(0.0),
-             flags, pn, _bits(dt) if isinstance(dt, torch.Tensor) else 0,
              _bits(eps), _bits(0.0)))
     return out
 
