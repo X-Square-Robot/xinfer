@@ -1,7 +1,7 @@
-"""The ViT and prompt stream of the Wall-X Qwen3.5 models on xcompute (``numerics="optimized"``).
+"""The ViT and prompt stream of the Wall-X Qwen3.5 models on the CUDA backend's kernels (``numerics="optimized"``).
 
 The Wall-X 2B stages use one operator per fusion from ``xinfer/ops/reference/``.
-xcompute selects the kernel for each shape. GEMM weights are ``[N, K]``. Differences to the
+The backend selects the kernel for each shape. GEMM weights are ``[N, K]``. Differences to the
 reference composition (``numerics="reference"``, the wall-x model under autocast):
 
 - ViT: every weight in BF16, including the position table, which one kernel interpolates; the patch embedding is a
@@ -12,7 +12,7 @@ reference composition (``numerics="reference"``, the wall-x model under autocast
   padding follows every real token, so real tokens do not see it); the DeltaNet mixer from the convolution to the
   gated norm is one call (``gated_delta_net``); ``[Q·gate | K | V]`` is one GEMM, the q/k norms and split one
   kernel and RoPE another; attention and its output gate are one call; the MLP's SiLU-mul is the gate/up GEMM's
-  epilogue; the MLP's down projection stays torch's GEMM (xcompute lists no kernel for it, and its cuBLASLt
+  epilogue; the MLP's down projection stays torch's GEMM (the backend lists no kernel for it, and its cuBLASLt
   fallback with a fixed workspace is slower there).
 """
 
@@ -269,7 +269,7 @@ class OptimizedPrefill(_FormatStage):
         return qkv_zba[:, :self.conv_dim], qkv_zba[:, self.conv_dim:]
 
     def _mlp(self, x, layer):
-        """gate/up with SiLU·up, then down. BF16: the down projection stays torch's GEMM (no xcompute kernel is listed
+        """gate/up with SiLU·up, then down. BF16: the down projection stays torch's GEMM (no kernel is listed
         for this shape, and its cuBLASLt fallback is slower here); MXFP8 and NVFP4: gate/up writes down's quantized
         input."""
         if self.fmt is None:

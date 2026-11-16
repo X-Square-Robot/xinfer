@@ -282,33 +282,14 @@ def test_gemm_family_norms_quantize_the_bf16_norm():
     assert torch.equal(q.view(torch.uint8), expected[0].view(torch.uint8)) and torch.equal(s, expected[1])
 
 
-def test_mxfp8_packings_go_with_their_weight(monkeypatch):
-    """An MXFP8 weight is packed once per operator; its entries go when its values or scales are freed, so a weight
-    allocated later at the same address gets its own packing."""
-    import gc
-    from types import SimpleNamespace
-
-    from xinfer.ops.backends.cuda import gemm
-
-    packed = []
-    monkeypatch.setattr(gemm, "xc", SimpleNamespace(prepack_weight=lambda q, op, scale: packed.append(op) or op))
-    monkeypatch.setattr(gemm, "_packed", {})
-    q, scales = mxfp8.quantize(torch.ones(32, 128, dtype=torch.bfloat16))
-    assert gemm._mxfp8_weight("gemm", (q, scales)) == "gemm" == gemm._mxfp8_weight("gemm", (q, scales))
-    assert gemm._mxfp8_weight("gemm_glu", (q, scales)) == "gemm_glu" and packed == ["gemm", "gemm_glu"]
-    del q
-    gc.collect()
-    assert gemm._packed == {}
-
-
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_xcompute_gemm_family_forms_match_the_references_at_wallx2b_shapes():
-    """The CUDA operators (xcompute's MXFP8 GEMM family) against the references at Wall-X 2B's shapes: ViT rows
+def test_cuda_gemm_family_forms_match_the_references_at_wallx2b_shapes():
+    """The CUDA operators (the kernels with MXFP8 operands) against the references at Wall-X 2B's shapes: ViT rows
     1568 (hidden 1024, 16 heads of 64, MLP 4096) and a prompt of 640 (hidden 2048, MLP 6144, DeltaNet 8224)."""
     table = ops.registry.build_table(resolve_platform("cuda"))
-    if table.selection("mxfp8_gemm_epilogue").library != "xcompute":
-        pytest.skip("needs an xcompute build with the MXFP8 GEMM family")
+    if table.selection("mxfp8_gemm_epilogue").library != "kernels":
+        pytest.skip("needs the CUDA kernel library (docs/kernels.md)")
     g = torch.Generator(device="cuda").manual_seed(0)
 
     def randn(*shape, scale=1.0):

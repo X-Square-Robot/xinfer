@@ -2,8 +2,8 @@
 
 A backend is the hardware an implementation runs on (``"cuda"``); the torch reference (``"reference"``) runs on every
 platform. Backend modules (``xinfer/ops/backends/<backend>/<category>.py``) import the kernel libraries they call
-(xcompute, flash-attn) and declare their implementations with ``register``; an implementation whose library did not
-import is not registered, so the operator runs on its reference.
+(the CUDA kernel library, flash-attn) and declare their implementations with ``register``; an implementation whose
+library did not import is not registered, so the operator runs on its reference.
 
 Implementations are selected once, when a model is built, not per call. The selection is recorded so that a service
 can report which backend, library, version and contract each operator uses.
@@ -62,7 +62,7 @@ class Implementation:
         contract: the numerical and runtime properties it guarantees.
         priority: selection rank; the highest-priority supported implementation wins (reference: ``-1``).
         version: library version string for the selection report, or None.
-        library: name of the kernel library it calls (``"xcompute"``), or None.
+        library: name of the kernel library it calls (``"kernels"``), or None.
     """
 
     op: str
@@ -76,7 +76,7 @@ class Implementation:
 
     @property
     def name(self) -> str:
-        """``backend:library`` (``"cuda:xcompute"``), or the backend for an implementation without a library."""
+        """``backend:library`` (``"cuda:kernels"``), or the backend for an implementation without a library."""
         return self.backend if self.library is None else f"{self.backend}:{self.library}"
 
     def supports(self, platform: Platform) -> bool:
@@ -345,17 +345,17 @@ class OpRegistry:
         """Import the built-in backend modules, then every module of the ``xinfer.ops`` entry point group.
 
         Importing a backend module registers its implementations (``register``) into the process-wide ``registry``.
-        Built-in: ``xinfer/ops/backends/cuda/`` (``attn``, ``gemm``, ``norm``, ``flow``, ``position``), on xcompute
-        (``XINFER_XCOMPUTE_LIBRARY`` or the installed ``xcompute`` package) and flash-attn (the ``flash_attn``
-        package) when they import; ``XINFER_XCOMPUTE=0`` and ``XINFER_FLASH_ATTN=0`` leave them out.
+        Built-in: ``xinfer/ops/backends/cuda/`` (``attn``, ``gemm``, ``norm``, ``flow``, ``position``), on the
+        backend's kernel library (``xinfer_kernels.so``, built from ``xinfer/ops/backends/cuda/src``) and flash-attn
+        (the ``flash_attn`` package) when they load; ``XINFER_KERNELS=0`` and ``XINFER_FLASH_ATTN=0`` leave them out.
         ``XINFER_<NAME>=0`` skips the entry point ``<name>`` without importing it (upper case, characters other than
         letters, digits and ``_`` as ``_``).
 
         Runs once per registry; later calls do nothing. Errors raised while importing a module (for example a missing
-        ``XINFER_XCOMPUTE_LIBRARY`` file) propagate.
+        ``XINFER_KERNELS_LIBRARY`` file) propagate.
 
         Returns:
-            The names (``"cuda:xcompute"``) of the implementations this call added to this registry, in order, without
+            The names (``"cuda:kernels"``) of the implementations this call added to this registry, in order, without
             repeats (empty after the first call).
         """
         if self._plugins_loaded:
@@ -386,8 +386,8 @@ class OpRegistry:
     ) -> OpTable:
         """Select the implementations of every operator for ``platform``.
 
-        ``backends`` pins an implementation per operator, by backend (``"cuda"``), library (``"xcompute"``) or both
-        (``"cuda:xcompute"``); the highest-priority match wins, and a pin that matches no implementation supporting
+        ``backends`` pins an implementation per operator, by backend (``"cuda"``), library (``"kernels"``) or both
+        (``"cuda:kernels"``); the highest-priority match wins, and a pin that matches no implementation supporting
         the platform is an error. Otherwise the highest-priority supported implementation is selected and the
         reference is the fallback.
 

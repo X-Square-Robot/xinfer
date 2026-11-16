@@ -1,8 +1,7 @@
-"""Wall-OSS ``numerics="optimized"`` against the Wall-X eager BF16 reference (GPU, xcompute, external assets).
+"""Wall-OSS ``numerics="optimized"`` against the Wall-X eager BF16 reference (GPU, external assets).
 
 Uses the assets of ``test_wall_oss_parity.py`` (``XINFER_WALL_OSS_CHECKPOINT``, ``XINFER_WALL_OSS_REFERENCE``,
-``XINFER_WALL_OSS_BF16_REFERENCE``) and ``XINFER_XCOMPUTE_LIBRARY``, an xcompute build with the unified entries
-(``main`` ``7336b0d``) and its Python package importable.
+``XINFER_WALL_OSS_BF16_REFERENCE``) and the CUDA kernel library (docs/kernels.md).
 
 The composition rounds at other points than the eager model, so each stage is compared with the reference's
 result from the reference's inputs to it within a tolerance, the full chain must stay closer to the BF16 reference
@@ -24,9 +23,8 @@ BF16 = os.environ.get("XINFER_WALL_OSS_BF16_REFERENCE")
 pytestmark = [
     pytest.mark.gpu,
     pytest.mark.assets,
-    pytest.mark.skipif(not (CKPT and REF and BF16 and os.environ.get("XINFER_XCOMPUTE_LIBRARY")
-                            and torch.cuda.is_available()),
-                       reason="Wall-OSS GPU assets or xcompute not configured"),
+    pytest.mark.skipif(not (CKPT and REF and BF16 and torch.cuda.is_available()),
+                       reason="Wall-OSS GPU assets not configured"),
 ]
 INSTRUCTION = (
     "Pick a package, flip it to show the barcode, then pass it. "
@@ -45,15 +43,15 @@ def setup():
     ops.registry.load_plugins()
     platform = resolve_platform("cuda")
     table = ops.registry.build_table(platform)
-    if table.selection("gemm_epilogue").library != "xcompute":
-        pytest.skip("needs the xcompute Python package with the unified entries")
+    if table.selection("gemm_epilogue").library != "kernels":
+        pytest.skip("needs the CUDA kernel library (docs/kernels.md)")
     with ops.use_ops(table):  # exact prompts: the fixtures' K/V have the prompt's length
         model = WallOSS.from_checkpoint(CKPT, device=platform.device,
                                         processing=ProcessingConfig(instruction_override=INSTRUCTION, prompt_bucket=0))
     assert model.numerics == "optimized"
-    xcompute_ops = {op for stage in OPTIMIZED_STAGE_OPS.values() for op in stage} - {
+    kernel_ops = {op for stage in OPTIMIZED_STAGE_OPS.values() for op in stage} - {
         "varlen_attention", "causal_attention", "linear", "silu"}
-    assert {op: table.selection(op).library for op in xcompute_ops} == {op: "xcompute" for op in xcompute_ops}
+    assert {op: table.selection(op).library for op in kernel_ops} == {op: "kernels" for op in kernel_ops}
     names = [r["name"] for r in json.loads((Path(BF16) / "bf16_reference.json").read_text())["requests"]]
     return dict(model=model, device=platform.device, prepare=model.input_processor(), names=names,
                 requests=pickle.load(open(Path(REF) / "requests.pkl", "rb")),

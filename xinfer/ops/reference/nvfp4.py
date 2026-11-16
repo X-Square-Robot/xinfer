@@ -247,7 +247,7 @@ def silu_mul_quantize(gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return quantize_values(mxfp8._silu_mul(g, u))
 
 
-# Forms of xcompute's GEMM family with NVFP4 inputs: activations ``(q [M, K/2], scales)``, weights
+# Forms of the CUDA backend's GEMM family with NVFP4 inputs: activations ``(q [M, K/2], scales)``, weights
 # ``(q [N, K/2], scales, global_scale)``. The GEMM rounds ``g · x̂·Ŵᵀ + bias`` once to BF16 (``gemm``); the epilogue
 # then works on that BF16 tensor in FP32 and rounds again, and a quantized output is ``quantize`` of the final BF16
 # tensor, so every quantized activation is a BF16 tensor quantized with ``quantize`` (the Wall-X NVFP4 recipe).
@@ -259,7 +259,7 @@ def _act(name: str | None, y: torch.Tensor) -> torch.Tensor:
 
 def gemm_epilogue(x, weight, bias=None, *, activation: str | None = None, residual: torch.Tensor | None = None,
                   out_quant: bool = False):
-    """NVFP4 ``x · weightᵀ`` with xcompute ``gemm``'s epilogue.
+    """NVFP4 ``x · weightᵀ`` with the epilogue of the CUDA backend's ``gemm``.
 
     ``y = bf16(g · x̂·Ŵᵀ + bias)`` (``gemm``), then ``bf16(act(y))``; with ``residual`` ``bf16(y + residual)``; with
     ``out_quant`` the NVFP4 ``quantize`` of the result.
@@ -290,7 +290,8 @@ def gemm_epilogue(x, weight, bias=None, *, activation: str | None = None, residu
 
 
 def gemm_glu_quantize(x, weight) -> tuple[torch.Tensor, torch.Tensor]:
-    """NVFP4 of ``bf16(silu(y_gate) · y_up)``, ``y = bf16(g · x̂·Ŵᵀ)`` (xcompute ``gemm_glu`` with ``out_quant``).
+    """NVFP4 of ``bf16(silu(y_gate) · y_up)``, ``y = bf16(g · x̂·Ŵᵀ)`` (the CUDA backend's ``gemm_glu`` with
+    ``out_quant``).
 
     Args:
         x: ``(q [M, K/2], scales)``.
@@ -308,8 +309,8 @@ def gemm_glu_quantize(x, weight) -> tuple[torch.Tensor, torch.Tensor]:
 def qkv_rope_epilogue(x, weight, bias: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, num_heads: int,
                       head_dim: int) -> torch.Tensor:
     """NVFP4 ``[Q | K | V]``: ``y = bf16(g · x̂·Ŵᵀ + bias)``, then rotate-half RoPE on every Q and K head of ``y`` in
-    FP32, rounded to BF16 (xcompute ``qkv_proj_rope``; equal Q, K and V heads, the rotation covers ``2·cos.shape[-1]``
-    channels of a head).
+    FP32, rounded to BF16 (the CUDA backend's ``qkv_proj_rope``; equal Q, K and V heads, the rotation covers
+    ``2·cos.shape[-1]`` channels of a head).
 
     Args:
         x: ``(q [M, K/2], scales)``.

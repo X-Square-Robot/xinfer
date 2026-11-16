@@ -102,7 +102,7 @@ Wall-X 2B 的各阶段不经线性层，直接调用 xcompute GEMM 系列的 NVF
 
 ## 后端
 
-PyTorch 提供 MXFP8 和 NVFP4 的参考算子。在 CUDA 上，包含 MXFP8 GEMM 和归一化入口的 xcompute 构建可以加速 Wall-X 2B 的 MXFP8 预设，带 NVFP4 输入的构建（NVFP4 量化器、GEMM 的 NVFP4 输入与输出、归一化的 NVFP4 输出）可以加速 NVFP4 预设。xcompute 的 NVFP4 量化器按 Wall-X kernel 的方式做除法（`a · rcp.approx(b)`），所以在舍入的平局处可能与参考实现不同（随机 BF16 输入中约 0.05 % 的元素）。构建和所选算子的检查方法见 [kernel 指南](kernels.zh-CN.md)。
+PyTorch 提供 MXFP8 和 NVFP4 的参考算子。在 CUDA（SM120）上，kernel 库可以加速 Wall-X 2B 的 MXFP8 预设；NVFP4 预设运行参考算子。编译和所选算子的检查方法见 [kernel 指南](kernels.zh-CN.md)。
 
 ## 测试
 

@@ -87,12 +87,17 @@ def environment(npu: bool = False) -> dict:
     """Where the row was measured (device name comes from ``request_latency.py``)."""
     import torch
 
-    library = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
+    if npu:  # the external library the Ascend backend binds
+        library = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
+    else:  # the kernel library built from this repository
+        from xinfer.ops.backends.cuda import _native
+
+        library = _native.LIBRARY_PATH
     revision = subprocess.run(["git", "-C", str(HERE), "rev-parse", "HEAD"], capture_output=True,
                               text=True).stdout.strip() if (HERE.parent / ".git").exists() else None
     result = {"created_utc": datetime.now(timezone.utc).isoformat(), "host": platform.node(), "revision": revision,
-              "torch": torch.__version__, "xcompute_library": library,
-              "xcompute_sha256": hashlib.sha256(Path(library).read_bytes()).hexdigest() if library else None}
+              "torch": torch.__version__, "kernel_library": library,
+              "kernel_library_sha256": hashlib.sha256(Path(library).read_bytes()).hexdigest() if library else None}
     if npu:
         from importlib.metadata import version
 

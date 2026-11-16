@@ -315,9 +315,9 @@ def gemm_residual(a_q, a_scales, w_q, w_scales, residual, bias=None) -> torch.Te
     return (acc + residual.to(torch.float32)).to(torch.bfloat16)
 
 
-# ------------------------------------------------- forms of xcompute's GEMM family
+# ------------------------------------------------- forms of the CUDA backend's GEMM family
 # Weights are ``(q [N, K], scales)`` pairs in the checkpoint's row order (a gate/up weight: the gate rows, then the
-# up rows); xcompute packs them for its kernels. Activations are ``(q, scales)`` pairs; outputs that feed the next
+# up rows); the backend packs them for its kernels. Activations are ``(q, scales)`` pairs; outputs that feed the next
 # GEMM are quantized with one scale per 128 columns.
 
 
@@ -346,11 +346,11 @@ def add_zero_centered_rms_norm_quantize(x: torch.Tensor, residual: torch.Tensor,
 
 def gemm_epilogue(x, weight, bias=None, *, activation: str | None = None, residual: torch.Tensor | None = None,
                   row_mask: torch.Tensor | None = None, out_quant: bool = False):
-    """MXFP8 ``x · weightᵀ`` with xcompute ``gemm``'s epilogue.
+    """MXFP8 ``x · weightᵀ`` with the CUDA backend's ``gemm``'s epilogue.
 
     ``y = act(x̂·Ŵᵀ + bias)`` in FP32, ``x̂`` and ``Ŵ`` dequantized, rows of ``x`` with ``row_mask`` 0 taken as
-    zero. The result is ``bf16(y)``; with ``residual`` ``bf16(bf16(y) + residual)`` (two roundings, as xcompute's
-    MXFP8 GEMMs); with ``out_quant`` the MXFP8 (1x128) of the FP32 ``y``.
+    zero. The result is ``bf16(y)``; with ``residual`` ``bf16(bf16(y) + residual)`` (two roundings, as the CUDA
+    backend's MXFP8 GEMMs); with ``out_quant`` the MXFP8 (1x128) of the FP32 ``y``.
 
     Args:
         x: ``(q [M, K], scales)``.
@@ -380,7 +380,7 @@ def gemm_epilogue(x, weight, bias=None, *, activation: str | None = None, residu
 
 
 def gemm_glu_quantize(x, weight) -> tuple[torch.Tensor, torch.Tensor]:
-    """MXFP8 (1x128) of ``silu(x̂·Ŵ_gateᵀ) · (x̂·Ŵ_upᵀ)`` computed in FP32 (xcompute ``gemm_glu``).
+    """MXFP8 (1x128) of ``silu(x̂·Ŵ_gateᵀ) · (x̂·Ŵ_upᵀ)`` computed in FP32 (the CUDA backend's ``gemm_glu``).
 
     Args:
         x: ``(q [M, K], scales)``.

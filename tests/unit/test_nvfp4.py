@@ -367,8 +367,8 @@ def nvfp4_backends():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     ops.registry.load_plugins()
-    if "nvfp4_gemm_epilogue" not in ops.registry.backend_ops("cuda:xcompute"):
-        pytest.skip("needs an xcompute build with NVFP4 inputs")
+    if "nvfp4_gemm_epilogue" not in ops.registry.backend_ops("cuda:kernels"):
+        pytest.skip("needs NVFP4 kernels in the CUDA kernel library")
     return ops.registry.build_table(resolve_platform("cuda"))
 
 
