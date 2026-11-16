@@ -325,6 +325,28 @@ def _qkv_2b_split(packed, q_weight, k_weight, tail):
     return q, k, v, gate
 
 
+# FLOW-TAIL FT-1: the per-layer q/k norm factors ``weight.float()+1``
+# are constants; caching them keeps the Cast+Adds prep kernels out of eager
+# runs and NPU graph capture (the cached tensors hold the weights alive, so
+# the data_ptr key stays unique; values are the identical torch composition).
+_FT_QKV_FACTORS = {}
+
+
+def _ft_qkv_factor_pair(q_weight, k_weight):
+    key = (q_weight.data_ptr(), k_weight.data_ptr())
+    pair = _FT_QKV_FACTORS.get(key)
+    if pair is None:
+        pair = (q_weight.float() + 1, k_weight.float() + 1)
+        _FT_QKV_FACTORS[key] = pair
+    return pair
+
+
+def _gqa_bhsd():
+    import os
+
+    return "bhsd" in os.environ.get("XINFER_GQA_GLUE", "")
+
+
 @register("qkv_norm_split", backend="ascend",
           requires=xc if callable(_split_forward) or callable(_qkv_2b_pair) else None,
           version=VERSION)
@@ -353,6 +375,10 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
         from xcompute.kernel.qkv_split_vec import qkv_split_vec as _qkv_vec
     except (ImportError, OSError):
         _qkv_vec = None
+    try:
+        from xcompute.kernel.qkv_split_bhsd import qkv_split_bhsd as _qkv_bhsd
+    except (ImportError, OSError):
+        _qkv_bhsd = None
     if (_qkv_vec is not None
             and packed.dim() == 3 and packed.shape[0] == 1 and packed.shape[2] == 5120
             and num_heads == 8 and num_kv_heads == 2 and head_dim == 256
@@ -373,8 +399,11 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
             k32 = kview.float()
             rq = torch.rsqrt(q32.pow(2).mean(-1, keepdim=True) + float(eps)).reshape(-1)
             rk = torch.rsqrt(k32.pow(2).mean(-1, keepdim=True) + float(eps)).reshape(-1)
-            qf = q_weight.float() + 1
-            kf = k_weight.float() + 1
+            qf, kf = _ft_qkv_factor_pair(q_weight, k_weight)
+            if (_gqa_bhsd() and _qkv_bhsd is not None and (b * n) % 8 == 0):
+                # GQA-GLUE knife 1: head-major BHSD q/k/v direct
+                # production (bitwise-equal values; layout permutation).
+                return _qkv_bhsd(packed, rq, rk, qf, kf)
             return _qkv_vec(packed, rq, rk, qf, kf)
         except (ValueError, RuntimeError):
             pass

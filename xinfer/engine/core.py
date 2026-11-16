@@ -666,6 +666,27 @@ class Engine:
         return True
 
     def _upload_prepared(self, request: _Request) -> dict:
+        """The request's tensors on the device, plus optional model-derived stage inputs.
+
+        GQA-GLUE knife 5: after the plain upload the model's optional
+        ``derive_stage_inputs`` hook may add request-derived tensors (the rope
+        tables) to the inputs dict; the stage graphs then treat them as
+        ordinary static-view-refreshed inputs instead of capturing their
+        per-request rebuild chain.
+        """
+        inputs = self._upload_prepared_base(request)
+        hook = getattr(self.model, "derive_stage_inputs", None)
+        if callable(hook):
+            try:
+                extra = hook(request.prepared.tensors, inputs)
+            except Exception:  # noqa: BLE001 - the mount is optional
+                logger.exception("derive_stage_inputs failed; running without derived inputs")
+                extra = None
+            if extra:
+                inputs.update(extra)
+        return inputs
+
+    def _upload_prepared_base(self, request: _Request) -> dict:
         """The request's tensors on the device (ADMISSION-GAP AG2: batched when possible).
 
         The batcher packs every CPU tensor of ``prepared.tensors`` into one pinned slab and issues a single

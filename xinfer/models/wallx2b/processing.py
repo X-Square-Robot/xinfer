@@ -11,6 +11,7 @@ The exact-length configuration is tested against that service bit for bit.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -427,6 +428,17 @@ class Wallx2bInputProcessor:
             self._pin_prepared = torch.zeros(1).pin_memory() is not None
         except Exception:  # noqa: BLE001 - any deviceless or pinned-alloc failure disables it
             self._pin_prepared = False
+        # HOST-FINAL HF3: with batched admission uploads on (AG2, XINFER_UPLOAD_BATCH,
+        # default on) the engine packs every CPU tensor of the request into its own
+        # pinned slab and issues one H2D copy, so per-tensor pinning in prepare
+        # (K5/PC3, ~0.17 ms of CPU per request inside the DVPP wave window) buys
+        # nothing on the batched path, and its memcpys compete with the wave's host
+        # supply chain (the PC5 lesson). Keep the pin only when batching is off (the
+        # fallback _to_device pins on the engine thread then, as before K5). Values,
+        # shapes and every uploaded byte are unchanged; pinned-ness is not observable
+        # downstream because AG2 packs from any host memory.
+        if self._pin_prepared and os.environ.get("XINFER_UPLOAD_BATCH", "1") not in ("0", "false", "False"):
+            self._pin_prepared = False
         # PREPARE-C PC3: the built _pincpp pins the prepared tensors with the GIL
         # released (the python pin loop held it ~0.5 ms per request, the largest
         # main-thread GIL item left on the K1-K6 arm; probe start.gilphase
@@ -781,6 +793,7 @@ class Wallx2bOutputProcessor:
                                                                                             c.action_dim)
         action = ((normalized[0] + 1) / 2) * c.action_norm.delta + c.action_norm.min
         response = {}
+        arms_f32 = []
         for side, key in _ARMS:
             state = request.meta["arms"][side]
             position = state[None, 0:3] + action[:, self._segments[f"{side}_ee_cartesian_pos_relative"]]
@@ -793,8 +806,12 @@ class Wallx2bOutputProcessor:
             if not np.isfinite(arm).all():
                 raise FloatingPointError(f"non-finite {key}")
             response[key] = arm.tolist()
+            arms_f32.append(arm)
         response["predict_action_norm"] = normalized
-        response["action_pred"] = np.concatenate(
-            [np.asarray(response["follow1_pos"], dtype=np.float32), np.asarray(response["follow2_pos"], np.float32)],
-            axis=-1)
+        # HOST-FINAL HF1a: concatenate the arm arrays themselves instead of the
+        # list round trip. tolist boxes float32 values as exact python floats,
+        # and np.asarray(..., float32) casts them straight back -- a lossless
+        # round trip, so values, dtype and layout are bitwise identical to the
+        # lists it used to rebuild (~12 us per request).
+        response["action_pred"] = np.concatenate(arms_f32, axis=-1)
         return response

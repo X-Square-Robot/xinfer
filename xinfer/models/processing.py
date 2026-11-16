@@ -9,6 +9,7 @@ camera order; the model's first stage normalizes them on its device (``xinfer.mo
 from __future__ import annotations
 
 import functools
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
@@ -174,6 +175,56 @@ class SegmentTokenizer:
         # disappears. A text that misses pays one hash and takes the piece path below
         # unchanged, so the ids are identical either way.
         self._whole = functools.lru_cache(cache_size)(self._encode_whole)
+        # HOST-LAST HL1: per-number ids for single-space digit runs. The serving-form
+        # state piece differs every request, so the piece lru misses and its encode is
+        # a ~0.5 ms GIL-held span on the prepare tail (probe hl-probe-B: total
+        # +0.50 ms/request); the digit run is 75% of that span and every " <int>"
+        # token repeats across requests. Assembly = concat of cached per-number
+        # tuples, byte-identical to the whole-piece encode for the guarded shape
+        # (fuzz: exhaustive pairs 0..999 + 30k random runs + boundary mutations).
+        # XINFER_HL1_NUMCACHE=off restores the released path exactly.
+        self._hl1 = os.environ.get("XINFER_HL1_NUMCACHE", "on").strip().lower() != "off"
+        self._num_run = re.compile(r"\d+(?: \d+)*")
+        self._num_token = functools.lru_cache(max(8 * cache_size, 4096))(
+            lambda token: tuple(tokenizer.encode(token, add_special_tokens=False).ids))
+
+    def _num_ids(self, run: str) -> tuple[int, ...]:
+        """The ids of a single-space digit run, assembled from per-number tuples."""
+        out: list[int] = []
+        first = True
+        for number in run.split(" "):
+            out.extend(self._num_token(number if first else " " + number))
+            first = False
+        return tuple(out)
+
+    def _encode_piece(self, piece: str) -> tuple[int, ...]:
+        """One piece's ids, with a qualifying digit run assembled from number caches.
+
+        Qualifying run: ``\d+(?: \d+)*`` of at least 4 numbers, preceded by a space
+        (or piece start) and followed by end-of-piece or a newline. The boundaries are
+        pretoken splits for this tokenizer (the space before a digit and the newline
+        after one are standalone), so ``enc(head) + enc(run) + enc(tail)`` equals the
+        whole-piece encode exactly; anything else takes the unchanged path.
+        """
+        if self._hl1:
+            for m in self._num_run.finditer(piece):
+                run = m.group(0)
+                if len(run.split(" ")) < 4:
+                    continue
+                start, end = m.span()
+                if start and piece[start - 1] != " ":
+                    continue
+                if end != len(piece) and piece[end] != "\n":
+                    continue
+                head, tail = piece[:start], piece[end:]
+                out: list[int] = []
+                if head:
+                    out.extend(self._encode(head))
+                out.extend(self._num_ids(run))
+                if tail:
+                    out.extend(self._encode(tail))
+                return tuple(out)
+        return self._encode(piece)
 
     def _encode_whole(self, text: str) -> tuple[int, ...]:
         ids = []
@@ -181,7 +232,7 @@ class SegmentTokenizer:
             if piece in self.added:
                 ids.append(self.added[piece])
             elif piece:
-                ids.extend(self._encode(piece))
+                ids.extend(self._encode_piece(piece))
         return tuple(ids)
 
     def __call__(self, text: str) -> list[int]:

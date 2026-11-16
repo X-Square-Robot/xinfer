@@ -286,14 +286,28 @@ class WallXQwen35(VLAModel, nn.Module):
         p = int(x["prompt_len"])
         h = self.embed_tokens[x["input_ids"][:, :p]]
         h[0, x["image_token_index"]] = x["image_embeds"].to(h.dtype)
-        cos, sin = text_rope_tables(self.inv_freq, x["position_ids"][:, :, :p], g.mrope_section)
         kv = batch.out["prompt_kv"]
         keep = prompt_keep_mask(x["prompt_valid"], p, dtype=h.dtype)
         if self.numerics == "optimized":
             half = g.rotary_dim // 2
+            # GQA-GLUE knife 5: the request-level cached tables (derived stage
+            # inputs) replace the in-stage rebuild chain; any envelope miss
+            # falls back to the released build.
+            rc = x["rope_cos"] if "rope_cos" in x else None
+            rs = x["rope_sin"] if "rope_sin" in x else None
+            if (torch.is_tensor(rc) and torch.is_tensor(rs)
+                    and rc.dtype == rs.dtype == torch.float32
+                    and tuple(rc.shape) == (1, p, half)
+                    and tuple(rs.shape) == tuple(rc.shape)
+                    and rc.is_contiguous() and rs.is_contiguous()
+                    and rc.device == h.device and rs.device == h.device):
+                self.prefill_stack(h, rc, rs, kv, keep.reshape(-1).to(torch.float32))
+                return
+            cos, sin = text_rope_tables(self.inv_freq, x["position_ids"][:, :, :p], g.mrope_section)
             self.prefill_stack(h, cos[:, :, 0, :half].contiguous(), sin[:, :, 0, :half].contiguous(), kv,
                                keep.reshape(-1).to(torch.float32))
             return
+        cos, sin = text_rope_tables(self.inv_freq, x["position_ids"][:, :, :p], g.mrope_section)
         full = g.full_attention_layers
         for i, layer in enumerate(self.prefill_layers[:full[-1] + 1]):
             h, k, v = layer(h, cos, sin, keep, kv_only=i == full[-1])

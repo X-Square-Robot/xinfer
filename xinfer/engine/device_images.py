@@ -19,6 +19,11 @@ from xinfer.engine.executor import _to_device
 from xinfer.models.interface import DeviceImage
 from xinfer.platforms.devices import jpeg_decoder_for
 
+try:  # aa-resample (XINFER_AA_RESAMPLE, default off)
+    from xcompute.kernel import aa_resample
+except Exception:  # pragma: no cover - optional mount
+    aa_resample = None
+
 
 def _quant_u8(x):
     """SOUP2 quant knife: one kernel for add+floor+clamp+cast; falls back."""
@@ -109,6 +114,14 @@ def _resize(view: torch.Tensor, image: DeviceImage) -> torch.Tensor:
     x = view.unsqueeze(0)
     for (mode, antialias), size in zip(image.resize, image.sizes):
         if tuple(size) != tuple(x.shape[-2:]):
+            if (
+                aa_resample is not None and mode == "bicubic" and antialias
+                and x.dtype == torch.uint8
+            ):
+                routed = aa_resample.step(x, tuple(size))
+                if routed is not None:
+                    x = routed
+                    continue
             x = F.interpolate(x.float(), size=tuple(size), mode=mode, antialias=antialias, align_corners=False)
             x = _quant_u8(x)
     return x[0].permute(1, 2, 0).contiguous()

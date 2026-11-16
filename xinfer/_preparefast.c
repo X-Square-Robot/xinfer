@@ -30,6 +30,7 @@
  */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <pthread.h>
 #define NPY_NO_DEPRECATED_API NPY_1_7_VERSION_BUILD
 #include <numpy/arrayobject.h>
 #include <math.h>
@@ -160,6 +161,158 @@ static void pf_b64_init(void) {
     pf_b64_value['/'] = 63;
 }
 
+/* ---------------- HOST-FINAL HF2: chunk-parallel large-string decode ----------------
+ * The decode is position-pure (quad q only reads src[4q..4q+3] and writes
+ * dst[3q..3q+2]), so splitting the quads into contiguous ranges produces
+ * byte-identical output, and each range applies the same first-touch quad
+ * validation; any range failing declines the whole call exactly as the serial
+ * loop would -- the accept/decline set is unchanged. The 3 static workers are
+ * created once; the calling thread decodes chunk 0. At most one parallel
+ * decode runs at a time (a second large handoff falls back to the serial
+ * path), and everything runs inside the existing Py_BEGIN_ALLOW_THREADS
+ * section, on idle cores BEFORE the wave's tickets are out (the device is
+ * idle then; the PC5 lesson about competing with the DVPP host supply chain
+ * does not apply pre-wave). */
+#define PF_B64_PARALLEL_MIN 131072
+#define PF_B64_CHUNKS 4
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv_work, cv_done;
+    int live;      /* 0 = not started, 1 = up, -1 = gave up */
+    int busy;      /* a parallel decode owns the pool */
+    int pending;   /* bitmask of dispatched worker chunks still running */
+    int ok_mask;   /* per-chunk results (bit set = chunk failed) */
+    const unsigned char *src;
+    unsigned char *dst;
+    Py_ssize_t q0[PF_B64_CHUNKS - 1], q1[PF_B64_CHUNKS - 1];
+    Py_ssize_t quads, pad;
+} pf_b64_pool_t;
+
+static pf_b64_pool_t pf_b64_pool = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER,
+    0, 0, 0, 0, NULL, NULL, {0, 0, 0}, {0, 0, 0}, 0, 0,
+};
+
+static int pf_b64_range(const unsigned char *src, unsigned char *dst,
+                        Py_ssize_t q0, Py_ssize_t q1, Py_ssize_t quads, Py_ssize_t pad) {
+    /* returns 0 on success, 1 on the first invalid quad (same math and order
+     * as the serial loop; only the quad numbered quads-1 takes pad branches) */
+    for (Py_ssize_t q = q0; q < q1; q++) {
+        const unsigned char *p = src + 4 * q;
+        unsigned v0 = pf_b64_value[p[0]], v1 = pf_b64_value[p[1]];
+        unsigned v2 = pf_b64_value[p[2]], v3 = pf_b64_value[p[3]];
+        unsigned char *d = dst + 3 * q;
+        if (v0 == 0xFF || v1 == 0xFF) return 1;
+        if (q + 1 == quads) {
+            if (pad < 2 && v2 == 0xFF) return 1;
+            if (pad < 1 && v3 == 0xFF) return 1;
+            unsigned trip = (v0 << 18) | (v1 << 12);
+            if (pad < 2) trip |= v2 << 6;
+            if (pad == 0) trip |= v3;
+            d[0] = (unsigned char)(trip >> 16);
+            if (pad != 2) d[1] = (unsigned char)(trip >> 8);
+            if (pad == 0) d[2] = (unsigned char)trip;
+        } else {
+            if (v2 == 0xFF || v3 == 0xFF) return 1;
+            unsigned trip = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+            d[0] = (unsigned char)(trip >> 16);
+            d[1] = (unsigned char)(trip >> 8);
+            d[2] = (unsigned char)trip;
+        }
+    }
+    return 0;
+}
+
+static void *pf_b64_worker(void *arg) {
+    long id = (long)arg;
+    pf_b64_pool_t *pool = &pf_b64_pool;
+    pthread_mutex_lock(&pool->mu);
+    for (;;) {
+        int bit = 1 << id;
+        while (!(pool->busy && (pool->pending & bit)))
+            pthread_cond_wait(&pool->cv_work, &pool->mu);
+        const unsigned char *src = pool->src;
+        unsigned char *dst = pool->dst;
+        Py_ssize_t q0 = pool->q0[id], q1 = pool->q1[id];
+        Py_ssize_t quads = pool->quads, pad = pool->pad;
+        pthread_mutex_unlock(&pool->mu);
+        int failed = pf_b64_range(src, dst, q0, q1, quads, pad);
+        pthread_mutex_lock(&pool->mu);
+        if (failed) pool->ok_mask |= bit;
+        /* HOST-FINAL fix: the pending bit marks the chunk IN FLIGHT and is
+         * cleared only here, after the worker stopped touching dst -- the
+         * caller returns (and may free the bytes object on decline) the
+         * moment pending hits zero, so clearing at dispatch raced the free. */
+        pool->pending &= ~bit;
+        pthread_cond_broadcast(&pool->cv_done);
+    }
+    return NULL;
+}
+
+static int pf_b64_pool_start(void) {
+    pf_b64_pool_t *pool = &pf_b64_pool;
+    pthread_mutex_lock(&pool->mu);
+    if (pool->live == 0) {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int ok = 1;
+        for (long i = 0; i < PF_B64_CHUNKS - 1; i++) {
+            pthread_t tid;
+            if (pthread_create(&tid, &attr, pf_b64_worker, (void *)i) != 0) { ok = 0; break; }
+        }
+        pthread_attr_destroy(&attr);
+        pool->live = ok ? 1 : -1;
+    }
+    int live = pool->live == 1;
+    pthread_mutex_unlock(&pool->mu);
+    return live;
+}
+
+/* returns 1 when it decoded (or declined) the whole string, 0 = caller must
+ * take the serial path */
+static int pf_b64_parallel(const unsigned char *src, unsigned char *dst,
+                           Py_ssize_t quads, Py_ssize_t pad, Py_ssize_t n) {
+    if (n < PF_B64_PARALLEL_MIN || quads < PF_B64_CHUNKS) return 0;
+    pf_b64_pool_t *pool = &pf_b64_pool;
+    if (!pf_b64_pool_start()) return 0;
+    Py_ssize_t per = quads / PF_B64_CHUNKS;
+    Py_ssize_t bounds[PF_B64_CHUNKS + 1];
+    for (int c = 0; c < PF_B64_CHUNKS; c++) bounds[c] = per * c;
+    bounds[PF_B64_CHUNKS] = quads;  /* the last quad (pad rules) goes to chunk PF_B64_CHUNKS-1 */
+    pthread_mutex_lock(&pool->mu);
+    if (pool->busy) {  /* another large decode owns the pool: serial for us */
+        pthread_mutex_unlock(&pool->mu);
+        return 0;
+    }
+    pool->src = src;
+    pool->dst = dst;
+    pool->quads = quads;
+    pool->pad = pad;
+    pool->ok_mask = 0;
+    pool->pending = 0;
+    for (int c = 1; c < PF_B64_CHUNKS; c++) {
+        pool->q0[c - 1] = bounds[c];
+        pool->q1[c - 1] = bounds[c + 1];
+        if (pool->q1[c - 1] > pool->q0[c - 1]) pool->pending |= 1 << (c - 1);
+    }
+    pool->busy = 1;
+    pthread_cond_broadcast(&pool->cv_work);
+    pthread_mutex_unlock(&pool->mu);
+    /* chunk 0 runs on the calling thread */
+    int failed = pf_b64_range(src, dst, bounds[0], bounds[1], quads, pad);
+    pthread_mutex_lock(&pool->mu);
+    while (pool->pending)
+        pthread_cond_wait(&pool->cv_done, &pool->mu);
+    if (failed) pool->ok_mask |= 1;
+    int bad = pool->ok_mask != 0;
+    pool->busy = 0;
+    pthread_cond_broadcast(&pool->cv_work);
+    pthread_mutex_unlock(&pool->mu);
+    return bad ? -1 : 1;
+}
+
 /* canonical base64 -> bytes (None = declined), the _wirefast.b64decode math */
 static PyObject *pf_b64(PyObject *arg) {
     Py_ssize_t n = 0;
@@ -179,7 +332,10 @@ static PyObject *pf_b64(PyObject *arg) {
         const unsigned char *src = (const unsigned char *)s;
         int ok = 1;
         Py_BEGIN_ALLOW_THREADS
-        for (Py_ssize_t q = 0; q < quads; q++) {
+        int prc = pf_b64_parallel(src, dst, quads, pad, n);
+        if (prc != 0) {
+            ok = prc > 0;
+        } else for (Py_ssize_t q = 0; q < quads; q++) {
             const unsigned char *p = src + 4 * q;
             unsigned v0 = pf_b64_value[p[0]], v1 = pf_b64_value[p[1]];
             unsigned v2 = pf_b64_value[p[2]], v3 = pf_b64_value[p[3]];
