@@ -253,28 +253,32 @@ def gemm_qkv_vision_rope_finish(out, accumulator, bias, cosine, sine):
              and cosine.shape[0] == rows,
              "vision rope finish requires FP32 [rows, half] cosine and sine")
     _launch(lib, "gemm_qkv_vision_rope_finish",
-            (out, accumulator, bias, cosine, sine), ())
+            (out, accumulator, bias, cosine, sine), (rows,))
 
 
 # ---------------------------------------------------------------------------
 # gemm_epilogue_glu — the served split finish (N22016 half width)
 # ---------------------------------------------------------------------------
-def gemm_epilogue_glu(out, projected, has_bias_flag, n2):
+def gemm_epilogue_glu(out, projected, has_bias_flag, half_width):
     """The fused FP32 SwiGLU finish over a borrowed FP32 accumulator.
 
-    The v22 FFI entry dispatched split_<n2/2> by width; the unified core
-    carries the served width only (11008; the 2048/3456 sites are served by
-    the smallm gateup / g2112 routes). Any other width raises and the caller
-    keeps its released chain.
+    The v22 FFI entry's 4-arg surface, kept verbatim: the last argument is the
+    OUTPUT width (half the accumulator's) and the entry dispatched
+    split_<width> by it; the unified core carries the served width only (11008;
+    the 2048/3456 sites are served by the smallm gateup / g2112 routes). Any
+    other width raises and the caller keeps its released chain.
     """
     lib = _provider.core_library()
     _require(lib is not None, "gemm_epilogue_glu: no core library")
-    half = n2 // 2
-    _require(half == 11008 and projected.dtype == torch.float32
-             and projected.is_contiguous() and projected.shape[1] == n2,
+    _require(half_width == 11008 and projected.dtype == torch.float32
+             and projected.is_contiguous() and projected.shape[1] == 2 * half_width,
              "gemm_epilogue_glu: only the N22016 half-width split is carried")
+    # The kernel takes (output, accum, bias, rows, has_bias); the v22 FFI entry
+    # this replaces fed bias=nullptr with has_bias=0 (the callers pre-fold the
+    # bias or have none). The null-optional convention passes a live pointer
+    # for the slot the kernel does not read.
     _launch(lib, "gemm_glu_fp32_finish_split_11008",
-            (out, projected), (projected.shape[0],))
+            (out, projected, projected), (projected.shape[0], int(has_bias_flag)))
 
 
 # ---------------------------------------------------------------------------
