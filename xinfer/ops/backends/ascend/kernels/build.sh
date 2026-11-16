@@ -133,8 +133,8 @@ gen simdepi ops.norm.simdepi_r1 se1_ubv1280_buf2f se1_ubv2048_buf2f
 link libsimdepi.so simdepi se1_ubv1280_buf2f se1_ubv2048_buf2f
 
 # RMSFUSE_R4 (walloss)
-gen rmsfuse_r4 ops.norm.rmsfuse_r4 rf4_m16 rf4_ubv2048_f
-link librmsfuse_r4.so rmsfuse_r4 rf4_m16 rf4_ubv2048_f
+gen rmsfuse_r4 ops.norm.rmsfuse_r4 rf4_m16 rf4_m16_f32in rf4_ubv2048_f
+link librmsfuse_r4.so rmsfuse_r4 rf4_m16 rf4_m16_f32in rf4_ubv2048_f
 
 # UBBFINISH_R5 (walloss; s4_c2048 mirrors the v22 registry's second entry)
 gen ubfinish_r5 ops.finish.ubfinish_r5 ubfinish_r5_s8_c1280 ubfinish_r5_s4_c2048
