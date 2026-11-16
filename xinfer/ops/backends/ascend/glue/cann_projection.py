@@ -442,6 +442,17 @@ class CannProjection:
                 y = y.reshape(residual.shape)
             return _add_rmsnorm(residual, y, norm_weight, epsilon, inference=True)
 
+    def copykill_f32in_available(self):
+        """INT-WOSS COPYKILL-r2 K2 capability: the core library's f32in AOT pair.
+
+        The v22 delivery's probe resolved the pair from its combined library;
+        the unified core carries the same kernel (rms_consistent_generic_h1024_f32in,
+        the leaf battery's bitwise-verified entry), so the probe resolves it there.
+        """
+        lib = _provider.core_library()
+        return (lib is not None
+                and _provider.has_symbol(lib, "xinfer_aot_rms_consistent_generic_h1024_f32in_call"))
+
     def _bnsd_m768(self, x, weight):
         """The r8 prefill M768 BNSD route: BF16 out, zero workspace, no shared buffers.
 
