@@ -315,7 +315,7 @@ def _kvcache_attention(sdpa, q, k, v, k_cache, v_cache, cache_start, cache_valid
 def prefix_kvcache_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                              prefix_len: torch.Tensor, new_pos: int, *, flash_mask: torch.Tensor | None = None,
                              scale: float | None = None) -> torch.Tensor:
-    """Attention of ``M`` new tokens over a cache prefix and their own keys (xcompute ``attention_kvcache``).
+    """Attention of ``M`` new tokens over a cache prefix and their own keys (the CUDA backend's ``attention_kvcache``).
 
     Each query can attend to the valid prefix and the new keys. An optional column mask supplies the valid query
     row range for each key.
@@ -436,7 +436,7 @@ def segment_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seql
 
 def gated_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor, *,
                            scale: float | None = None) -> torch.Tensor:
-    """Causal attention over one sequence, output times ``sigmoid(gate)`` (xcompute ``attention_varlen``).
+    """Causal attention over one sequence, output times ``sigmoid(gate)`` (the CUDA backend's ``attention_varlen``).
 
     Args:
         q: ``[T, H, D]`` BF16.
@@ -458,7 +458,7 @@ def gated_kvcache_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: tor
                             flash_mask: torch.Tensor | None = None, scale: float | None = None) -> torch.Tensor:
     """Attention of ``M`` new tokens over a cache prefix and their own keys, output times ``sigmoid(gate)``.
 
-    xcompute ``attention_kvcache`` with ``new_pos``: request ``b`` sees cache rows ``[0, prefix_len[b])`` and
+    The CUDA backend's ``attention_kvcache`` with ``new_pos``: request ``b`` sees cache rows ``[0, prefix_len[b])`` and
     ``[new_pos, new_pos + M)`` (the new tokens' keys, already in the cache). ``flash_mask`` (int32
     ``[B, 1, L, 2]``, ``(LTS, UTE)`` per cache row) removes row ``c`` for query ``t`` when ``t >= LTS`` or
     ``t < UTE``.

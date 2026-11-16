@@ -28,7 +28,7 @@ Wall-OSS 是这一架构的开源名称（[X-Square-Robot/wall-x](https://github
 - `pip install -e '.[models]'`（tokenizers、OpenCV、PyYAML）以及 `numba`。旋转换算在 numba 下运行，以便与参考服务逐位一致（见[设计](wall_oss_design.zh-CN.md#处理)）。
 - 一块 CUDA GPU，BF16 权重需要约 10 GB 空闲显存（测试可在 CPU 上运行）。
 - 使用 `image_preprocess_device="gpu"` 时：`pip install -e '.[gpu-image]'`（NVIDIA 的 nvImageCodec，`nvidia-nvimgcodec-cu13`）。
-- optimized 组合（默认）：可导入一个针对该 GPU 架构编译的 xcompute 构建的 Python 包，安装与检查方法见 [kernel](../kernels.zh-CN.md)。本文的数据在 RTX 5090（SM120）上测得。缺少时它运行在 torch 参考实现上（很慢）。
+- optimized 组合（默认）：针对该 GPU 架构编译的 CUDA kernel 库，编译与检查方法见 [kernel](../kernels.zh-CN.md)。本文的数据在 RTX 5090（SM120）上测得。缺少时它运行在 torch 参考实现上（很慢）。
 
 ## 运行
 

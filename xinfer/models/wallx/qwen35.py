@@ -68,7 +68,7 @@ class WallXQwen35(VLAModel, nn.Module):
         checkpoint: Checkpoint directory (kept for the processors).
         embedding_rows: Rows of the token embedding table in the checkpoint.
         processing: ``ProcessingConfig``, dict or ``None``, passed to the processors.
-        numerics: ``"optimized"`` (xcompute's operators) or ``"reference"`` (the Wall-X model under BF16
+        numerics: ``"optimized"`` (the CUDA backend's kernels) or ``"reference"`` (the Wall-X model under BF16
             autocast).
         mxfp8: Stages of the optimized composition whose GEMMs run in MXFP8 (``"vision"``, ``"prefill"``).
 

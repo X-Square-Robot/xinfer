@@ -34,7 +34,7 @@ def gemm_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
                   activation: str | None = None, residual: torch.Tensor | None = None,
                   residual_gate: torch.Tensor | None = None, row_class: torch.Tensor | None = None,
                   row_scale: torch.Tensor | None = None) -> torch.Tensor:
-    """``x · weightᵀ`` with xcompute ``gemm``'s epilogue.
+    """``x · weightᵀ`` with the CUDA backend's ``gemm``'s epilogue.
 
     ``y = act(row_scale · (x·Wᵀ + bias))`` in FP32. Without ``residual`` the result is ``bf16(y)``; with it
     ``bf16(residual + y)``; with a ``residual_gate`` ``[R, N]`` and ``row_class`` the gated branch is rounded first:
@@ -70,7 +70,7 @@ def gemm_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
 def gemm_glu_epilogue(x: torch.Tensor, weight: torch.Tensor, *, bias: torch.Tensor | None = None,
                       modulation: torch.Tensor | None = None, row_class: torch.Tensor | None = None,
                       eps: float = 1e-6) -> torch.Tensor:
-    """``silu(x̂·W_gateᵀ) · (x̂·W_upᵀ)`` (xcompute ``gemm_glu``), with an optional AdaRMS input norm.
+    """``silu(x̂·W_gateᵀ) · (x̂·W_upᵀ)`` (the CUDA backend's ``gemm_glu``), with an optional AdaRMS input norm.
 
     ``x̂ = x`` or, with a ``modulation`` table, ``x · rsqrt(mean(x²) + eps) · (1 + scale) + shift`` of each token's
     row in FP32, not rounded before the GEMM.
@@ -96,7 +96,8 @@ def gemm_glu_epilogue(x: torch.Tensor, weight: torch.Tensor, *, bias: torch.Tens
 
 def qkv_rope_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, cos: torch.Tensor,
                       sin: torch.Tensor, num_heads: int, head_dim: int, *, qk_order: str = "standard") -> torch.Tensor:
-    """``[Q | K | V] = x·Wᵀ + bias`` with rotate-half RoPE on every Q and K head (xcompute ``qkv_proj_rope``).
+    """``[Q | K | V] = x·Wᵀ + bias`` with rotate-half RoPE on every Q and K head (the CUDA backend's
+    ``qkv_proj_rope``).
 
     Equal numbers of Q, K and V heads (a ViT); the rotation covers ``2·cos.shape[-1]`` channels of each head and
     is applied to the FP32 accumulator, so the output rounds once.
@@ -210,7 +211,7 @@ def qkv_rope_kvcache(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
                      sin: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, start: int, num_heads: int,
                      num_kv_heads: int, head_dim: int) -> torch.Tensor:
     """``[Q | K | V] = x·Wᵀ + bias`` in FP32, rotate-half RoPE on the Q and K heads, K and V written to head-major
-    caches (xcompute ``qkv_proj_rope`` with ``kv_cache``): grouped-query attention without q/k norms.
+    caches (the CUDA backend's ``qkv_proj_rope`` with ``kv_cache``): grouped-query attention without q/k norms.
 
     Args:
         x: ``[M, K]`` BF16.

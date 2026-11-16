@@ -55,8 +55,8 @@ Use Python 3.10+ and a PyTorch build matched to your accelerator. These examples
 python -m pip install -e ".[models,serve]"
 ```
 
-The default Wall-OSS BF16 path uses **xcompute**. Install a build for your CUDA GPU and
-check the selected backends in the [kernel guide](docs/kernels.md). If the build is unavailable,
+The default Wall-OSS BF16 path uses the CUDA kernels in this repository. Build them for your GPU and
+check the selected backends in the [kernel guide](docs/kernels.md). Without the built library,
 XInfer uses the slower PyTorch reference implementations.
 
 The examples use BF16 and require the [supported Wall-OSS checkpoint layout](docs/models/wall_oss.md#requirements), including its tokenizer and normalization files.
@@ -121,9 +121,9 @@ Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 
 
 Each accelerator runs its own Engine and weights.
 
-Optimized CUDA execution uses an **xcompute** build and the optional FlashAttention
+Optimized CUDA execution uses the kernel library built from this repository and the optional FlashAttention
 backend; see [kernels](docs/kernels.md).
-Ascend binds a prebuilt Ascend **xcompute** build the same way, with NPU graphs and
+Ascend binds a prebuilt Ascend **xcompute** build, with NPU graphs and
 DVPP device images; see the [Ascend guide](docs/ascend950dt.md).
 
 ## Performance

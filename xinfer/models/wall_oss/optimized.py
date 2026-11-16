@@ -1,9 +1,9 @@
-"""Wall-OSS on xcompute (``numerics="optimized"``, the default), BF16.
+"""Wall-OSS on the CUDA backend's kernels (``numerics="optimized"``, the default), BF16.
 
 Each stage runs the steps of the reference composition (``numerics="reference"``, the Wall-X eager model) on
-operators of ``xinfer/ops/reference/`` (each an xcompute call where xcompute lists a kernel, else its torch
+operators of ``xinfer/ops/reference/`` (each a kernel call where the CUDA backend lists a kernel, else its torch
 reference). GEMM weights are ``[N, K]``; the action stage's output and down projections are stored ``[K, N]``,
-which selects xcompute's small-M kernel. Differences to the reference:
+which selects the small-M kernel. Differences to the reference:
 
 - every residual add and the RMSNorm after it are one call (``add_rms_norm``), the sum rounded to BF16 as before;
   in the ViT the projection before it joins them (``gemm_add_rms_norm``), which on integrated GPUs adds the residual

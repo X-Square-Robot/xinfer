@@ -12,7 +12,7 @@ model splits exactly into three stages:
 - ``action``: N Euler steps of expert 1 attending to the prompt K/V.
 
 The ``numerics`` model option selects the composition, both BF16. ``"optimized"`` (the default) runs the
-steps on xcompute's operators (``optimized.py``). ``"reference"`` follows the Wall-X eager model
+steps on the CUDA backend's kernels (``optimized.py``). ``"reference"`` follows the Wall-X eager model
 (Wall-X 02c5351d): BF16 weights and activations, FP32 RMSNorm weights in the
 language stacks, FP32 action head and ODE state. RTC requests use the served attention
 semantics (pinned action tokens never attend to denoising tokens, at every
@@ -263,7 +263,7 @@ class WallOSS(VLAModel, nn.Module):
             processing: ``ProcessingConfig``, dict or ``None`` for the input processor.
             norm_key: Key suffix of the action statistics (``min.<key>``, ``delta.<key>``).
             quantization: ``None`` or ``"bf16"`` (the only precision).
-            numerics: ``"optimized"`` (xcompute's operators, ``xinfer/models/wall_oss/optimized.py``) or
+            numerics: ``"optimized"`` (the CUDA backend's kernels, ``xinfer/models/wall_oss/optimized.py``) or
                 ``"reference"`` (the Wall-X eager model).
 
         Returns:

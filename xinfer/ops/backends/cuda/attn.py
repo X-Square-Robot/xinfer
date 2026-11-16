@@ -24,28 +24,46 @@ order), deterministic, graph safe. ``varlen_attention``
 takes ``cu_seqlens`` as a host sequence; its device copy is created on the
 first (eager) call for each layout and reused, also inside captured graphs.
 
-xcompute (``_xcompute``), each on the shapes and options its kernel lists (asked once per shape on the first, eager
-call); the other calls run on the reference:
+The kernels of this backend (``_native``), each on the shapes it is tuned and tested on (``*_takes``); the other
+calls run on the reference:
 
-| operator | xcompute entry | other calls |
-|---|---|---|
-| ``prefix_kvcache_attention`` | ``attention_kvcache`` | reference |
-| ``segment_attention`` | ``attention_varlen`` (segment layout on the host) | reference |
-| ``gated_causal_attention`` | ``attention_varlen`` with the gate | reference |
-| ``gated_kvcache_attention`` | ``attention_kvcache`` with the gate | ungated kernel and separate sigmoid gate when listed, otherwise reference |
-| ``gated_delta_net`` | ``gated_delta_rule_prefill`` | reference for unlisted lengths; one sequence with heads of 128 only (ValueError) |
+| operator | function here |
+|---|---|
+| ``prefix_kvcache_attention`` | ``attention_kvcache`` |
+| ``segment_attention`` | ``attention_varlen`` |
+| ``gated_kvcache_attention`` | ``attention_kvcache`` (``gate``) |
+| ``gated_delta_net`` | ``gated_delta_rule_prefill`` (one sequence) |
+
+``attention_kvcache``: a few new tokens over a KV cache. The keys of request ``b`` are the cache rows
+``[0, prefix_len[b])`` and ``[p, p + M)``, with ``p = new_pos`` or ``prefix_len[b]`` when ``new_pos`` is None;
+the K and V of the new tokens are already in the cache. The kernel splits the keys into chunks, one CTA per
+(head group, chunk) computing a partial softmax, and a second kernel merges the partials; the chunk size depends
+on the cache length only.
+
+``attention_varlen``: bidirectional attention inside each segment of a packed sequence (the images of a vision
+tower). One persistent CTA per SM with two teams of warps; the (segment, head, 64 query rows) units are spread
+over the SMs by their key count on the host, and a unit cut between two SMs is merged by whichever half finishes
+last, so no CTA waits for another.
+
+``gated_delta_rule_prefill``: the gated delta rule (a linear-attention mixer) over one sequence, from a zero
+state, from the mixer's input projections to its normalized output: a causal depthwise convolution (4 taps) + SiLU
+on ``qkv``, L2-normalized q and k, the delta-rule recurrence in chunks of 32 rows, and a gated RMSNorm with ``z``.
+Three kernels chained on the stream; every element is summed in an order that depends on the shape only, so results
+repeat bit for bit.
 
 Contracts against the torch references: tolerance.
 """
 
 from __future__ import annotations
 
+import collections
+import math
 import os
 
 import torch
 
 from xinfer.ops import reference
-from xinfer.ops.backends._xcompute import XCOMPUTE, xc, xcompute_with
+from xinfer.ops.backends.cuda._native import BUILD_ARCHS, NATIVE, arch, capturing, lib, scratch
 from xinfer.ops.reference import attn as reference_attn
 from xinfer.ops.registry import register
 
@@ -224,89 +242,279 @@ def action_attention(q, k, v, k_prompt, v_prompt, num_pinned, prompt_lengths=Non
     return out.reshape(b, n, heads, d)
 
 
-_listed = {}  # (entry, shapes, options) -> whether the entry's kernel list takes the call
+# ---------------------------------------------------------------------------
+# Kernels of this backend
+# ---------------------------------------------------------------------------
+# arch -> (query heads, KV heads, head dim) -> inclusive ranges of batch, M (query rows) and L (cache rows)
+KVCACHE_SHAPES = {
+    120: {(16, 2, 128): dict(batch=(1, 8), m=(1, 32), l=(64, 1984)),
+          (8, 2, 256): dict(batch=(1, 2), m=(1, 32), l=(64, 1984))},
+}
 
 
-def _takes(entry, probe, key, *args, **kwargs) -> bool:
-    """Whether ``probe(*args, **kwargs)``, an xcompute ``*_backend`` query, finds a kernel (it raises ValueError
-    otherwise).
+def _chunk(cache_rows):
+    """Keys per chunk: shorter caches use smaller chunks so that every SM has work."""
+    return 32 if cache_rows <= 576 else 64
 
-    Asked once per ``(entry, key)``, on its first (eager) call: the engine runs every new graph key before capturing it.
+
+def attention_kvcache_takes(q, k_cache) -> bool:
+    """Whether :func:`attention_kvcache` runs ``q`` ``[B, M, H, D]`` over ``k_cache`` ``[B, L, H_kv, D]`` here."""
+    if q.dim() != 4 or k_cache.dim() != 4 or q.dtype != torch.bfloat16:
+        return False
+    device_arch = arch(q.device)
+    b, m, heads, d = q.shape
+    ranges = KVCACHE_SHAPES.get(device_arch, {}).get((heads, k_cache.shape[2], d)) if device_arch in BUILD_ARCHS else None
+    if ranges is None:
+        return False
+    return all(lo <= v <= hi for v, (lo, hi) in ((b, ranges["batch"]), (m, ranges["m"]),
+                                                   (k_cache.shape[1], ranges["l"])))
+
+
+def attention_kvcache(q, k_cache, v_cache, *, prefix_len, new_pos=None, flash_mask=None, softmax_scale=None,
+                      gate=None, out=None):
+    """Attention of ``q`` ``[B, M, H, D]`` over ``k_cache`` / ``v_cache`` ``[B, L, H_kv, D]`` (BF16, the last
+    dimension dense); BF16 ``[B, M, H * D]``.
+
+    ``prefix_len``: int32 ``[B]`` on the device. ``new_pos``: an int, the same for every request, or None.
+    ``flash_mask``: int32 ``[B, 1 | H_kv, L, 2]`` holding (LTS, UTE) per cache row: query row ``t`` skips the key
+    when ``t >= LTS`` or ``t < UTE``. ``softmax_scale`` defaults to ``1 / sqrt(D)``. ``gate``: BF16
+    ``[B, M, H * D]`` (the last dimension dense); the result is multiplied by ``bf16(sigmoid(gate))`` in a second
+    kernel.
     """
-    if (entry, key) not in _listed:
-        try:
-            probe(*args, **kwargs)
-            _listed[entry, key] = True
-        except ValueError:
-            _listed[entry, key] = False
-    return _listed[entry, key]
+    if not attention_kvcache_takes(q, k_cache):
+        raise ValueError(f"attention_kvcache: no kernel for q {tuple(q.shape)} over a cache {tuple(k_cache.shape)} "
+                         f"on SM{arch(q.device)} (see attention_kvcache_takes)")
+    b, m, heads, d = q.shape
+    cache_rows, kv_heads = k_cache.shape[1], k_cache.shape[2]
+    if tuple(v_cache.shape) != tuple(k_cache.shape) or k_cache.shape[0] != b or k_cache.shape[3] != d:
+        raise ValueError("attention_kvcache: k_cache and v_cache must be [B, L, H_kv, D]")
+    for t in (q, k_cache, v_cache):
+        if t.dtype != torch.bfloat16 or t.stride(-1) != 1:
+            raise ValueError("attention_kvcache: q and the caches must be BF16 with a dense last dimension")
+    if prefix_len.dtype != torch.int32 or tuple(prefix_len.shape) != (b,):
+        raise ValueError("attention_kvcache: prefix_len must be an int32 device tensor [B]")
+    if new_pos is not None and not 0 <= int(new_pos) <= cache_rows - m:
+        raise ValueError(f"attention_kvcache: new_pos={new_pos} needs 0 <= new_pos and new_pos + M <= L")
+    if out is None:
+        out = torch.empty(b, m, heads * d, dtype=torch.bfloat16, device=q.device)
+    chunk = _chunk(cache_rows)
+    need = int(lib.attention_kvcache_splitkv_workspace_size(b, m, heads, kv_heads, d, cache_rows, chunk))
+    lib.attention_kvcache_splitkv(
+        out, None, k_cache, v_cache, scratch("attention_kvcache", need, q.device), q, prefix_len, None, None,
+        flash_mask, None, None, -1 if new_pos is None else int(new_pos), False,
+        1.0 / math.sqrt(d) if softmax_scale is None else float(softmax_scale), chunk, 0, False)
+    if gate is not None:
+        lib.sigmoid_gate_mul_inplace(out, gate, True)
+    return out
 
 
-@register("prefix_kvcache_attention", backend="cuda", **XCOMPUTE)
+# arch -> (heads, head dim) -> inclusive ranges of the segment count and of T (total rows)
+VARLEN_SHAPES = {
+    120: {(16, 64): dict(segments=(1, 64), t=(1, 4096))},
+}
+
+_plans = collections.OrderedDict()  # (device, heads, segment lengths) -> (pieces, team ranges) on the device
+_plans_in_graph = set()  # plans a captured graph points at: never dropped
+_PLANS_MAX = 256
+_varlen_scratch = {}  # (device, stream) -> (FP32 partial sums, zeroed int32 pair counters the kernel leaves zeroed)
+
+
+def _lengths(segments):
+    bounds = [int(b) for b in (segments.tolist() if torch.is_tensor(segments) else segments)]
+    return tuple(b - a for a, b in zip(bounds[:-1], bounds[1:])), bounds
+
+
+def attention_varlen_takes(q, segments) -> bool:
+    """Whether :func:`attention_varlen` runs ``q`` ``[T, H, D]`` with these segment bounds here."""
+    if q.dim() != 3 or q.dtype != torch.bfloat16:
+        return False
+    device_arch = arch(q.device)
+    ranges = VARLEN_SHAPES.get(device_arch, {}).get(tuple(q.shape[1:])) if device_arch in BUILD_ARCHS else None
+    if ranges is None:
+        return False
+    lengths, bounds = _lengths(segments)
+    if not lengths or bounds[0] != 0 or bounds[-1] != q.shape[0] or min(lengths) < 1:
+        return False
+    return all(lo <= v <= hi for v, (lo, hi) in ((len(lengths), ranges["segments"]), (q.shape[0], ranges["t"])))
+
+
+def _plan(lengths, heads, sms):
+    """Pieces (first row of the segment, its length, head, first query row, first and last key block, part,
+    pair id) and the piece ranges of the ``2 * sms`` teams.
+
+    A unit is 64 query rows of one (segment, head) and costs its key blocks (64 keys each). The units, largest
+    first, are cut into ``sms`` equal runs of key blocks; a unit crossing a boundary becomes a front and a back
+    piece (never more than two), and the pieces of an SM go to its two teams by longest-processing-time-first."""
+    starts, total = [], 0
+    for n in lengths:
+        starts.append(total)
+        total += n
+    units = [[starts[s], n, h, row, 0, -(-n // 64), -1, 0]
+             for h in range(heads) for s, n in enumerate(lengths) for row in range(0, n, 64)]
+    units.sort(key=lambda u: -u[5])  # stable
+    blocks = sum(u[5] for u in units)
+    per_sm = [[] for _ in range(sms)]
+    done = unit = offset = pairs = 0
+    for sm in range(sms):
+        end = (sm + 1) * blocks // sms
+        while done < end and unit < len(units):
+            u = units[unit]
+            # a unit is cut at most once: its back piece takes all that is left, even past this SM's share
+            take = u[5] - offset if offset > 0 else min(u[5], end - done)
+            piece = list(u)
+            piece[4], piece[5] = offset, offset + take
+            if take < u[5] or offset > 0:
+                piece[6] = 0 if offset == 0 else 1
+                piece[7] = pairs if offset == 0 else pairs - 1
+                pairs += offset == 0
+            per_sm[sm].append(piece)
+            done += take
+            offset += take
+            if offset == u[5]:
+                offset, unit = 0, unit + 1
+    pieces, team_start = [], [0]
+    for mine in per_sm:
+        teams, load = ([], []), [0, 0]
+        for piece in sorted(mine, key=lambda p: -(p[5] - p[4])):
+            team = 0 if load[0] <= load[1] else 1
+            teams[team].append(piece)
+            load[team] += piece[5] - piece[4]
+        for team in teams:
+            pieces += team
+            team_start.append(len(pieces))
+    return pieces or [[0] * 8], team_start
+
+
+def attention_varlen(q, k, v, segments, *, softmax_scale=None, out=None):
+    """Attention of every row of ``q`` ``[T, H, D]`` over the ``k`` / ``v`` ``[T, H, D]`` rows of its own
+    segment (BF16, the last dimension dense); BF16 ``[T, H * D]``.
+
+    ``segments``: the ``n + 1`` row bounds of the ``n`` segments, ``0 .. T``, as a host sequence. The work plan
+    of a segment layout and the scratch memory of a stream are made on their first call, which must not be inside
+    a CUDA graph capture.
+    """
+    if not attention_varlen_takes(q, segments):
+        raise ValueError(f"attention_varlen: no kernel for q {tuple(q.shape)} with segments {list(segments)} on "
+                         f"SM{arch(q.device)} (see attention_varlen_takes)")
+    if tuple(k.shape) != tuple(q.shape) or tuple(v.shape) != tuple(q.shape):
+        raise ValueError("attention_varlen: q, k and v must have the same shape [T, H, D]")
+    device = q.device
+    total, heads, d = q.shape
+    lengths, _ = _lengths(segments)
+    in_capture = capturing(device)
+    key = (device.index, heads, lengths)
+    plan = _plans.get(key)
+    if plan is None:
+        if in_capture:
+            raise RuntimeError("attention_varlen plans a segment layout on its first call, which must not "
+                               "be inside a CUDA graph capture")
+        pieces, team_start = _plan(lengths, heads, torch.cuda.get_device_properties(device).multi_processor_count)
+        plan = _plans[key] = (torch.tensor(pieces, dtype=torch.int32).to(device),
+                              torch.tensor(team_start, dtype=torch.int32).to(device))
+        for old in [p for p in _plans if p not in _plans_in_graph][: max(0, len(_plans) - _PLANS_MAX)]:
+            del _plans[old]
+    else:
+        _plans.move_to_end(key)
+    if in_capture:
+        _plans_in_graph.add(key)
+    stream_key = (device.index, torch.cuda.current_stream(device).cuda_stream)
+    buffers = _varlen_scratch.get(stream_key)
+    if buffers is None:
+        if in_capture:
+            raise RuntimeError("attention_varlen needs scratch memory on a stream that is capturing a CUDA "
+                               "graph; run it once before capture")
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        buffers = _varlen_scratch[stream_key] = (torch.empty(sms * 2 * 128 * 36, dtype=torch.float32, device=device),
+                                                 torch.zeros(sms, dtype=torch.int32, device=device))
+    if out is None:
+        out = torch.empty(total, heads * d, dtype=torch.bfloat16, device=device)
+    lib.attention_varlen_lpt_bf16_sm120(out, q, k, v, plan[0], plan[1], buffers[0], buffers[1],
+                                        1.0 / math.sqrt(d) if softmax_scale is None else float(softmax_scale))
+    return out
+
+
+HEAD_DIM = 128
+# arch -> (key heads, value heads) -> inclusive range of the sequence length
+DELTA_RULE_SHAPES = {
+    120: {(16, 16): (1, 1024)},
+}
+
+
+def _heads(qkv, zba, num_k_heads):
+    value_heads, rest = divmod(zba.shape[-1], HEAD_DIM + 2)
+    if rest or qkv.shape[-1] != (2 * num_k_heads + value_heads) * HEAD_DIM:
+        return None
+    return int(num_k_heads), value_heads
+
+
+def gated_delta_rule_prefill_takes(qkv, zba, *, num_k_heads) -> bool:
+    """Whether :func:`gated_delta_rule_prefill` runs ``qkv`` ``[S, ...]`` and ``zba`` ``[S, ...]`` here."""
+    if qkv.dim() != 2 or zba.dim() != 2 or qkv.dtype != torch.bfloat16 or qkv.shape[0] != zba.shape[0]:
+        return False
+    device_arch = arch(qkv.device)
+    lo, hi = DELTA_RULE_SHAPES.get(device_arch if device_arch in BUILD_ARCHS else None, {}).get(_heads(qkv, zba, num_k_heads),
+                                                                                     (1, 0))
+    return lo <= qkv.shape[0] <= hi
+
+
+def gated_delta_rule_prefill(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, *, num_k_heads, eps=1e-6, out=None):
+    """``qkv`` BF16 ``[S, (2 H_k + H_v) * 128]``: the q, k and v inputs of the convolution. ``zba`` BF16
+    ``[S, H_v * 130]``: per value head the gate input ``z`` (128), then the logits of the write strength and of
+    the decay. ``conv_weight`` BF16 ``[(2 H_k + H_v) * 128, 4]``; ``A_log``, ``dt_bias`` FP32 ``[H_v]``
+    (``decay = exp(-exp(A_log) * softplus(logit + dt_bias))``); ``norm_weight`` BF16 ``[128]``.
+
+    Returns BF16 ``[S, H_v * 128]``.
+    """
+    if not gated_delta_rule_prefill_takes(qkv, zba, num_k_heads=num_k_heads):
+        raise ValueError(f"gated_delta_rule_prefill: no kernel for qkv {tuple(qkv.shape)}, zba {tuple(zba.shape)}, "
+                         f"num_k_heads={num_k_heads} on SM{arch(qkv.device)} (see gated_delta_rule_prefill_takes)")
+    key_heads, value_heads = _heads(qkv, zba, num_k_heads)
+    rows = qkv.shape[0]
+    if out is None:
+        out = torch.empty(rows, value_heads * HEAD_DIM, dtype=torch.bfloat16, device=qkv.device)
+    need = int(lib.gated_delta_rule_prefill_workspace_size(0, rows, key_heads, value_heads))
+    lib.gated_delta_rule_prefill(out, scratch("gated_delta_rule", need, qkv.device), qkv, zba, conv_weight, A_log,
+                                 dt_bias, norm_weight, None, key_heads, 0, float(eps), False)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Operators on them
+# ---------------------------------------------------------------------------
+@register("prefix_kvcache_attention", backend="cuda", **NATIVE)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
-    options = dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
-    key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
-    if not _takes("kvcache", xc.attention_kvcache_backend, key, q, k_cache, v_cache, **options):
+    if not attention_kvcache_takes(q, k_cache):
         return reference_attn.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
-                                                       flash_mask=flash_mask,
-                                                       scale=scale)
-    b, m = q.shape[:2]
-    return xc.attention_kvcache(q, k_cache, v_cache, **options).reshape(b, m, -1)
+                                                       flash_mask=flash_mask, scale=scale)
+    return attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
+                                flash_mask=flash_mask, softmax_scale=scale)
 
 
-_segment_layouts = {}  # (segment bounds, heads, head_dim) -> whether attention_varlen's kernel list takes the layout
-
-
-@register("segment_attention", backend="cuda", **xcompute_with("attention_varlen", "attention_varlen_backend"))
+@register("segment_attention", backend="cuda", **NATIVE)
 def segment_attention(q, k, v, cu_seqlens, *, scale=None):
     bounds = tuple(cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else cu_seqlens)
-    cu = torch.tensor(bounds, dtype=torch.int32)  # on the host: the backend plans its work per segment layout
-    longest = max(end - start for start, end in zip(bounds[:-1], bounds[1:]))
-    key = (bounds, *q.shape[1:])
-    if key not in _segment_layouts:
-        try:
-            xc.attention_varlen_backend(q, k, v, cu_seqlens=cu, max_seqlen=longest)
-            _segment_layouts[key] = True
-        except ValueError:
-            _segment_layouts[key] = False
-    if not _segment_layouts[key]:
+    if not attention_varlen_takes(q, bounds):
         return reference.varlen_attention(q, k, v, bounds, scale=scale)
-    return xc.attention_varlen(q, k, v, cu_seqlens=cu, max_seqlen=longest, softmax_scale=scale).view(q.shape)
+    return attention_varlen(q, k, v, bounds, softmax_scale=scale).view(q.shape)
 
 
-@register("gated_causal_attention", backend="cuda", **xcompute_with("attention_varlen", "attention_varlen_backend"))
-def gated_causal_attention(q, k, v, gate, *, scale=None):
-    options = dict(seg_len=q.shape[0], causal=True, out_gate=gate, gate_act="sigmoid")
-    if not _takes("varlen", xc.attention_varlen_backend, (q.shape, k.shape), q, k, v, **options):
-        return reference_attn.gated_causal_attention(q, k, v, gate, scale=scale)  # no kernel listed for these heads
-    return xc.attention_varlen(q, k, v, softmax_scale=scale, pdl=False, **options)
-
-
-@register("gated_kvcache_attention", backend="cuda", **xcompute_with("sigmoid_gate_mul_inplace"))
+@register("gated_kvcache_attention", backend="cuda", **NATIVE)
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
-    options = dict(prefix_len=prefix_len, new_pos=int(new_pos), flash_mask=flash_mask, softmax_scale=scale)
-    key = (q.shape, k_cache.shape, int(new_pos), flash_mask is not None)
-    if _takes("kvcache_gated", xc.attention_kvcache_backend, key, q, k_cache, v_cache, out_gate=gate,
-              gate_act="sigmoid", **options):
-        return xc.attention_kvcache(q, k_cache, v_cache, out_gate=gate, gate_act="sigmoid", **options)
-    if not _takes("kvcache", xc.attention_kvcache_backend, key, q, k_cache, v_cache, **options):
+    if not attention_kvcache_takes(q, k_cache):
         return reference_attn.gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate,
-                                                      flash_mask=flash_mask, scale=scale)  # no kernel for these heads
-    o = xc.attention_kvcache(q, k_cache, v_cache, **options)  # no gated kernel for these heads
-    return xc.sigmoid_gate_mul_inplace(o.reshape(gate.shape), gate, round_sigmoid=True)
+                                                      flash_mask=flash_mask, scale=scale)
+    return attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
+                                flash_mask=flash_mask, softmax_scale=scale, gate=gate)
 
 
-@register("gated_delta_net", backend="cuda", **xcompute_with("gated_delta_rule_prefill", "gated_delta_rule_prefill_backend"))
+@register("gated_delta_net", backend="cuda", **NATIVE)
 def gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim,
                     head_v_dim, eps):
     b, n, _ = qkv.shape
-    if b != 1 or head_k_dim != 128 or head_v_dim != 128 or zba.shape[-1] != num_v_heads * (head_v_dim + 2):
-        raise ValueError("xcompute gated_delta_rule_prefill takes one sequence with heads of 128")
-    rows = (qkv.reshape(n, -1), zba.reshape(n, -1))
-    if not _takes("gated_delta_rule", xc.gated_delta_rule_prefill_backend, (n, num_k_heads, num_v_heads), *rows,
-                  num_k_heads=num_k_heads):  # no kernel listed for this length, these heads or this GPU
+    rows = (qkv.reshape(b * n, -1), zba.reshape(b * n, -1))
+    if b != 1 or head_k_dim != head_v_dim or not gated_delta_rule_prefill_takes(*rows, num_k_heads=num_k_heads):
         return reference_attn.gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads,
                                               num_v_heads, head_k_dim, head_v_dim, eps)
-    out = xc.gated_delta_rule_prefill(*rows, conv_weight, A_log, dt_bias, norm_weight, num_k_heads=num_k_heads,
+    out = gated_delta_rule_prefill(*rows, conv_weight, A_log, dt_bias, norm_weight, num_k_heads=num_k_heads,
                                       eps=float(eps))
     return out.view(1, n, -1)

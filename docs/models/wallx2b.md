@@ -29,7 +29,7 @@ xinfer-serve --model wallx2b --checkpoint /path/to/wallx2b-checkpoint \
   --device cuda --warmup flow.msgpack rtc.msgpack --port 33985
 ```
 
-The default optimized BF16 composition uses xcompute when available. See the [kernel guide](../kernels.md) to install a matching build and inspect the selected operators. To run the reference composition with FlashAttention 2 for vision, install a compatible FlashAttention 2 build and add `--model-options '{"numerics":"reference"}' --reference-ops --op-backends varlen_attention=flash_attn` to the service command.
+The default optimized BF16 composition uses the CUDA kernel library when it is built. See the [kernel guide](../kernels.md) to build it and inspect the selected operators. To run the reference composition with FlashAttention 2 for vision, install a compatible FlashAttention 2 build and add `--model-options '{"numerics":"reference"}' --reference-ops --op-backends varlen_attention=flash_attn` to the service command.
 
 The same flow observation can be run in process. The example selects CPU image preprocessing to match the service default.
 

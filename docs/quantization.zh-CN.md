@@ -90,7 +90,7 @@ GEMM 始终是输出 BF16 的 `nvfp4_gemm`。其余部分都在该输出上运�
 
 ## 后端
 
-PyTorch 提供 MXFP8 和 NVFP4 的参考算子。在 CUDA 上，包含 MXFP8 GEMM 和归一化入口的 xcompute 构建可以加速 Wall-X 2B 的 MXFP8 预设。构建和所选算子的检查方法见 [kernel 指南](kernels.zh-CN.md)。
+PyTorch 提供 MXFP8 和 NVFP4 的参考算子。在 CUDA（SM120）上，kernel 库可以加速 Wall-X 2B 的 MXFP8 预设。编译和所选算子的检查方法见 [kernel 指南](kernels.zh-CN.md)。
 
 ## 测试
 

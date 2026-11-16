@@ -2,62 +2,64 @@
 
 English | [简体中文](kernels.zh-CN.md)
 
-The default BF16 compositions for Wall-OSS and Wall-X 2B use xcompute's fused operators on CUDA. XInfer can run the same composition using PyTorch reference implementations when a compatible xcompute build is unavailable. Install the optional `flash-attn` package for vision and prompt attention.
+The default compositions for Wall-OSS and Wall-X 2B use fused operators on CUDA. Their kernels are in this repository (`xinfer/ops/backends/cuda/src`) and build into one library, `xinfer_kernels.so`. XInfer runs the same compositions on PyTorch reference implementations when the library is not built. Install the optional `flash-attn` package for vision and prompt attention.
 
-The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the xcompute and flash-attn libraries and load the same way as extensions in the `xinfer.ops` entry point group ([registration](design.md#142-backend-registration-and-selection)). Operators whose library does not import run on their torch references, and a warning lists the slow ones; `XINFER_OPS_STRICT=1` makes that warning an error. For example, set `XINFER_FLASH_ATTN=0` to skip flash-attn at load time.
+The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the kernel library and flash-attn and load the same way as extensions in the `xinfer.ops` entry point group ([registration](design.md#142-backend-registration-and-selection)). Operators whose library does not load run on their torch references, and a warning lists the slow ones; `XINFER_OPS_STRICT=1` makes that warning an error. For example, set `XINFER_FLASH_ATTN=0` to skip flash-attn at load time.
 
 ## GPU support
 
-The xcompute build must target the architecture of the serving GPU. Check `xcompute.build_target_archs()`. The [Wall-OSS and Wall-X 2B benchmarks](performance.md) used an RTX 5090 and xcompute `7336b0d`. Built for Jetson Thor (`--arch 110`), xcompute `c0d03ca` or later also has the SM110 kernels Wall-OSS's optimized composition selects there: the fused prefill MLP, the weight-multicast GEMMs and the QKV projection writing Q and K in rotary-pair order ([Wall-OSS design](models/wall_oss_design.md)).
+The kernel library is built for one GPU architecture and registers its operators on that architecture only. This repository has kernels for SM120 (RTX 50 series).
 
-## Install and select a build
+A GEMM runs on a kernel written for its architecture when the call is one that kernel was tuned on, and otherwise on cuBLASLt with the epilogue as a separate kernel. Each kernel lists the shapes it takes next to the code that launches it (`xinfer/ops/backends/cuda/gemm_sm120.py`): the ranges of rows over which it was measured not slower than the cuBLASLt path on an RTX 5090. The attention and flow kernels list their shapes the same way (`attn.py`, `flow.py`), and the calls outside them run on the torch reference.
 
-Install a matching xcompute Python package and shared library from your provider. Neither is bundled with XInfer. For BF16, use a build with the unified GEMM, attention and norm entries. A build that supports `prepack_weight(layout="kn")` uses transposed weights without copying. Older builds copy these weights to a contiguous tensor. Wall-X 2B selects its additional CUDA operators individually when the build provides their entry points. If using a CUDA 13 source build, install the `apache-tvm-ffi` Python package in the same environment and compile for the deployment GPU.
+## Build
+
+Building needs the CUDA 13 toolkit, CMake 3.24 or later, the `apache-tvm-ffi` Python package and the CUTLASS headers (a submodule):
+
+```bash
+git submodule update --init third_party/cutlass
+pip install -e ".[kernels]"
+cmake -S xinfer/ops/backends/cuda/src -B build/kernels
+cmake --build build/kernels -j
+```
+
+This writes `xinfer/ops/backends/cuda/xinfer_kernels.so`. The target architecture is the first GPU of the build machine; `-DXINFER_CUDA_ARCH=120` sets it on a machine without that GPU.
 
 ## Run
 
-Put the Python package of the checkout on the path; it finds the library the checkout built:
-
 ```bash
-export PYTHONPATH=/path/to/xcompute/python:$PYTHONPATH
 xinfer-serve --model wall_oss --checkpoint /path/to/checkpoint --device cuda \
   --warmup observation.msgpack --port 33985
 ```
 
-XInfer loads the library of the importable `xcompute` package and uses its unified GEMM, attention and norm entries,
-with the package's rebuild-on-import turned off. `XINFER_XCOMPUTE_LIBRARY=/path/to/xcompute.so` loads another
-library instead, such as another BF16 build; the package must then come from the same build. `XINFER_XCOMPUTE=0`
-turns the backend off. The same variables apply to `Policy`, the tests and the benchmarks.
+XInfer loads `xinfer_kernels.so` from its package directory. `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` loads a library built elsewhere from the same sources. `XINFER_KERNELS=0` turns the backend off. The same variables apply to `Policy`, the tests and the benchmarks.
 
 ## Check
 
 `xinfer-serve` logs each operator's backend when the model is loaded:
 
 ```
-xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue': 'xcompute', 'gemm_glu_epilogue': 'xcompute', ...}
+xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue': 'kernels', 'gemm_glu_epilogue': 'kernels', ...}
 ```
 
-`--resolved-config FILE` writes the same list to `FILE`, and in Python `Policy.describe()["ops"]` lists it. With a
-working build the fused operators (`gemm_epilogue`, `gemm_glu_epilogue`, `qkv_rope_kvcache` and the other
-operators of `xinfer/ops/reference/` that the model uses) report `xcompute`. `reference` for them means XInfer found no
-usable build:
+`--resolved-config FILE` writes the same list to `FILE`, and in Python `Policy.describe()["ops"]` lists it. With the library loaded the fused operators (`gemm_epilogue`, `gemm_glu_epilogue`, `qkv_rope_kvcache` and the other operators of `xinfer/ops/reference/` that the model uses) report `kernels`. `reference` for them means XInfer did not load it:
 
-- no `xcompute` package is importable and `XINFER_XCOMPUTE_LIBRARY` is unset, or it points to a missing file;
-- the build does not target this GPU's architecture (`python -c "import xcompute; print(xcompute.build_target_archs())"`);
-- the `xcompute` package lacks the unified entries;
-- the library lacks the functions those entries call: it comes from a different build than the package.
+- `xinfer/ops/backends/cuda/xinfer_kernels.so` is not built, or `XINFER_KERNELS_LIBRARY` points to a missing file;
+- the `apache-tvm-ffi` package is not installed;
+- the library was built for another GPU architecture.
 
 `Policy` and `xinfer-serve` then log a warning when they load Wall-OSS on a GPU:
 
 ```
-wall_oss: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Install
-xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: docs/kernels.md
+wall_oss: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Build the
+CUDA kernel library for this GPU: docs/kernels.md
 ```
 
-xcompute may select its generic cuBLASLt GEMM when a build has no shape-specific kernel for a weight.
+`pytest tests/kernels` runs every kernel on the shapes it takes against FP32 torch; it needs the GPU and the built library.
 
 ## Ascend
 
-The `ascend` backend uses the same shared xcompute loader and `XINFER_XCOMPUTE_LIBRARY` /
-`XINFER_XCOMPUTE=0` settings. Available implementations are selected automatically; unsupported calls use
-their torch fallback. See the [Ascend guide](ascend950dt.md) for runtime, image processing and NPU graphs.
+The `ascend` backend binds an external xcompute build through `xinfer/ops/backends/_xcompute.py`, with the
+`XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0` settings. Available implementations are selected automatically;
+unsupported calls use their torch fallback. See the [Ascend guide](ascend950dt.md) for runtime, image processing
+and NPU graphs.

@@ -1,6 +1,4 @@
-"""Fused Wall-OSS and Wall-X 2B operators against unfused torch (CPU) and xcompute kernels (GPU)."""
-
-import os
+"""Fused Wall-OSS and Wall-X 2B operators against unfused torch (CPU) and the CUDA backend's kernels (GPU)."""
 
 import pytest
 import torch
@@ -43,50 +41,29 @@ def test_gemm_glu_epilogue_is_ada_rms_norm_then_silu_mul():
                                F.silu(y[:, :8]) * y[:, 8:])
 
 
-def test_transposed_gemm_weight_on_an_xcompute_build_without_kn(monkeypatch):
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    from xinfer.ops.backends.cuda import gemm
-
-    prepack = Mock(side_effect=ValueError("prepack_weight: layout= only takes 'nk_k64blk' (a BF16 gemm weight)"))
-    monkeypatch.setattr(gemm, "xc", SimpleNamespace(prepack_weight=prepack))
-    monkeypatch.setattr(gemm, "_supports_kn", True)
-    for n in (4, 6):
-        weight = torch.arange(3 * n).reshape(3, n).t()
-        dense = gemm._kn(weight)
-        assert dense.is_contiguous() and torch.equal(dense, weight)
-    assert prepack.call_count == 1
-
-
-def test_a_packed_weight_is_not_reused_for_another_weight_at_the_same_address(monkeypatch):
-    """The packing cache is keyed by the weight's address; its entry goes when the weight is freed, so a weight
-    allocated later at that address (another model loaded in the same process) gets its own packing."""
+def test_a_derived_weight_is_not_reused_for_another_weight_at_the_same_address(monkeypatch):
+    """The cache of reordered weight copies is keyed by the weight's address; its entry goes when the weight is
+    freed, so a weight allocated later at that address (another model loaded in the same process) gets its own."""
     import gc
-    import types
-    import weakref
 
-    from xinfer.ops.backends.cuda import gemm
+    from xinfer.ops.backends.cuda import _native
 
-    packings = []
+    monkeypatch.setattr(_native, "capturing", lambda device: False)
+    monkeypatch.setattr(_native, "_derived", {})
+    made = []
 
-    def prepack_weight(weight, op):  # a packing is a copy: it keeps no reference to the weight
-        packings.append(weakref.ref(weight))
-        return types.SimpleNamespace(source=weakref.ref(weight))
+    def copy_of(weight):
+        made.append(tuple(weight.shape))
+        return weight.clone()
 
-    package = types.SimpleNamespace(
-        prepack_weight=prepack_weight,
-        selected_backend=lambda op, x, w, **options: "fast" if hasattr(w, "source") else "generic")
-    monkeypatch.setattr(gemm, "xc", package)
-    monkeypatch.setattr(gemm, "_packed", {})
-    x = torch.zeros(2, 8)
     w = torch.ones(4, 8)
-    assert gemm._listed_weight("gemm", x, w).source() is w
-    assert gemm._listed_weight("gemm", x, w[:2]).source() is not w  # a view of another shape: its own packing
-    assert gemm._listed_weight("gemm", x, w).source() is w and len(packings) == 2  # cached
-    del w
+    first = _native.derived("kn", w, lambda: copy_of(w))
+    assert _native.derived("kn", w, lambda: copy_of(w)) is first  # cached
+    assert _native.derived("kn", w[:2], lambda: copy_of(w[:2])) is not first  # a view of another shape: its own
+    assert made == [(4, 8), (2, 8)]
+    w = first = None
     gc.collect()
-    assert gemm._packed == {}  # the weight is gone: so are its entries
+    assert _native._derived == {}  # the weight is gone: so are its entries
 
 
 def test_qkv_rope_epilogue_rotates_q_and_k_halves():
@@ -139,52 +116,17 @@ def test_add_rms_norm_is_the_rounded_sum_and_its_norm():
     assert torch.equal(total, residual + x) and torch.equal(normed, reference.rms_norm(residual + x, w, 1e-6))
 
 
-def test_an_xcompute_package_of_another_build_is_not_used(monkeypatch, tmp_path):
-    """A package whose library lacks the unified entries' functions (another build, such as the MXFP8 one) would fail
-    at the first GEMM: the fused operators stay on their references."""
-    import sys
-    import types
-
-    from xinfer.ops.backends import _xcompute as xcompute
-
-    path = tmp_path / "xcompute.so"
-    path.write_bytes(b"")
-    package = types.ModuleType("xcompute")
-    package.KERNEL_LIB_PATH = str(path)
-    for name in xcompute.UNIFIED:
-        setattr(package, name, object())
-    monkeypatch.setitem(sys.modules, "xcompute", package)
-    monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
-
-    class Library:
-        def __init__(self, functions):
-            self.path, self.functions = str(path), functions
-
-        def has_function(self, name):
-            return name in self.functions
-
-        def function(self, name):
-            return lambda: "120"  # a CUDA-style build: the arch probe answers with digits
-
-    assert xcompute._python_package(Library(xcompute.LIBRARY_ENTRIES)) is package
-    assert xcompute._python_package(Library(())) is None
-
-
 def _fake_package(monkeypatch, tmp_path):
     """A stand-in ``xcompute`` package whose library is ``tmp_path/xcompute.so``, importable as ``xcompute``."""
     import importlib.machinery
     import sys
     import types
 
-    from xinfer.ops.backends import _xcompute as xcompute
-
     path = tmp_path / "xcompute.so"
     path.write_bytes(b"")
     package = types.ModuleType("xcompute")
     package.__spec__ = importlib.machinery.ModuleSpec("xcompute", None)
     package.KERNEL_LIB_PATH = str(path)
-    for name in xcompute.UNIFIED:
-        setattr(package, name, object())
     monkeypatch.setitem(sys.modules, "xcompute", package)
     monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
     return package
@@ -193,132 +135,71 @@ def _fake_package(monkeypatch, tmp_path):
 MXFP8 = ("mxfp8_quantize", "mxfp8_layer_norm_quantize", "mxfp8_zero_centered_rms_norm_quantize",
          "mxfp8_add_zero_centered_rms_norm_quantize", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
          "mxfp8_qkv_rope_epilogue")
+FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm",
+         "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler")
+WALLX2B = ("layer_norm_cast", "zero_centered_rms_norm", "add_zero_centered_rms_norm", "modulated_rms_norm",
+           "gated_residual_modulated_rms_norm", "identity_layer_norms_", "qkv_norm_split", "qkv_norm_rope_kvcache",
+           "rope_full", "rot_pos", "pos_embed_interp", "segment_attention", "gated_kvcache_attention",
+           "gated_delta_net", "flow_input_embed")
 
 
-@pytest.mark.parametrize("archs,platforms", [("110,120", ("sm110", "sm120")), ("120", ("sm120",)), ("", ())])
-def test_xcompute_runs_on_the_architectures_the_build_targets(archs, platforms):
-    from xinfer.ops.backends import _xcompute
-
-    class Library:
-        def function(self, name):
-            assert name == "build_target_archs"
-            return lambda: archs
-
-    assert _xcompute.target_archs(Library()) == platforms
-
-
-@pytest.mark.parametrize("mxfp8", [False, True])
-def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(monkeypatch, mxfp8):
-    """With xcompute imported, every fused operator is registered on its build's architectures (the MXFP8 ones when the
-    library has the MXFP8 GEMM family); without it, none."""
+def test_the_cuda_modules_register_their_operators_when_the_kernel_library_loads(monkeypatch):
+    """With the kernel library loaded, every operator of the CUDA modules is registered on the architectures it was
+    built for; without it, none."""
     import importlib
     import types
 
-    from xinfer.ops.backends import _xcompute
+    from xinfer.ops.backends.cuda import _native
     from xinfer.ops.registry import BUILTIN_MODULES, OpRegistry
 
     registry_module = importlib.import_module("xinfer.ops.registry")  # ``xinfer.ops.registry`` is the instance
 
-    def registered(xcompute):
-        """A registry of every operator after importing the CUDA modules with ``_xcompute.XCOMPUTE = xcompute``."""
+    def registered(arguments):
+        """A registry of every operator after importing the CUDA modules with ``_native.NATIVE = arguments``."""
         registry = OpRegistry()
         for name in ops.registry.names():
             registry.define(ops.registry.spec(name))
         monkeypatch.setattr(registry_module, "registry", registry)
-        monkeypatch.setattr(_xcompute, "XCOMPUTE", xcompute)
-        monkeypatch.setattr(_xcompute, "xc", xcompute["requires"])
-        monkeypatch.setattr(_xcompute, "library", types.SimpleNamespace(
-            has_function=lambda name: mxfp8 and name in _xcompute.MXFP8_FUNCTIONS))
+        monkeypatch.setattr(_native, "NATIVE", arguments)
         for module in BUILTIN_MODULES:
             importlib.reload(importlib.import_module(module))
         return registry
 
-    package = types.ModuleType("xcompute")
-    package.denoise_output_euler_backend = object()
+    library = types.SimpleNamespace(__name__="kernels")
     try:
-        registry = registered(dict(requires=package, platforms=("sm120",), version="sha256:0"))
-        names = registry.backend_ops("cuda:xcompute")
-        assert set(names) == set(FUSED) | (set(MXFP8) if mxfp8 else set())
+        registry = registered(dict(requires=library, platforms=("sm120",), version="sha256:0"))
+        names = registry.backend_ops("cuda:kernels")
+        assert set(names) == set(FUSED) | set(WALLX2B) | set(MXFP8)
         # Filter by implementation: the Ascend backend registers some of the same operators after the CUDA modules.
         assert {i.platforms for name in names for i in registry.implementations(name)
-                if i.name == "cuda:xcompute"} == {("sm120",)}
-        # A build may have the base GEMM kernels and only some of the 2B kernels.
-        package.denoise_input_embed = object()
-        enabled = registered(dict(requires=package, platforms=("sm120",), version="sha256:0"))
-        assert set(enabled.backend_ops("cuda:xcompute")) == (set(FUSED) | {"flow_input_embed"}
-                                                             | (set(MXFP8) if mxfp8 else set()))
-        assert registered(dict(requires=None, platforms=(), version=None)).backend_ops("cuda:xcompute") == []
+                if i.name == "cuda:kernels"} == {("sm120",)}
+        assert registered(dict(requires=None, platforms=(), version=None)).backend_ops("cuda:kernels") == []
     finally:
         monkeypatch.undo()
         for module in BUILTIN_MODULES:  # register the modules as imported into the process-wide registry again
             importlib.reload(importlib.import_module(module))
 
 
-@pytest.mark.parametrize("gated,ungated,expected", [(True, True, "gated"), (False, True, "separate"),
-                                                    (False, False, "reference")])
-def test_gated_kvcache_selects_an_available_kernel(monkeypatch, gated, ungated, expected):
-    from types import SimpleNamespace
-
-    from xinfer.ops.backends.cuda import attn as cuda
-
-    def probe(*args, **options):
-        if not (gated if "out_gate" in options else ungated):
-            raise ValueError("no listed kernel")
-
-    gate = torch.zeros(1, 2, 4)
-    xc = SimpleNamespace(attention_kvcache_backend=probe,
-                         attention_kvcache=lambda *args, **opts: "gated" if "out_gate" in opts else gate,
-                         sigmoid_gate_mul_inplace=lambda *args, **opts: "separate")
-    monkeypatch.setattr(cuda, "xc", xc)
-    monkeypatch.setattr(cuda, "_listed", {})
-    monkeypatch.setattr(attn, "gated_kvcache_attention", lambda *args, **opts: "reference")
-    q, cache = gate.view(1, 2, 2, 2), torch.zeros(1, 4, 1, 2)
-    assert cuda.gated_kvcache_attention(q, cache, cache, torch.tensor([2]), 2, gate) == expected
-
-
-def test_cuda_operators_use_reference_when_the_build_rejects_a_shape(monkeypatch):
-    from types import SimpleNamespace
+def test_cuda_operators_use_the_reference_for_a_shape_their_kernel_does_not_take(monkeypatch):
     from unittest.mock import Mock
 
     from xinfer.ops.backends.cuda import attn as cuda_attn
     from xinfer.ops.backends.cuda import flow as cuda_flow
 
-    reject = Mock(side_effect=ValueError("no listed kernel"))
-    launch = Mock(side_effect=AssertionError("kernel was not admitted"))
-    xc = SimpleNamespace(gated_delta_rule_prefill_backend=reject, gated_delta_rule_prefill=launch,
-                         denoise_input_embed_backend=reject, denoise_input_embed=launch,
-                         denoise_output_euler_backend=reject, denoise_output_euler=launch)
-    monkeypatch.setattr(cuda_attn, "xc", xc)
-    monkeypatch.setattr(cuda_attn, "_listed", {})
-    monkeypatch.setattr(cuda_flow, "xc", xc)
+    launch = Mock(side_effect=AssertionError("the kernel does not take this call"))
+    for module, name in ((cuda_attn, "gated_delta_rule_prefill"), (cuda_flow, "denoise_input_embed"),
+                         (cuda_flow, "denoise_output_euler")):
+        monkeypatch.setattr(module, name, launch)
+        monkeypatch.setattr(module, name + "_takes", lambda *args, **options: False)
     monkeypatch.setattr(attn, "gated_delta_net", lambda *args: "delta reference")
     qkv, zba = torch.zeros(1, 3, 384, dtype=BF16), torch.zeros(1, 3, 130, dtype=BF16)
     assert cuda_attn.gated_delta_net(qkv, zba, None, None, None, None, 1, 1, 128, 128, 1e-6) == "delta reference"
     x, h = torch.arange(6.).reshape(1, 3, 2), torch.ones(1, 3, 4, dtype=BF16)
     embed, readout = torch.ones(1, 4, 2), torch.ones(2, 4)
-    for _ in range(2):
-        assert torch.equal(cuda_flow.flow_input_embed(x, embed), flow.flow_input_embed(x, embed))
-        assert torch.equal(cuda_flow.flow_velocity_euler(x, h, readout, 0.25),
-                           flow.flow_velocity_euler(x, h, readout, 0.25))
-    assert reject.call_count == 3
+    assert torch.equal(cuda_flow.flow_input_embed(x, embed), flow.flow_input_embed(x, embed))
+    assert torch.equal(cuda_flow.flow_velocity_euler(x, h, readout, 0.25),
+                       flow.flow_velocity_euler(x, h, readout, 0.25))
     launch.assert_not_called()
-
-
-def test_flow_embed_on_a_build_without_a_capability_query(monkeypatch):
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-
-    from xinfer.ops.backends.cuda import flow as cuda
-
-    launch = Mock(return_value="native")
-    monkeypatch.setattr(cuda, "xc", SimpleNamespace(denoise_input_embed=launch))
-    x, weight = torch.ones(1, 2, 2), torch.ones(1, 4, 2)
-    assert cuda.flow_input_embed(x, weight) == "native"
-    launch.side_effect = ValueError("denoise_input_embed: no white-list entry accepts this shape")
-    assert torch.equal(cuda.flow_input_embed(x, weight), flow.flow_input_embed(x, weight))
-    launch.side_effect = ValueError("invalid weights")
-    with pytest.raises(ValueError, match="invalid weights"):
-        cuda.flow_input_embed(x, weight)
 
 
 def test_the_xcompute_library_comes_from_the_installed_package(monkeypatch, tmp_path):
@@ -339,21 +220,16 @@ def test_xinfer_xcompute_0_skips_xcompute(monkeypatch):
     assert _xcompute._import() is None and calls == []
 
 
-# --------------------------------------------------------------------------- xcompute (GPU, RTX 5090)
-XCOMPUTE = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
-gpu = pytest.mark.skipif(not (XCOMPUTE and torch.cuda.is_available()
-                              and torch.cuda.get_device_capability() == (12, 0)),
-                         reason="xcompute + an SM120 GPU required")
-FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm",
-         "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler",
-         "prefetch_weights", "join_prefetch")
+# --------------------------------------------------------------------------- the kernel library (GPU, RTX 5090)
+gpu = pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0)),
+                         reason="an SM120 GPU required")
 
 
 @pytest.fixture(scope="module")
 def xc():
-    names = (ops.registry.load_plugins(), ops.registry.backend_ops("cuda:xcompute"))[1]
+    names = (ops.registry.load_plugins(), ops.registry.backend_ops("cuda:kernels"))[1]
     if "gemm_epilogue" not in names:
-        pytest.skip("needs a build of xcompute main and the xcompute Python package of the same build")
+        pytest.skip("needs the CUDA kernel library (docs/kernels.md)")
     missing = set(FUSED) - set(names)
     assert not missing, missing
     return ops.registry.build_table(resolve_platform("cuda"))
@@ -370,7 +246,7 @@ def _check(table, name, args, *, atol=0.0, bitwise=False, equal=False, relative=
     got = getattr(table, name)(*clone(args), **kwargs)
     want = ops.registry.spec(name).reference(*clone(args), **kwargs)
     got, want = (tuple(x) if isinstance(x, tuple) else (x,) for x in (got, want))
-    assert table.selection(name).library == "xcompute"
+    assert table.selection(name).library == "kernels"
     assert table.selection(name).contract.numerics == ("bitwise" if bitwise else "tolerance")
     for a, b in zip(got, want):
         if bitwise or equal:
@@ -383,7 +259,7 @@ def _check(table, name, args, *, atol=0.0, bitwise=False, equal=False, relative=
 
 @gpu
 @pytest.mark.gpu
-def test_xcompute_matches_the_references_at_wall_oss_shapes(xc):
+def test_kernels_match_the_references_at_wall_oss_shapes(xc):
     """Wall-OSS: ViT width 1280 (16 heads of 80, GLU with bias), expert 0 width 2048 and expert 1 width 1024 with
     16/2/128 attention heads, QKV bias and M-RoPE; FP32 norm weights."""
     g = torch.Generator().manual_seed(17)
@@ -400,7 +276,7 @@ def test_xcompute_matches_the_references_at_wall_oss_shapes(xc):
         args = (r(m, k), r(2560, k, scale=k ** -0.5), r(2560), angles.cos(), angles.sin())
         got = xc.qkv_rope_kvcache(*args, caches[0][0], caches[0][1], 32, 16, 2, 128)
         want = ops.registry.spec("qkv_rope_kvcache").reference(*args, caches[1][0], caches[1][1], 32, 16, 2, 128)
-        assert xc.selection("qkv_rope_kvcache").library == "xcompute"
+        assert xc.selection("qkv_rope_kvcache").library == "kernels"
         for a, b in ((got, want), (caches[0], caches[1])):
             assert float((a.float() - b.float()).norm() / b.float().norm()) < 0.01
     p, m = 768, 16
@@ -410,22 +286,6 @@ def test_xcompute_matches_the_references_at_wall_oss_shapes(xc):
     _check(xc, "prefix_kvcache_attention", (r(1, m, 16, 128), r(1, p + m, 2, 128), r(1, p + m, 2, 128),
                                             torch.tensor([p], dtype=torch.int32, device="cuda"), p),
            kwargs=dict(flash_mask=flash_mask.contiguous()), relative=0.01)
-
-
-@gpu
-@pytest.mark.gpu
-def test_xcompute_gemm_packs_a_weight_only_a_packed_layout_lists(xc):
-    """At 16 rows xcompute lists the gate/up GEMM only for a packed weight: the binding packs the raw weight and runs
-    the listed kernel."""
-    import xcompute
-
-    g = torch.Generator().manual_seed(17)
-    x = _randn(16, 1024, dtype=BF16, device="cuda", generator=g)
-    w = _randn(4096, 1024, scale=1 / 32, dtype=BF16, device="cuda", generator=g)
-    packed = xcompute.prepack_weight(w, op="gemm_glu")
-    assert xcompute.selected_backend("gemm_glu", x, w, activation="silu") == "generic"
-    assert xcompute.selected_backend("gemm_glu", x, packed, activation="silu") != "generic"
-    assert torch.equal(xc.gemm_glu_epilogue(x, w), xcompute.gemm_glu(x, packed, activation="silu"))
 
 
 def test_add_zero_centered_norm_returns_the_sum_and_its_norm():
@@ -573,19 +433,12 @@ def test_qkv_norm_rope_kvcache_is_the_gemm_then_the_split_norms_and_rope():
 
 @gpu
 @pytest.mark.gpu
-def test_xcompute_matches_the_references_at_wallx2b_shapes(xc):
-    """Wall-X 2B: attention heads 8/2/256 (no gated kernel is listed: ungated attention_kvcache and the gate, and the
-    reference for the causal prompt attention), action width 1024, 16 action rows, 26 action values."""
-    required = ("gated_causal_attention", "gated_kvcache_attention", "modulated_rms_norm",
-                "gated_residual_modulated_rms_norm", "identity_layer_norms_", "qkv_norm_rope_kvcache",
-                "flow_input_embed")
-    missing = [name for name in required if xc.selection(name).library != "xcompute"]
-    if missing:
-        pytest.skip(f"installed xcompute build lacks Wall-X 2B kernels: {', '.join(missing)}")
+def test_kernels_match_the_references_at_wallx2b_shapes(xc):
+    """Wall-X 2B: attention heads 8/2/256 (attention_kvcache and the gate as a second kernel), action width 1024,
+    16 action rows, 26 action values."""
     g = torch.Generator().manual_seed(16)
     r = lambda *s, scale=1.0, dtype=BF16: _randn(*s, scale=scale, dtype=dtype, device="cuda", generator=g)  # noqa: E731
     p, m, a = 430, 16, 1024
-    _check(xc, "gated_causal_attention", (r(p, 8, 256), r(p, 2, 256), r(p, 2, 256), r(p, 2048)), equal=True)
     visible = torch.ones(m, p + m, dtype=torch.bool, device="cuda")
     visible[:3, p + 3:] = False  # RTC: the pinned rows do not see the others
     _check(xc, "gated_kvcache_attention", (r(1, m, 8, 256), r(1, p + m, 2, 256), r(1, p + m, 2, 256),
@@ -607,7 +460,7 @@ def test_xcompute_matches_the_references_at_wallx2b_shapes(xc):
     double = dict(pinned_input_modulation=pinned, pinned_post_modulation=mod, pinned_rows=rows)
     got_gate = xc.identity_layer_norms_(*got, gate, mod, pinned, 1e-6, **double)
     want_gate = ops.registry.spec("identity_layer_norms_").reference(*want, gate, mod, pinned, 1e-6, **double)
-    assert xc.selection("identity_layer_norms_").library == "xcompute"
+    assert xc.selection("identity_layer_norms_").library == "kernels"
     for x, y in zip((*got, got_gate), (*want, want_gate)):
         assert float((x.float() - y.float()).norm() / y.float().norm()) < 0.01
     angles = torch.rand(m, 32, device="cuda") * 20
@@ -625,72 +478,6 @@ def test_xcompute_matches_the_references_at_wallx2b_shapes(xc):
            relative=1e-4)
 
 
-def test_qkv_rope_epilogue_writes_pair_order_only_when_asked_and_listed(monkeypatch):
-    """qk_order="any" runs the rotary-pair weight and output where packing gives that layout and the call selects
-    a kernel for it; the default order, a GPU without such a kernel, or a call outside its table run as before."""
-    import types
-
-    from xinfer.ops.backends.cuda import gemm
-
-    calls = []
-    packed = types.SimpleNamespace(layout="nk_rope_pairs")
-    package = types.SimpleNamespace(
-        pack_rope_table=lambda cos, sin: "table",
-        prepack_weight=lambda w, **kwargs: calls.append(("prepack", kwargs["num_heads"])) or packed,
-        selected_backend=lambda op, x, w, **kwargs: "tcgen05_bf16_sm110",
-        qkv_proj_rope=lambda x, w, *args, **kwargs: calls.append(
-            ("qkv", "packed" if w is packed else "raw", kwargs.get("out_layout"))))
-    monkeypatch.setattr(gemm, "xc", package)
-    monkeypatch.setattr(gemm, "_pair_weights", {})
-    x, w, b, cs = torch.zeros(4, 8), torch.zeros(24, 8), torch.zeros(24), torch.zeros(4, 2)
-
-    gemm.qkv_rope_epilogue(x, w, b, cs, cs, 2, 4)
-    gemm.qkv_rope_epilogue(x, w, b, cs, cs, 2, 4, qk_order="any")
-    assert calls == [("qkv", "raw", None), ("prepack", 2), ("qkv", "packed", "rope_pairs")]
-
-    calls.clear()  # a call the pair kernel's table does not take
-    package.selected_backend = lambda op, x, w, **kwargs: "generic"
-    gemm.qkv_rope_epilogue(x, w, b, cs, cs, 2, 4, qk_order="any")
-    assert calls == [("qkv", "raw", None)]
-
-    calls.clear()  # no pair-order kernel on this GPU: packing picks another layout, the raw weight runs
-    monkeypatch.setattr(gemm, "_pair_weights", {})
-    packed.layout = "nk"
-    gemm.qkv_rope_epilogue(x, w, b, cs, cs, 2, 4, qk_order="any")
-    assert calls == [("prepack", 2), ("qkv", "raw", None)]
-
-
-@pytest.mark.parametrize("integrated", [True, False])
-def test_gemm_add_rms_norm_adds_the_residual_in_the_gemm_on_integrated_gpus(monkeypatch, integrated):
-    """On an integrated GPU the CUDA gemm_add_rms_norm runs xcompute's gemm with the bias and the residual, then
-    rmsnorm; on a discrete GPU gemm_epilogue and add_rms_norm, so their results are unchanged."""
-    import types
-
-    from xinfer.ops.backends.cuda import gemm
-
-    calls = []
-    package = types.SimpleNamespace(
-        gemm=lambda x, w, **kwargs: calls.append(("gemm", kwargs["bias"] is not None, kwargs["residual"].shape))
-        or torch.zeros(4, 8),
-        rmsnorm=lambda x, w, eps, inference: calls.append(("rmsnorm",)) or "normed")
-    monkeypatch.setattr(gemm, "xc", package)
-    monkeypatch.setattr(gemm.torch.cuda, "get_device_properties",
-                        lambda device: types.SimpleNamespace(is_integrated=integrated))
-    monkeypatch.setattr(gemm, "_integrated", {})
-    monkeypatch.setattr(gemm, "_listed_weight", lambda op, x, w, **kwargs: w)
-    monkeypatch.setattr(gemm, "gemm_epilogue", lambda x, w, b: calls.append(("gemm_epilogue", b is not None)) or x)
-    monkeypatch.setattr(gemm, "add_rms_norm", lambda y, r, w, eps: calls.append(("add_rms_norm",)) or (r, "normed"))
-    x, projection, bias, residual = torch.zeros(4, 6), torch.zeros(8, 6), torch.zeros(8), torch.zeros(1, 4, 8)
-
-    out, normed = gemm.gemm_add_rms_norm(torch.zeros(4, 8) if not integrated else x, projection, residual,
-                                         torch.ones(8), 1e-6, bias=bias)
-    if integrated:
-        assert calls == [("gemm", True, (4, 8)), ("rmsnorm",)] and out.shape == residual.shape
-    else:
-        assert calls == [("gemm_epilogue", True), ("add_rms_norm",)]
-    assert normed == "normed"
-
-
 def test_gemm_add_rms_norm_reference_is_the_unfused_composition():
     torch.manual_seed(0)
     x, projection, bias = torch.randn(5, 16), torch.randn(12, 16) * 0.2, torch.randn(12) * 0.1
@@ -702,17 +489,15 @@ def test_gemm_add_rms_norm_reference_is_the_unfused_composition():
 
 
 def test_the_rope_table_is_packed_once_per_cos_and_sin(monkeypatch):
-    """qkv_rope_epilogue packs xcompute's RoPE table on the first call with a cos / sin pair and reuses it while the
+    """qkv_rope_epilogue packs the RoPE table on the first call with a cos / sin pair and reuses it while the
     tensors live; new tensors at the same address get their own table."""
     import gc
-    import types
 
     from xinfer.ops.backends.cuda import gemm
 
     packs = []
-    package = types.SimpleNamespace(pack_rope_table=lambda cos, sin: packs.append(cos) or ("table", len(packs)),
-                                    qkv_proj_rope=lambda x, w, b, **kwargs: kwargs["rope_table"])
-    monkeypatch.setattr(gemm, "xc", package)
+    monkeypatch.setattr(gemm.layout, "rope_table", lambda cos, sin: packs.append(cos) or ("table", len(packs)))
+    monkeypatch.setattr(gemm, "qkv_proj_rope", lambda x, w, b, **kwargs: kwargs["rope_table"])
     monkeypatch.setattr(gemm, "_rope_tables", {})
     x, weight, bias = torch.zeros(4, 8), torch.zeros(24, 8), torch.zeros(24)
     cos, sin = torch.zeros(4, 2), torch.zeros(4, 2)
@@ -724,53 +509,6 @@ def test_the_rope_table_is_packed_once_per_cos_and_sin(monkeypatch):
     assert gemm.qkv_rope_epilogue(x, weight, bias, torch.ones(4, 2), torch.ones(4, 2), 2, 4) == ("table", 1)
 
 
-def test_mlp_add_rms_norm_runs_the_fused_mlp_only_where_xcompute_lists_it(monkeypatch):
-    """The CUDA mlp_add_rms_norm runs xcompute's fused MLP (adding into the residual in place) and rmsnorm where
-    packing finds a fused kernel layout and the call selects it; elsewhere gate/up and gemm_add_rms_norm (the unfused
-    operators with their bits on discrete GPUs, the residual in the down projection on integrated ones)."""
-    import types
-
-    from xinfer.ops.backends.cuda import gemm
-
-    calls = []
-    packed = types.SimpleNamespace(layout="nk")
-
-    def prepack_weight(w, **kwargs):
-        calls.append(("prepack", kwargs.get("op"), kwargs.get("layout"), kwargs.get("pad_n"), kwargs.get("pad_k")))
-        return packed if kwargs.get("op") == "fused_mlp" else types.SimpleNamespace(layout=kwargs.get("layout"))
-
-    package = types.SimpleNamespace(
-        prepack_weight=prepack_weight,
-        selected_backend=lambda op, *args, **kwargs: "mcast_bf16_sm110",
-        fused_mlp=lambda *args, **kwargs: calls.append(("fused_mlp", kwargs["activation"],
-                                                        kwargs["out"].data_ptr() == kwargs["residual"].data_ptr())),
-        rmsnorm=lambda x, w, eps, inference: calls.append(("rmsnorm",)) or "normed")
-    monkeypatch.setattr(gemm, "xc", package)
-    monkeypatch.setattr(gemm, "_fused_mlp", {})
-    monkeypatch.setattr(gemm, "gemm_glu_epilogue", lambda x, w: calls.append(("gemm_glu_epilogue",)) or x)
-    monkeypatch.setattr(gemm, "gemm_add_rms_norm",
-                        lambda h, w, r, nw, eps: calls.append(("gemm_add_rms_norm",)) or (r, "normed"))
-    x, residual = torch.zeros(4, 8), torch.zeros(1, 4, 8)
-    gate_up, down = torch.zeros(12, 8), torch.zeros(8, 6)
-
-    gemm.mlp_add_rms_norm(x, gate_up, down, residual, torch.ones(8), 1e-6)  # packing picks the generic layout
-    assert [c[0] for c in calls] == ["prepack", "gemm_glu_epilogue", "gemm_add_rms_norm"]
-
-    calls.clear()
-    monkeypatch.setattr(gemm, "_fused_mlp", {})
-    packed.layout = "nk_glu_blocked128_k64"
-    out, normed = gemm.mlp_add_rms_norm(x, gate_up, down, residual, torch.ones(8), 1e-6)
-    assert calls == [("prepack", "fused_mlp", None, gemm.FUSED_MLP_PAD, None),
-                     ("prepack", None, "nk_k64blk", None, gemm.FUSED_MLP_PAD), ("fused_mlp", "silu", True),
-                     ("rmsnorm",)]
-    assert out is residual and normed == "normed"  # the residual is added in place, not copied
-
-    calls.clear()  # a call the fused kernel's table does not take (another M): the unfused operators
-    package.selected_backend = lambda op, *args, **kwargs: "generic"
-    gemm.mlp_add_rms_norm(x, gate_up, down, residual, torch.ones(8), 1e-6)
-    assert [c[0] for c in calls] == ["gemm_glu_epilogue", "gemm_add_rms_norm"]
-
-
 def test_mlp_add_rms_norm_reference_is_the_unfused_composition():
     torch.manual_seed(0)
     x, gate_up, down = torch.randn(5, 16), torch.randn(24, 16) * 0.2, torch.randn(16, 12) * 0.2
@@ -780,35 +518,3 @@ def test_mlp_add_rms_norm_reference_is_the_unfused_composition():
     s_ref, normed_ref = norm.add_rms_norm(y.view(residual.shape), residual, weight, 1e-6)
     assert torch.equal(s, s_ref) and torch.equal(normed, normed_ref)
 
-
-@gpu
-@pytest.mark.gpu
-def test_prefetch_weights_leaves_results_and_graph_capture_intact(xc, monkeypatch):
-    """prefetch_weights forks a side stream and join_prefetch joins it: eager and under CUDA graph capture (which
-    fails on an unjoined stream), the GEMM after it gives the same bits as without the prefetch."""
-    from xinfer.ops.backends.cuda import gemm
-
-    torch.manual_seed(0)
-    x = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
-    weights = [torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16) * 0.03 for _ in range(3)]
-    want = gemm.gemm_epilogue(x, weights[1])
-    monkeypatch.setattr(gemm, "_integrated", {torch.cuda.current_device(): True})  # prefetch on any GPU here
-
-    def step():
-        gemm.prefetch_weights(weights)
-        y = gemm.gemm_epilogue(x, weights[1])
-        gemm.join_prefetch()
-        return y
-
-    assert torch.equal(step(), want)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        step()  # warm up on the capture stream
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        y = step()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(y, want)

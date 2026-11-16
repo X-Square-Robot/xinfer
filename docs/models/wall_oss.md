@@ -39,8 +39,8 @@ yet.
   service (see [design](wall_oss_design.md#processing)).
 - A CUDA GPU with about 10 GB free for BF16 weights (CPU works for tests).
 - For `image_preprocess_device="gpu"`: `pip install -e '.[gpu-image]'` (NVIDIA's nvImageCodec, `nvidia-nvimgcodec-cu13`).
-- Optimized composition (the default): the Python package of an xcompute build for the GPU's architecture
-  importable. See [kernels](../kernels.md) for setup and checks. The reported measurements use an RTX 5090 (SM120).
+- Optimized composition (the default): the CUDA kernel library built for the GPU's architecture.
+  See [kernels](../kernels.md) for the build and checks. The reported measurements use an RTX 5090 (SM120).
   Without it the composition runs on the torch references (slowly).
 
 ## Run

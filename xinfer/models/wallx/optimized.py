@@ -1,7 +1,7 @@
-"""The ViT and prompt stream of the Wall-X Qwen3.5 models on xcompute (``numerics="optimized"``).
+"""The ViT and prompt stream of the Wall-X Qwen3.5 models on the CUDA backend's kernels (``numerics="optimized"``).
 
 The Wall-X 2B stages use one operator per fusion from ``xinfer/ops/reference/``.
-xcompute selects the kernel for each shape. GEMM weights are ``[N, K]``. Differences to the
+The backend selects the kernel for each shape. GEMM weights are ``[N, K]``. Differences to the
 reference composition (``numerics="reference"``, the wall-x model under autocast):
 
 - ViT: every weight in BF16, including the position table, which one kernel interpolates; the patch embedding is a
@@ -12,7 +12,7 @@ reference composition (``numerics="reference"``, the wall-x model under autocast
   padding follows every real token, so real tokens do not see it); the DeltaNet mixer from the convolution to the
   gated norm is one call (``gated_delta_net``); ``[Q·gate | K | V]`` is one GEMM, the q/k norms and split one
   kernel and RoPE another; attention and its output gate are one call; the MLP's SiLU-mul is the gate/up GEMM's
-  epilogue; the MLP's down projection stays torch's GEMM (xcompute lists no kernel for it, and its cuBLASLt
+  epilogue; the MLP's down projection stays torch's GEMM (the backend lists no kernel for it, and its cuBLASLt
   fallback with a fixed workspace is slower there).
 """
 
@@ -197,7 +197,7 @@ class OptimizedPrefill(nn.Module):
                 mixed = ops.gemm_epilogue(o.view(p, -1), layer.out)
             h, normed = ops.add_zero_centered_rms_norm(mixed.view(1, p, -1), h, layer.post_norm, eps)
             hidden = ops.gemm_glu_epilogue(normed.view(p, -1), layer.gate_up)
-            # torch's GEMM: no xcompute kernel is listed for this shape, and its cuBLASLt fallback is slower here
+            # torch's GEMM: no kernel is listed for this shape, and its cuBLASLt fallback is slower here
             h, normed = ops.add_zero_centered_rms_norm(ops.linear(hidden, layer.down).view(1, p, -1), h,
                                                        self.layers[i + 1].input_norm, eps)
 
