@@ -1,4 +1,4 @@
-"""Ascend attention through OpSpec-named exports, optional CANN bridges and raw xcompute entries.
+"""Ascend attention through OpSpec-named exports, optional CANN bridges and raw provider entries.
 
 Unsupported layouts fall back per cached call key to the graph-safe Ascend Torch composition;
 the platform-independent reference remains SDPA. Legacy eager-only variable-length entries are not registered.

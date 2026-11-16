@@ -34,12 +34,9 @@ DTYPE = torch.bfloat16
 def _gqa_fused_prefill(packed, q_norm, k_norm, cos, sin, eps, rotary_dim):
     import os
 
-    if "stats" not in os.environ.get("XINFER_GQA_GLUE", "") or rotary_dim != 64:
-        return None
-    try:
-        from xcompute.kernel.qkv_rope_fused import qkv_rope_fused
-    except Exception:
-        return None
+    # gqa-glue k2 stayed parked (door-rejected: gate increment over band); the
+    # fused-stats kernel is routed=0 in both final stacks and is not carried.
+    return None
     if (packed.dim() != 3 or packed.shape[-1] != 5120 or not packed.is_contiguous()
             or packed.dtype != DTYPE or packed.device.type != "npu"
             or (packed.shape[0] * packed.shape[1]) % 4):
@@ -60,7 +57,7 @@ def _SOUPUNLOCK_LN(x, weight, bias, eps):
     kernel (fp32 vector-tree stats + Newton rsqrt, band-witnessed); any
     envelope miss returns None so the caller keeps the released chain."""
     try:
-        from xcompute.kernel import soupunlock
+        from xinfer.ops.backends.ascend.glue import soupunlock
 
         if soupunlock.enabled("visionln"):
             return soupunlock.layernorm_c1024(x, weight, bias, eps)
@@ -75,7 +72,7 @@ def _SOUPUNLOCK_RMSFULL(x, residual, weight, eps, layer_idx):
     vs the fp64 oracle). Armed only for layer_idx >= the configured floor;
     any miss returns None so the caller keeps the released chain."""
     try:
-        from xcompute.kernel import soupunlock
+        from xinfer.ops.backends.ascend.glue import soupunlock
 
         if soupunlock.enabled("rmsfull") and layer_idx >= soupunlock.from_layer():
             return soupunlock.rmsnorm_full(x, residual, weight, eps)
@@ -141,7 +138,7 @@ _SOUPKILL_PROJECTION = []
 def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
     """ViT QKV projection + bias + RoPE in one pass over the FP32 accumulator.
 
-    Opt-in through ``XINFER_SOUPKILL=vrope`` (xcompute's soupkill mount). Every
+    Opt-in through ``XINFER_SOUPKILL=vrope`` (the soupkill mount). Every
     path that is not a clean envelope hit -- flag off, absent knife library, a
     shape or table mismatch, any error from the fused launch -- returns the
     released operator's result, so the model never depends on the knife being
@@ -151,13 +148,13 @@ def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
         normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d
     )
     try:
-        from xcompute.kernel import soupkill
+        from xinfer.ops.backends.ascend.glue import soupkill
     except Exception:  # noqa: BLE001 - the mount is optional
         return released()
     if not soupkill.enabled("vrope") or normed.dim() != 2 or cos2 is None or cos2.shape[-1] != d:
         return released()
     if not _SOUPKILL_PROJECTION:
-        from xcompute.kernel.cann_projection import CannProjection
+        from xinfer.ops.backends.ascend.glue.cann_projection import CannProjection
 
         _SOUPKILL_PROJECTION.append(CannProjection())
     projection = _SOUPKILL_PROJECTION[0]
@@ -174,7 +171,7 @@ def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
 
 def _SOUPFORM_ENABLED(family):
     try:
-        from xcompute.kernel import soupform
+        from xinfer.ops.backends.ascend.glue import soupform
 
         return soupform.enabled(family)
     except Exception:  # noqa: BLE001 - the mount is optional
@@ -184,13 +181,13 @@ def _SOUPFORM_ENABLED(family):
 def _zba_soupform(flat, weight, keep, conv, p):
     """soupform zbasplit / finish-bf16 zba: rne(acc*keep) into contiguous buffers.
 
-    Opt-in through ``XINFER_SOUPFORM=zbasplit`` (xcompute's soupform mount,
+    Opt-in through ``XINFER_SOUPFORM=zbasplit`` (the soupform mount,
     default off). Any miss -- flag off, absent knife library, wrong rank or a
     fused-path error -- returns None and the caller keeps the released chain.
     """
     if flat.dim() == 2:
         try:
-            from xcompute.kernel import finishbf16
+            from xinfer.ops.backends.ascend.glue import finishbf16
 
             if finishbf16.enabled("zba"):
                 out = finishbf16.zbasplit_bf16(flat, weight, keep, conv)
@@ -201,12 +198,12 @@ def _zba_soupform(flat, weight, keep, conv, p):
     if not _SOUPFORM_ENABLED("zbasplit") or flat.dim() != 2:
         return None
     if not _SOUPKILL_PROJECTION:
-        from xcompute.kernel.cann_projection import CannProjection
+        from xinfer.ops.backends.ascend.glue.cann_projection import CannProjection
 
         _SOUPKILL_PROJECTION.append(CannProjection())
     proj = _SOUPKILL_PROJECTION[0]
     try:
-        from xcompute.kernel import soupform
+        from xinfer.ops.backends.ascend.glue import soupform
 
         with proj.accumulator(flat, weight) as acc:
             return soupform.zbasplit(acc, keep, conv)
@@ -224,7 +221,7 @@ def _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
     """
     if normed.dim() == 2 and cos2 is not None and cos2.shape[-1] == d:
         try:
-            from xcompute.kernel import finishbf16
+            from xinfer.ops.backends.ascend.glue import finishbf16
 
             if finishbf16.enabled("vrope"):
                 packed = finishbf16.vrope_bf16(normed, block.qkv_weight, block.qkv_bias,
@@ -235,12 +232,12 @@ def _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
             pass
     if _SOUPFORM_ENABLED("vropepack") and normed.dim() == 2 and cos2 is not None and cos2.shape[-1] == d:
         if not _SOUPKILL_PROJECTION:
-            from xcompute.kernel.cann_projection import CannProjection
+            from xinfer.ops.backends.ascend.glue.cann_projection import CannProjection
 
             _SOUPKILL_PROJECTION.append(CannProjection())
         proj = _SOUPKILL_PROJECTION[0]
         try:
-            from xcompute.kernel import soupform
+            from xinfer.ops.backends.ascend.glue import soupform
 
             with proj.accumulator(normed, block.qkv_weight) as acc:
                 packed = soupform.vision_qkv_rope_packed(acc, block.qkv_bias, cos2, sin2, heads, d)
@@ -302,7 +299,7 @@ class OptimizedVision(_FormatStage):
         # Two cat kernels per request, not per block; None keeps the released op.
         cos2 = sin2 = None
         try:
-            from xcompute.kernel import soupkill
+            from xinfer.ops.backends.ascend.glue import soupkill
 
             if soupkill.enabled("vrope") and cos.dim() == 2:
                 cos2 = torch.cat((cos, cos), dim=-1).contiguous()

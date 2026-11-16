@@ -68,10 +68,10 @@ def _entry(name, n_ptr, scalar_types):
         pair = _ENTRIES.get(name)
         if pair is None:
             lib = _library()
-            call = getattr(lib, f"xcompute_aot_{name}_call")
+            call = getattr(lib, f"xinfer_aot_{name}_call")
             call.restype = ctypes.c_int32
             call.argtypes = [ctypes.c_void_p] * n_ptr + list(scalar_types) + [ctypes.c_void_p]
-            err = getattr(lib, f"xcompute_aot_{name}_get_last_error")
+            err = getattr(lib, f"xinfer_aot_{name}_get_last_error")
             err.restype = ctypes.c_char_p
             pair = (call, err)
             _ENTRIES[name] = pair

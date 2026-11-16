@@ -1,0 +1,137 @@
+"""simdepi-r1 opt-in route: fused-after SIMD add_rms (buf2/f32direct plans).
+
+SIMD-EPILOGUE R1. Off by default (XINFER_SIMDEPI=off). Families:
+v1280 -- [rows,1280] BF16 vision/merger add rows ride se1_ubv1280_buf2f
+       (the released ubv_h1280 arithmetic with sum/out MTE3 double
+       buffering + FP32-direct weight row; probe-se1: sum+norm bitwise,
+       12.71 -> 10.66 us graph on r2112).
+p2048 -- [1,P,2048] BF16 prefill add rows ride se1_ubv2048_buf2f (the
+       released ubv_h2048 arithmetic with the same buf2 scheduling;
+       probe-se1: sum+norm bitwise, 8.28 -> 7.26 us graph on p768).
+
+All launches resolve the current stream per call so NPUGraph capture
+records the node (the gdn-gamma ctypes rule). The FP32 weight row is
+cached per storage identity (identical f32 values to the in-kernel UNPK
+upcast of the BF16 staging; the rmsfuse-r5 v1280 pattern).
+The library path is XINFER_SIMDEPI_LIB; unset disables the route (the callers treat a missing route as the released chain).
+"""
+import array
+import ctypes
+import os
+from threading import Lock
+
+import torch
+
+_ENABLED = None
+_LIB = None
+_ENTRIES = {}
+_LOCK = Lock()
+
+_FAMILIES = ("v1280", "p2048")
+_KERNELS = {"v1280": "se1_ubv1280_buf2f", "p2048": "se1_ubv2048_buf2f"}
+
+
+def _parse():
+    global _ENABLED
+    raw = os.environ.get("XINFER_SIMDEPI", "off").strip().lower()
+    if raw in ("off", "", "0"):
+        _ENABLED = frozenset()
+    elif raw in ("1", "all", "on"):
+        _ENABLED = frozenset(_FAMILIES)
+    else:
+        wanted = {t.strip() for t in raw.split(",")}
+        unknown = wanted - set(_FAMILIES)
+        if unknown:
+            raise RuntimeError(f"XINFER_SIMDEPI unknown families: {sorted(unknown)}")
+        _ENABLED = frozenset(wanted)
+
+
+def enabled(family):
+    if _ENABLED is None:
+        _parse()
+    return family in _ENABLED
+
+
+def _library():
+    global _LIB
+    if _LIB is None:
+        path = os.environ.get("XINFER_SIMDEPI_LIB")
+        if not path:
+            raise OSError("simdepi-r1: XINFER_SIMDEPI_LIB is not set")
+        _LIB = ctypes.CDLL(path)
+    return _LIB
+
+
+def _entry(name):
+    with _LOCK:
+        pair = _ENTRIES.get(name)
+        if pair is None:
+            lib = _library()
+            call = getattr(lib, f"xinfer_aot_{name}_call")
+            call.restype = ctypes.c_int32
+            err = getattr(lib, f"xinfer_aot_{name}_get_last_error")
+            err.restype = ctypes.c_char_p
+            pair = (call, err)
+            _ENTRIES[name] = pair
+    return pair
+
+
+def _eps_bits(epsilon):
+    return array.array("i", array.array("f", [float(epsilon)]).tobytes())[0]
+
+
+_W32 = {}
+
+
+def _weight32(weight):
+    """The FP32 row of the norm weight, cached per storage identity."""
+    if weight.dtype == torch.float32:
+        return weight if weight.is_contiguous() else weight.contiguous()
+    key = (weight.data_ptr(), tuple(weight.shape), weight.dtype)
+    cached = _W32.get(key)
+    if cached is None:
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError(
+                "warm up the simdepi-r1 weight conversion on this stream before graph capture"
+            )
+        cached = weight.detach().float().contiguous()
+        _W32[key] = cached
+    return cached
+
+
+def _launch(name, tensors, scalars):
+    call, err = _entry(name)
+    stream = torch.npu.current_stream(tensors[0].device).npu_stream
+    args = [ctypes.c_void_p(t.data_ptr()) for t in tensors]
+    args += [ctypes.c_int64(s) for s in scalars]
+    status = call(*args, ctypes.c_void_p(stream))
+    if status:
+        raise RuntimeError(
+            "simdepi-r1 " + name + ": " + (err() or b"?").decode("utf-8", "replace")
+        )
+
+
+def _add_rms(name, x, residual, weight, eps):
+    rows, width = x.shape[0], x.shape[1]
+    wt = _weight32(weight)
+    sum_out = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
+    norm_out = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
+    _launch(name, [x, residual, sum_out, wt, norm_out], [rows, 1, _eps_bits(eps)])
+    return sum_out, norm_out
+
+
+def add_rms_v1280(x, residual, weight, eps):
+    """[rows,1280] BF16 vision/merger add rows -> (sum, normed), both BF16.
+
+    Bitwise to the released ubv_h1280 plan on the same inputs (probe-se1)."""
+    return _add_rms(_KERNELS["v1280"], x, residual, weight, eps)
+
+
+def add_rms_p2048(x, residual, weight, eps):
+    """[1,P,2048] BF16 prefill add rows -> (sum, normed), both BF16 [1,P,2048].
+
+    Bitwise to the released ubv_h2048 plan on the same inputs (probe-se1)."""
+    x2 = x[0]
+    r2 = residual[0]
+    sum_out, norm_out = _add_rms(_KERNELS["p2048"], x2, r2, weight, eps)
+    return sum_out.view(x.shape), norm_out.view(x.shape)

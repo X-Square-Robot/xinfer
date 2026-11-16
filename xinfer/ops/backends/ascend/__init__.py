@@ -1,1 +1,1 @@
-"""Ascend operator implementations, using the shared xcompute loader and registration contracts."""
+"""Ascend operator implementations over the unified in-tree kernel provider."""

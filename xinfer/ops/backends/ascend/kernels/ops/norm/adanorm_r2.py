@@ -1,0 +1,308 @@
+"""ADANORM-R2: precision-band-unlocked pure-VEC reduction variant of the
+Wall-X 2B adarsnorm action kernels (R6D adafast double 4.9us / gated 3.3us).
+
+Re-verification context (REPORT.md section 2): the R6D "floor" was priced
+under the OLD gate (kernel-level 0 flips + engine-level bitwise + action band
+0.0062 with 0.0011 margin), which froze the statistics reduction to the
+production SimtVF serial per-lane chain verbatim and forced the
+VEC<->SIMT<->VEC domain fences. Under the 2026-11-15/16 ruling (numerical
+equivalence band, action gate cap 0.03, no worse than vendor vs fp64 oracle)
+that constraint dissolves:
+
+- The elementwise phases (gated absorption add, norm apply, gate packing) are
+  kept VERBATIM from R6D v2, including every bf16 intermediate rounding point
+  (store-then-reload idiom) -- these are algorithmic semantics, not a
+  bit-alignment concession.
+- Each SIMT statistics phase is replaced by a CCE-vector reduction using the
+  proven rms_consistent `ubv` idiom: squares of the already-rounded bf16 row
+  staged as fp32 lane vectors inside the elementwise pass, a balanced
+  16-segment vadd tree, a 6-step vcpadd chain, vdupv broadcast, and a
+  correctly-rounded inv = 1 / vsqrt(mean + eps). Pairwise tree summation has
+  a strictly smaller worst-case error bound than the serial chain it replaces
+  and vsqrt+vdiv is correctly rounded, so the fp64-oracle distance of the
+  statistics cannot get worse than the vendor approximation class.
+- double keeps its two chained statistics but both now run inside the single
+  SimdVF region: the kernel drops from 6 cross-unit fences
+  (MTE->VEC->SIMT->VEC->SIMT->VEC->MTE) to 2 (MTE->VEC->MTE); gated from 4
+  to 2.
+
+Kernel names match the production AOT object symbols exactly, so the relink
+swaps the R6D adafast objects 1:1 inside the final combined library.
+"""
+
+import tilelang.ascend.language as T
+
+ROWS, HIDDEN, WARP, LANES = 16, 1024, 32, 64
+
+
+def action_fast(double):
+    """One block per token; pure-VEC elementwise + statistics (no SIMT)."""
+
+    @T.prim_func
+    def main(
+        rh: T.handle, bh: T.handle, gh: T.handle, roh: T.handle, boh: T.handle,
+        goh: T.handle, m1h: T.handle, m2h: T.handle, epsilon_bits: T.int64,
+    ):
+        residual = T.match_buffer(rh, (ROWS, HIDDEN), "bfloat16")
+        branch = T.match_buffer(bh, (ROWS, HIDDEN), "bfloat16")
+        previous_gate = T.match_buffer(gh, (HIDDEN,), "bfloat16")
+        residual_out = T.match_buffer(roh, (ROWS, HIDDEN), "bfloat16")
+        branch_out = T.match_buffer(boh, (ROWS, HIDDEN), "bfloat16")
+        next_gate = T.match_buffer(goh, (HIDDEN,), "bfloat16")
+        modulation1 = T.match_buffer(m1h, (3 * HIDDEN,), "float32")
+        modulation2 = T.match_buffer(m2h, (3 * HIDDEN,), "float32")
+        epsilon = T.reinterpret("float32", T.cast(epsilon_bits, "uint32"))
+        with T.Kernel(ROWS) as block:
+            row = T.cast(block, "int32")
+            r = T.alloc_shared((HIDDEN,), "bfloat16")
+            b = T.alloc_shared((HIDDEN,), "bfloat16")
+            gate = T.alloc_shared((HIDDEN,), "bfloat16")
+            first = T.alloc_shared((3 * HIDDEN,), "float32")
+            second = T.alloc_shared((3 * HIDDEN,), "float32")
+            n16 = T.alloc_shared((HIDDEN,), "bfloat16")
+            g16 = T.alloc_shared((HIDDEN,), "bfloat16")
+            sq = T.alloc_shared((HIDDEN,), "float32")
+            T.copy(residual[row, :], r)
+            T.copy(branch[row, :], b)
+            T.copy(previous_gate, gate)
+            T.copy(modulation1, first)
+            if double:
+                T.copy(modulation2, second)
+            with T.SimdVF():
+                m = T.simd.pset(32)
+                one = T.simd.vdup(1.0, "float32")
+                wide = T.simd.vdup(1.0 / HIDDEN, "float32")
+                eps_v = T.simd.vdup(epsilon, "float32")
+                # ---- VEC A: r = RNE(r_f32 + RNE(b_f32 * g_f32))  [_action_add]
+                #      squares of the rounded row staged in the same pass
+                for c in range(HIDDEN // LANES):
+                    o = c * LANES
+                    rv = T.simd.vcvt(
+                        T.simd.vld(r[o], dist="UNPK_B16"), "float32", part=0
+                    )
+                    bv = T.simd.vcvt(
+                        T.simd.vld(b[o], dist="UNPK_B16"), "float32", part=0
+                    )
+                    gv = T.simd.vcvt(
+                        T.simd.vld(gate[o], dist="UNPK_B16"), "float32", part=0
+                    )
+                    prod = T.simd.vmul(bv, gv, m)
+                    T.simd.vsts(
+                        n16[o], T.simd.vcvt(prod, "bfloat16", round="ROUND_R"),
+                        dist="PK_B32",
+                    )
+                    pf = T.simd.vcvt(
+                        T.simd.vld(n16[o], dist="UNPK_B16"), "float32", part=0
+                    )
+                    s = T.simd.vadd(rv, pf, m)
+                    T.simd.vsts(
+                        r[o], T.simd.vcvt(s, "bfloat16", round="ROUND_R"),
+                        dist="PK_B32",
+                    )
+                    rr = T.simd.vcvt(
+                        T.simd.vld(r[o], dist="UNPK_B16"), "float32", part=0
+                    )
+                    T.simd.vsts(sq[o], T.simd.vmul(rr, rr, m))
+                # ---- statistics 1: 16-segment vadd tree (balanced)
+                # VST_VLD fence: the scheduler may otherwise hoist the tree
+                # loads above the staging stores (opaque intrinsics, no dep).
+                T.simd.mem_bar("VST_VLD")
+                q0 = T.simd.vld(sq[0])
+                q1 = T.simd.vld(sq[LANES])
+                q2 = T.simd.vld(sq[2 * LANES])
+                q3 = T.simd.vld(sq[3 * LANES])
+                q4 = T.simd.vld(sq[4 * LANES])
+                q5 = T.simd.vld(sq[5 * LANES])
+                q6 = T.simd.vld(sq[6 * LANES])
+                q7 = T.simd.vld(sq[7 * LANES])
+                q8 = T.simd.vld(sq[8 * LANES])
+                q9 = T.simd.vld(sq[9 * LANES])
+                q10 = T.simd.vld(sq[10 * LANES])
+                q11 = T.simd.vld(sq[11 * LANES])
+                q12 = T.simd.vld(sq[12 * LANES])
+                q13 = T.simd.vld(sq[13 * LANES])
+                q14 = T.simd.vld(sq[14 * LANES])
+                q15 = T.simd.vld(sq[15 * LANES])
+                t0 = T.simd.vadd(q0, q1, m)
+                t1 = T.simd.vadd(q2, q3, m)
+                t2 = T.simd.vadd(q4, q5, m)
+                t3 = T.simd.vadd(q6, q7, m)
+                t4 = T.simd.vadd(q8, q9, m)
+                t5 = T.simd.vadd(q10, q11, m)
+                t6 = T.simd.vadd(q12, q13, m)
+                t7 = T.simd.vadd(q14, q15, m)
+                u0 = T.simd.vadd(t0, t1, m)
+                u1 = T.simd.vadd(t2, t3, m)
+                u2 = T.simd.vadd(t4, t5, m)
+                u3 = T.simd.vadd(t6, t7, m)
+                w0 = T.simd.vadd(u0, u1, m)
+                w1 = T.simd.vadd(u2, u3, m)
+                tree = T.simd.vadd(w0, w1, m)
+                # ---- statistics 1: vcpadd chain 64 -> 1 lane, broadcast
+                cp1 = T.simd.vcpadd(tree, m)
+                cp2 = T.simd.vcpadd(cp1, m)
+                cp3 = T.simd.vcpadd(cp2, m)
+                cp4 = T.simd.vcpadd(cp3, m)
+                cp5 = T.simd.vcpadd(cp4, m)
+                total = T.simd.vdupv(T.simd.vcpadd(cp5, m), m)
+                denom = T.simd.vadd(T.simd.vmul(total, wide, m), eps_v, m)
+                inv1 = T.simd.vdiv(one, T.simd.vsqrt(denom, m), m)
+                if not double:
+                    # ---- VEC B (gated): b = norm(r, first, inv1); gate row 0
+                    wv = T.simd.alloc_local((1,), "float32")
+                    for c in range(HIDDEN // LANES):
+                        o = c * LANES
+                        rf = T.simd.vcvt(
+                            T.simd.vld(r[o], dist="UNPK_B16"), "float32",
+                            part=0,
+                        )
+                        sc = T.simd.vld(first[o])
+                        sh = T.simd.vld(first[HIDDEN + o])
+                        wv[0] = T.simd.vmul(rf, inv1, m)
+                        u = T.simd.vadd(one, sc, m)
+                        T.simd.vmadd(wv[0], u, sh, m)
+                        T.simd.vsts(
+                            b[o],
+                            T.simd.vcvt(wv[0], "bfloat16", round="ROUND_R"),
+                            dist="PK_B32",
+                        )
+                        gt = T.simd.vld(first[2 * HIDDEN + o])
+                        T.simd.vsts(
+                            gate[o],
+                            T.simd.vcvt(gt, "bfloat16", round="ROUND_R"),
+                            dist="PK_B32",
+                        )
+                else:
+                    # ---- VEC B (double): gate1 pack, then norm1 + gated add
+                    wv = T.simd.alloc_local((1,), "float32")
+                    for c in range(HIDDEN // LANES):
+                        o = c * LANES
+                        gt = T.simd.vld(first[2 * HIDDEN + o])
+                        T.simd.vsts(
+                            g16[o],
+                            T.simd.vcvt(gt, "bfloat16", round="ROUND_R"),
+                            dist="PK_B32",
+                        )
+                    for c in range(HIDDEN // LANES):
+                        o = c * LANES
+                        rf = T.simd.vcvt(
+                            T.simd.vld(r[o], dist="UNPK_B16"), "float32",
+                            part=0,
+                        )
+                        sc = T.simd.vld(first[o])
+                        sh = T.simd.vld(first[HIDDEN + o])
+                        wv[0] = T.simd.vmul(rf, inv1, m)
+                        u = T.simd.vadd(one, sc, m)
+                        T.simd.vmadd(wv[0], u, sh, m)
+                        T.simd.vsts(
+                            n16[o],
+                            T.simd.vcvt(wv[0], "bfloat16", round="ROUND_R"),
+                            dist="PK_B32",
+                        )
+                        nf = T.simd.vcvt(
+                            T.simd.vld(n16[o], dist="UNPK_B16"), "float32",
+                            part=0,
+                        )
+                        g1v = T.simd.vcvt(
+                            T.simd.vld(g16[o], dist="UNPK_B16"), "float32",
+                            part=0,
+                        )
+                        prod2 = T.simd.vmul(nf, g1v, m)
+                        T.simd.vsts(
+                            n16[o],
+                            T.simd.vcvt(prod2, "bfloat16", round="ROUND_R"),
+                            dist="PK_B32",
+                        )
+                        pf2 = T.simd.vcvt(
+                            T.simd.vld(n16[o], dist="UNPK_B16"), "float32",
+                            part=0,
+                        )
+                        s2 = T.simd.vadd(rf, pf2, m)
+                        T.simd.vsts(
+                            r[o],
+                            T.simd.vcvt(s2, "bfloat16", round="ROUND_R"),
+                            dist="PK_B32",
+                        )
+                        rr2 = T.simd.vcvt(
+                            T.simd.vld(r[o], dist="UNPK_B16"), "float32",
+                            part=0,
+                        )
+                        T.simd.vsts(sq[o], T.simd.vmul(rr2, rr2, m))
+                    # ---- statistics 2 (same vector reduction, second stats)
+                    T.simd.mem_bar("VST_VLD")
+                    v0 = T.simd.vld(sq[0])
+                    v1 = T.simd.vld(sq[LANES])
+                    v2 = T.simd.vld(sq[2 * LANES])
+                    v3 = T.simd.vld(sq[3 * LANES])
+                    v4 = T.simd.vld(sq[4 * LANES])
+                    v5 = T.simd.vld(sq[5 * LANES])
+                    v6 = T.simd.vld(sq[6 * LANES])
+                    v7 = T.simd.vld(sq[7 * LANES])
+                    v8 = T.simd.vld(sq[8 * LANES])
+                    v9 = T.simd.vld(sq[9 * LANES])
+                    v10 = T.simd.vld(sq[10 * LANES])
+                    v11 = T.simd.vld(sq[11 * LANES])
+                    v12 = T.simd.vld(sq[12 * LANES])
+                    v13 = T.simd.vld(sq[13 * LANES])
+                    v14 = T.simd.vld(sq[14 * LANES])
+                    v15 = T.simd.vld(sq[15 * LANES])
+                    x0 = T.simd.vadd(v0, v1, m)
+                    x1 = T.simd.vadd(v2, v3, m)
+                    x2 = T.simd.vadd(v4, v5, m)
+                    x3 = T.simd.vadd(v6, v7, m)
+                    x4 = T.simd.vadd(v8, v9, m)
+                    x5 = T.simd.vadd(v10, v11, m)
+                    x6 = T.simd.vadd(v12, v13, m)
+                    x7 = T.simd.vadd(v14, v15, m)
+                    y0 = T.simd.vadd(x0, x1, m)
+                    y1 = T.simd.vadd(x2, x3, m)
+                    y2 = T.simd.vadd(x4, x5, m)
+                    y3 = T.simd.vadd(x6, x7, m)
+                    z0 = T.simd.vadd(y0, y1, m)
+                    z1 = T.simd.vadd(y2, y3, m)
+                    tree2 = T.simd.vadd(z0, z1, m)
+                    dq1 = T.simd.vcpadd(tree2, m)
+                    dq2 = T.simd.vcpadd(dq1, m)
+                    dq3 = T.simd.vcpadd(dq2, m)
+                    dq4 = T.simd.vcpadd(dq3, m)
+                    dq5 = T.simd.vcpadd(dq4, m)
+                    total2 = T.simd.vdupv(T.simd.vcpadd(dq5, m), m)
+                    denom2 = T.simd.vadd(
+                        T.simd.vmul(total2, wide, m), eps_v, m
+                    )
+                    inv2 = T.simd.vdiv(one, T.simd.vsqrt(denom2, m), m)
+                    # ---- VEC C (double): b = norm(r, second, inv2); gate row 0
+                    wv2 = T.simd.alloc_local((1,), "float32")
+                    for c in range(HIDDEN // LANES):
+                        o = c * LANES
+                        rf = T.simd.vcvt(
+                            T.simd.vld(r[o], dist="UNPK_B16"), "float32",
+                            part=0,
+                        )
+                        sc = T.simd.vld(second[o])
+                        sh = T.simd.vld(second[HIDDEN + o])
+                        wv2[0] = T.simd.vmul(rf, inv2, m)
+                        u = T.simd.vadd(one, sc, m)
+                        T.simd.vmadd(wv2[0], u, sh, m)
+                        T.simd.vsts(
+                            b[o],
+                            T.simd.vcvt(wv2[0], "bfloat16", round="ROUND_R"),
+                            dist="PK_B32",
+                        )
+                        gt = T.simd.vld(second[2 * HIDDEN + o])
+                        T.simd.vsts(
+                            gate[o],
+                            T.simd.vcvt(gt, "bfloat16", round="ROUND_R"),
+                            dist="PK_B32",
+                        )
+            T.copy(r, residual_out[row, :])
+            T.copy(b, branch_out[row, :])
+            if row == 0:
+                T.copy(gate, next_gate)
+
+    return main
+
+
+def build_programs():
+    yield "adarmsnorm_action_gated_bf16_f32", action_fast(False)
+    yield "adarmsnorm_action_double_bf16_f32", action_fast(True)

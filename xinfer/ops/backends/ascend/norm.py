@@ -3,7 +3,7 @@
 Wall-OSS needs ``add_rms_norm`` and ``rms_norm`` (the vision, prompt and action streams' input norms); Wall-X 2B
 also needs the zero-centered VoT norms, the ViT's layer norm and the AdaRMS family (``modulated_rms_norm``,
 ``gated_residual_modulated_rms_norm``, ``identity_layer_norms_``). Each registration names one OpSpec and delegates
-to the xcompute entry that implements that semantics; entries reject unsupported layouts with ``ValueError`` (or
+to the glue entry that implements that semantics; entries reject unsupported layouts with ``ValueError`` (or
 fail the ``check`` predicate) and the reference runs instead.
 """
 
@@ -50,7 +50,7 @@ def add_rms_norm(x, residual, weight, eps):
     # library; the module is absent without that delivery and these guards fall through to the entries
     # below, so the composition is unchanged.
     try:
-        from xcompute.kernel import simdepi_r1
+        from xinfer.ops.backends.ascend.glue import simdepi_r1
         if (simdepi_r1.enabled("v1280")
                 and x.dim() == 2 and x.shape[-1] == 1280
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -76,7 +76,7 @@ def add_rms_norm(x, residual, weight, eps):
     # delivered package's AOT kernels; the module is absent without that delivery and these guards
     # fall through to the entries below, so the composition is unchanged.
     try:
-        from xcompute.kernel import rmsfuse_r4
+        from xinfer.ops.backends.ascend.glue import rmsfuse_r4
         if (rmsfuse_r4.enabled("m16")
                 and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -109,7 +109,7 @@ def add_rms_norm(x, residual, weight, eps):
 # artifacts plus the CANN projection bridge; without them the attributes stay absent and the
 # action loop keeps the operator composition above.
 try:
-    from xcompute.kernel import rmsfuse_r4
+    from xinfer.ops.backends.ascend.glue import rmsfuse_r4
     if rmsfuse_r4.enabled("f32in"):
         from xinfer.ops.backends.ascend import gemm as _gemm_backend
         _projection = getattr(_gemm_backend, "cann_projection", None)
@@ -130,7 +130,7 @@ if _copykill_enabled("k2"):
 
 
 # ---------------------------------------------------------------- Wall-X 2B normalization family
-# The xcompute entries below are classes with a stateful call, or functions that overwrite their first tensors.
+# The glue entries below are classes with a stateful call, or functions that overwrite their first tensors.
 _rmsnorm = getattr(xc, "Rmsnorm", None) if xc is not None else None
 _add_rmsnorm = getattr(xc, "AddRmsnorm", None) if xc is not None else None
 _adarmsnorm = getattr(xc, "Adarmsnorm", None) if xc is not None else None
@@ -209,11 +209,11 @@ def add_zero_centered_rms_norm(x, residual, weight, eps):
     # SOUP-FORM normprep: one pass computes s = rne(res+x) and sq = f32(s)^2,
     # the aclnn statistics chain runs over the identical sq values, and the
     # apply is the elementwise (s*rstd)*(1+w) with a single RNE. Opt-in through
-    # ``XINFER_SOUPFORM=normprep`` (xcompute's soupform mount, default off);
+    # ``XINFER_SOUPFORM=normprep`` (the soupform mount, default off);
     # every miss -- flag off, absent knife library, an envelope mismatch or a
     # fused-path error -- falls back to the entry chain below.
     try:
-        from xcompute.kernel import soupform
+        from xinfer.ops.backends.ascend.glue import soupform
 
         if soupform.enabled("normprep"):
             fused = soupform.normprep_norm(x, residual, weight, eps)

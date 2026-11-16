@@ -311,7 +311,7 @@ class OptimizedAction(nn.Module):
                     # it with the transpose folded into the Cube A-load; every other backend permutes.
                     # The fused gemm+add_rms entries (RMSFUSE RF3 gemm_add_rms_r4, then COPYKILL K2's
                     # gemm_add_rms) take the [H, M, D] operand directly and return the (sum, normalized)
-                    # pair; both need the delivered xcompute package and stay absent otherwise, and the
+                    # pair; both need the provider's knife library and stay absent otherwise, and the
                     # composition below is then exactly the previous chain.
                     _fused_entry = getattr(ops.add_rms_norm, "gemm_add_rms_r4", None)
                     _pair = _fused_entry(o[0], layer.o, h, layer.post_norm, eps) if _fused_entry is not None else None

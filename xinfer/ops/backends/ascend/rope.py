@@ -38,17 +38,17 @@ def _gqa_bhsd():
          and 0 < rotary_dim <= q.shape[-1] and cos.shape[-1] * 2 >= rotary_dim)
 def rope_full(q, k, cos, sin, rotary_dim):
     # 2B-COVERAGE: the rotary_dim-64 partial rotation rides the d64 AOT launcher (ctypes; the
-    # internal xcompute_aot_* launcher precedent) on the exact 2B prefill envelope — q [1, P, 8, 256]
+    # internal xinfer_aot_* launcher precedent) on the exact 2B prefill envelope — q [1, P, 8, 256]
     # and k [1, P, 2, 256] BF16 contiguous with compact FP32 [1, P, 32] tables and P a multiple of 4.
     # Bitwise to the torch composition (the only bit-level deviations are signed zeros, +0 vs -0);
     # the angle tables are duplicated to 64 columns with a fresh concat per call, so a graph capture
     # always bakes the duplication into the graph. Every miss keeps the paths below.
     try:
-        from xcompute.kernel.rope_d64 import rope_half_d64 as _rope_d64
+        from xinfer.ops.backends.ascend.glue.rope_d64 import rope_half_d64 as _rope_d64
     except (ImportError, OSError):
         _rope_d64 = None
     try:
-        from xcompute.kernel.rope_d64_bhsd import rope_d64_bhsd as _rope_bhsd
+        from xinfer.ops.backends.ascend.glue.rope_d64_bhsd import rope_d64_bhsd as _rope_bhsd
     except (ImportError, OSError):
         _rope_bhsd = None
     # GQA-GLUE knives 1+3 (XINFER_GQA_GLUE=bhsd): head-major BHSD
@@ -117,8 +117,12 @@ def rope_full(q, k, cos, sin, rotary_dim):
 
 
 # --------------------------------------------------------------- Wall-X 2B vision positions
-_position_functions = (has_functions("pos_embed_interp", "get_token_counts")
-                       and has_functions("rot_pos"))
+# The unified core does not carry the position kernels (rot_pos / pos_embed_interp
+# / get_token_counts): the model builds each grid's tables once and caches them
+# (the _grids dict below), so the launches are cold-path; the reference
+# compositions are the bitwise anchors of those kernels and serve the first-build
+# calls. The registrations below therefore stand down (requires=None).
+_position_functions = False
 _grids = {}  # (host grids, merge size, device) -> (grid, out_cumsum, hw_cumsum, rot_cumsum, total)
 
 
@@ -132,7 +136,7 @@ def _grid_tensors(grids, merge_size, device):
         out_cumsum = torch.zeros_like(hw_cumsum)
         out_cumsum[1:] = (grid[:, 0] * grid[:, 1] * grid[:, 2]).cumsum(0)
         counts = torch.empty(len(grids), dtype=torch.int32, device=device)
-        xc.xcompute_lib.get_token_counts(grid, counts, int(merge_size))
+        counts = grid[:, 1] * grid[:, 2]  # host-side reference; unreachable while _position_functions is False
         rot_cumsum = torch.zeros_like(hw_cumsum)
         rot_cumsum[1:] = counts.cumsum(0)
         _grids[key] = (grid, out_cumsum, hw_cumsum, rot_cumsum, sum(t * h * w for t, h, w in key[0]))
@@ -145,7 +149,7 @@ def _grid_tensors(grids, merge_size, device):
 def rot_pos(inv_freq, grids, merge_size):
     grid, _, _, rot_cumsum, total = _grid_tensors(grids, merge_size, inv_freq.device)
     out = torch.empty((total, 2 * inv_freq.numel()), dtype=torch.float32, device=inv_freq.device)
-    xc.xcompute_lib.rot_pos(inv_freq, grid, out, rot_cumsum, int(merge_size))
+    raise NotImplementedError("rot_pos: not carried by the unified core")
     return out
 
 
@@ -158,6 +162,5 @@ def rot_pos(inv_freq, grids, merge_size):
 def pos_embed_interp(weight, grids, merge_size):
     grid, out_cumsum, hw_cumsum, _, total = _grid_tensors(grids, merge_size, weight.device)
     out = torch.empty((total, weight.shape[1]), dtype=weight.dtype, device=weight.device)
-    xc.xcompute_lib.pos_embed_interp(weight, grid, out_cumsum, hw_cumsum, out, math.isqrt(weight.shape[0]),
-                                     int(merge_size))
+    raise NotImplementedError("pos_embed_interp: not carried by the unified core")
     return out

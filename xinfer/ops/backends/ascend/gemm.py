@@ -1,6 +1,6 @@
-"""Fused Ascend projections using the paired xcompute package.
+"""Fused Ascend projections over the in-tree glue package.
 
-Explicit xcompute exports with the OpSpec names take precedence. Otherwise CANN bridges handle supported
+Explicit glue exports with the OpSpec names take precedence. Otherwise CANN bridges handle supported
 projection and AdaRMS calls in eager execution and graph capture. Builds
 without these bridges use the references. Other layouts/options also run the reference, with support cached
 per call layout; legacy eager-only raw entries are not registered.
@@ -175,10 +175,10 @@ def qkv_rope_kvcache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_hea
 
 
 # The prompt stream's plain projection (``F.linear``'s contract) and its gated Q/K split. The GEMM family's
-# unified entry serves both on Ascend: ``xcompute.gemm`` runs the plain arithmetic (bit for bit the torch
+# unified entry serves both on Ascend: the provider's gemm entry runs the plain arithmetic (bit for bit the torch
 # reference at the served shapes), and ``qkv_norm_rope_kvcache`` below is the same family's fused projection.
 _plain_gemm = getattr(xc, "gemm", None) if xc is not None else None
-_split_forward = getattr(xc.xcompute_lib, "qwen35_vla_qkv_norm_replace_forward", None) if xc is not None else None
+_split_forward = None  # the qwen35 replace kernel is routed=0 in both final stacks (INVENTORY §8)
 
 
 def _linear_supported(x, weight, bias=None):
@@ -237,7 +237,7 @@ _no_action_rows = {}  # (batch, device) -> zero action-row starts/ends [B] and o
 
 
 try:
-    from xcompute.kernel.cann_action import _qkv_2b_cache_finish_pair as _qkv_2b_pair
+    from xinfer.ops.backends.ascend.glue.cann_action import _qkv_2b_cache_finish_pair as _qkv_2b_pair
 except Exception:  # builds without the package's CANN bridge module
     _qkv_2b_pair = None
 
@@ -366,17 +366,17 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
         if split is not None:
             return split
     # 2B-COVERAGE: the vectorized split/apply kernel rides the AOT launcher (ctypes; the internal
-    # xcompute_aot_* launcher precedent) with the torch-chain FP32 statistics and the (weight + 1)
+    # xinfer_aot_* launcher precedent) with the torch-chain FP32 statistics and the (weight + 1)
     # factors mirrored verbatim from the reference's _zero_centered_heads chain — the library's
     # scalar qkv_split_rstd measured slower than the reference tail at the prefill shapes (149 us
     # per call at 464 rows), and this kernel is bitwise to the composition on identical statistics.
     # The module is absent without the delivered package and the guard falls through below.
     try:
-        from xcompute.kernel.qkv_split_vec import qkv_split_vec as _qkv_vec
+        from xinfer.ops.backends.ascend.glue.qkv_split_vec import qkv_split_vec as _qkv_vec
     except (ImportError, OSError):
         _qkv_vec = None
     try:
-        from xcompute.kernel.qkv_split_bhsd import qkv_split_bhsd as _qkv_bhsd
+        from xinfer.ops.backends.ascend.glue.qkv_split_bhsd import qkv_split_bhsd as _qkv_bhsd
     except (ImportError, OSError):
         _qkv_bhsd = None
     if (_qkv_vec is not None
