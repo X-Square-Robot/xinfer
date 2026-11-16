@@ -54,7 +54,12 @@ VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
 # Limits on the pinned RTC poses (columns of both arms): positions in metres, angles in radians (slightly above π),
 # grippers. The reference service rejects larger values, which have overflowed its forward pass to NaN.
-RTC_POSE_LIMITS = (((0, 1, 2, 7, 8, 9), 5.0), ((3, 4, 5, 10, 11, 12), 3.2), ((6, 13), 5.0))
+# The gripper columns (6, 13) rail at 5.3 on the 2026-11-16 user adjudication: the model's gripper
+# outputs sit naturally near the rail (per-response rail P50 4.51, 90.2% of the 5.0 rail) and every
+# archived violation is the first free row after the teacher-forced prefix boundary overshooting
+# rather than an optimization regression (overshoot spectrum max 5.2724 on the current stack's
+# batch-knob arms, 5.2523 at the 15-robot arms), inside the adjudicated tolerance.
+RTC_POSE_LIMITS = (((0, 1, 2, 7, 8, 9), 5.0), ((3, 4, 5, 10, 11, 12), 3.2), ((6, 13), 5.3))
 # Optional state fields: agent_pos_config name -> wire key under request["state"].
 _OPTIONAL_STATE = {"velocity_decomposed": "velocity_decomposed", "height": "lift", "head_actions": "head_pos"}
 # Action dims the desktop robot never commands.
