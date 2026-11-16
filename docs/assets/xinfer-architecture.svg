@@ -67,19 +67,18 @@
     <text class="node" x="59" y="480">Python Policy</text>
     <text class="meta" x="59" y="504">In-process inference</text>
 
-    <path class="flow" d="M275 389H359"/>
-    <path class="flow" d="M275 484H317V444H359"/>
-    <rect class="engine" x="363" y="354" width="290" height="118" rx="4"/>
-    <text class="node" x="383" y="393">XInfer Engine</text>
-    <text class="meta" x="383" y="422">Admission and per-stage queues</text>
-    <text class="meta" x="383" y="447">Batching and buffer lifetimes</text>
+    <path class="flow" d="M275 388.5H317V417.5H359"/>
+    <path class="flow" d="M275 484.5H317V467.5H359"/>
+    <rect class="engine" x="363" y="383.5" width="290" height="118" rx="4"/>
+    <text class="node" x="383" y="422.5">XInfer Engine</text>
+    <text class="meta" x="383" y="451.5">Admission and per-stage queues</text>
+    <text class="meta" x="383" y="476.5">Batching and buffer lifetimes</text>
 
-    <path class="branch" d="M653 413H711 M711 374V512"/>
-    <path class="flow" d="M711 374H762"/>
-    <path class="flow" d="M711 443H762"/>
-    <path class="flow" d="M711 512H762"/>
-    <circle cx="711" cy="413" r="2.8" fill="#485868"/>
-    <circle cx="711" cy="443" r="2.8" fill="#485868"/>
+    <path class="branch" d="M711 373.5V511.5"/>
+    <path class="flow" d="M711 373.5H762"/>
+    <path class="flow" d="M653 442.5H762"/>
+    <path class="flow" d="M711 511.5H762"/>
+    <circle cx="711" cy="442.5" r="2.8" fill="#485868"/>
     <rect class="device" x="766" y="344" width="314" height="59" rx="4"/>
     <text class="node" x="783" y="370">RTX 5090 · Jetson AGX Thor</text>
     <text class="meta" x="783" y="392">NVIDIA CUDA · SM120 / SM110</text>
