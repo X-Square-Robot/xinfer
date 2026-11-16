@@ -78,6 +78,26 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkp
 
 SIGINT/SIGTERM 会停止前端，释放 graph 和锁页缓冲区，并以 0 退出。服务每 0.5 s 检查一次 `Engine.health()`；当引擎无法继续服务（引擎线程或完成线程已停止）时，它以同样的方式关闭并以 1 退出，以便其监管进程重启它。
 
+## 容量旋钮（Wall-X 2B 机型）
+
+`--max-batch` 配合 `--allow-non-invariant-batching` 用单请求延迟换机队吞吐（action 段）。
+单卡 Ascend 950DT 上的实测配方（CAPACITY-R3，2026-11-16，150ms 规则阶梯）：
+
+```bash
+python -m xinfer.entrypoints.serve ...   --max-batch action=4 --allow-non-invariant-batching
+```
+
+- action 段每次派发最多配对四个单机器人请求；零等待批量器只合并**已在队列**的
+  相容请求，绝不等待。
+- 需要 `--allow-non-invariant-batching`：该段批量后的 gemm/attention 合同为容差级
+  （非逐位）批量不变；单请求路径不变。
+- 吞吐：非批量 70.9 req/s → `action=4` 下 **77.5 req/s**（14-15 台；成对率在 12-14 台
+  之间越过交叉点，低于该深度旋钮只排队不配对）。12 台时仍过 150ms 规则，代价
+  P50 +48ms——按部署目标取舍。
+- **不要与 action 段 `--lanes` ≥ 2 同开**：lanes4 臂实测 75.0 req/s（低于 77.5）——
+  并行 lane 把队列抽干，饿死批量器的配对窗口。12-13 台且 vision/prefill 深排队时
+  lanes 仍是更优选择；约 14 台起批量占优。**每套部署二选一，不要叠加。**
+
 ## 压测
 
 `benchmarks/robot_load.py` 以闭环方式让虚拟机器人向服务发送请求。见 [benchmark.md](benchmark.zh-CN.md)。
