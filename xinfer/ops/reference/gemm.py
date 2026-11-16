@@ -120,13 +120,21 @@ def qkv_rope_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
     """
     if qk_order not in ("standard", "any"):
         raise ValueError(f"qkv_rope_epilogue: qk_order must be 'standard' or 'any', got {qk_order!r}")
-    m, half = x.shape[0], cos.shape[-1]
-    y = (x.float() @ weight.float().t() + bias.float()).view(m, 3, num_heads, head_dim)
+    y = x.float() @ weight.float().t() + bias.float()
+    return rope_qk_heads(y, cos, sin, num_heads, head_dim).to(x.dtype)
+
+
+def rope_qk_heads(y: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, num_heads: int,
+                  head_dim: int) -> torch.Tensor:
+    """Rotate-half RoPE on every Q and K head of an FP32 ``[M, 3·H·D]`` ``[Q | K | V]`` (``qkv_rope_epilogue``): the
+    pairs ``(j, j + R/2)`` of the first ``R = 2·cos.shape[-1]`` channels of a head; FP32 ``[M, 3·H·D]``."""
+    m, half = y.shape[0], cos.shape[-1]
+    y = y.view(m, 3, num_heads, head_dim)
     c, s = cos[:, None, None, :], sin[:, None, None, :]
     qk = y[:, :2]
     a, b = qk[..., :half], qk[..., half:2 * half]
     rotated = torch.cat((a * c - b * s, b * c + a * s, qk[..., 2 * half:]), dim=-1)
-    return torch.cat((rotated, y[:, 2:]), dim=1).reshape(m, -1).to(x.dtype)
+    return torch.cat((rotated, y[:, 2:]), dim=1).reshape(m, -1)
 
 
 

@@ -3,7 +3,11 @@
 Stream-K GEMMs may differ at rounding level across runs (``deterministic=False``). The MXFP8 operators
 (``mxfp8_quantize``: ``quantize_mxfp8_into``; ``mxfp8_gemm_epilogue``, ``mxfp8_gemm_glu_quantize``,
 ``mxfp8_qkv_rope_epilogue``: ``gemm``, ``gemm_glu``, ``qkv_proj_rope`` with MXFP8 inputs) register with a build that has
-the MXFP8 GEMM family (``mxfp8_registration``) and write one scale per 128 columns.
+the MXFP8 GEMM family (``format_registration``) and write one scale per 128 columns. The NVFP4 operators
+(``nvfp4_quantize``: ``quantize_nvfp4``; ``nvfp4_gemm``, ``nvfp4_gemm_epilogue``, ``nvfp4_gemm_glu_quantize``,
+``nvfp4_qkv_rope_epilogue``: the same entries with NVFP4 inputs) register with a build that has NVFP4 inputs
+(``format_registration``); their weights ``(q, scales, global_scale)`` are packed on their first call (eager), with the
+global scale, which the GEMM applies to its FP32 accumulator.
 
 | operator | xcompute entry |
 |---|---|
@@ -28,13 +32,13 @@ import weakref
 
 import torch
 
-from xinfer.ops.backends._xcompute import XCOMPUTE, library, mxfp8_registration, xc, xcompute_with
+from xinfer.ops.backends._xcompute import XCOMPUTE, format_registration, library, xc, xcompute_with
 from xinfer.ops.backends.cuda.norm import add_rms_norm
 from xinfer.ops.layout.mxfp8 import scale_elements
 from xinfer.ops.registry import register
 
 FUSED_MLP_PAD = 1024  # intermediate multiple xcompute's fused MLP kernels take in whole chunks (padding adds zeros)
-MXFP8 = mxfp8_registration()
+MXFP8 = format_registration("mxfp8")
 MXFP8_OUT = dict(out_quant="mxfp8", scale_block=128)
 
 _supports_kn = True
@@ -280,3 +284,47 @@ def mxfp8_qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim):
     heads = dict(num_heads=num_heads, num_kv_heads=num_heads, head_dim=head_dim)
     return xc.qkv_proj_rope(x, _mxfp8_weight("qkv_proj_rope", weight, **heads), bias,
                             rope_table=xc.pack_rope_table(cos, sin), **heads, backend="auto")
+
+
+NVFP4 = format_registration("nvfp4")
+
+
+def _nvfp4_weight(op, weight, **heads):
+    """The xcompute packing of an NVFP4 weight ``(q [N, K/2], scales, global_scale)`` for ``op``, made on its first
+    call."""
+    q, scales, global_scale = weight
+    return _cached(_packed, (op, *_key(q), global_scale), (q, scales),
+                   lambda: xc.prepack_weight(q, op, scale=scales, global_scale=global_scale, **heads))
+
+
+@register("nvfp4_quantize", backend="cuda", **NVFP4)
+def nvfp4_quantize(x, *, global_scale=1.0, mse=False):
+    return xc.quantize_nvfp4(x.contiguous(), global_scale=global_scale, mse=mse)
+
+
+@register("nvfp4_gemm", backend="cuda", **NVFP4)
+def nvfp4_gemm(a_q, a_scales, w_q, w_scales, bias=None, *, alpha=1.0):
+    return xc.gemm((a_q, a_scales), _nvfp4_weight("gemm", (w_q, w_scales, 1.0)), bias=bias, alpha=alpha,
+                   backend="auto")
+
+
+@register("nvfp4_gemm_epilogue", backend="cuda", **NVFP4)
+def nvfp4_gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, out_quant=False):
+    options = dict(bias=bias, activation=activation)
+    if residual is not None:
+        options.update(residual=residual, round_before_residual=True)
+    if out_quant:
+        options["out_quant"] = "nvfp4"
+    return xc.gemm(x, _nvfp4_weight("gemm", weight), **options, backend="auto")
+
+
+@register("nvfp4_gemm_glu_quantize", backend="cuda", **NVFP4)
+def nvfp4_gemm_glu_quantize(x, weight):
+    return xc.gemm_glu(x, _nvfp4_weight("gemm_glu", weight), activation="silu", out_quant="nvfp4", backend="auto")
+
+
+@register("nvfp4_qkv_rope_epilogue", backend="cuda", **NVFP4)
+def nvfp4_qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim):
+    heads = dict(num_heads=num_heads, num_kv_heads=num_heads, head_dim=head_dim)
+    return xc.qkv_proj_rope(x, _nvfp4_weight("qkv_proj_rope", weight, **heads), bias, cos, sin, **heads,
+                            backend="auto")

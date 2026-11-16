@@ -1,9 +1,9 @@
 """Wall-X 2B structure on a tiny random checkpoint.
 
-For both compositions (the optimized one on the torch references of its operators): the weight mapping covers
-every parameter, the three stages run, an RTC request returns its pinned rows unchanged, uncommanded dimensions
-move to the normalized zero action as the source's velocity padding gives, and the stages are deterministic. The
-optimized composition stays close to the reference.
+For both compositions and the optimized one with ``quantization="mxfp8"`` and ``"nvfp4"`` (the optimized ones on the
+torch references of their operators): the weight mapping covers every parameter, the three stages run, an RTC request
+returns its pinned rows unchanged, uncommanded dimensions move to the normalized zero action as the source's velocity
+padding gives, and the stages are deterministic. The optimized compositions stay close to the reference.
 """
 
 import numpy as np
@@ -58,9 +58,17 @@ def tiny_mxfp8(tiny):
         return Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu", quantization="mxfp8")
 
 
-@pytest.fixture(params=["reference", "optimized", "mxfp8"])
-def composition(request, tiny, tiny_optimized, tiny_mxfp8):
-    return {"reference": tiny, "optimized": tiny_optimized, "mxfp8": tiny_mxfp8}[request.param]
+@pytest.fixture(scope="module")
+def tiny_nvfp4(tiny):
+    from xinfer.models.wallx2b.model import Wallx2b
+
+    with ops.use_ops(ops.registry.build_table(resolve_platform("cpu"))):
+        return Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu", quantization="nvfp4")
+
+
+@pytest.fixture(params=["reference", "optimized", "mxfp8", "nvfp4"])
+def composition(request, tiny, tiny_optimized, tiny_mxfp8, tiny_nvfp4):
+    return {"reference": tiny, "optimized": tiny_optimized, "mxfp8": tiny_mxfp8, "nvfp4": tiny_nvfp4}[request.param]
 
 
 def _run(model, stage, inputs):
@@ -123,14 +131,14 @@ def test_quantization_selects_only_the_requested_stage(tiny):
         model = Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu",
                                         quantization={"groups": {"prefill": "mxfp8"}})
     declared = model.capabilities().stage_ops
-    assert model.prefill_stack.mxfp8 and not model.vision.mxfp8
+    assert model.prefill_stack.quant == "mxfp8" and model.vision.quant is None
     assert "mxfp8_gemm_epilogue" in declared["prefill"]
     assert not any(op.startswith("mxfp8") for stage in ("vision", "action") for op in declared[stage])
     assert not hasattr(model.prefill_stack.layers[0], "qkv_zba")
     assert model.prefill_stack.layers[0].qkv_zba_q.dtype == torch.float8_e4m3fn
 
 
-@pytest.mark.parametrize("quantization", ["nvfp4", {"groups": {"action": "mxfp8"}},
+@pytest.mark.parametrize("quantization", [{"default": "nvfp4"}, {"groups": {"action": "mxfp8"}},
                                           {"options": {"mxfp8": {"share_scale_128": False}}}])
 def test_incompatible_quantization_is_rejected(tiny, quantization):
     with pytest.raises(ValueError, match="quantization"):
@@ -164,23 +172,25 @@ def test_uncommanded_dimensions_move_to_the_normalized_zero_action(composition):
     np.testing.assert_allclose(out[..., 20:].numpy(), expected, rtol=0, atol=1e-6)
 
 
-@pytest.mark.parametrize("name", ["optimized", "mxfp8"])
+@pytest.mark.parametrize("name", ["optimized", "mxfp8", "nvfp4"])
 @pytest.mark.parametrize("rtc_delay", [0, 3])
-def test_optimized_composition_stays_close_to_the_reference(tiny, tiny_optimized, tiny_mxfp8, rtc_delay, name):
+def test_optimized_composition_stays_close_to_the_reference(tiny, tiny_optimized, tiny_mxfp8, tiny_nvfp4, rtc_delay,
+                                                            name):
     """The same model with other rounding steps (``mxfp8``: also MXFP8 GEMMs in the ViT blocks and the prompt stream,
-    whose E4M3 rounding the random layers amplify in the K/V; a wrong row order or scale gives errors near 1): each
-    stage from the same inputs, relative error."""
+    ``nvfp4`` NVFP4 GEMMs in the ViT and the prompt stream, whose E4M3 / E2M1 rounding the random layers amplify in
+    the K/V; a wrong row order or scale gives errors near 1): each stage from the same inputs, relative error."""
     def relative(a, b):
         return float((a.float() - b.float()).norm() / b.float().norm())
 
-    model = {"optimized": tiny_optimized, "mxfp8": tiny_mxfp8}[name]
+    model = {"optimized": tiny_optimized, "mxfp8": tiny_mxfp8, "nvfp4": tiny_nvfp4}[name]
+    bounds = {"optimized": (0.05, 0.05), "mxfp8": (0.05, 0.3), "nvfp4": (0.1, 0.4)}[name]  # vision, prefill
     inputs = _inputs(tiny, rtc_delay=rtc_delay)
     with torch.no_grad():
         image = _run(tiny, "vision", inputs)["image_embeds"]
-        assert relative(_run(model, "vision", inputs)["image_embeds"], image) < 0.05
+        assert relative(_run(model, "vision", inputs)["image_embeds"], image) < bounds[0]
         inputs["image_embeds"] = image
         kv = _run(tiny, "prefill", inputs)["prompt_kv"]
-        assert relative(_run(model, "prefill", inputs)["prompt_kv"], kv) < (0.3 if name == "mxfp8" else 0.05)
+        assert relative(_run(model, "prefill", inputs)["prompt_kv"], kv) < bounds[1]
         inputs["prompt_kv"] = kv
         out = _run(model, "action", inputs)["predict_action_norm"]
         assert relative(out, _run(tiny, "action", inputs)["predict_action_norm"]) < 0.05
