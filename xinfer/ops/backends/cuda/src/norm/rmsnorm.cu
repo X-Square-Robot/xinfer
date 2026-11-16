@@ -33,6 +33,9 @@
 #include "common/tvm_ffi_cuda_tensor.h"
 
 #include "common/cuda_utils.h"
+#ifdef XINFER_WITH_SM110
+#include "norm/sm110/bf16_rmsnorm_sm110.h"
+#endif
 
 namespace tvm_ffi_rmsnorm {
 
@@ -803,6 +806,32 @@ void LaunchAddRMSNormKernel(
       sum_row_stride, norm_row_stride);
 }
 
+#ifdef XINFER_WITH_SM110
+// SM110 kernel of the BF16 forward (sm110/bf16_rmsnorm_sm110.cu): one warp per row, row kept in registers. Measured
+// on Thor against the wide kernel: 1.2-1.5x faster from 256 rows up, slower below (2112 x 1280: 16.8 -> 11.8 us;
+// 20 x 1024: 2.1 vs 2.4 us), hence the row threshold.
+constexpr int64_t kSm110RmsnormMinRows = 256;
+
+bool UseRMSNormSM110(const tvm::ffi::TensorView& output, const tvm::ffi::TensorView& input,
+                     const tvm::ffi::TensorView& weight, const RMSNormShape& shape,
+                     const RMSNormShape& output_shape) {
+  if (!IsBFloat16(input.dtype()) || !IsBFloat16(weight.dtype()) || !IsBFloat16(output.dtype()) ||
+      shape.num_tokens < kSm110RmsnormMinRows || shape.row_stride != shape.hidden_size ||
+      output_shape.row_stride != shape.hidden_size || !bf16_rmsnorm_sm110::Supported(shape.hidden_size)) {
+    return false;
+  }
+  for (const void* pointer : {output.data_ptr(), input.data_ptr(), weight.data_ptr()}) {
+    if (reinterpret_cast<uintptr_t>(pointer) % 16 != 0) return false;
+  }
+  int major = 0;
+  int minor = 0;
+  const int device = input.device().device_id;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  return major == 11 && minor == 0;
+}
+#endif
+
 template<bool ZeroCentered>
 void RMSNormImpl(tvm::ffi::TensorView output, tvm::ffi::TensorView input,
                  tvm::ffi::TensorView weight, double epsilon,
@@ -822,6 +851,17 @@ void RMSNormImpl(tvm::ffi::TensorView output, tvm::ffi::TensorView input,
   ASSERT_CHECK(output_shape.row_stride % GetVecSize(input.dtype()) == 0);
   cudaStream_t stream = static_cast<cudaStream_t>(
       TVMFFIEnvGetStream(input.device().device_type, input.device().device_id));
+#ifdef XINFER_WITH_SM110
+  if constexpr (!ZeroCentered) {
+    if (use_wide && rstd_ptr == nullptr && UseRMSNormSM110(output, input, weight, shape, output_shape)) {
+      bf16_rmsnorm_sm110::Launch(static_cast<__nv_bfloat16*>(output.data_ptr()),
+                                 static_cast<const __nv_bfloat16*>(input.data_ptr()),
+                                 static_cast<const __nv_bfloat16*>(weight.data_ptr()), num_tokens, hidden_size,
+                                 static_cast<float>(epsilon), 256, input.device().device_id, stream);
+      return;
+    }
+  }
+#endif
   if (use_wide && TryRMSNormForwardWide<ZeroCentered>(
           output, input, weight, rstd_ptr, static_cast<float>(epsilon),
           hidden_size, num_tokens, shape.row_stride, output_shape.row_stride,

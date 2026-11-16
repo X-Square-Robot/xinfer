@@ -31,10 +31,10 @@ def rnd():
     return make
 
 
-def sm(arch):
-    """Mark a test as needing a GPU of compute capability ``arch`` and a library built for it."""
-    here = torch.cuda.is_available() and _native.arch(DEVICE) == arch and arch in _native.BUILD_ARCHS
-    return pytest.mark.skipif(not here, reason=f"needs an SM{arch} GPU and build")
+def sm(*archs):
+    """Mark a test as needing a GPU of one of the compute capabilities ``archs`` and a library built for it."""
+    here = torch.cuda.is_available() and _native.arch(DEVICE) in archs and _native.arch(DEVICE) in _native.BUILD_ARCHS
+    return pytest.mark.skipif(not here, reason=f"needs an SM{' or SM'.join(map(str, archs))} GPU and build")
 
 
 def close(actual, expected, tolerance=5e-3):

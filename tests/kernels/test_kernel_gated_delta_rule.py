@@ -31,7 +31,7 @@ def reference(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, heads, eps):
     return (normed * F.silu(z.view(rows, heads, D))).view(rows, heads * D)
 
 
-@sm(120)
+@sm(110, 120)
 @pytest.mark.parametrize("rows", [1, 31, 32, 33, 464])
 def test_matches_reference(rows, rnd):
     heads = 16

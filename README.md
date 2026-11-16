@@ -115,7 +115,7 @@ Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 
 | Hardware | Device | Runtime |
 |---|---|---|
 | NVIDIA GPUs · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
-| NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA, optional Wall-OSS Xcompute kernels |
+| NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
 | CPU | `cpu` | Reference implementations and tests |
 

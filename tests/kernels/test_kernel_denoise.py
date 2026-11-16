@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from xinfer.ops.backends.cuda import flow
+from xinfer.ops.backends.cuda import _native, flow
 from conftest import DEVICE, sm
 
 
@@ -17,7 +17,7 @@ def reference(x, h, weight, dt, dof_mask=None, padding_velocity=None, pinned=Non
     return out
 
 
-@sm(120)
+@sm(110, 120)
 @pytest.mark.parametrize("b,m,a", [(1, 16, 26), (2, 32, 32), (4, 1, 26)])
 @pytest.mark.parametrize("h_dtype,w_dtype", [(torch.bfloat16, torch.float32), (torch.bfloat16, torch.bfloat16),
                                              (torch.float32, torch.float32)])
@@ -33,6 +33,9 @@ def test_matches_reference(b, m, a, h_dtype, w_dtype, options, rnd):
         kw.update(pinned=torch.full((b,), min(5, m), dtype=torch.int32, device=DEVICE))
     if "values" in options:
         kw.update(pinned_values=rnd(b, m, a, dtype=torch.float32))
+    if _native.arch(DEVICE) == 110 and b > 2 and h_dtype == w_dtype == torch.bfloat16:  # not listed on SM110
+        assert not flow.denoise_output_euler_takes(x, h, weight)
+        return
     assert flow.denoise_output_euler_takes(x, h, weight)
     expected = reference(x, h, weight, 0.2, **kw)
     out = flow.denoise_output_euler(x, h, weight, dt=0.2, out=torch.empty_like(x), **kw)
@@ -41,7 +44,7 @@ def test_matches_reference(b, m, a, h_dtype, w_dtype, options, rnd):
     assert torch.equal(x, out)
 
 
-@sm(120)
+@sm(110, 120)
 @pytest.mark.parametrize("extra", [False, True])
 @pytest.mark.parametrize("heads", [1, 2])
 @pytest.mark.parametrize("options", ["plain", "addends", "mask+override"])

@@ -6,7 +6,8 @@
 cmake_minimum_required(VERSION 3.24)
 project(xinfer_kernels LANGUAGES CXX CUDA)
 
-# The GPU architecture to build for, as the compute capability without the dot: 120 (RTX 50 series).
+# The GPU architecture to build for, as the compute capability without the dot: 120 (RTX 50 series) or 110
+# (Jetson Thor).
 # Unset: the architecture of this machine's first GPU.
 set(XINFER_CUDA_ARCH "" CACHE STRING "Target compute capability without the dot, e.g. 120")
 if(NOT XINFER_CUDA_ARCH)
@@ -15,10 +16,13 @@ if(NOT XINFER_CUDA_ARCH)
   string(REGEX MATCH "^[0-9]+\\.[0-9]" _cap "${_caps}")
   string(REPLACE "." "" XINFER_CUDA_ARCH "${_cap}")
 endif()
-set(XINFER_SUPPORTED_ARCHS 120)
+set(XINFER_SUPPORTED_ARCHS 110 120)
 if(NOT XINFER_CUDA_ARCH IN_LIST XINFER_SUPPORTED_ARCHS)
   message(FATAL_ERROR "The CUDA backend has kernels for compute capability ${XINFER_SUPPORTED_ARCHS}; got "
                       "'${XINFER_CUDA_ARCH}'. Pass -DXINFER_CUDA_ARCH=<capability>.")
+endif()
+if(XINFER_CUDA_ARCH STREQUAL "110" AND CMAKE_VERSION VERSION_LESS 3.28)
+  message(FATAL_ERROR "Building for compute capability 11.0 (sm_110a) needs CMake 3.28 or later")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -63,8 +67,17 @@ set(KERNEL_SOURCES
   denoise_output/denoise_input_embed.cu
   denoise_output/denoise_output_euler.cu
   denoise_output/denoise_output_euler_kernel.cu
+  prefetch/l2_prefetch.cu
 )
 # Kernels of one architecture, compiled with its architecture-specific instructions (sm_<arch>a).
+set(KERNEL_SM110_SOURCES
+  gemm/sm110/bf16_qkv_rope.cu
+  gemm/sm110/bf16_gemm_silu_mul.cu
+  gemm/sm110/mcast_bf16_sm110.cu
+  gemm/sm110/mcast_ffn_sm110.cu
+  gemm/sm110/mcast_sm110_ffi.cc
+  norm/sm110/bf16_rmsnorm_sm110.cu
+)
 set(KERNEL_SM120_SOURCES
   gemm/sm120/smallm_bf16_sm120.cu
   gemm/sm120/streamk_bf16_sm120.cu
@@ -101,6 +114,9 @@ set_target_properties(xinfer_kernels_arch PROPERTIES CUDA_ARCHITECTURES "${XINFE
 
 add_library(xinfer_kernels SHARED ${KERNEL_SOURCES} $<TARGET_OBJECTS:xinfer_kernels_arch>)
 kernels_target_setup(xinfer_kernels)
+if(XINFER_CUDA_ARCH STREQUAL "110")  # the generic rmsnorm calls the SM110 kernel of BF16 rows
+  target_compile_definitions(xinfer_kernels PRIVATE XINFER_WITH_SM110=1)
+endif()
 target_link_libraries(xinfer_kernels PRIVATE tvm_ffi::shared CUDA::cublasLt)
 set_target_properties(xinfer_kernels PROPERTIES
   CUDA_ARCHITECTURES "${XINFER_CUDA_ARCH}"
