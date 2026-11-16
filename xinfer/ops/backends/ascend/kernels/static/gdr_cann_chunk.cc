@@ -13,8 +13,8 @@
 //    double and narrowed exactly like the old FFI (static_cast<float>).
 //
 // 2. Execution form: per-call Prepare. The 20.62 stack's live path was the
-//    FFI TensorView Launch (xcompute::gdr_cann_chunk::Launch), which
-//    prepared a fresh executor on every call, launched once and destroyed
+//    retired v22 bridge's FFI TensorView Launch, which prepared a fresh
+//    executor on every call, launched once and destroyed
 //    it. The R1 port cached a repeatable executor keyed on (shape, scale,
 //    buffer addresses) and kept its descriptors alive -- dead code in the
 //    v22 tree, numerically suspect here. This file now mirrors the old
