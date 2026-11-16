@@ -319,16 +319,19 @@ def gated_residual_adarmsnorm(out, gate, residual_out, residual, branch, branch_
 
 def double_adarmsnorm_gated_residual_inplace(residual, branch, gate, previous_gate,
                                              first_modulation, second_modulation, epsilon,
-                                             pinned_modulation=None, pinned_rows=None,
-                                             **_legacy):
+                                             pinned_input_modulation=None,
+                                             pinned_post_modulation=None,
+                                             pinned_rows=None):
     """The identity layer-norm pair on the action family (action_double kernel).
 
     Port of the .cc DoubleContinue fast path: one kernel fuses both AdaRMS
-    norms and both residual adds for the [1, 16, 1024] action shape.
+    norms and both residual adds for the [1, 16, 1024] action shape. The
+    pinned form takes the two pinned modulations by the retired pkg's names;
+    the RTC rows (``pinned_rows`` and beyond on the input side) read them
+    instead of the step's.
     """
     lib = _action_entries()
     _require(lib is not None, "adanorm_r2: the knife library is not loaded")
-    pinned = pinned_modulation is not None and pinned_rows is not None
     _require(branch.dtype == torch.bfloat16 and branch.is_contiguous(),
              "the action kernel requires contiguous BF16 activations")
     stream = torch.npu.current_stream(branch.device).npu_stream
@@ -337,11 +340,13 @@ def double_adarmsnorm_gated_residual_inplace(residual, branch, gate, previous_ga
     # the v22 .cc's DoubleContinue passes the caller's buffers through both
     # in/out pairs (residual -> residual_out, branch -> branch_out) with the
     # previous gate at slot 3 and the next gate at slot 6.
-    if pinned:
+    if pinned_rows is not None:
+        _require(pinned_input_modulation is not None and pinned_post_modulation is not None,
+                 "the pinned action-double kernel takes both pinned modulations")
         _launch(lib, "adarmsnorm_action_double_bf16_f32_pinned",
                 (residual, branch, previous_gate, residual, branch, gate,
-                 first_modulation, second_modulation, pinned_modulation,
-                 pinned_modulation, pinned_rows),
+                 first_modulation, second_modulation, pinned_input_modulation,
+                 pinned_post_modulation, pinned_rows),
                 (_bits(epsilon),))
     else:
         _launch(lib, "adarmsnorm_action_double_bf16_f32",
