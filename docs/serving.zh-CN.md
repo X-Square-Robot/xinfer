@@ -115,6 +115,23 @@ python -m xinfer.entrypoints.serve ... \
 - action lanes=1 拒用：单流串行化派发，@15 台仅 68.4 req/s。vision 与
   prefill 段 lanes 维持 2。
 
+## 容量旋钮（Wall-OSS 机型）
+
+已发布的 Wall-OSS 容量行（单卡 5 台、round-P50/P95 中位 122.2/138.8 ms、6 台饱和档最高实测
+33.2 req/s；2026-11-16，单张 950DT 上的 150 ms 规则阶梯）测自终态刀栈的 reference-ops pins 形态
+（`--reference-ops` 加 xcompute op 后端与 `--require-xcompute-npu` / `--require-native-ops` 校验）
+并开启 smallm_r3 qkv 路由：
+
+```bash
+export XINFER_SMALLM_R3=oproj,gateup,down,qkv   # 内核在随栈交付的 xcompute 库中
+```
+
+- `qkv` 族把解码环 qkv GEMM 路由到 smallm_r3 内核；该路由在 quick100 锚点、成对 e2e 会话与成对
+  动作转储上逐位相同，容量行即按此臂记数。
+- rtc_actions 固定形状无需旋钮：它是本仓请求处理器的一部分，正是它让服务路径从预热好的 NPU 图
+  重放全部三段（修复前 RTC 请求命不中预热图键、action 段走 eager：同栈单台 P50 134 ms；修复后
+  5 台 122 ms）。
+
 ## 压测
 
 `benchmarks/robot_load.py` 以闭环方式让虚拟机器人向服务发送请求。见 [benchmark.md](benchmark.zh-CN.md)。

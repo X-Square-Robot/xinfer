@@ -144,6 +144,26 @@ python -m xinfer.entrypoints.serve ... \
 - Action lanes=1 is rejected: it serializes the dispatch and reads 68.4 req/s
   at 15 robots. The vision and prefill lanes stay at 2.
 
+## Capacity knobs (Wall-OSS fleets)
+
+The published Wall-OSS capacity row (5 robots per NPU, round-P50/P95 medians 122.2/138.8 ms, the
+highest measured rate 33.2 req/s at the 6-robot saturation tier; 2026-11-16, the 150 ms rule ladder
+on one 950DT) was measured on the terminal knife stack with the reference-ops pins form
+(`--reference-ops` with the xcompute op backends and the `--require-xcompute-npu` /
+`--require-native-ops` checks) and the smallm_r3 qkv route armed:
+
+```bash
+export XINFER_SMALLM_R3=oproj,gateup,down,qkv   # the kernels live in the delivered xcompute library
+```
+
+- The `qkv` family routes the decode-loop qkv GEMM to the smallm_r3 kernel; the route is bit-exact
+  on the quick100 anchor, the paired e2e sessions and the paired action dumps, and the capacity row
+  cites this arm.
+- The rtc_actions fixed shape needs no knob: it is part of the request processor in this repository,
+  and it is what lets the serving path replay all three stages from the warmed NPU graphs (before
+  the fix the RTC requests missed the warmed graph key and ran the action stage eager: one robot at
+  P50 134 ms on the same stack, five robots at 122 ms after the fix).
+
 ## Load testing
 
 `benchmarks/robot_load.py` runs virtual robots against the service in closed
