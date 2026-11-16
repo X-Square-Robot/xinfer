@@ -20,6 +20,20 @@ from xinfer.models.interface import DeviceImage
 from xinfer.platforms.devices import jpeg_decoder_for
 
 
+def _quant_u8(x):
+    """SOUP2 quant knife: one kernel for add+floor+clamp+cast; falls back."""
+    try:
+        from xcompute.kernel import soup2
+
+        if soup2.enabled("quant"):
+            out = soup2.quant_u8(x)
+            if out is not None:
+                return out
+    except Exception:  # noqa: BLE001 - any miss runs the released chain
+        pass
+    return x.add_(0.5).floor_().clamp_(0, 255).to(torch.uint8)
+
+
 class DeviceImageDecoder:
     """Turns the ``DeviceImage`` inputs of one request into ``[h, w, 3]`` uint8 views on the device.
 
@@ -96,5 +110,5 @@ def _resize(view: torch.Tensor, image: DeviceImage) -> torch.Tensor:
     for (mode, antialias), size in zip(image.resize, image.sizes):
         if tuple(size) != tuple(x.shape[-2:]):
             x = F.interpolate(x.float(), size=tuple(size), mode=mode, antialias=antialias, align_corners=False)
-            x = x.add_(0.5).floor_().clamp_(0, 255).to(torch.uint8)
+            x = _quant_u8(x)
     return x[0].permute(1, 2, 0).contiguous()
