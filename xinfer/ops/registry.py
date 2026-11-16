@@ -275,6 +275,29 @@ class OpRegistry:
         """Names of all defined operators, sorted."""
         return tuple(sorted(self._specs))
 
+    def backend_runtime_report(self) -> dict:
+        """Report the unified Ascend backend's loaded AOT state (the v22 provider's runtime witness).
+
+        The legacy entry counted the provider's Python host dispatches -- the witness that graph
+        replay never calls Python held there; the unified backend replays whole graphs the same
+        way, so the runtime witness is the loaded core library (path and pinned sha) and the
+        operators the backend registered. Empty when the backend is not armed.
+        """
+        path = os.environ.get("XINFER_ASCEND_CORE_LIB")
+        if not path:
+            return {}
+        from xinfer.ops.backends.ascend import _provider
+
+        if _provider.core_library() is None:
+            return {}
+        registered = sorted(name for name, impls in self._impls.items()
+                            if any(implementation.backend == "ascend" for implementation in impls))
+        return {"ascend:xinfer_ascend": {
+            "library_path": path,
+            "library_sha256": os.environ.get("XINFER_ASCEND_CORE_SHA256", ""),
+            "registered": registered,
+        }}
+
     def add(
         self,
         op: str,
