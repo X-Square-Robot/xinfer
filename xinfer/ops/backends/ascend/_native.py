@@ -14,13 +14,27 @@ vendor's device name lowercased to alphanumerics, the string ``platforms/npu.py`
 arch) and registers its operators on exactly those platforms. A library of another device family (it reports
 no SoC) registers nothing here.
 
-Buffers: scratch memory per (device, stream) and tensors derived once from a weight. An NPU graph (TorchNPU's
-``NPUGraph``) replays the device-side work it captured, so a buffer a captured graph launches against keeps
-its address for the graph's life: growing one while its stream captures is an error (run each shape once
-before capturing — the engine's warmup and capture discipline does), and an outgrown buffer that a graph used
-is kept alive. CANN's operator framework workspaces (the workspace some aclnn operators want besides their
-arguments) flow through the same scratch ledger, per (name, device, stream), so a captured graph keeps
-pointing at the workspace it was captured with.
+The external loader and this one must never serve each other's library. ``XINFER_XCOMPUTE_LIBRARY`` does not
+name this library: the external loader's ``is_ascend`` heuristic reads a soc string as "an Ascend build", and
+what refuses the library there is the paired-package check (an in-tree build has no xcompute Python package
+whose ``KERNEL_LIB_PATH`` matches), so the misdirection ends in a refusal, not a double registration — the
+acceptance test that points ``XINFER_XCOMPUTE_LIBRARY`` at ``xinfer_kernels_ascend.so`` and expects ``xc is
+None`` must keep passing. During the transition an operator may exist twice (``ascend:xcompute`` and
+``ascend:kernels``); which one wins is decided explicitly — priority or pin — when IN-TREE-R1 moves the first
+operator onto this library, never by registration order.
+
+Buffers: scratch memory per (device, stream) and tensors derived once from a weight. **The scratch key carries
+the NPU stream**: a scratch buffer is never shared across streams, because concurrent streams reading one
+buffer through this backend corrupted results before (the Wall-X 2B concurrency fix) — a per-stream buffer is
+a correctness rule, not an optimization. An NPU graph (TorchNPU's ``NPUGraph``) replays the device-side work
+it captured, so a buffer a captured graph launches against keeps its address for the graph's life: growing
+one while its stream captures is an error (run each shape once before capturing — the engine's warmup and
+capture discipline does), and an outgrown buffer that a graph used is kept alive. CANN's operator framework
+workspaces (the workspace some aclnn operators want besides their arguments) flow through the same scratch
+ledger, per (name, device, stream), so a captured graph keeps pointing at the workspace it was captured with.
+
+Calls go through TVM-FFI typed functions, which forward the current torch stream with the tensor arguments;
+under TorchNPU that stream is the NPU stream the caller is on.
 
 This regulation is written after the CUDA-graph rules of the CUDA backend's ``_native.py`` and the NPUGraph
 discipline the Ascend deployment validated (launches resolve the current NPU stream per call; every shape is
@@ -33,6 +47,8 @@ verify on hardware, then keep or amend each point:
   all, or the warmup rule alone must prevent them — the FIA-FIX lesson stands either way: a first launch of
   a shape on a capturing stream is not trusted, because AOT MixedKernel launches were seen to drop silently
   (a device slab rewritten in place per request interacted with NPUGraph capture);
+- that TVM-FFI's implicit stream forwarding follows the caller's NPU stream under TorchNPU, per operator
+  moved in (the CUDA side relies on the same mechanism);
 - that ``derived`` copies keyed by address stay valid under TorchNPU's caching allocator, whose reuse of a
   freed address must never hand a later weight an earlier weight's copy (the CUDA tests assert this; the
   Ascend kernel tests must too).
@@ -144,7 +160,9 @@ def capturing(device) -> bool:
 def scratch(name, nbytes, device, zeroed=False):
     """A uint8 buffer of at least ``nbytes`` for the current stream of ``device``; grows, never shrinks.
 
-    ``zeroed``: cleared when allocated, for kernels that leave their flags zeroed.
+    The buffer is per stream (the key carries the NPU stream handle) and is never shared across streams:
+    concurrent streams reading one buffer corrupted results before. ``zeroed``: cleared when allocated, for
+    kernels that leave their flags zeroed.
     """
     if nbytes == 0:
         return None

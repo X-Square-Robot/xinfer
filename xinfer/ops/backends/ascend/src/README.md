@@ -93,6 +93,8 @@ implementation detail behind the TVM-FFI exports, unlike the ctypes knife librar
 - Sources come from the v22 knife tree: the `src/<family>/npu/*.py` TileLang modules and the generator pair
   (`aot/generate.py`, `aot/abi.py`) per the build-spike contract; `finish_br_c1024` needs family-ization first
   (it lives outside the v22 `src/` families), and the two walloss remnant kernels ride along.
+- Kernel sources keep their Apache-2.0 headers in the move (they come from the xcompute project, as the CUDA
+  sources did); new host glue written here follows the repository's own files.
 - Each family README's table is the checklist: kernel name, envelope, dose, v22 source path, gate evidence.
 - The SHAPES envelope of the GEMM family is already declared in `../gemm_950dt.py`; the other families get
   theirs next to their glue as R1 rewrites the wrappers in the CUDA paradigm (`Call` normalization, `takes`,
