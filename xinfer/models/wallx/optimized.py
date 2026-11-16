@@ -26,6 +26,35 @@ from xinfer.loader import Source
 from xinfer.ops import active_ops
 
 DTYPE = torch.bfloat16
+
+
+# GQA-GLUE knife 2 (fused one-launch prefill GQA chain). The mount is
+# optional and stateless per call; every envelope miss returns None and the
+# released registry path runs (with the K1 BHSD branches when enabled).
+def _gqa_fused_prefill(packed, q_norm, k_norm, cos, sin, eps, rotary_dim):
+    import os
+
+    if "stats" not in os.environ.get("XINFER_GQA_GLUE", "") or rotary_dim != 64:
+        return None
+    try:
+        from xcompute.kernel.qkv_rope_fused import qkv_rope_fused
+    except Exception:
+        return None
+    if (packed.dim() != 3 or packed.shape[-1] != 5120 or not packed.is_contiguous()
+            or packed.dtype != DTYPE or packed.device.type != "npu"
+            or (packed.shape[0] * packed.shape[1]) % 4):
+        return None
+    if (cos.dim() != 3 or cos.shape[-1] != 32 or not cos.is_contiguous()
+            or cos.shape[-2] != packed.shape[0] * packed.shape[1]
+            or not torch.is_tensor(sin) or sin.shape != cos.shape
+            or not sin.is_contiguous() or sin.device != cos.device
+            or cos.device != packed.device):
+        return None
+    try:
+        q, k, v, gate, _, _ = qkv_rope_fused(packed, q_norm, k_norm, cos, sin, eps)
+        return q, k, v, gate
+    except (ValueError, RuntimeError):
+        return None
 def _SOUPUNLOCK_LN(x, weight, bias, eps):
     """soupunlock visionln: the vision LayerNorm site as ONE fused two-pass
     kernel (fp32 vector-tree stats + Newton rsqrt, band-witnessed); any
@@ -116,12 +145,22 @@ def _SOUPFORM_ENABLED(family):
 
 
 def _zba_soupform(flat, weight, keep, conv, p):
-    """soupform zbasplit: rne(acc*keep) into contiguous conv/zba buffers.
+    """soupform zbasplit / finish-bf16 zba: rne(acc*keep) into contiguous buffers.
 
     Opt-in through ``XINFER_SOUPFORM=zbasplit`` (xcompute's soupform mount,
     default off). Any miss -- flag off, absent knife library, wrong rank or a
     fused-path error -- returns None and the caller keeps the released chain.
     """
+    if flat.dim() == 2:
+        try:
+            from xcompute.kernel import finishbf16
+
+            if finishbf16.enabled("zba"):
+                out = finishbf16.zbasplit_bf16(flat, weight, keep, conv)
+                if out is not None:
+                    return out
+        except Exception:  # noqa: BLE001 - the mount is optional
+            pass
     if not _SOUPFORM_ENABLED("zbasplit") or flat.dim() != 2:
         return None
     if not _SOUPKILL_PROJECTION:
@@ -139,13 +178,24 @@ def _zba_soupform(flat, weight, keep, conv, p):
 
 
 def _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
-    """(qkv, packed): the soupform packed [3, rows, heads, dim] store first.
+    """(qkv, packed): the finish-bf16 / soupform packed [3, rows, heads, dim] store first.
 
     Opt-in through ``XINFER_SOUPFORM=vropepack`` (default off): the fused
     finish stores the packed layout directly, so the model-side pack transpose
     disappears (same values, different addresses). Every miss falls through to
     the soupkill vrope knife and then the released operator.
     """
+    if normed.dim() == 2 and cos2 is not None and cos2.shape[-1] == d:
+        try:
+            from xcompute.kernel import finishbf16
+
+            if finishbf16.enabled("vrope"):
+                packed = finishbf16.vrope_bf16(normed, block.qkv_weight, block.qkv_bias,
+                                               cos2, sin2, heads, d)
+                if packed is not None:
+                    return packed, True
+        except Exception:  # noqa: BLE001 - the mount is optional
+            pass
     if _SOUPFORM_ENABLED("vropepack") and normed.dim() == 2 and cos2 is not None and cos2.shape[-1] == d:
         if not _SOUPKILL_PROJECTION:
             from xcompute.kernel.cann_projection import CannProjection
@@ -339,11 +389,21 @@ class OptimizedPrefill(nn.Module):
             flat = normed.view(p, -1)
             if c.layer_types[i] == "full_attention":
                 packed = ops.gemm_epilogue(flat, layer.qkv).view(1, p, -1)
-                q, k, v, gate = ops.qkv_norm_split(packed, layer.q_norm, layer.k_norm, heads, kv_heads, d, eps)
-                q, k = ops.rope_full(q, k, cos, sin, c.rotary_dim)
+                fused = _gqa_fused_prefill(packed, layer.q_norm, layer.k_norm, cos, sin, eps, c.rotary_dim)
+                if fused is not None:
+                    q, k, v, gate = fused
+                else:
+                    q, k, v, gate = ops.qkv_norm_split(packed, layer.q_norm, layer.k_norm, heads, kv_heads, d, eps)
+                    q, k = ops.rope_full(q, k, cos, sin, c.rotary_dim)
                 slot = full.index(i)
-                prompt_kv[slot, 0].copy_(k.transpose(1, 2))
-                prompt_kv[slot, 1].copy_(v.transpose(1, 2))
+                if k.dim() == 4 and k.shape[1] == kv_heads:
+                    # GQA-GLUE knife 1: head-major K/V already match the
+                    # prompt_kv slot layout -- plain contiguous copies.
+                    prompt_kv[slot, 0].copy_(k)
+                    prompt_kv[slot, 1].copy_(v)
+                else:
+                    prompt_kv[slot, 0].copy_(k.transpose(1, 2))
+                    prompt_kv[slot, 1].copy_(v.transpose(1, 2))
                 if i == full[-1]:
                     return
                 o = ops.gated_causal_attention(q[0], k[0], v[0], gate.reshape(p, -1), scale=d ** -0.5)

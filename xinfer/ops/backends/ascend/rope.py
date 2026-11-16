@@ -21,6 +21,12 @@ _rope = getattr(xc, "Rope", None) if xc is not None else None
 _full = _rope().full if callable(_rope) else None
 
 
+def _gqa_bhsd():
+    import os
+
+    return "bhsd" in os.environ.get("XINFER_GQA_GLUE", "")
+
+
 @register("rope_full", backend="ascend", requires=xc if callable(_full) else None,
           version=VERSION)
 @partial(reference_rope_full,
@@ -41,6 +47,34 @@ def rope_full(q, k, cos, sin, rotary_dim):
         from xcompute.kernel.rope_d64 import rope_half_d64 as _rope_d64
     except (ImportError, OSError):
         _rope_d64 = None
+    try:
+        from xcompute.kernel.rope_d64_bhsd import rope_d64_bhsd as _rope_bhsd
+    except (ImportError, OSError):
+        _rope_bhsd = None
+    # GQA-GLUE knives 1+3 (XINFER_GQA_GLUE=bhsd): head-major BHSD
+    # [b, 8, n, 256] q and [b, 2, n, 256] k (the BHSD qkv split's direct
+    # outputs) rotate through the bhsd kernel over the compact width-32
+    # tables (in-kernel duplication; no cat). Bitwise to the token-major
+    # kernel on the same values (a pure layout permutation).
+    if (_rope_bhsd is not None and _gqa_bhsd()
+            and int(rotary_dim) == 64
+            and q.ndim == 4 and k.ndim == 4
+            and q.shape[1] == 8 and q.shape[-1] == 256
+            and (q.shape[0] * q.shape[2]) % 8 == 0
+            and tuple(k.shape) == (q.shape[0], 2, q.shape[2], 256)
+            and q.dtype == k.dtype == torch.bfloat16
+            and q.device.type == "npu" and k.device == q.device
+            and q.is_contiguous() and k.is_contiguous()
+            and torch.is_tensor(cos) and cos.dtype == torch.float32
+            and cos.dim() == 3 and cos.shape[-1] == 32
+            and cos.shape[-2] == q.shape[0] * q.shape[2]
+            and cos.is_contiguous() and cos.device == q.device
+            and torch.is_tensor(sin) and sin.dtype == torch.float32
+            and sin.shape == cos.shape and sin.is_contiguous()):
+        try:
+            return _rope_bhsd(q, k, cos, sin)
+        except (ValueError, RuntimeError):
+            pass
     if (_rope_d64 is not None
             and int(rotary_dim) == 64
             and q.ndim == 4 and k.ndim == 4

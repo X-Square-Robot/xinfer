@@ -203,6 +203,38 @@ def segment_attention(q, k, v, cu_seqlens, *, scale=None):
 _bridge_gated_causal = getattr(attention, "gated_causal_attention", None) if attention is not None else None
 
 
+def _gqa_bhsd():
+    import os
+
+    return "bhsd" in os.environ.get("XINFER_GQA_GLUE", "")
+
+
+def _gqa_causal_bnsd(q, k, v, scale):
+    """GQA-GLUE knife 1: dense causal FIA over head-major [H, L, D] GQA q/k/v.
+
+    A byte-for-byte copy of the bridge's ``causal_attention`` with the
+    single change that q/k/v are already head-major contiguous -- the three
+    materializing ``t.transpose(1, 2).contiguous()`` copies of the token-major
+    path disappear. Dense drop mask, workspace warm-cache machinery and the
+    FIA launch are identical; the output keeps the released transpose-view
+    tail (the caller's flatten + sigmoid*mul bytes are unchanged).
+    """
+    batch, heads, length, dim = 1, q.shape[0], q.shape[1], q.shape[2]
+    if scale is None:
+        scale = dim ** -0.5
+    key = attention._key("causal-bnsdq", q[None], k[None], scale)
+
+    query, keys, values = q[None], k[None], v[None]
+    with attention._lock:
+        drop_mask = attention._warmed(
+            ("mask", *key),
+            lambda: torch.ones((batch, 1, length, length), dtype=torch.bool, device=q.device).triu(1),
+        )
+        out = attention._run(query, keys, values, key, (drop_mask, scale, 0, 0),
+                             attention._bnsd_query, attention._bnsd_launch)
+    return out.transpose(1, 2)
+
+
 @register("gated_causal_attention", backend="ascend", requires=xc if callable(_attention_varlen) else None,
           version=VERSION)
 @partial(_torch_attn.gated_causal_attention,
@@ -212,6 +244,21 @@ _bridge_gated_causal = getattr(attention, "gated_causal_attention", None) if att
          and (_bridge_gated_causal is not None
               or _varlen_accepts(q, k, v, seg_len=q.shape[0], causal=True, out_gate=gate)))
 def gated_causal_attention(q, k, v, gate, *, scale=None):
+    # GQA-GLUE knife 1 (XINFER_GQA_GLUE=bhsd): head-major [H, L, D] contiguous
+    # q/k/v (the BHSD QKV/rope kernel outputs) feed FIA without the token-major
+    # materialization; every other shape keeps the released path.
+    if (_gqa_bhsd()
+            and q.ndim == 3 and q.shape[0] == 8 and q.is_contiguous()
+            and k.ndim == 3 and k.shape[0] == 2 and k.is_contiguous()
+            and v.shape == k.shape and v.is_contiguous()
+            and q.dtype == torch.bfloat16 and k.dtype == q.dtype
+            and v.dtype == q.dtype and q.device.type == "npu"
+            and k.shape[1] == q.shape[1] and v.shape[1] == q.shape[1]
+            and torch.is_tensor(gate) and gate.dtype == torch.bfloat16
+            and tuple(gate.shape) == (q.shape[1], q.shape[0] * q.shape[2])
+            and gate.device == q.device):
+        out = _gqa_causal_bnsd(q, k, v, scale)
+        return out[0].flatten(1) * torch.sigmoid(gate)
     # The entry expects one head count for queries and keys, as the reference's helper does: repeat the grouped
     # keys and values up to the query heads. One sequence per call, so the segment length is the row count; the
     # entry returns [T, H*D] with the gate applied, which is this operator's contract.
