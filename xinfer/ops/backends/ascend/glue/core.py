@@ -593,6 +593,36 @@ def _carried_attention_varlen(q, k, v, cu_seqlens=None, max_seqlen=None, causal=
                                    scale=softmax_scale)
 
 
+def _carried_attention_varlen_backend(q, k, v, *, cu_seqlens=None, seg_len=None, max_seqlen=None,
+                                      key_len=None, causal=False, out_quant="none", out_gate=None,
+                                      gate_act="sigmoid", backend="auto"):
+    """Name of the backend the carried varlen entry would use (raises when none accepts).
+
+    The unified core carries the TND non-causal non-gated form only -- the packed
+    vision segments over the FIA V5 bridge. This mirrors the retired FFI face's
+    ``attention_varlen_backend`` selector so the binding layers' partial-support
+    probes stay truthful; the envelope check is the bridge's own, run without
+    launching anything.
+    """
+    if (causal or out_gate is not None or out_quant != "none" or seg_len is not None
+            or key_len is not None):
+        raise ValueError("the unified ascend library carries no causal/gated/quantized varlen entry")
+    if cu_seqlens is None:
+        raise ValueError("the varlen entry requires cu_seqlens")
+    if (q.ndim != 3 or k.ndim != 3 or v.ndim != 3
+            or tuple(q.shape) != tuple(k.shape) or tuple(k.shape) != tuple(v.shape)
+            or q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype
+            or q.device.type != "npu" or k.device != q.device or v.device != q.device
+            or q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1
+            or not q.shape[0] or not q.shape[1] or not 0 < q.shape[2] <= 512):
+        raise ValueError("the TND varlen entry requires dense BF16 [T, H, D] rows, D <= 512, on the NPU")
+    bounds = tuple(int(i) for i in (cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else cu_seqlens))
+    if (len(bounds) < 2 or bounds[0] != 0 or bounds[-1] != q.shape[0]
+            or any(end < start for start, end in zip(bounds[:-1], bounds[1:]))):
+        raise ValueError("packed segment boundaries must cover the token sequence in order")
+    return "ascend_fia"
+
+
 # The namespace surface consumed through ``_support.xc`` / ``CORE``:
 _EXPORTS = {
     # carried class entries and bridge callables; the class imports resolve
@@ -608,6 +638,7 @@ _EXPORTS = {
     "AddRmsnorm": _CarriedAddRmsnorm,
     "add_rmsnorm": _CarriedAddRmsnorm(),
     "attention_varlen": _carried_attention_varlen,
+    "attention_varlen_backend": _carried_attention_varlen_backend,
     "Rope": _CarriedRope,
     "gemm_qkv_cache_bias_rope_m16": gemm_qkv_cache_bias_rope_m16,
     "gemm_qkv_cache_bias_rope_prefill": gemm_qkv_cache_bias_rope_prefill,

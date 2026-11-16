@@ -158,10 +158,20 @@ class OptimizedAction(nn.Module):
                     keys, vals = cache[full.index(i), 0], cache[full.index(i), 1]  # [1, KV, P + H, D]
                     packed = ops.qkv_norm_rope_kvcache(normed[0], layer.qkv, layer.q_norm, layer.k_norm, cos, sin,
                                                        keys[0], vals[0], p, heads, kv_heads, d, eps)
-                    o = ops.gated_kvcache_attention(packed[:, :heads * d].view(1, rows, heads, d),
-                                                    keys.transpose(1, 2), vals.transpose(1, 2), start, p,
-                                                    packed[None, :, heads * d:], flash_mask=flash_mask,
-                                                    scale=d ** -0.5)
+                    if isinstance(packed, tuple):
+                        # R6B-BRIDGE B1: the pinned 2B QKV tail returns the per-request
+                        # (q_bnsd [1, H, M, D], gate [1, M, H*D]) pair; the head-major
+                        # query feeds FIA without the token-major materialization (the
+                        # v22 model-side pairing, ported).
+                        q_attn, gate_rows = packed
+                        o = ops.gated_kvcache_attention(q_attn, keys.transpose(1, 2), vals.transpose(1, 2),
+                                                        start, p, gate_rows, flash_mask=flash_mask,
+                                                        scale=d ** -0.5)
+                    else:
+                        o = ops.gated_kvcache_attention(packed[:, :heads * d].view(1, rows, heads, d),
+                                                        keys.transpose(1, 2), vals.transpose(1, 2), start, p,
+                                                        packed[None, :, heads * d:], flash_mask=flash_mask,
+                                                        scale=d ** -0.5)
                     mixed = ops.gemm_epilogue(o[0], layer.o_t.t())[None]
                     normed, gate, h = ops.gated_residual_modulated_rms_norm(h, mixed, gate_in, eps=eps,
                                                                             **mod(mods, 2 * i + 1))

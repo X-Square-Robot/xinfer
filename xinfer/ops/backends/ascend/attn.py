@@ -33,6 +33,11 @@ def _cache_supported(q, k, v, prefix, new_pos, mask, scale):
         return False
     b, m, h, d = q.shape
     length, kv = k.shape[1:3]
+    # R6B-BRIDGE B1: a head-major [B, H, M, D] query (the 2B QKV tail's direct
+    # write) carries the head count on axis 1; the gate pairing at the
+    # registration discriminates the two layouts.
+    if (h, kv, d) not in _CACHE_HEADS and m != h and (m, kv, d) in _CACHE_HEADS:
+        m, h = h, m
     if (h, kv, d) not in _CACHE_HEADS or k.shape[0] != b or k.shape[-1] != d or not b or not m:
         return False
     if not (0 <= new_pos <= length - m and (scale is None or (math.isfinite(scale) and scale > 0))):
@@ -286,7 +291,8 @@ def gated_causal_attention(q, k, v, gate, *, scale=None):
          check=lambda q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None:
          _cache_supported(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
          and gate.dtype == torch.bfloat16 and gate.device == q.device
-         and gate.shape == (q.shape[0], q.shape[1], q.shape[2] * q.shape[3]))
+         and gate.shape in ((q.shape[0], q.shape[1], q.shape[2] * q.shape[3]),
+                            (q.shape[0], q.shape[2], q.shape[1] * q.shape[3])))
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
     # FIA-FUSE (env XINFER_FIA_FUSE, default off): the 2B decode family takes the
     # specialized scan+reduce pair that fuses the cache attention call and the
@@ -300,6 +306,12 @@ def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, f
         _fused = None
     if _fused is not None:
         return _fused
+    # R6B-BRIDGE B1: the head-major [B, H, M, D] query pairs with the [B, M, H*D]
+    # gate (the shape discriminates the layouts); the prefix entry below reads
+    # the same bytes after one exact transpose.
+    if (q.ndim == 4 and q.shape[1] != q.shape[2]
+            and gate.shape == (q.shape[0], q.shape[2], q.shape[1] * q.shape[3])):
+        q = q.transpose(1, 2).contiguous()
     # The same two steps as the reference — the cache attention, then the BF16 gated product — with the attention
     # served by the native entry above instead of SDPA.
     out = prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)

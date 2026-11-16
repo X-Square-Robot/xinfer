@@ -29,15 +29,15 @@ def _qkv_2b_cache_finish_pair():
 
         try:
             library = _provider.core_library()
-            call = getattr(library, "xinfer_aot_gemm_qkv_2b_norm_gate_cache_call")
+            call = getattr(library, "xinfer_aot_gemm_qkv_2b_norm_gate_cache_bnsdq_call")
             get_error = getattr(
-                library, "xinfer_aot_gemm_qkv_2b_norm_gate_cache_get_last_error"
+                library, "xinfer_aot_gemm_qkv_2b_norm_gate_cache_bnsdq_get_last_error"
             )
         except (OSError, AttributeError):
             _QKV_2B_CACHE_FINISH = False
             return None
         call.restype = ctypes.c_int
-        call.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int64] * 3 + [ctypes.c_void_p]
+        call.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int64] * 3 + [ctypes.c_void_p]
         get_error.restype = ctypes.c_char_p
         _QKV_2B_CACHE_FINISH = (call, get_error)
     return _QKV_2B_CACHE_FINISH or None
@@ -558,17 +558,25 @@ class CannAction:
             projected_ctx = self._accumulator(x, weight)
         with projected_ctx as y:
             _check_tensor(y, "accumulator result", x.device, (m, n), (torch.float32,))
-            # 2b-qkv: the wallx2b action QKV tail fused into one AOT kernel
-            # (per-head RMS norm on the raw FP32 accumulator, the (1 + w)
-            # factors, the 64-dim partial rotary, the head-major K/V append
-            # and the packed [Q | gate] return; the torch chain measured
-            # 43.9 us of the 49.6 us op, the kernel 6.4 us). K/V caches and
-            # the gate half are bitwise with the chain; Q/K values carry an
-            # ulp-level rstd residue (CANN npu_rms_norm approximate rsqrt,
-            # ~7e-7 rel; probe: 1 BF16 flip in 65536 on a synthetic batch).
+            # 2b-qkv / R6B-BRIDGE B1 (env XINFER_R6B_BRIDGE=1, the v22 20.62
+            # stack's run flag): the wallx2b action QKV tail fused into one
+            # AOT kernel -- per-head RMS norm on the raw FP32 accumulator,
+            # the (1 + w) factors, the 64-dim partial rotary, the head-major
+            # K/V append, the Q half stored head-major (BNSD-contiguous) and
+            # the gate in its own dense buffer, both by the same job plan and
+            # FP32 arithmetic as the released packed kernel, only the store
+            # indices move. Returns (q_bnsd [1, H, M, D], gate [1, M, H*D]) --
+            # the head-major query is what the ACLNN FIA dense descriptor
+            # reads, so the action attention takes the FIA-FUSE pair without
+            # the token-major materialization. K/V caches and the gate half
+            # are bitwise with the chain; Q/K values carry an ulp-level rstd
+            # residue (CANN npu_rms_norm approximate rsqrt, ~7e-7 rel; probe:
+            # 1 BF16 flip in 65536 on a synthetic batch). Envelope misses (or
+            # the flag off) keep the released _write_qkv chain below.
             finish = _qkv_2b_cache_finish_pair()
             if (
                 finish is not None
+                and os.environ.get("XINFER_R6B_BRIDGE", "0") == "1"
                 and (m, n, x.shape[1], num_heads, num_kv_heads, head_dim)
                 == (16, 5120, 1024, 8, 2, 256)
                 and float(eps) == 1e-6
@@ -598,8 +606,11 @@ class CannAction:
                         "warm up the fused 2B QKV tail on this stream before graph capture"
                     )
                 call, get_error = finish
-                q_out = x.new_empty(
-                    (m, n - 2 * num_kv_heads * head_dim), dtype=torch.bfloat16
+                q_bnsd = x.new_empty(
+                    (1, num_heads, m, head_dim), dtype=torch.bfloat16
+                )
+                gate = x.new_empty(
+                    (1, m, num_heads * head_dim), dtype=torch.bfloat16
                 )
                 q_factor = self._one_plus(q_weight)
                 k_factor = self._one_plus(k_weight)
@@ -607,7 +618,8 @@ class CannAction:
                     torch.npu.current_stream(x.device).npu_stream
                 )
                 rc = call(
-                    ctypes.c_void_p(q_out.data_ptr()),
+                    ctypes.c_void_p(q_bnsd.data_ptr()),
+                    ctypes.c_void_p(gate.data_ptr()),
                     ctypes.c_void_p(k_cache.data_ptr()),
                     ctypes.c_void_p(v_cache.data_ptr()),
                     ctypes.c_void_p(y.data_ptr()),
@@ -626,8 +638,8 @@ class CannAction:
                     text = (
                         message.decode("utf-8", "replace") if message else "unknown failure"
                     )
-                    raise RuntimeError(f"gemm_qkv_2b_norm_gate_cache: {text}")
-                return q_out
+                    raise RuntimeError(f"gemm_qkv_2b_norm_gate_cache_bnsdq: {text}")
+                return q_bnsd, gate
             return self._write_qkv(
                 y,
                 q_weight,

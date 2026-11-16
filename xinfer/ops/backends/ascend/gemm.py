@@ -10,6 +10,8 @@ Stream-K reductions may differ at rounding level across runs.
 ``add_rms_norm`` in turn (the default selections of those operators), so their results are those calls'.
 """
 
+import os
+
 import torch
 
 from xinfer.ops.backends.ascend._support import VERSION, bridge, canonical, partial, xc
@@ -31,7 +33,14 @@ def _action(projection):
     if not callable(getattr(projection, "accumulator", None)):
         return None
     factory = getattr(bridge("cann_action"), "CannAction", None)
-    return factory(projection.accumulator, precision="bf16-split2") if callable(factory) else None
+    if not callable(factory):
+        return None
+    # The action-precision run knob (the v22 XINFER_XCOMPUTE_NPU_ACTION_PRECISION
+    # flag, renamed like the other XCOMPUTE_* carries): bf16-round is the single-RNE
+    # form the 20.62 stack ran; bf16-split2 (the default) splits the normalized
+    # activation into high/low BF16 halves for a compensated accumulator.
+    precision = os.environ.get("XINFER_ASCEND_ACTION_PRECISION", "bf16-split2")
+    return factory(projection.accumulator, precision=precision)
 
 
 canonical_gemm = canonical("gemm_epilogue", reference.gemm_epilogue)
