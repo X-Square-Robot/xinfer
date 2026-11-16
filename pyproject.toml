@@ -28,8 +28,9 @@ models = [
 gpu-image = [
     "nvidia-nvimgcodec-cu13>=0.10",
 ]
-# The CUDA kernel library (xinfer/ops/backends/cuda/src) is called through TVM-FFI; building it also needs CMake, the
-# CUDA toolkit and the CUTLASS submodule (docs/kernels.md).
+# The kernel libraries (xinfer/ops/backends/cuda/src and xinfer/ops/backends/ascend/src) are called through
+# TVM-FFI; building them also needs CMake and their hardware toolchains (docs/kernels.md,
+# xinfer/ops/backends/ascend/src/README.md).
 kernels = [
     "apache-tvm-ffi>=0.1",
 ]
@@ -60,7 +61,7 @@ xinfer-profile = "xinfer.entrypoints.profile:main"
 include = ["xinfer*"]
 
 [tool.setuptools.package-data]
-xinfer = ["tuned/*/*.json", "ops/backends/cuda/xinfer_kernels.so"]
+xinfer = ["tuned/*/*.json", "ops/backends/cuda/xinfer_kernels.so", "ops/backends/ascend/xinfer_kernels_ascend.so"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
