@@ -604,8 +604,9 @@ class WallOSSInputProcessor:
             - ``vision_positions``, ``vision_window_index``, ``vision_reverse_index``, ``vision_cu_window``,
               ``vision_cu_full``: the ``vision_layout`` of the image grids;
             - ``inference_delay`` ``[1]`` int64 (0 for flow requests) and ``num_steps`` (int);
-            - RTC only: ``rtc_actions`` ``[1, T, D]`` float32, the normalized relative previous actions,
-              ``T = min(N - 1, H)``.
+            - RTC only: ``rtc_actions`` ``[1, H, D]`` float32, the normalized relative previous actions
+              (``T = min(N - 1, H)`` rows; rows ``T..H-1`` repeat row ``T-1``, matching the stage's
+              repeat and keeping the tensor shape -- and so the NPU-graph key -- request-invariant).
 
             ``meta`` holds ``arms`` (the state pose, see ``build_agent_pos``), ``image_size`` (``(w, h)`` of
             each resized view), ``rtc``, ``inference_delay`` (int) and ``prompt_len_range``: the shortest and
@@ -729,6 +730,15 @@ class WallOSSInputProcessor:
                 fill = np.zeros((1, model_config.action_horizon - t, model_config.action_dim), np.float32)
                 p = np.concatenate([p, fill], 1)
             p = self._normalize_actions(p[:, : model_config.action_horizon])[:, :t]
+            if t < model_config.action_horizon:
+                # Fixed [1, H, D] shape (a stable NPU-graph key; the serving
+                # path replays instead of running the action stage eager).
+                # The stage repeats the last pinned row up to H, so the same
+                # repeat here is value-identical; rows >= delay are never
+                # selected (the admitted delay is <= t), so the padded rows
+                # cannot change any output bit.
+                p = np.concatenate(
+                    [p, np.repeat(p[:, -1:], model_config.action_horizon - t, axis=1)], 1)
             tensors["rtc_actions"] = torch.from_numpy(np.ascontiguousarray(p))
             meta["inference_delay"] = delay
             requested = observation.get("num_flow_steps", observation.get("num_steps"))
