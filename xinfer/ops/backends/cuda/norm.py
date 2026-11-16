@@ -12,17 +12,20 @@
 | ``mxfp8_layer_norm_quantize`` | ``layernorm`` (``quant="mxfp8"``) |
 | ``mxfp8_zero_centered_rms_norm_quantize`` | ``rmsnorm`` (``zero_centered``, ``quant="mxfp8"``, ``round_to_bf16``) |
 | ``mxfp8_add_zero_centered_rms_norm_quantize`` | the same with ``residual`` |
+| ``nvfp4_layer_norm_quantize`` | ``layernorm`` (``quant="nvfp4"``) |
+| ``nvfp4_add_zero_centered_rms_norm_quantize`` | ``rmsnorm`` (``zero_centered``, ``residual``, ``quant="nvfp4"``) |
 
 Contracts against the torch references: tolerance. The empty action-row tensors of ``qkv_norm_split`` are created on
 the first call for a batch size, which must therefore be eager (before a capture). The MXFP8 operators register with a
-build that has the MXFP8 GEMM family (``mxfp8_registration``) and write one scale per 128 columns.
+build that has the MXFP8 GEMM family (``format_registration``) and write one scale per 128 columns. The NVFP4 operators
+register with a build that has NVFP4 inputs (``format_registration``) and give ``nvfp4_quantize`` of the BF16 norm.
 """
 
 from __future__ import annotations
 
 import torch
 
-from xinfer.ops.backends._xcompute import XCOMPUTE, library, mxfp8_registration, xc, xcompute_with
+from xinfer.ops.backends._xcompute import XCOMPUTE, format_registration, library, xc, xcompute_with
 from xinfer.ops.registry import register
 
 
@@ -105,7 +108,7 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
     return q, k, v, gate
 
 
-MXFP8 = mxfp8_registration()
+MXFP8 = format_registration("mxfp8")
 
 
 @register("mxfp8_layer_norm_quantize", backend="cuda", **MXFP8)
@@ -124,4 +127,20 @@ def mxfp8_add_zero_centered_rms_norm_quantize(x, residual, weight, eps):
     k = x.shape[-1]
     summed, q, scales = xc.rmsnorm(x.reshape(-1, k), weight, float(eps), residual=residual.reshape(-1, k),
                                    zero_centered=True, quant="mxfp8", scale_block=128, round_to_bf16=True)
+    return summed.view(x.shape), (q, scales)
+
+
+NVFP4 = format_registration("nvfp4")
+
+
+@register("nvfp4_layer_norm_quantize", backend="cuda", **NVFP4)
+def nvfp4_layer_norm_quantize(x, weight, bias, eps):
+    return xc.layernorm(x.reshape(-1, x.shape[-1]), weight, bias, float(eps), quant="nvfp4")
+
+
+@register("nvfp4_add_zero_centered_rms_norm_quantize", backend="cuda", **NVFP4)
+def nvfp4_add_zero_centered_rms_norm_quantize(x, residual, weight, eps):
+    k = x.shape[-1]
+    summed, q, scales = xc.rmsnorm(x.reshape(-1, k), weight, float(eps), residual=residual.reshape(-1, k),
+                                   zero_centered=True, quant="nvfp4")
     return summed.view(x.shape), (q, scales)

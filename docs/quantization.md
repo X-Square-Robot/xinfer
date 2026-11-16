@@ -15,7 +15,7 @@ QuantConfig(groups={"vision.blocks": "mxfp8", "vision.merger": "mxfp8", "prefill
 After the checkpoint is loaded, `process_weights(model)` converts each
 layer once, before weights are shared or graphs captured. Models may define
 presets (`quantization="<preset>"`), or take a `QuantConfig` or a dict with `groups`, `default` and
-`options`; Wall-X 2B defines `"bf16"` (default) and `"mxfp8"`. Its MXFP8 preset covers the vision blocks and the prompt stream with a fixed 1×128 scale recipe. For individual stages, use `{"groups":{"vision":"mxfp8"}}` or `{"groups":{"prefill":"mxfp8"}}`. See the [Wall-X 2B design](models/wallx2b_design.md). Wall-OSS uses BF16. No model preset uses `nvfp4` or `nvfp4_mse`.
+`options`; Wall-X 2B defines `"bf16"` (default), `"mxfp8"` and `"nvfp4"`. Its MXFP8 preset covers the vision blocks and the prompt stream with a fixed 1×128 scale recipe. Its NVFP4 preset is the Wall-X NVFP4 recipe: `nvfp4` for the vision transformer and `nvfp4_mse` for the prompt stream, whose DeltaNet z/b/a projection stays BF16. For individual stages, use `{"groups":{"vision":"mxfp8"}}` or `{"groups":{"prefill":"mxfp8"}}` (or `nvfp4`, `nvfp4_mse`). See the [Wall-X 2B design](models/wallx2b_design.md). Wall-OSS uses BF16.
 
 ## Methods
 
@@ -76,6 +76,19 @@ plain composition on that output: the residual add, the eager rotary of
 checkpoint order. The service computed the expert-0 gated activation in the
 down projection's input quantization, which is `GatedMLP(act_fused_into="down")`.
 
+The Wall-X 2B stages call NVFP4 forms of xcompute's GEMM family directly instead of linear layers. They take
+`(q, scales)` activations and `(q, scales, global_scale)` weights. The GEMM rounds `g · x̂·Ŵᵀ + bias` once to BF16,
+the epilogue works on that BF16 tensor and rounds again, and a quantized output is `nvfp4_quantize` of the final BF16
+tensor, so every NVFP4 GEMM input is a BF16 tensor quantized with the activation recipe:
+
+| Operator | Computes |
+|---|---|
+| `nvfp4_gemm_epilogue` | `bf16(g · x̂·Ŵᵀ + bias)`, then `bf16(act(·))`; `bf16(y + residual)` with a residual, or quantized (`out_quant`) |
+| `nvfp4_gemm_glu_quantize` | `bf16(silu(y_gate) · y_up)` of the BF16 GEMM `y`, quantized |
+| `nvfp4_qkv_rope_epilogue` | `[Q \| K \| V] = bf16(g · x̂·Ŵᵀ + bias)` with rotate-half RoPE on the BF16 Q and K heads, rounded again |
+| `nvfp4_layer_norm_quantize` | the BF16 LayerNorm (`layer_norm_cast`), quantized |
+| `nvfp4_add_zero_centered_rms_norm_quantize` | `add_zero_centered_rms_norm`'s BF16 sum, and its BF16 norm quantized |
+
 ## MXFP8 format
 
 The format is defined by the torch reference in `xinfer/ops/reference/mxfp8.py`, with the scale layout and weight row orders in `xinfer/ops/layout/mxfp8.py`, and follows xcompute:
@@ -111,13 +124,13 @@ scale or element.
 
 ## Backends
 
-PyTorch provides reference operators for MXFP8 and NVFP4. On CUDA, an xcompute build with the MXFP8 GEMM and norm entries can accelerate the Wall-X 2B preset. See the [kernel guide](kernels.md) to check the build and the selected operators.
+PyTorch provides reference operators for MXFP8 and NVFP4. On CUDA, an xcompute build with the MXFP8 GEMM and norm entries can accelerate the Wall-X 2B MXFP8 preset, and a build with NVFP4 inputs (the NVFP4 quantizer, GEMM inputs and outputs, and the norms' NVFP4 outputs) the NVFP4 preset. xcompute's NVFP4 quantizer divides as the Wall-X kernels do (`a · rcp.approx(b)`), so it can differ from the reference at rounding ties (about 0.05 % of the elements of random BF16 inputs). See the [kernel guide](kernels.md) to check the build and the selected operators.
 
 ## Tests
 
 | Test | Checks |
 |---|---|
 | `tests/unit/test_mxfp8.py` | reference format, error bounds and fused references (CPU); fusable forms: BF16 equals the eager composition bitwise, MXFP8 tracks BF16 (CPU) |
-| `tests/unit/test_nvfp4.py` | reference format against hand-computed codes and scales, MSE scale search, fused references, GEMM epilogues (CPU); `nvfp4` and `nvfp4_mse` layers and their fusable forms (CPU); reference GEMM vs `torch._scaled_mm` NVFP4, the GEMM the Wall-X service ran for the shapes without a CUTLASS kernel (GPU, sm100 or newer) |
+| `tests/unit/test_nvfp4.py` | reference format against hand-computed codes and scales, MSE scale search, fused references, GEMM epilogues (CPU); `nvfp4` and `nvfp4_mse` layers and their fusable forms (CPU); the GEMM-family forms against their definitions (CPU); reference GEMM vs `torch._scaled_mm` NVFP4, the GEMM the Wall-X service ran for the shapes without a CUTLASS kernel (GPU, sm100 or newer); xcompute's NVFP4 operators against the references at Wall-X 2B's shapes (GPU) |
 
 Quantization changes are checked as in [precision](precision.md): agreement with the reference composition, and the internal precision gate.

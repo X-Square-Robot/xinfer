@@ -12,7 +12,7 @@ xcompute 构建必须支持服务所用 GPU 的架构。可通过 `xcompute.buil
 
 ## 安装与选择构建
 
-从提供方获得相互匹配的 xcompute Python 包与动态库并安装；XInfer 发行包不包含它们。BF16 需要统一的 GEMM、注意力和归一化接口。支持 `prepack_weight(layout="kn")` 的构建可以直接使用转置权重；旧版构建会把这些权重复制到连续张量中。Wall-X 2B 会逐项检查当前构建是否提供所需入口，选择可用的 CUDA 算子。若从源码构建 CUDA 13 版本，请在同一环境安装 `apache-tvm-ffi`，并针对部署 GPU 编译。
+从提供方获得相互匹配的 xcompute Python 包与动态库并安装；XInfer 发行包不包含它们。BF16 需要统一的 GEMM、注意力和归一化接口。支持 `prepack_weight(layout="kn")` 的构建可以直接使用转置权重；旧版构建会把这些权重复制到连续张量中。Wall-X 2B 会逐项检查当前构建是否提供所需入口，选择可用的 CUDA 算子。它的 MXFP8 预设需要带 MXFP8 GEMM 系列的构建，NVFP4 预设需要带 NVFP4 输入的构建（xcompute `7034bdf` 或更新，SM120）；没有时这些算子在 torch 参考实现上运行，速度较慢。若从源码构建 CUDA 13 版本，请在同一环境安装 `apache-tvm-ffi`，并针对部署 GPU 编译。
 
 ## 运行
 

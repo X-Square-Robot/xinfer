@@ -72,6 +72,13 @@ FORMULA_CASES = {
     "mxfp8_qkv_rope_epilogue": (((A8, S), (W8, S), t(32), t(4, 2, dtype=F32), t(4, 2, dtype=F32), 2, 4),
                                 OpCost(GEMM, 256 + 512 + 2048 + 512 + 64 + 64, 4 * 32 * 2, "mxfp8")),
     "nvfp4_gemm": ((A4, S4, W4, S4), OpCost(GEMM, 128 + 512 + 1024 + 512, 4 * 32 * 2, "nvfp4")),
+    # weights (q, scales, global scale); an NVFP4 output writes 9/32 of the BF16 bytes
+    "nvfp4_gemm_epilogue": (((A4, S4), (W4, S4, 0.5), t(32)),
+                            OpCost(GEMM, 128 + 512 + 1024 + 512 + 64, 4 * 32 * 2, "nvfp4")),
+    "nvfp4_gemm_glu_quantize": (((A4, S4), (W4, S4, 0.5)),
+                                OpCost(GEMM, 128 + 512 + 1024 + 512, 4 * 16 * 2 * 9 // 32, "nvfp4")),
+    "nvfp4_qkv_rope_epilogue": (((A4, S4), (W4, S4, 0.5), t(32), t(4, 2, dtype=F32), t(4, 2, dtype=F32), 2, 4),
+                                OpCost(GEMM, 128 + 512 + 1024 + 512 + 64 + 64, 4 * 32 * 2, "nvfp4")),
     "gemm_epilogue": ((X, W, t(32)), OpCost(GEMM, 512 + 4096 + 64, 4 * 32 * 2, "bf16")),
     "gemm_glu_epilogue": ((X, W), OpCost(GEMM, 512 + 4096, 4 * 16 * 2, "bf16")),  # 16 gate and 16 up rows
     # bias [32] (64 bytes), residual [1, 4, 32] (256 bytes), FP32 norm weight [32] (128 bytes); writes the sum and
