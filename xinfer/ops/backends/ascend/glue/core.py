@@ -53,8 +53,6 @@ import math
 import torch
 
 from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.cann_gated_delta_net import CannGatedDeltaNet  # noqa: F401
-from xinfer.ops.backends.ascend.glue.adarmsnorm import Adarmsnorm  # noqa: F401
 
 
 class MissingBackendError(AttributeError):
@@ -96,6 +94,28 @@ def _require(cond, message):
 # CANN bridge trio (static bridge objects in the core library)
 # ---------------------------------------------------------------------------
 _BRIDGE = _provider.BRIDGE
+
+
+def _gdr_pair():
+    pair = getattr(_gdr_pair, "_cache", None)
+    if pair is None:
+        pair = _BRIDGE.gdr_chunk_pair()
+        _gdr_pair._cache = pair
+    return pair
+
+
+def gdr_cann_chunk_workspace_size(out, final_state, q, k, v, beta, initial_state, seq_lengths, g, scale):
+    """The vendor chunk workspace query (the glue's TensorView-signature call)."""
+    pair = _gdr_pair()
+    _require(pair is not None, "gdr_cann_chunk: the bridge is not in this build")
+    return pair[0](out, final_state, q, k, v, beta, initial_state, seq_lengths, g, scale)
+
+
+def gdr_cann_chunk(out, final_state, workspace, q, k, v, beta, initial_state, seq_lengths, g, scale):
+    """The vendor chunk launch (the glue's TensorView-signature call)."""
+    pair = _gdr_pair()
+    _require(pair is not None, "gdr_cann_chunk: the bridge is not in this build")
+    return pair[1](out, final_state, workspace, q, k, v, beta, initial_state, seq_lengths, g, scale)
 
 
 def _mm_pair():
@@ -455,9 +475,8 @@ def denoise_output_euler(x, h, weight, *, dt, bias=None, prenorm="none", norm_we
 
 # The namespace surface consumed through ``_support.xc`` / ``CORE``:
 _EXPORTS = {
-    # carried class entries and bridge callables
-    "CannGatedDeltaNet": CannGatedDeltaNet,
-    "Adarmsnorm": Adarmsnorm,
+    # carried class entries and bridge callables; the class imports resolve
+    # lazily (the glue modules themselves import CORE from here)
     "MissingBackendError": MissingBackendError,
     "cann_mm_fp32_workspace_size": cann_mm_fp32_workspace_size,
     "cann_mm_fp32": cann_mm_fp32,
@@ -468,6 +487,8 @@ _EXPORTS = {
     "gemm_qkv_cache_bias_rope_m16": gemm_qkv_cache_bias_rope_m16,
     "gemm_qkv_cache_bias_rope_prefill": gemm_qkv_cache_bias_rope_prefill,
     "gemm_qkv_vision_rope_finish": gemm_qkv_vision_rope_finish,
+    "gdr_cann_chunk_workspace_size": gdr_cann_chunk_workspace_size,
+    "gdr_cann_chunk": gdr_cann_chunk,
     "gemm_epilogue_glu": gemm_epilogue_glu,
     "gated_residual_adarmsnorm": gated_residual_adarmsnorm,
     "double_adarmsnorm_gated_residual_inplace": double_adarmsnorm_gated_residual_inplace,
@@ -476,7 +497,16 @@ _EXPORTS = {
 }
 
 
+_CLASS_ENTRIES = ("CannGatedDeltaNet", "Adarmsnorm")
+
+
 def __getattr__(name):
+    if name in _CLASS_ENTRIES:
+        import importlib
+        module = importlib.import_module(
+            "xinfer.ops.backends.ascend.glue."
+            + ("cann_gated_delta_net" if name == "CannGatedDeltaNet" else "adarmsnorm"))
+        return getattr(module, name)
     entry = _EXPORTS.get(name)
     if entry is None:
         raise AttributeError(f"the unified ascend library carries no entry {name!r}")

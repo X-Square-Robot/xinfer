@@ -609,7 +609,6 @@ def _i32(t, name, device):
     return t
 
 
-@dump_op_inputs
 def denoise_output_euler(
     x: torch.Tensor,
     h: torch.Tensor,
@@ -791,7 +790,6 @@ def _embed_select(arch, b, m, a, n, extra, backend):
     )
 
 
-@dump_op_inputs
 def denoise_input_embed(
     x: torch.Tensor,
     weight: torch.Tensor,

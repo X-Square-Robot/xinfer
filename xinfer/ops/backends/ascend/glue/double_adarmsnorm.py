@@ -41,7 +41,6 @@ def _gate_like(tensor, pinned):
     return torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
 
 
-@dump_op_inputs
 def double_adarmsnorm_initial_into(
     residual,
     normalized,
@@ -139,7 +138,6 @@ def double_adarmsnorm(
     return residual, normalized, next_gate
 
 
-@dump_op_inputs
 def double_adarmsnorm_gated_residual_inplace(
     residual,
     branch,

@@ -319,7 +319,13 @@ class RawBridge:
 
     # ---- GDN vendor chunk (cann_gated_delta_net) ---------------------
     def gdr_chunk_pair(self):
-        """``(query, launch)`` over the vendor ChunkGatedDeltaRule FFI bridge."""
+        """``(query, launch)`` over the vendor ChunkGatedDeltaRule bridge.
+
+        The TensorView-signature callables the glue expects:
+        ``query(out, final_state, q, k, v, beta, state, lengths, g, scale)``
+        and ``launch(out, final_state, workspace, q, k, v, beta, state,
+        lengths, g, scale)`` over the raw C-ABI of the static bridge.
+        """
         lib = self.library()
         if lib is None:
             return None
@@ -330,7 +336,41 @@ class RawBridge:
         except AttributeError:
             return None
         error.restype = ctypes.c_char_p
-        return _gdr_pair(query, launch, error)
+        query.restype = ctypes.c_int64
+        query.argtypes = ([ctypes.c_int32] + [ctypes.c_void_p] * 9
+                          + [ctypes.c_int64] * 3 + [ctypes.c_double])
+        launch.restype = ctypes.c_int
+        launch.argtypes = ([ctypes.c_int32] + [ctypes.c_void_p] * 9 + [ctypes.c_int64] * 3
+                           + [ctypes.c_double, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64])
+
+        def chunk_query(out, final_state, q, k, v, beta, state, lengths, g, scale):
+            t, nk, nv = int(q.shape[0]), int(q.shape[1]), int(v.shape[1])
+            size = query(q.get_device(),
+                         ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
+                         ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(beta.data_ptr()),
+                         ctypes.c_void_p(g.data_ptr()) if g is not None else None,
+                         ctypes.c_void_p(state.data_ptr()), ctypes.c_void_p(final_state.data_ptr()),
+                         ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(lengths.data_ptr()),
+                         t, nk, nv, float(scale))
+            if size < 0:
+                raise RuntimeError(f"gdr chunk: {error().decode('utf-8', 'replace')}")
+            return int(size)
+
+        def chunk_launch(out, final_state, workspace, q, k, v, beta, state, lengths, g, scale):
+            t, nk, nv = int(q.shape[0]), int(q.shape[1]), int(v.shape[1])
+            stream = _torch_current_stream(q)
+            status = launch(q.get_device(),
+                            ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
+                            ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(beta.data_ptr()),
+                            ctypes.c_void_p(g.data_ptr()) if g is not None else None,
+                            ctypes.c_void_p(state.data_ptr()), ctypes.c_void_p(final_state.data_ptr()),
+                            ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(lengths.data_ptr()),
+                            t, nk, nv, float(scale), ctypes.c_void_p(stream),
+                            ctypes.c_void_p(workspace.data_ptr()), workspace.numel())
+            if status:
+                raise RuntimeError(f"gdr chunk: {error().decode('utf-8', 'replace')}")
+
+        return chunk_query, chunk_launch
 
     # ---- GEMM finish launchers ---------------------------------------
     def gemm_glu_fp32_launch(self):
@@ -441,19 +481,6 @@ def _fia_pair(pair, *, bnsd: bool):
             raise RuntimeError(f"fia vision launch: {error().decode('utf-8', 'replace')}")
 
     return tnd_query, tnd_launch
-
-
-def _gdr_pair(query, launch, error):
-    """The GDR chunk query/launch pair (TND packed operands, the vendor ABI)."""
-    # The v22 v22 library exported gdr_cann_chunk as a tvm_ffi entry; the
-    # unified static bridge (kernels/static/gdr_cann_chunk.cc) exposes the
-    # same composition as raw C. The binding below mirrors the ctypes call
-    # the knife used; until the static port lands its exact ABI is verified
-    # by the S2 cross-library witness.
-    raise NotImplementedError(
-        "gdr chunk raw bridge: bind after kernels/static/gdr_cann_chunk.cc "
-        "lands (S2 verifies the ABI against the v22 FFI surface)"
-    )
 
 
 BRIDGE = RawBridge()

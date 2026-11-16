@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from numbers import Integral, Real
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 from xinfer.ops.backends.ascend import _provider
 from xinfer.ops.backends.ascend.glue.core import CORE
 from xinfer.ops.backends.ascend.glue._cann_action_scope import memo_action_metadata
+from xinfer.ops.backends.ascend.glue import smallm_r3
 
 
 _QKV_2B_CACHE_FINISH = None
@@ -543,7 +545,18 @@ class CannAction:
             eps,
             allow_gate=True,
         )
-        with self._accumulator(x, weight) as y:
+        # smallm-r3 qkv blade (XINFER_SMALLM_R3=qkv, default off): the m16
+        # action QKV projection rides the bitwise Cube kernel; the route is
+        # lock-free with no shared buffers (the WALLOSS-QKV capacity win).
+        if (smallm_r3.enabled("qkv")
+                and (m, n, x.shape[1]) == (16, 2560, 1024)
+                and x.dtype == weight.dtype == torch.bfloat16
+                and x.is_contiguous() and weight.is_contiguous()
+                and x.device.type == "npu"):
+            projected_ctx = contextlib.nullcontext(smallm_r3.qkv_fp32(x, weight))
+        else:
+            projected_ctx = self._accumulator(x, weight)
+        with projected_ctx as y:
             _check_tensor(y, "accumulator result", x.device, (m, n), (torch.float32,))
             # 2b-qkv: the wallx2b action QKV tail fused into one AOT kernel
             # (per-head RMS norm on the raw FP32 accumulator, the (1 + w)

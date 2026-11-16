@@ -112,7 +112,6 @@ class _AdarmsnormFunction(torch.autograd.Function):
         return dx, dmod, None
 
 
-@dump_op_inputs
 class Adarmsnorm:
     def __init__(self):
         self.lib = CORE

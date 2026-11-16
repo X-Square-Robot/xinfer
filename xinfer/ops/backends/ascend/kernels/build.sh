@@ -46,7 +46,25 @@ PYCHECK
 gen() {  # gen <out-subdir> <module> <kernels...>
     local out="$WORK/out/$1"; shift
     mkdir -p "$out"
-    "$PY" generate.py --output "$out" --module "$1" --kernels "${@:2}"
+    # the ops/ packages sit next to build.sh (one level above tools/), so the
+    # module roots resolve from the tree root while generate.py keeps its
+    # script-directory cwd (the `from abi import ...` contract). generate.py
+    # writes one manifest per invocation; successive calls for the same family
+    # (the core library builds from several modules) merge into family.json.
+    local manifest="$WORK/out/$1.family.json"
+    PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" "$PY" generate.py --output "$out"         --module "$1" --kernels "${@:2}"
+    "$PY" - "$manifest" "$out/manifest.json" "$1" <<'MERGE'
+import json, pathlib, sys
+target, source, module = sys.argv[1], sys.argv[2], sys.argv[3]
+merged = json.loads(pathlib.Path(target).read_text()) if pathlib.Path(target).exists() else {"kernels": {}}
+fresh = json.loads(pathlib.Path(source).read_text())
+merged.setdefault("tilelang", fresh.get("tilelang"))
+merged.setdefault("arch", fresh.get("arch"))
+for name, entry in fresh["kernels"].items():
+    entry["module"] = module
+    merged["kernels"][name] = entry
+pathlib.Path(target).write_text(json.dumps(merged, indent=2) + chr(10))
+MERGE
 }
 
 link() {  # link <libname> <out-subdir> <objects...>
@@ -65,20 +83,21 @@ link() {  # link <libname> <out-subdir> <objects...>
 # libraries below; this core carries only what glue/core dispatch launches.
 gen core ops.norm.rms_apply          rms_apply_rstd_h2048
 gen core ops.norm.rms_consistent     rms_consistent_ubv_h1280 rms_consistent_generic_h1024_f32in
-gen core ops.denoise.denoise_input_embed  denoise_input_embed
-gen core ops.denoise.denoise_head_cube    denoise_fp32head_cube
-gen core ops.denoise.denoise_fp32_scalar  denoise_fp32head_prep
+gen core ops.denoise.denoise_output denoise_input_embed denoise_fp32head_cube denoise_fp32head_prep
 gen core ops.gemm.qkv_bnsdq          gemm_qkv_2b_norm_gate_cache_bnsdq
 gen core ops.gemm.gemm_smallm_action bnsd_o_proj_m768_bf16
 gen core ops.gemm.gemm_qkv_cache     gemm_qkv_cache_bias_rope_m16 gemm_qkv_cache_bias_rope_prefill
 gen core ops.gemm.gemm_qkv_bf16_wide gemm_qkv_vision_rope_finish
 gen core ops.gemm.gemm_glu_fp32_finish gemm_glu_fp32_finish_split_11008
+gen core ops.norm.qkv_bhsd qkv_split_vec_bhsd_h256
+gen core ops.norm.rope_bhsd rope_half_d64_bhsd
 link libxinfer_ascend_core.so core \
      rms_apply_rstd_h2048 rms_consistent_ubv_h1280 rms_consistent_generic_h1024_f32in \
      denoise_input_embed denoise_fp32head_cube denoise_fp32head_prep \
      gemm_qkv_2b_norm_gate_cache_bnsdq bnsd_o_proj_m768_bf16 \
      gemm_qkv_cache_bias_rope_m16 gemm_qkv_cache_bias_rope_prefill \
-     gemm_qkv_vision_rope_finish gemm_glu_fp32_finish_split_11008
+     gemm_qkv_vision_rope_finish gemm_glu_fp32_finish_split_11008 \
+     qkv_split_vec_bhsd_h256 rope_half_d64_bhsd
 
 # ---------------------------------------------------------------- knife libraries
 # One library per routed family; env names XINFER_<FAMILY>_LIB unchanged.
@@ -144,6 +163,31 @@ gen aa_resample ops.resample.aa_resample_kernels \
     aa_v_720_1280_128_224 aa_h_720_1280_128_224 aa_v_480_640_160_224 aa_h_480_640_160_224
 link libaa_resample.so aa_resample \
      aa_v_720_1280_128_224 aa_h_720_1280_128_224 aa_v_480_640_160_224 aa_h_480_640_160_224
+
+# ---------------------------------------------------------------- static bridges
+# The lane-3 C-ABI bridges (ffi.h + cann_fia_v5 + cann_mm_fp32 + gdr_cann_chunk)
+# compiled into the core library. torch_npu headers locate the stream helper.
+STATIC_SRC_DIR="$HERE/static"
+if compgen -G "$STATIC_SRC_DIR/*.cc" > /dev/null; then
+    PYV=$(dirname "$(dirname "$PY")")
+    TORCH_INC="$PYV/lib/python3.11/site-packages/torch/include"
+    TORCH_LIB="$PYV/lib/python3.11/site-packages/torch/lib"
+    NPU_LIB_DIR="$PYV/lib/python3.11/site-packages/torch_npu/lib"
+    NPU_INC="$PYV/lib/python3.11/site-packages/torch_npu/include"
+    PY_INC="$PYV/include"
+    mkdir -p "$WORK/out/static"
+    for cc in "$STATIC_SRC_DIR"/*.cc; do
+        g++ -std=c++17 -O2 -fPIC \
+            -I"$STATIC_SRC_DIR" -I"$RUNTIME/include" -I"$RUNTIME/aarch64-linux/include" \
+            -I"$TORCH_INC" -I"$TORCH_INC/torch/csrc/api/include" -I"$NPU_INC" -I"$PY_INC" \
+            -c "$cc" -o "$WORK/out/static/$(basename "${cc%.cc}").o"
+    done
+    g++ -shared -o "$WORK/libxinfer_ascend_core.so" \
+        "$WORK"/out/static/*.o \
+        "$WORK"/out/core/{rms_apply_rstd_h2048,rms_consistent_ubv_h1280,rms_consistent_generic_h1024_f32in,denoise_input_embed,denoise_fp32head_cube,denoise_fp32head_prep,gemm_qkv_2b_norm_gate_cache_bnsdq,bnsd_o_proj_m768_bf16,gemm_qkv_cache_bias_rope_m16,gemm_qkv_cache_bias_rope_prefill,gemm_qkv_vision_rope_finish,gemm_glu_fp32_finish_split_11008,qkv_split_vec_bhsd_h256,rope_half_d64_bhsd}.o \
+        -L"$RUNTIME/lib64" -lascendcl -lopapi -lruntime -lnnopbase \
+        -L"$TORCH_LIB" -L"$NPU_LIB_DIR" -lc10 -ltorch_cpu -ltorch_npu
+fi
 
 # ---------------------------------------------------------------- receipts
 ( cd "$WORK" && find out -name "*.o" | sort | xargs sha256sum > SHA256SUMS.objects

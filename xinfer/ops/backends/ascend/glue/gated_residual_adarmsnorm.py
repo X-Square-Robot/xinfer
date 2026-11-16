@@ -20,7 +20,6 @@ from xinfer.ops.backends.ascend.glue.core import CORE
 
 
 
-@dump_op_inputs
 def gated_residual_adarmsnorm(
     residual,
     branch,
