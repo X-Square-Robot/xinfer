@@ -17,9 +17,10 @@ import sys
 from pathlib import Path
 
 MAX_FILE_BYTES = 1 << 20
-ALLOWED_LARGE_FILES: set[str] = set()  # repository-relative paths
+# repository-relative paths: the built kernel library
+ALLOWED_LARGE_FILES = {"xinfer/ops/backends/cuda/xinfer_kernels.so"}
 SKIP_DIRS = {".git", ".cache", ".ruff_cache", ".pytest_cache", "__pycache__", "artifacts", ".venv", "venv",
-             "build", "dist"}
+             "build", "dist", "third_party"}
 MACHINE_PATH = re.compile(r"(?<![\w.])/(?:opt|mnt|workspace)/|\bdevbox\b", re.IGNORECASE)
 ISSUE_REFERENCE = re.compile(r"\b[\w.-]+/[\w.-]+#\d+|\b(?:issue|MR|PR)\s*[#!]\d+", re.IGNORECASE)
 

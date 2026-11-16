@@ -29,7 +29,7 @@ xinfer-serve --model wallx2b --checkpoint /path/to/wallx2b-checkpoint \
   --device cuda --warmup flow.msgpack rtc.msgpack --port 33985
 ```
 
-默认的优化 BF16 组合可使用 xcompute。安装与 GPU 匹配的构建并查看实际选择的算子后端，见 [kernel 指南](../kernels.zh-CN.md)。如需使用参考组合并让视觉阶段使用 FlashAttention 2，安装兼容的 FlashAttention 2 构建，并在服务命令中追加 `--model-options '{"numerics":"reference"}' --reference-ops --op-backends varlen_attention=flash_attn`。
+默认的优化 BF16 组合在 CUDA kernel 库已编译时使用它。编译方法和实际选择的算子后端见 [kernel 指南](../kernels.zh-CN.md)。如需使用参考组合并让视觉阶段使用 FlashAttention 2，安装兼容的 FlashAttention 2 构建，并在服务命令中追加 `--model-options '{"numerics":"reference"}' --reference-ops --op-backends varlen_attention=flash_attn`。
 
 同一条 flow 观测也可以直接在进程内运行。示例选择 CPU 图像预处理，与服务默认设置一致。
 

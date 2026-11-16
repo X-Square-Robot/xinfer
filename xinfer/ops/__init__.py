@@ -158,7 +158,7 @@ for _spec in (
         "mxfp8_gemm_residual(a_q, a_scales, w_q, w_scales, residual_bf16[M, N], bias=None) -> bf16[M, N]",
         mxfp8.gemm_residual,
     ),
-    # Forms of xcompute's GEMM family (xinfer/ops/reference/mxfp8.py): MXFP8 pairs (q, scales), weights in the
+    # Forms of the CUDA backend's GEMM family (xinfer/ops/reference/mxfp8.py): MXFP8 pairs (q, scales), weights in the
     # checkpoint's row order, quantized outputs with one scale per 128 columns.
     OpSpec("mxfp8_layer_norm_quantize", "mxfp8_layer_norm_quantize(x[..., K], weight, bias, eps) -> (q[M, K], scales)"
            "  # the BF16 LayerNorm, quantized", mxfp8.layer_norm_quantize),
@@ -200,7 +200,7 @@ for _spec in (
            gemm.qkv_norm_split),
     OpSpec("segment_attention",
            "segment_attention(q[T, H, D], k, v, cu_seqlens, *, scale=None) -> [T, H, D]"
-           "  # varlen_attention's function on xcompute's attention_varlen",
+           "  # varlen_attention's function on the CUDA backend's attention_varlen",
            attn.segment_attention),
     OpSpec("gated_causal_attention",
            "gated_causal_attention(q[T, H, D], k[T, KV, D], v, gate[T, HD], *, scale=None) -> attention·sigmoid(gate)",
@@ -284,7 +284,7 @@ for _spec in (
         "nvfp4_silu_mul_quantize(gate_up_bf16[M, 2K]) -> (e2m1x2[M, K/2], scales)",
         nvfp4.silu_mul_quantize,
     ),
-    # Forms of xcompute's GEMM family (xinfer/ops/reference/nvfp4.py): NVFP4 pairs (q, scales), weights
+    # Forms of the CUDA backend's GEMM family (xinfer/ops/reference/nvfp4.py): NVFP4 pairs (q, scales), weights
     # (q[N, K/2], scales, global_scale); the GEMM rounds to BF16 before the epilogue, and a quantized output is the
     # final BF16 tensor quantized.
     OpSpec("nvfp4_layer_norm_quantize",
@@ -341,8 +341,7 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
     names = sorted({name for names in stage_ops.values() for name in names
                     if _is_slow_fallback(table.selection(name)) and name in FUSED_OPS})
     if names:
-        hint = ("Install xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: "
-                "docs/kernels.md" if kind == "cuda" else
+        hint = ("Build the CUDA kernel library for this GPU: docs/kernels.md" if kind == "cuda" else
                 "Install the Ascend xcompute build, or set XINFER_XCOMPUTE_LIBRARY to it: docs/ascend950dt.md")
         message = (f"{model}: {len(names)} operators have no fast kernel loaded and fall back to slow torch code "
                    f"({', '.join(names)}). {hint}")

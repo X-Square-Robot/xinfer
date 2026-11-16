@@ -12,6 +12,9 @@ dist/
 .coverage
 htmlcov/
 
+# The CUDA kernel library built from xinfer/ops/backends/cuda/src
+/xinfer/ops/backends/cuda/xinfer_kernels.so
+
 # Local configuration and credentials
 .env
 .env.*

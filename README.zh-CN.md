@@ -46,7 +46,7 @@ XInfer 的设计与评测见我们的论文 [Scaling VLA Serving Under Robotic E
 python -m pip install -e ".[models,serve]"
 ```
 
-Wall-OSS 默认的 BF16 优化路径使用 **Xcompute**。在支持的 GPU 上安装与其架构匹配的构建后，按 [kernel 指南](docs/kernels.zh-CN.md)检查各算子的后端。缺少兼容构建时使用较慢的 PyTorch 实现。
+Wall-OSS 默认的 BF16 优化路径使用本仓库中的 CUDA kernel。针对所用 GPU 编译后，按 [kernel 指南](docs/kernels.zh-CN.md)检查各算子的后端。没有编译这个库时使用较慢的 PyTorch 实现。
 
 以下示例使用 BF16，需要[受支持的 Wall-OSS checkpoint 布局](docs/models/wall_oss.zh-CN.md#环境要求)，包括 tokenizer 和归一化文件。公开的 Wall-OSS-0.5 和 WALL-OSS-FLOW 权重布局不同，目前无法直接加载。
 
@@ -103,7 +103,7 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 
 每个加速器运行各自的引擎（Engine）和权重。
 
-优化的 CUDA 执行路径使用 **Xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 以同样的方式绑定预构建的昇腾 **Xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
+优化的 CUDA 执行路径使用由本仓库编译的 kernel 库和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
 ## 性能
 

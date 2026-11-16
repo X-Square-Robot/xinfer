@@ -124,7 +124,7 @@ scale or element.
 
 ## Backends
 
-PyTorch provides reference operators for MXFP8 and NVFP4. On CUDA, an xcompute build with the MXFP8 GEMM and norm entries can accelerate the Wall-X 2B MXFP8 preset, and a build with NVFP4 inputs (the NVFP4 quantizer, GEMM inputs and outputs, and the norms' NVFP4 outputs) the NVFP4 preset. xcompute's NVFP4 quantizer divides as the Wall-X kernels do (`a · rcp.approx(b)`), so it can differ from the reference at rounding ties (about 0.05 % of the elements of random BF16 inputs). See the [kernel guide](kernels.md) to check the build and the selected operators.
+PyTorch provides reference operators for MXFP8 and NVFP4. On CUDA (SM120), the kernel library accelerates the Wall-X 2B MXFP8 preset; the NVFP4 preset runs on the reference operators. See the [kernel guide](kernels.md) to build it and check the selected operators.
 
 ## Tests
 

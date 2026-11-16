@@ -2,56 +2,63 @@
 
 [English](kernels.md) | 简体中文
 
-Wall-OSS 和 Wall-X 2B 默认的 BF16 组合在 CUDA 上使用 xcompute 融合算子。没有兼容的 xcompute 构建时，XInfer 用 PyTorch 参考实现运行同一组合。安装可选的 `flash-attn` 包可启用视觉和 prompt 注意力的优化实现。
+Wall-OSS 和 Wall-X 2B 的默认组合在 CUDA 上使用融合算子。它们的 kernel 在本仓库中（`xinfer/ops/backends/cuda/src`），编译成一个库 `xinfer_kernels.so`。没有编译这个库时，XInfer 用 PyTorch 参考实现运行同样的组合。安装可选的 `flash-attn` 包可启用视觉和 prompt 注意力的优化实现。
 
-内置的 `cuda` 后端模块（`xinfer/ops/backends/cuda/`）调用 xcompute 和 flash-attn 库，与 `xinfer.ops` 入口点中的扩展以同样方式加载（[注册](design.zh-CN.md#142-后端注册与选择)）。库 import 失败时，相应算子运行 torch 参考实现，并由一条告警列出变慢的算子；设置 `XINFER_OPS_STRICT=1` 时这条告警变成错误。例如，设置 `XINFER_FLASH_ATTN=0` 会在加载时跳过 flash-attn。
+内置的 `cuda` 后端模块（`xinfer/ops/backends/cuda/`）调用 kernel 库和 flash-attn，与 `xinfer.ops` 入口点中的扩展以同样方式加载（[注册](design.zh-CN.md#142-后端注册与选择)）。库加载失败时，相应算子运行 torch 参考实现，并由一条告警列出变慢的算子；设置 `XINFER_OPS_STRICT=1` 时这条告警变成错误。例如，设置 `XINFER_FLASH_ATTN=0` 会在加载时跳过 flash-attn。
 
 ## GPU 支持
 
-xcompute 构建必须支持服务所用 GPU 的架构。可通过 `xcompute.build_target_archs()` 检查。[Wall-OSS 和 Wall-X 2B 的性能测试](performance.zh-CN.md)均使用 RTX 5090 和 xcompute `7336b0d`。为 Jetson Thor 构建（`--arch 110`）时，xcompute `c0d03ca` 及之后的版本还带有 Wall-OSS optimized 组合在 Thor 上选用的 SM110 kernel：融合的 prefill MLP、权重组播 GEMM，以及按旋转对顺序输出 Q、K 的 QKV 投影（[Wall-OSS 设计](models/wall_oss_design.zh-CN.md)）。
+kernel 库针对一种 GPU 架构编译，只在这种架构上注册算子。本仓库目前有 SM120（RTX 50 系列）的 kernel。
 
-## 安装与选择构建
+GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`）：在 RTX 5090 上实测不慢于 cuBLASLt 路径的行数区间。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
 
-从提供方获得相互匹配的 xcompute Python 包与动态库并安装；XInfer 发行包不包含它们。BF16 需要统一的 GEMM、注意力和归一化接口。支持 `prepack_weight(layout="kn")` 的构建可以直接使用转置权重；旧版构建会把这些权重复制到连续张量中。Wall-X 2B 会逐项检查当前构建是否提供所需入口，选择可用的 CUDA 算子。它的 MXFP8 预设需要带 MXFP8 GEMM 系列的构建，NVFP4 预设需要带 NVFP4 输入的构建（xcompute `7034bdf` 或更新，SM120）；没有时这些算子在 torch 参考实现上运行，速度较慢。若从源码构建 CUDA 13 版本，请在同一环境安装 `apache-tvm-ffi`，并针对部署 GPU 编译。
+## 编译
+
+编译需要 CUDA 13 工具链、CMake 3.24 或更高版本、`apache-tvm-ffi` Python 包和 CUTLASS 头文件（子模块）：
+
+```bash
+git submodule update --init third_party/cutlass
+pip install -e ".[kernels]"
+cmake -S xinfer/ops/backends/cuda/src -B build/kernels
+cmake --build build/kernels -j
+```
+
+产物是 `xinfer/ops/backends/cuda/xinfer_kernels.so`。目标架构取编译机器的第一块 GPU；在没有该 GPU 的机器上用 `-DXINFER_CUDA_ARCH=120` 指定。
 
 ## 运行
 
-把这份源码的 Python 包加入路径，它会找到这份源码编译出的库：
-
 ```bash
-export PYTHONPATH=/path/to/xcompute/python:$PYTHONPATH
 xinfer-serve --model wall_oss --checkpoint /path/to/checkpoint --device cuda \
   --warmup observation.msgpack --port 33985
 ```
 
-XInfer 加载可导入的 `xcompute` 包所用的库，并使用其统一的 GEMM、注意力和归一化入口，同时关闭包在导入时的自动重新编译。设置 `XINFER_XCOMPUTE_LIBRARY=/path/to/xcompute.so` 时改为加载这个库（例如另一个 BF16 构建），这时包也要来自同一个构建。`XINFER_XCOMPUTE=0` 关闭这个后端。同样的环境变量也适用于 `Policy`、测试和 benchmark。
+XInfer 从自己的包目录加载 `xinfer_kernels.so`。设置 `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` 时改为加载在别处用同一份源码编译的库。`XINFER_KERNELS=0` 关闭这个后端。同样的环境变量也适用于 `Policy`、测试和 benchmark。
 
 ## 检查
 
 `xinfer-serve` 在模型加载后会记录每个算子的后端：
 
 ```
-xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue': 'xcompute', 'gemm_glu_epilogue': 'xcompute', ...}
+xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue': 'kernels', 'gemm_glu_epilogue': 'kernels', ...}
 ```
 
-`--resolved-config FILE` 会把同样的列表写入 `FILE`；在 Python 中，`Policy.describe()["ops"]` 也会列出它。构建可用时，融合算子（`gemm_epilogue`、`gemm_glu_epilogue`、`qkv_rope_kvcache`，以及模型用到的 `xinfer/ops/reference/` 中的其他算子）显示为 `xcompute`。它们显示为 `reference` 说明 XInfer 没有找到可用的构建：
+`--resolved-config FILE` 会把同样的列表写入 `FILE`；在 Python 中，`Policy.describe()["ops"]` 也会列出它。库已加载时，融合算子（`gemm_epilogue`、`gemm_glu_epilogue`、`qkv_rope_kvcache`，以及模型用到的 `xinfer/ops/reference/` 中的其他算子）显示为 `kernels`。它们显示为 `reference` 说明 XInfer 没有加载到这个库：
 
-- 没有可导入的 `xcompute` 包且没有设置 `XINFER_XCOMPUTE_LIBRARY`，或它指向的文件不存在；
-- 构建没有针对当前 GPU 的架构（`python -c "import xcompute; print(xcompute.build_target_archs())"`）；
-- `xcompute` 包没有统一入口；
-- 库缺少这些入口调用的函数：库与包来自不同的构建。
+- 没有编译 `xinfer/ops/backends/cuda/xinfer_kernels.so`，或 `XINFER_KERNELS_LIBRARY` 指向的文件不存在；
+- 没有安装 `apache-tvm-ffi` 包；
+- 库是为另一种 GPU 架构编译的。
 
 此时 `Policy` 和 `xinfer-serve` 在 GPU 上加载 Wall-OSS 时会记录一条警告：
 
 ```
-wall_oss: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Install
-xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: docs/kernels.md
+wall_oss: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Build the
+CUDA kernel library for this GPU: docs/kernels.md
 ```
 
-对于没有专用 kernel 的权重形状，xcompute 可以选择通用的 cuBLASLt GEMM。
+`pytest tests/kernels` 在每个 kernel 接受的形状上把它与 FP32 torch 对比；需要 GPU 和已编译的库。
 
 ## 昇腾
 
-`ascend` 后端使用相同的共享 xcompute 加载器与 `XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0`
-设置。可用实现会自动选中；不支持的调用使用 torch 回退。运行环境、图像处理和 NPU 图执行见
-[昇腾指南](ascend950dt.zh-CN.md)。
+`ascend` 后端通过 `xinfer/ops/backends/_xcompute.py` 绑定外部的 xcompute 构建，使用
+`XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0` 设置。可用实现会自动选中；不支持的调用使用 torch 回退。
+运行环境、图像处理和 NPU 图执行见[昇腾指南](ascend950dt.zh-CN.md)。
