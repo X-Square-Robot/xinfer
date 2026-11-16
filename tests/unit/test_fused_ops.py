@@ -193,6 +193,8 @@ def _fake_package(monkeypatch, tmp_path):
 MXFP8 = ("mxfp8_quantize", "mxfp8_layer_norm_quantize", "mxfp8_zero_centered_rms_norm_quantize",
          "mxfp8_add_zero_centered_rms_norm_quantize", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
          "mxfp8_qkv_rope_epilogue")
+NVFP4 = ("nvfp4_quantize", "nvfp4_gemm", "nvfp4_gemm_epilogue", "nvfp4_gemm_glu_quantize", "nvfp4_qkv_rope_epilogue",
+         "nvfp4_layer_norm_quantize", "nvfp4_add_zero_centered_rms_norm_quantize")
 
 
 @pytest.mark.parametrize("archs,platforms", [("110,120", ("sm110", "sm120")), ("120", ("sm120",)), ("", ())])
@@ -207,10 +209,11 @@ def test_xcompute_runs_on_the_architectures_the_build_targets(archs, platforms):
     assert _xcompute.target_archs(Library()) == platforms
 
 
-@pytest.mark.parametrize("mxfp8", [False, True])
-def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(monkeypatch, mxfp8):
-    """With xcompute imported, every fused operator is registered on its build's architectures (the MXFP8 ones when the
-    library has the MXFP8 GEMM family); without it, none."""
+@pytest.mark.parametrize("families", [(), ("mxfp8",), ("nvfp4",), ("mxfp8", "nvfp4")])
+def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(monkeypatch, families):
+    """With xcompute imported, every xcompute operator is registered on its build's architectures, the MXFP8 ones
+    when the library has the MXFP8 GEMM family and the NVFP4 ones when it has NVFP4 inputs; without xcompute,
+    none."""
     import importlib
     import types
 
@@ -227,8 +230,8 @@ def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(
         monkeypatch.setattr(registry_module, "registry", registry)
         monkeypatch.setattr(_xcompute, "XCOMPUTE", xcompute)
         monkeypatch.setattr(_xcompute, "xc", xcompute["requires"])
-        monkeypatch.setattr(_xcompute, "library", types.SimpleNamespace(
-            has_function=lambda name: mxfp8 and name in _xcompute.MXFP8_FUNCTIONS))
+        functions = {name for family in families for name in _xcompute.FORMAT_FUNCTIONS[family]}
+        monkeypatch.setattr(_xcompute, "library", types.SimpleNamespace(has_function=functions.__contains__))
         for module in BUILTIN_MODULES:
             importlib.reload(importlib.import_module(module))
         return registry
@@ -238,7 +241,8 @@ def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(
     try:
         registry = registered(dict(requires=package, platforms=("sm120",), version="sha256:0"))
         names = registry.backend_ops("cuda:xcompute")
-        assert set(names) == set(FUSED) | (set(MXFP8) if mxfp8 else set())
+        assert set(names) == (set(FUSED) | (set(MXFP8) if "mxfp8" in families else set())
+                              | (set(NVFP4) if "nvfp4" in families else set()))
         # Filter by implementation: the Ascend backend registers some of the same operators after the CUDA modules.
         assert {i.platforms for name in names for i in registry.implementations(name)
                 if i.name == "cuda:xcompute"} == {("sm120",)}
@@ -246,7 +250,8 @@ def test_the_cuda_modules_register_the_xcompute_operators_when_xcompute_imports(
         package.denoise_input_embed = object()
         enabled = registered(dict(requires=package, platforms=("sm120",), version="sha256:0"))
         assert set(enabled.backend_ops("cuda:xcompute")) == (set(FUSED) | {"flow_input_embed"}
-                                                             | (set(MXFP8) if mxfp8 else set()))
+                                                             | (set(MXFP8) if "mxfp8" in families else set())
+                                                             | (set(NVFP4) if "nvfp4" in families else set()))
         assert registered(dict(requires=None, platforms=(), version=None)).backend_ops("cuda:xcompute") == []
     finally:
         monkeypatch.undo()

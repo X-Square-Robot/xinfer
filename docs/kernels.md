@@ -12,7 +12,7 @@ The xcompute build must target the architecture of the serving GPU. Check `xcomp
 
 ## Install and select a build
 
-Install a matching xcompute Python package and shared library from your provider. Neither is bundled with XInfer. For BF16, use a build with the unified GEMM, attention and norm entries. A build that supports `prepack_weight(layout="kn")` uses transposed weights without copying. Older builds copy these weights to a contiguous tensor. Wall-X 2B selects its additional CUDA operators individually when the build provides their entry points. If using a CUDA 13 source build, install the `apache-tvm-ffi` Python package in the same environment and compile for the deployment GPU.
+Install a matching xcompute Python package and shared library from your provider. Neither is bundled with XInfer. For BF16, use a build with the unified GEMM, attention and norm entries. A build that supports `prepack_weight(layout="kn")` uses transposed weights without copying. Older builds copy these weights to a contiguous tensor. Wall-X 2B selects its additional CUDA operators individually when the build provides their entry points. Its MXFP8 preset needs a build with the MXFP8 GEMM family, and its NVFP4 preset a build with NVFP4 inputs (xcompute `7034bdf` or later, SM120); without them those operators run on their torch references, slowly. If using a CUDA 13 source build, install the `apache-tvm-ffi` Python package in the same environment and compile for the deployment GPU.
 
 ## Run
 

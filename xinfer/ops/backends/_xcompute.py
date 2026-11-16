@@ -161,11 +161,14 @@ def xcompute_with(*entries, functions=()):
     return dict(XCOMPUTE, requires=xc if available else None)
 
 
-# Library functions of the builds with the MXFP8 GEMM family (and the norms' MXFP8 outputs).
-MXFP8_FUNCTIONS = ("quantize_mxfp8_into", "layernorm_quant_mxfp8")
+# Library functions of the builds with a quantized format in the GEMM family: the quantizer, the norms' quantized
+# outputs and (NVFP4) the generic GEMM.
+FORMAT_FUNCTIONS = {"mxfp8": ("quantize_mxfp8_into", "layernorm_quant_mxfp8"),
+                    "nvfp4": ("quantize_nvfp4_into", "gemm_generic_nvfp4", "layernorm_quant_nvfp4",
+                              "add_rmsnorm_zero_centered_nvfp4")}
 
 
-def mxfp8_registration() -> dict:
-    """``register`` arguments of an operator on the MXFP8 GEMM family: ``XCOMPUTE`` when the library has the family,
-    else nothing registers (the operators run on their references)."""
-    return xcompute_with(functions=MXFP8_FUNCTIONS)
+def format_registration(fmt: str) -> dict:
+    """``register`` arguments of an operator in the format ``fmt`` (``"mxfp8"``, ``"nvfp4"``): ``XCOMPUTE`` when the
+    library has the format's functions, else nothing registers (the operators run on their references)."""
+    return xcompute_with(functions=FORMAT_FUNCTIONS[fmt])

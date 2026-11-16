@@ -89,7 +89,7 @@ finally:
 
 | 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
 |---|---|---|---|---|
-| Wall-X 2B | `wallx2b` | BF16；视觉和预填充可选 MXFP8，动作阶段保留 BF16 | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
+| Wall-X 2B | `wallx2b` | BF16；视觉和预填充可选 MXFP8 或 NVFP4，动作阶段保留 BF16 | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
 Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。Wall-X 2B 在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)；昇腾 950DT 上的数据在同一张表内，该模型在此平台的算子见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
@@ -111,7 +111,8 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 | # | 模型 | 精度、组合 | 加速器 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 峰值吞吐 |
 |---|---|---|---|---|---|---|---|---|
 | 1 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
-| 2 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+| 2 | Wall-X 2B | 视觉和预填充 NVFP4，优化组合 | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
+| 3 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## 工作原理
 
