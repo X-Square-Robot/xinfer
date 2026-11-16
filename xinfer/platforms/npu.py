@@ -151,6 +151,20 @@ _CHROMA = {
 }
 
 
+def _quant_u8(x):
+    """SOUP2 quant knife: one kernel for add+floor+clamp+cast; falls back."""
+    try:
+        from xcompute.kernel import soup2
+
+        if soup2.enabled("quant"):
+            out = soup2.quant_u8(x)
+            if out is not None:
+                return out
+    except Exception:  # noqa: BLE001 - any miss runs the released chain
+        pass
+    return x.add_(0.5).floor_().clamp_(0, 255).to(torch.uint8)
+
+
 def _rgb(luma: torch.Tensor, chroma: torch.Tensor | None, pixel_format: int) -> torch.Tensor:
     """Unpack a cropped Y plane and interleaved chroma plane as CHW uint8 RGB."""
     if chroma is None:
@@ -166,7 +180,7 @@ def _rgb(luma: torch.Tensor, chroma: torch.Tensor | None, pixel_format: int) -> 
     u, v = uv[1 if vu_order else 0] - 128, uv[0 if vu_order else 1] - 128
     y = luma.float()
     rgb = torch.stack((y + 1.402 * v, y - 0.344136 * u - 0.714136 * v, y + 1.772 * u))
-    return rgb.add_(0.5).floor_().clamp_(0, 255).to(torch.uint8)
+    return _quant_u8(rgb)
 
 
 class NpuJpegDecoder:
