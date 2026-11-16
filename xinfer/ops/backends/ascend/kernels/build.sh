@@ -219,7 +219,7 @@ if compgen -G "$STATIC_SRC_DIR/*.cc" > /dev/null; then
     done
     g++ -shared -o "$WORK/libxinfer_ascend_core.so" \
         "$WORK"/out/static/*.o \
-        "$WORK"/out/core/{rms_apply_rstd_h2048,rms_consistent_ubv_h1280,rms_consistent_generic_h1024_f32in,denoise_input_embed,denoise_fp32head_cube,denoise_fp32head_prep,gemm_qkv_2b_norm_gate_cache_bnsdq,bnsd_o_proj_m768_bf16,gemm_qkv_cache_bias_rope_m16,gemm_qkv_cache_bias_rope_prefill,gemm_qkv_vision_rope_finish,gemm_glu_fp32_finish_split_11008,qkv_split_vec_bhsd_h256,rope_half_d64_bhsd}.o \
+        "$WORK"/out/core/{rms_apply_rstd_h2048,rms_consistent_ubv_h1280,rms_consistent_generic_h1024_f32in,denoise_input_embed,denoise_fp32head_cube,denoise_fp32head_prep,gemm_qkv_2b_norm_gate_cache_bnsdq,bnsd_o_proj_m768_bf16,smallm_bnsd_o_proj,smallm_bnsd_o_proj_m32,smallm_bnsd_o_proj_m64,gemm_qkv_cache_bias_rope_m16,gemm_qkv_cache_bias_rope_prefill,gemm_qkv_vision_rope_finish,gemm_glu_fp32_finish_split_11008,qkv_split_vec_bhsd_h256,rope_half_d64_bhsd}.o \
         -L"$RUNTIME/lib64" -lascendcl -lopapi -lruntime -lnnopbase \
         -L"$TORCH_LIB" -L"$NPU_LIB_DIR" -lc10 -ltorch_cpu -ltorch_npu
 fi
