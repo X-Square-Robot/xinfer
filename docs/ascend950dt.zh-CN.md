@@ -19,8 +19,9 @@ JPEG 解码器位于各平台模块。`platforms.devices.jpeg_decoder_for(device
 
 ## 外部 xcompute 后端
 
-安装预构建的昇腾 xcompute 共享库和同一构建的 Python 包。共享加载器 `xinfer/ops/backends/_xcompute.py`
-关闭导入时重建，供所有硬件后端使用。CUDA 与昇腾使用相同配置：
+安装预构建的昇腾 xcompute 共享库和同一构建的 Python 包。加载器 `xinfer/ops/backends/_xcompute.py`
+关闭导入时重建，只服务昇腾后端的外部构建：CUDA 后端的内核库从本仓库构建（`cuda/_native.py`，见
+[内核库](kernels.zh-CN.md)），不经此路径。昇腾外部构建的配置：
 
 | 环境变量 | 含义 |
 |---|---|

@@ -143,7 +143,7 @@ Single-request latency and capacity of each serving configuration, measured with
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. X-Square Robot’s Xcompute library provides fused kernels alongside optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. Huixi R1 uses a separate experimental native path from Python Policy." width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. The CUDA kernel library is built from this repository and the Ascend backend binds X-Square Robot’s external Xcompute build, alongside optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. Huixi R1 uses a separate experimental native path from Python Policy." width="100%">
 </p>
 
 The Frontend handles input and output processing. Models define stage

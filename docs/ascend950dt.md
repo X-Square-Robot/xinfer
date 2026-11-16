@@ -22,9 +22,10 @@ to both raw and decoded images.
 
 ## External xcompute backend
 
-Install a prebuilt Ascend xcompute shared library and the Python package from the same build. The shared
-loader in `xinfer/ops/backends/_xcompute.py` disables rebuild-on-import and serves every hardware backend.
-CUDA and Ascend use the same configuration:
+Install a prebuilt Ascend xcompute shared library and the Python package from the same build. The loader in
+`xinfer/ops/backends/_xcompute.py` disables rebuild-on-import and serves the Ascend backend's external builds
+only: the CUDA backend builds its kernel library from this repository (`cuda/_native.py`,
+[kernels.md](kernels.md)) and does not come through here. The Ascend external configuration:
 
 | Variable | Meaning |
 |---|---|

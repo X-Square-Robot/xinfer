@@ -121,7 +121,7 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 ## 工作原理
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.svg" alt="模型阶段调用加载时选定的算子实现。X-Square Robot 自研的 Xcompute 提供融合算子，也可选择 CUDA FlashAttention、PyTorch 参考算子或第三方插件。引擎支持 RTX 5090、Jetson AGX Thor、昇腾 950DT 和 CPU。Huixi R1 走独立的实验路径。" width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="模型阶段调用加载时选定的算子实现。CUDA 内核库从本仓库构建，昇腾后端绑定 X-Square Robot 自研的 Xcompute 外部构建，也可选择 CUDA FlashAttention、PyTorch 参考算子或第三方插件。引擎支持 RTX 5090、Jetson AGX Thor、昇腾 950DT 和 CPU。Huixi R1 走独立的实验路径。" width="100%">
 </p>
 
 前端（Frontend）负责输入处理和输出处理。模型定义各阶段的计算和张量交接；引擎管理准入、队列、组批和资源生命周期。加载模型时，算子注册表为目标设备上的每个算子选择实现。X-Square Robot 自研的 **Xcompute** 提供 QKV 投影与 RoPE、残差加法与 RMSNorm 等融合算子。同一注册表也支持 CUDA 上可选的 FlashAttention、PyTorch 参考算子和第三方算子库。平台适配器负责设备执行。在 CUDA、昇腾和 CPU 上，Python API 与网络服务共用同一引擎。虚线表示正在适配的 Huixi R1 路径，Wall-X 2B 通过进程内 Python 接口调用 Rhino Launch SDK。执行模型见[引擎指南](docs/engine.zh-CN.md)，默认值与覆盖方式见[配置](docs/configuration.zh-CN.md)。
