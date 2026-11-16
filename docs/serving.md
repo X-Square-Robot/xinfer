@@ -119,11 +119,30 @@ python -m xinfer.entrypoints.serve ... \
   robots (the pairing rate crosses over between 12 and 14 robots; below that
   the knob queues without pairing). At 12 robots it still passes the 150 ms
   rule at a +48 ms P50 cost -- deploy by target.
-- **Do not combine with action-stage `--lanes` ≥ 2**: the lanes4 arm measures
-  75.0 req/s (down from 77.5) -- parallel lanes drain the queue and starve the
-  batcher's pairing window. Lanes remain the better choice at 12-13 robots
-  when the vision/prefill stages queue deeply; batching wins from ~14 robots
-  on. Pick one per deployment, not both.
+- **On the CAPACITY-R3 stack, do not combine with action-stage `--lanes` ≥ 2**:
+  the lanes4 arm there measures 75.0 req/s (down from 77.5) -- parallel lanes
+  drain the queue and starve the batcher's pairing window. On that stack lanes
+  remain the better choice at 12-13 robots when the vision/prefill stages
+  queue deeply; batching wins from ~14 robots on. The landed stack below
+  supersedes this reading at 14-15 robots.
+
+The final measured configuration on the landed stack adds the action lanes=3
+knob (CAPACITY-SPRINT, 2026-11-16; the same 150 ms rule ladder on the branch's
+landed knife set, where the batch-only arm reads 80.28 req/s at P50 133.1 ms):
+
+```bash
+python -m xinfer.entrypoints.serve ... \
+  --max-batch action=4 --allow-non-invariant-batching \
+  --lanes vision=2,prefill=2,action=3
+```
+
+- At 15 robots this is the best arm of the eight-configuration matrix: P50
+  126.1 ms / P95 172.6 ms, 80.61 req/s, eight rounds with zero errors and zero
+  underflow. The lanes ladder on this configuration reaches 16 robots at P50
+  148.9 ms (the measured latency limit of one card) with the highest measured
+  rate 84.2 req/s at the 20-robot saturation tier.
+- Action lanes=1 is rejected: it serializes the dispatch and reads 68.4 req/s
+  at 15 robots. The vision and prefill lanes stay at 2.
 
 ## Load testing
 

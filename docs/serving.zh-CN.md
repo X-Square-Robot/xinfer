@@ -94,9 +94,26 @@ python -m xinfer.entrypoints.serve ...   --max-batch action=4 --allow-non-invari
 - 吞吐：非批量 70.9 req/s → `action=4` 下 **77.5 req/s**（14-15 台；成对率在 12-14 台
   之间越过交叉点，低于该深度旋钮只排队不配对）。12 台时仍过 150ms 规则，代价
   P50 +48ms——按部署目标取舍。
-- **不要与 action 段 `--lanes` ≥ 2 同开**：lanes4 臂实测 75.0 req/s（低于 77.5）——
-  并行 lane 把队列抽干，饿死批量器的配对窗口。12-13 台且 vision/prefill 深排队时
-  lanes 仍是更优选择；约 14 台起批量占优。**每套部署二选一，不要叠加。**
+- **在 CAPACITY-R3 栈上不要与 action 段 `--lanes` ≥ 2 同开**：该栈的 lanes4 臂实测
+  75.0 req/s（低于 77.5）——并行 lane 把队列抽干，饿死批量器的配对窗口。该栈上
+  12-13 台且 vision/prefill 深排队时 lanes 仍是更优选择；约 14 台起批量占优。
+  下方落地栈的终配置在 14-15 台取代该结论。
+
+落地栈上的终配置实测再叠加 action lanes=3 旋钮（CAPACITY-SPRINT，2026-11-16；
+同一 150ms 规则阶梯跑在分支已落地刀法集上，该栈仅批量臂读 80.28 req/s、
+P50 133.1 ms）：
+
+```bash
+python -m xinfer.entrypoints.serve ... \
+  --max-batch action=4 --allow-non-invariant-batching \
+  --lanes vision=2,prefill=2,action=3
+```
+
+- @15 台为八配置矩阵最优臂：P50 126.1 ms / P95 172.6 ms、80.61 req/s，
+  8 轮零错误零 underflow。该配置的阶梯 @16 台 P50 148.9 ms（单卡实测延迟
+  极限档），最高实测吞吐 84.2 req/s（@20 台饱和档）。
+- action lanes=1 拒用：单流串行化派发，@15 台仅 68.4 req/s。vision 与
+  prefill 段 lanes 维持 2。
 
 ## 压测
 
