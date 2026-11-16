@@ -11,6 +11,16 @@ import torch
 from xinfer.ops.backends.ascend import _provider
 from xinfer.ops.backends.ascend.glue.core import CORE
 from xinfer.ops.backends.ascend.glue._cann_action_scope import action_scope, memo_action_metadata
+try:  # decodeattn-r4: opt-in decode-family kernel pair (XINFER_DECODEATTN_R4)
+    from xinfer.ops.backends.ascend.glue import decodeattn_r4 as _decodeattn_r4
+except Exception:  # pragma: no cover - the route stays off without the lib
+    _decodeattn_r4 = None
+try:  # copykill-r2 integration flags (XINFER_COPYKILL_R2, default off)
+    from xinfer.ops.backends.copykill_r2 import enabled as _copykill_enabled
+except Exception:  # pragma: no cover - optional mount
+
+    def _copykill_enabled(_family):
+        return False
 
 _MAX_I32 = 2**31 - 1
 
@@ -129,6 +139,14 @@ class CannAttention:
         scale = _scale(scale, dim)
         if all_keep and flash_mask is not None:
             raise ValueError("all_keep cannot be combined with a flash mask")
+        if (
+            _decodeattn_r4 is not None
+            and not all_keep
+            and _decodeattn_r4.applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
+        ):
+            return _decodeattn_r4.prefix_kvcache_attention(
+                q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale, return_bnsd
+            )
         key = self._key("cache", q, k_cache, scale, all_keep)
 
         def positions():
@@ -167,7 +185,14 @@ class CannAttention:
 
             query = q.transpose(1, 2)
             if not query.is_contiguous():
-                query = query.contiguous()
+                if _copykill_enabled("k7"):
+                    def qbuf():
+                        return torch.empty((batch, heads, rows, dim), dtype=q.dtype, device=q.device)
+                    qbuf_v = self._warmed(("qbuf", *key), qbuf)
+                    qbuf_v.copy_(query)
+                    query = qbuf_v
+                else:
+                    query = query.contiguous()
             keys, values = cache_bnsd(k_cache), cache_bnsd(v_cache)
             out = torch.empty((batch, heads, rows, dim), dtype=q.dtype, device=q.device)
 

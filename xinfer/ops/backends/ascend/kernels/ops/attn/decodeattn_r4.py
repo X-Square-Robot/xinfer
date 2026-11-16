@@ -264,7 +264,78 @@ def reduce():
     return main
 
 
+def reduce_row():
+    """Token-major twin of reduce(): same 16-block math, OUT is [M, H, D].
+
+    Layout tax knife K1: the o-projection A is consumed as [M, H*D] rows, so
+    the shipped head-major store makes the consumer read 16 strided 256B
+    segments per row. Writing OUT[m, h, d] here keeps every arithmetic
+    statement of reduce() byte-identical (same weights, same vaxpy fold, same
+    RNE pack); only the destination address of the final GM store changes.
+    """
+
+    @T.prim_func
+    def main(ph: T.handle, oh: T.handle):
+        P = T.match_buffer(ph, (PAIRS, PAIR_ROWS, WIDTH), "float32")
+        OUT = T.match_buffer(oh, (QUERIES, HEADS, WIDTH), "bfloat16")
+        with T.Kernel(16) as block:
+            kv = block // 8
+            tile = (block % 8) // 4
+            h_local = block % 4
+            lr0 = h_local * 16
+            o7 = T.alloc_shared((CHUNKS * 16, WIDTH), "float32")
+            ml7 = T.alloc_shared((CHUNKS, WIDTH), "float32")
+            w_ub = T.alloc_shared((16, CHUNKS), "float32")
+            inv_ub = T.alloc_shared((16,), "float32")
+            out_ub = T.alloc_shared((16, WIDTH), "bfloat16")
+            base = _pair(kv, tile, 0)
+            for c in range(CHUNKS):
+                T.copy(P[base + c, lr0 : lr0 + 16, 0:WIDTH], o7[c * 16 : (c + 1) * 16, 0:WIDTH])
+                T.copy(P[base + c, 64, 0:WIDTH], ml7[c, 0:WIDTH])
+            with T.SimtVF(threads=16):
+                for m in T.Parallel(16):
+                    lr = lr0 + m
+                    m_star = T.alloc_var("float32", init=-T.infinity("float32"))
+                    for c in T.serial(CHUNKS):
+                        m_star = T.Select(ml7[c, lr] > m_star, ml7[c, lr], m_star)
+                    l_star = T.alloc_var("float32", init=0)
+                    for c in T.serial(CHUNKS):
+                        weight = T.exp(ml7[c, lr] - m_star)
+                        w_ub[m, c] = weight
+                        l_star = l_star + weight * ml7[c, 64 + lr]
+                    inv_ub[m] = T.float32(1) / l_star
+            with T.SimdVF():
+                S.mem_bar("VST_VLD")
+                allp = S.pset(32, "PAT_ALL")
+                for m in range(16):
+                    # Python-folded expression trees: TIR let variables must
+                    # not be reassigned across loop iterations (lesson 10).
+                    weights = [S.vld(w_ub[m, c], "BRC_B32") for c in range(CHUNKS)]
+                    terms0 = [
+                        S.vmul(S.vld(o7[c * 16 + m, 0], "NORM"), weights[c])
+                        for c in range(CHUNKS)
+                    ]
+                    terms64 = [
+                        S.vmul(S.vld(o7[c * 16 + m, 64], "NORM"), weights[c])
+                        for c in range(CHUNKS)
+                    ]
+                    acc0 = functools.reduce(
+                        lambda a, b: S.vadd(a, b, allp), terms0
+                    )
+                    acc64 = functools.reduce(
+                        lambda a, b: S.vadd(a, b, allp), terms64
+                    )
+                    inv = S.vld(inv_ub[m], "BRC_B32")
+                    S.vsts(out_ub[m, 0], S.vcvt(S.vmul(acc0, inv), "bfloat16", allp), allp, "PK_B32")
+                    S.vsts(out_ub[m, 64], S.vcvt(S.vmul(acc64, inv), "bfloat16", allp), allp, "PK_B32")
+                S.mem_bar("VST_VLD")
+            T.copy(out_ub, OUT[0:QUERIES, block, 0:WIDTH])
+
+    return main
+
+
 def build_programs():
     yield "decodeattn_r4_scan_a", scan(False)
     yield "decodeattn_r4_scan_b", scan(True)
     yield "decodeattn_r4_reduce", reduce()
+    yield "decodeattn_r4_reduce_row", reduce_row()

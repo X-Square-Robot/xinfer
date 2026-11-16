@@ -85,7 +85,7 @@ gen core ops.norm.rms_apply          rms_apply_rstd_h2048
 gen core ops.norm.rms_consistent     rms_consistent_ubv_h1280 rms_consistent_generic_h1024_f32in
 gen core ops.denoise.denoise_output denoise_input_embed denoise_fp32head_cube denoise_fp32head_prep
 gen core ops.gemm.qkv_bnsdq          gemm_qkv_2b_norm_gate_cache_bnsdq
-gen core ops.gemm.gemm_smallm_action bnsd_o_proj_m768_bf16
+gen core ops.gemm.gemm_smallm_action bnsd_o_proj_m768_bf16 smallm_bnsd_o_proj smallm_bnsd_o_proj_m32 smallm_bnsd_o_proj_m64
 gen core ops.gemm.gemm_qkv_cache     gemm_qkv_cache_bias_rope_m16 gemm_qkv_cache_bias_rope_prefill
 gen core ops.gemm.gemm_qkv_bf16_wide gemm_qkv_vision_rope_finish
 gen core ops.gemm.gemm_glu_fp32_finish gemm_glu_fp32_finish_split_11008
@@ -95,6 +95,7 @@ link libxinfer_ascend_core.so core \
      rms_apply_rstd_h2048 rms_consistent_ubv_h1280 rms_consistent_generic_h1024_f32in \
      denoise_input_embed denoise_fp32head_cube denoise_fp32head_prep \
      gemm_qkv_2b_norm_gate_cache_bnsdq bnsd_o_proj_m768_bf16 \
+     smallm_bnsd_o_proj smallm_bnsd_o_proj_m32 smallm_bnsd_o_proj_m64 \
      gemm_qkv_cache_bias_rope_m16 gemm_qkv_cache_bias_rope_prefill \
      gemm_qkv_vision_rope_finish gemm_glu_fp32_finish_split_11008 \
      qkv_split_vec_bhsd_h256 rope_half_d64_bhsd
@@ -134,17 +135,24 @@ link libsimdepi.so simdepi se1_ubv1280_buf2f se1_ubv2048_buf2f
 gen rmsfuse_r4 ops.norm.rmsfuse_r4 rf4_m16 rf4_ubv2048_f
 link librmsfuse_r4.so rmsfuse_r4 rf4_m16 rf4_ubv2048_f
 
-# UBBFINISH_R5 (walloss)
-gen ubfinish_r5 ops.finish.ubfinish_r5 ubfinish_r5_s8_c1280
-link libubfinish_r5.so ubfinish_r5 ubfinish_r5_s8_c1280
+# UBBFINISH_R5 (walloss; s4_c2048 mirrors the v22 registry's second entry)
+gen ubfinish_r5 ops.finish.ubfinish_r5 ubfinish_r5_s8_c1280 ubfinish_r5_s4_c2048
+link libubfinish_r5.so ubfinish_r5 ubfinish_r5_s8_c1280 ubfinish_r5_s4_c2048
 
-# DECODEATTN_R4 (walloss)
-gen decodeattn_r4 ops.attn.decodeattn_r4 decodeattn_r4_scan_b decodeattn_r4_reduce
-link libdecodeattn_r4.so decodeattn_r4 decodeattn_r4_scan_b decodeattn_r4_reduce
+# DECODEATTN_R4 (walloss; reduce_row = the ROW=1 final-arm form, INVENTORY wl #11)
+gen decodeattn_r4 ops.attn.decodeattn_r4 decodeattn_r4_scan_b decodeattn_r4_reduce decodeattn_r4_reduce_row
+link libdecodeattn_r4.so decodeattn_r4 decodeattn_r4_scan_b decodeattn_r4_reduce decodeattn_r4_reduce_row
 
-# FIA_FUSE (wall2b)
-gen fia_fuse ops.attn.fia_fuse fia_fuse_scan_l480 fia_fuse_reduce_l480
-link libfia_fuse.so fia_fuse fia_fuse_scan_l480 fia_fuse_reduce_l480
+# FIA_FUSE (wall2b; all four L forms the route's _BUILD_KEYS serves, plus the
+# reduce_bnsd twins the v22 delivery carried)
+gen fia_fuse ops.attn.fia_fuse \
+    fia_fuse_scan_l432 fia_fuse_scan_l448 fia_fuse_scan_l464 fia_fuse_scan_l480 \
+    fia_fuse_reduce_l432 fia_fuse_reduce_l448 fia_fuse_reduce_l464 fia_fuse_reduce_l480 \
+    fia_fuse_reduce_bnsd_l432 fia_fuse_reduce_bnsd_l448 fia_fuse_reduce_bnsd_l464 fia_fuse_reduce_bnsd_l480
+link libfia_fuse.so fia_fuse \
+    fia_fuse_scan_l432 fia_fuse_scan_l448 fia_fuse_scan_l464 fia_fuse_scan_l480 \
+    fia_fuse_reduce_l432 fia_fuse_reduce_l448 fia_fuse_reduce_l464 fia_fuse_reduce_l480 \
+    fia_fuse_reduce_bnsd_l432 fia_fuse_reduce_bnsd_l448 fia_fuse_reduce_bnsd_l464 fia_fuse_reduce_bnsd_l480
 
 # GDNV / MOVER2 / CONVGEMM (wall2b GDN wrapper stack)
 gen gdnv ops.gdn.gdnv_kernels gdrprep_bf16
@@ -158,11 +166,38 @@ link libconv_gemm.so conv_gemm dconv4_c6144
 gen soup2 ops.elem.soup2_kernels qksq_c6144 rawsq_r128 quant_u8
 link libsoup2.so soup2 qksq_c6144 rawsq_r128 quant_u8
 
-# AA_RESAMPLE (wall2b)
-gen aa_resample ops.resample.aa_resample_kernels \
-    aa_v_720_1280_128_224 aa_h_720_1280_128_224 aa_v_480_640_160_224 aa_h_480_640_160_224
-link libaa_resample.so aa_resample \
-     aa_v_720_1280_128_224 aa_h_720_1280_128_224 aa_v_480_640_160_224 aa_h_480_640_160_224
+# AA_RESAMPLE (wall2b) -- the real6 asset objects, renamed and relinked.
+# The vendored kernels/ops/resample/aa_resample_kernels.py is the real10-state
+# tree source: regenerating from it makes the auto-scheduler emit doubled
+# MTE2/MTE3 notifies whose FIFO flag matching DEADLOCKS the vector core (the
+# campaign's real9 pathology -- the source header documents it, and the v22
+# objcheck adjudicated "the real6 objects are assets; the relink must
+# reproduce"). The shipped libaa_resample-v22.so is a plain g++ -shared of the
+# four real6 objects (sha 95bd4874...), so the unified branch links the SAME
+# objects with the xinfer_aot_ symbol spelling (objcopy --redefine-syms over
+# every symbol containing the old prefix; the device-kernel registration is
+# symbol-address based, so the rename is internally consistent). Witness:
+# bitwise-equal output vs the delivered library on the 720p v-kernel (R2
+# probe, card 5, 2026-11-16). AA_REAL6_DIR overrides the asset location.
+aa_relink() {
+    local dir="${AA_REAL6_DIR:-/dev/shm/xcompute-parity-v22-20261110/aa-resample/build-real6/aot/aa_resample}"
+    local ren="$WORK/out/aa_renamed"; mkdir -p "$ren"
+    for k in aa_v_720_1280_128_224 aa_h_720_1280_128_224 aa_v_480_640_160_224 aa_h_480_640_160_224; do
+        if [ ! -f "$dir/$k.o" ]; then
+            echo "AA asset object missing: $dir/$k.o (set AA_REAL6_DIR)" >&2
+            exit 2
+        fi
+        nm "$dir/$k.o" | awk '{print $3}' | grep 'xcompute_aot_' | sort -u \
+            | while read -r s; do printf '%s %s\n' "$s" "${s/xcompute_aot_/xinfer_aot_}"; done \
+            > "$ren/$k.map"
+        objcopy --redefine-syms="$ren/$k.map" "$dir/$k.o" "$ren/$k.o"
+    done
+    g++ -shared -o "$WORK/libaa_resample.so" \
+        "$ren/aa_v_720_1280_128_224.o" "$ren/aa_h_720_1280_128_224.o" \
+        "$ren/aa_v_480_640_160_224.o" "$ren/aa_h_480_640_160_224.o" \
+        -L"$RUNTIME/lib64" -lascendcl -lopapi -lruntime -lnnopbase
+}
+aa_relink
 
 # ---------------------------------------------------------------- static bridges
 # The lane-3 C-ABI bridges (ffi.h + cann_fia_v5 + cann_mm_fp32 + gdr_cann_chunk)

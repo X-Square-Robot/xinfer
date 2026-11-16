@@ -24,6 +24,18 @@ try:  # finish-bf16 (XINFER_FINISHBF16, default off)
     from xinfer.ops.backends.ascend.glue import finishbf16
 except Exception:  # pragma: no cover - optional mount
     finishbf16 = None
+try:  # copykill-r2 integration flags (XINFER_COPYKILL_R2, default off)
+    from xinfer.ops.backends.copykill_r2 import enabled as _copykill_enabled
+except Exception:  # pragma: no cover - optional mount
+    def _copykill_enabled(_family):
+        return False
+try:  # INT-WOSS g2112-r3 flag-isolated routes (XINFER_G2112_*, default off)
+    from xinfer.ops.backends.ascend.glue.g2112_tilelang import (
+        G2112_FLAGS, glu_route, mm_fp32_route, down_route, accumulator_route, samu_route,
+    )
+except Exception:  # pragma: no cover - optional mount
+    G2112_FLAGS = {name: False for name in ("GLU", "VITQKV", "DOWN", "PREFQKV", "TORCH_A", "TORCH_C")}
+    glu_route = mm_fp32_route = down_route = accumulator_route = samu_route = None
 
 _ACTIVATIONS = {
     "silu": F.silu,
@@ -32,6 +44,50 @@ _ACTIVATIONS = {
 }
 _FLOAT_DTYPES = (torch.bfloat16, torch.float32)
 _MAX_I32 = 2**31 - 1
+
+# INT-WOSS COPYKILL-r2 K4: memoized FP32 bias copies (one cast per bias
+# storage identity, 64-entry LRU clear).
+_BIAS_FP32_MEMO = {}
+
+
+def _bias_fp32(bias):
+    key = (bias.data_ptr(), tuple(bias.shape), bias.dtype, bias.device.index)
+    entry = _BIAS_FP32_MEMO.get(key)
+    if entry is not None:
+        return entry[1]
+    value = bias.float()
+    if len(_BIAS_FP32_MEMO) >= 64:
+        _BIAS_FP32_MEMO.clear()
+    _BIAS_FP32_MEMO[key] = (bias, value)
+    return value
+
+
+# mx8-r3: opt-in routes for the wall-oss prefill down projection family.
+_MX8_DOWN_MODE = os.environ.get("XINFER_MX8_DOWN_MODE", "off")
+if _MX8_DOWN_MODE == "off":
+    # splitk outranks prepack when both are exported (the final-consolidate
+    # arm sets both; splitk is the form the 38.82 stack actually ran -- its
+    # down_bmm 3.1ms shows in the msprof ledger).
+    if os.environ.get("XINFER_MX8_DOWN_SPLITK", "0") not in ("", "0", "off"):
+        _MX8_DOWN_MODE = "splitk"
+    elif os.environ.get("XINFER_MX8_DOWN_PREPACK", "0") not in ("", "0", "off"):
+        _MX8_DOWN_MODE = "prepack"
+_MX8_DOWN_SPLITK = 4
+
+_GAP_UBF_READY = None
+
+
+def _gap_ubf_routes(m, n):
+    """GAP-WOSS-NONGE k2: compiled+tileable check for libubfinish_r5."""
+    global _GAP_UBF_READY
+    if _GAP_UBF_READY is None:
+        try:
+            from xinfer.ops.backends.ascend.glue import ubfinish_r5
+
+            _GAP_UBF_READY = ubfinish_r5.routes if ubfinish_r5.enabled() else (lambda rows, cols: False)
+        except Exception:  # noqa: BLE001 - any miss keeps the released chain
+            _GAP_UBF_READY = lambda rows, cols: False
+    return _GAP_UBF_READY(m, n)
 
 # gemm-audit K1 (XINFER_GEMM_BF16DIRECT=on, default off): see the route below.
 _BF16DIRECT_ON = os.environ.get("XINFER_GEMM_BF16DIRECT", "") == "on"
@@ -151,8 +207,16 @@ def _finish(y, bias, activation, residual, residual_gate, row_class, row_scale):
         fused = soup2.fc1gelu(y, bias.float(), y.new_empty(tuple(y.shape), dtype=torch.bfloat16))
         if fused is not None:
             return fused
+    # INT-WOSS COPYKILL-r2 K5: single-kernel biased BF16 round. Off keeps the
+    # walloss two-kernel chain byte-for-byte; K4 independently controls memo.
+    if (_copykill_enabled("k5") and bias is not None and activation is None
+            and residual is None and residual_gate is None and row_scale is None
+            and y.is_contiguous()):
+        out = torch.empty(y.shape, dtype=torch.bfloat16, device=y.device)
+        torch.add(y, _bias_fp32(bias), out=out)
+        return out
     if bias is not None:
-        y = y + bias.float()
+        y = y + (_bias_fp32(bias) if _copykill_enabled("k4") else bias.float())
     if row_scale is not None:
         y = y * row_scale[:, None]
     if activation is not None:
@@ -258,6 +322,10 @@ class CannProjection:
         # o-projection once the copy is cached). Keyed by the storage
         # identity of the source view and pinned to the source's lifetime.
         self._contig_weights = {}
+        # mx8-r3: flag-isolated routes for the wall-oss prefill down
+        # projection family ([M, 11008] x [2048, 11008]).
+        self._mx8_kn = {}
+        self._mx8_split = {}
         self._lock = Lock()
 
     def _stable_contiguous(self, weight):
@@ -277,6 +345,42 @@ class CannProjection:
             self._contig_weights[key] = (weight, copy)
             return copy
         return entry[1]
+
+    def _mx8_down(self, x, weight):
+        """mx8-r3 flag routes for the [M, 11008] x [2048, 11008] down projection.
+
+        Off by default (XINFER_MX8_DOWN_MODE=off keeps the released shared
+        FP32-accumulator chain). Prepack: one-time [K, N] copy per storage
+        identity and a single-round BF16 torch.mm -- bitwise with
+        mm(x, W.t()) (op-precheck card 0) and 147.6 -> 136.1 us on M=768.
+        Splitk: one-time [4, 2752, 2048] chunk stack, per-call strided-view
+        bmm + BF16 sum, 110.9 us -- the partials round 4x in BF16 (relerr
+        5.6e-3 vs the chain's 2.4e-3), so adoption rides the quick100 gate.
+        """
+        x = x.contiguous()
+        if _MX8_DOWN_MODE == "prepack":
+            key = (weight.data_ptr(), tuple(weight.shape), weight.dtype)
+            entry = self._mx8_kn.get(key)
+            if entry is None:
+                if torch.npu.is_current_stream_capturing():
+                    raise RuntimeError("warm up the mx8 down prepack route before graph capture")
+                copy = weight.t().contiguous()
+                self._mx8_kn[key] = (weight, copy)
+                entry = self._mx8_kn[key]
+            return torch.mm(x, entry[1])
+        if _MX8_DOWN_MODE == "splitk":
+            key = (weight.data_ptr(), tuple(weight.shape), weight.dtype)
+            entry = self._mx8_split.get(key)
+            if entry is None:
+                if torch.npu.is_current_stream_capturing():
+                    raise RuntimeError("warm up the mx8 down splitk route before graph capture")
+                stacked = weight.t().reshape(_MX8_DOWN_SPLITK, -1, weight.shape[0]).contiguous()
+                self._mx8_split[key] = (weight, stacked)
+                entry = self._mx8_split[key]
+            rows = x.shape[0]
+            view = x.reshape(rows, _MX8_DOWN_SPLITK, -1).permute(1, 0, 2)
+            return torch.bmm(view, entry[1]).sum(0)
+        raise RuntimeError(f"unknown XINFER_MX8_DOWN_MODE {_MX8_DOWN_MODE!r}")
 
     @contextmanager
     def _project(self, x, weight, shape):
@@ -304,6 +408,15 @@ class CannProjection:
 
     def accumulator(self, x, weight):
         """Borrow FP32 `[M,N]` inside a context, scheduling every consumer before exit."""
+        # INT-WOSS G2112-r3 PREFQKV, default off.
+        if x.ndim == 2 and weight.ndim == 2:
+            m, k = x.shape
+            if (G2112_FLAGS["PREFQKV"] and (m, k) == (768, 2048)
+                    and tuple(weight.shape) == (2560, 2048)
+                    and x.dtype == weight.dtype == torch.bfloat16
+                    and x.is_contiguous() and weight.is_contiguous()
+                    and x.device.type == "npu" and weight.device == x.device):
+                return accumulator_route(x, weight, "prefqkv")
         return self._project(x, weight, _geometry(x, weight))
 
     def gemm_add_rms_norm(self, x, weight, residual, norm_weight, epsilon):
@@ -387,6 +500,29 @@ class CannProjection:
         row_scale=None,
     ):
         """Project `[M,K]` by NK weights, apply the FP32 epilogue, and return BF16."""
+        # INT-WOSS G2112-r3 TORCH_C/DOWN, disjoint from MX8/SMALLM shapes.
+        if ((G2112_FLAGS["DOWN"] or G2112_FLAGS["TORCH_C"])
+                and bias is None and activation is None and residual is None
+                and residual_gate is None and row_class is None and row_scale is None
+                and x.ndim == 2 and weight.ndim == 2
+                and tuple(weight.shape) == (1280, 3456) and x.shape[0] == 2112
+                and x.dtype == weight.dtype == torch.bfloat16
+                and x.device.type == "npu" and weight.device == x.device):
+            if G2112_FLAGS["DOWN"]:
+                return down_route(x, weight)
+            return torch.mm(x, weight.t())
+        # mx8-r3: flag-isolated routes for the prefill e0 down projection
+        # ([M, 11008] x [2048, 11008], trivial epilogue only). Default off.
+        if (
+            _MX8_DOWN_MODE != "off"
+            and bias is None and activation is None and residual is None
+            and residual_gate is None and row_class is None and row_scale is None
+            and x.ndim == 2 and weight.ndim == 2
+            and tuple(weight.shape) == (2048, 11008)
+            and x.dtype == weight.dtype == torch.bfloat16
+            and x.device.type == "npu" and weight.device == x.device
+        ):
+            return self._mx8_down(x, weight)
         # 2b-m16: the wallx2b action o/down projection -- BF16 [16, 2048] rows
         # against the [1024, 2048] weight with a trivial epilogue (the finish
         # would only cast) -- is a single aclnnMatmul BF16 store: one launch
@@ -444,6 +580,19 @@ class CannProjection:
             # v2 card 5: -2.7/-5.3 us per call, hot==rot4).
             _BF16DIRECT_COUNT["routed"] += 1
             return torch.matmul(x, self._stable_contiguous(weight).t())
+        # smallm-r3: opt-in 32-block single-shot BNSD o-projection kernel
+        # (the shipped smallm_bnsd_o_proj runs 16 blocks; this one also folds
+        # the follow-up FP32->BF16 cast slot). Bitwise vs the shipped kernel
+        # + cast chain on the twin-fp32 reference (aot-verify, card 0).
+        if (smallm_r3 is not None and smallm_r3.enabled("oproj")
+                and bias is None and activation is None and residual is None
+                and residual_gate is None and row_class is None and row_scale is None
+                and x.ndim == 3 and tuple(x.shape) == (16, 16, 128)
+                and weight.ndim == 2 and tuple(weight.shape) == (1024, 2048)
+                and x.dtype == weight.dtype == torch.bfloat16
+                and x.is_contiguous() and weight.is_contiguous()
+                and x.device.type == "npu" and weight.device == x.device):
+            return smallm_r3.o_proj(x, weight)
         # r8: the prefill causal out arrives BNSD [16, 768, 128] head-major.
         # The dedicated Cube kernel folds the packed reshape copy and the
         # finish round (bitwise vs the composite chain, probe r8); only the
@@ -539,6 +688,57 @@ class CannProjection:
         elif row_class is not None:
             raise ValueError("row_class requires residual_gate")
 
+        # smallm-r3: opt-in action down-projection kernel ([16,2048]x
+        # [1024,2048], trivial epilogue): 32-block single-shot W stream, the
+        # BF16 store folds the cast round (bitwise on the twin reference).
+        if (smallm_r3 is not None and smallm_r3.enabled("down")
+                and bias is None and activation is None and residual is None
+                and residual_gate is None and row_class is None and row_scale is None
+                and x.ndim == 2 and weight.ndim == 2
+                and tuple(x.shape) == (16, 2048)
+                and tuple(weight.shape) == (1024, 2048)
+                and x.dtype == weight.dtype == torch.bfloat16
+                and x.is_contiguous() and weight.is_contiguous()
+                and x.device.type == "npu" and weight.device == x.device):
+            return smallm_r3.down(x, weight)
+        # layout-oproj K1: the decode attention hands back its output
+        # token-major [16, 2048], so the o-projection now sees the same
+        # contiguous A as the down site (same GEMM body, same k order, same
+        # RNE store round -> bitwise). Kept after the released down branch:
+        # the two sites are shape-identical, so in the combined arm the down
+        # branch still owns both and this only serves arms with down off.
+        if (smallm_r3 is not None and smallm_r3.enabled("oproj")
+                and bias is None and activation is None and residual is None
+                and residual_gate is None and row_class is None and row_scale is None
+                and x.ndim == 2 and weight.ndim == 2
+                and tuple(x.shape) == (16, 2048)
+                and tuple(weight.shape) == (1024, 2048)
+                and x.dtype == weight.dtype == torch.bfloat16
+                and x.is_contiguous() and weight.is_contiguous()
+                and x.device.type == "npu" and weight.device == x.device):
+            return smallm_r3.o_proj_row(x, weight)
+        # GAP-WOSS-NONGE k2: ubfinish-r5 rowpass-SIMD bias finish (witnessed
+        # bitwise vs the torch tail; graph 6.65us vs the 2-kernel chain
+        # 10.30us on [2112,1280]). Opt-in; unregistered shapes fall through.
+        if (
+            os.environ.get("XINFER_UBFINISH_R5") == "1"
+            and bias is not None
+            and activation is None
+            and residual is None
+            and residual_gate is None
+            and row_class is None
+            and row_scale is None
+            and bias.dtype == torch.bfloat16
+            and bias.is_contiguous()
+            and _gap_ubf_routes(m, n)
+        ):
+            from xinfer.ops.backends.ascend.glue import ubfinish_r5 as _ub5
+
+            with self._project(x, weight, shape) as output:
+                out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+                _ub5.finish(out, output, bias, m, n)
+                return out
+
         with self._project(x, weight, shape) as output:
             return _finish(output, bias, activation, residual, residual_gate, row_class, row_scale)
 
@@ -553,6 +753,16 @@ class CannProjection:
         if bias is not None:
             _check_tensor(bias, "bias", x.device, (n2,), _FLOAT_DTYPES)
         n = n2 // 2
+        # INT-WOSS G2112-r3 TORCH_A/GLU, default off.
+        if ((G2112_FLAGS["GLU"] or G2112_FLAGS["TORCH_A"])
+                and bias is not None and n2 == 6912 and shape[0] == 2112
+                and bias.dtype == torch.bfloat16 and bias.is_contiguous()
+                and x.dtype == weight.dtype == torch.bfloat16
+                and x.is_contiguous() and weight.is_contiguous()
+                and x.device.type == "npu" and weight.device == x.device):
+            if G2112_FLAGS["GLU"]:
+                return glu_route(x, weight, bias)
+            return samu_route(torch.addmm(bias, x, weight.t()))
         if (bias is not None and n2 == 6912 and bias.dtype == torch.bfloat16
                 and bias.is_contiguous() and callable(self._glu_fp32_deferred)):
             # glu-r1: the vision shape [2112, 1280] x [6912, 1280] rides the

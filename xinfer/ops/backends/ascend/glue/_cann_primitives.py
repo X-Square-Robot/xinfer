@@ -54,7 +54,14 @@ def mm_pair():
     The callables mirror the option-gated FFI signatures: ``query(out, x, w,
     math_type)`` returns the workspace bytes and ``launch(out, workspace, x,
     w, math_type)`` projects BF16 (math type 0) or FP32 (math type 3) rows by
-    an NK weight into the FP32 ``out``.
+    an NK weight into the FP32 ``out``. Three-dimensional BNSD ``[16, rows,
+    128]`` inputs against the o-projection weights ride the in-library Cube
+    kernels instead (the v22 bridge's SmallmBnsdRoute/BnsdM768Route, ported
+    to the python side): the [16, rows in {16, 32, 64}, 128] forms over the
+    [1024, 2048] weight take ``smallm_bnsd_o_proj{,_m32,_m64}`` with an FP32
+    ``[rows, 1024]`` out, and the prefill [16, 768, 128] form over the
+    [2048, 2048] weight takes ``bnsd_o_proj_m768_bf16`` with a BF16
+    ``[768, 2048]`` out; both routes are workspace-free.
     """
     library = _load()
     query = _symbol(library, "xinfer_cann_mm_fp32_workspace_bytes")
@@ -69,7 +76,54 @@ def mm_pair():
     launch.argtypes = [ctypes.c_int32, *_DENSE_PAIR, ctypes.c_void_p, ctypes.c_int64,
                        ctypes.c_int64]
 
+    bnsd_entries = {}
+    for name in ("smallm_bnsd_o_proj", "smallm_bnsd_o_proj_m32",
+                 "smallm_bnsd_o_proj_m64", "bnsd_o_proj_m768_bf16"):
+        call = _symbol(library, f"xinfer_aot_{name}_call")
+        kern_error = _symbol(library, f"xinfer_aot_{name}_get_last_error")
+        if call is None or kern_error is None:
+            continue
+        call.restype = ctypes.c_int32
+        call.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_void_p]
+        kern_error.restype = ctypes.c_char_p
+        bnsd_entries[name] = (call, kern_error)
+
+    def _bnsd_form(x, w, math_type):
+        """(kernel name, out dtype) for a BNSD input this build serves, else None."""
+        import torch
+
+        if (math_type != 0 or x.ndim != 3 or not x.is_contiguous()
+                or x.shape[0] != 16 or x.shape[2] != 128
+                or w.ndim != 2 or not w.is_contiguous()
+                or x.dtype != w.dtype or str(x.dtype) != "torch.bfloat16"
+                or x.device.type != "npu" or w.device != x.device):
+            return None
+        rows = int(x.shape[1])
+        if rows in (16, 32, 64) and tuple(w.shape) == (1024, 2048):
+            return ("smallm_bnsd_o_proj" if rows == 16 else f"smallm_bnsd_o_proj_m{rows}",
+                    torch.float32)
+        if rows == 768 and tuple(w.shape) == (2048, 2048):
+            return ("bnsd_o_proj_m768_bf16", torch.bfloat16)
+        return None
+
+    def _bnsd_validate(out, x, w, dtype):
+        import torch
+
+        rows = int(x.shape[1])
+        expected = (768, 2048) if dtype == torch.bfloat16 else (rows, 1024)
+        if (out.dtype != dtype or tuple(out.shape) != expected or not out.is_contiguous()
+                or out.device != x.device):
+            raise ValueError(
+                f"BNSD o-projection out must be a contiguous {dtype} "
+                f"{tuple(expected)} on the input NPU")
+
     def mm_query(out, x, w, math_type=0):
+        form = _bnsd_form(x, w, math_type)
+        if form is not None:
+            if form[0] not in bnsd_entries:
+                raise ValueError(f"this core library does not carry the {form[0]} BNSD kernel")
+            _bnsd_validate(out, x, w, form[1])
+            return 0
         m, k = x.shape
         n = w.shape[0]
         in_dims = (ctypes.c_int64 * 2)(int(m), int(k))
@@ -83,6 +137,24 @@ def mm_pair():
         return int(size)
 
     def mm_launch(out, workspace, x, w, math_type=0):
+        form = _bnsd_form(x, w, math_type)
+        if form is not None:
+            name = form[0]
+            if name not in bnsd_entries:
+                raise ValueError(f"this core library does not carry the {name} BNSD kernel")
+            _bnsd_validate(out, x, w, form[1])
+            call, kern_error = bnsd_entries[name]
+            import torch
+
+            stream = torch.npu.current_stream(x.device).npu_stream
+            status = call(ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(w.data_ptr()),
+                          ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(stream))
+            if status:
+                message = kern_error()
+                raise RuntimeError(
+                    f"{name} failed: "
+                    f"{message.decode('utf-8', 'replace') if message else 'unknown'}")
+            return
         m, k = x.shape
         n = w.shape[0]
         in_dims = (ctypes.c_int64 * 2)(int(m), int(k))
