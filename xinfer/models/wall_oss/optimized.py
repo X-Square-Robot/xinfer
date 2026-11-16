@@ -22,7 +22,7 @@ import torch
 from torch import nn
 
 from xinfer.models.layers.basic import ParamGroup
-from xinfer.models.layers.rotary import inverse_frequencies, mrope_cos_sin, vision_rotary_angles
+from xinfer.models.layers.rotary import inverse_frequencies, vision_rotary_angles
 from xinfer.loader import Source
 from xinfer.ops import active_ops
 
@@ -42,13 +42,11 @@ OPTIMIZED_STAGE_OPS = {
 def compact_rope(inv_freq: torch.Tensor, positions: torch.Tensor, section) -> tuple[torch.Tensor, torch.Tensor]:
     """FP32 ``(cos, sin)`` ``[L, D/2]`` of M-RoPE positions ``[3, 1, L]``, rounded through BF16 and band-selected as
     the reference's ``RopeTables.rotate`` uses them."""
-    cos, sin = mrope_cos_sin(inv_freq, positions, torch.float32)
-    tables = []
-    for table in (cos, sin):
-        half = table.to(DTYPE).float()[:, 0, :, :table.shape[-1] // 2]  # [3, L, D/2]
-        parts = half.split(list(section), dim=-1)
-        tables.append(torch.cat([part[i % 3] for i, part in enumerate(parts)], dim=-1).contiguous())
-    return tables[0], tables[1]
+    freqs = positions.to(torch.float32)[..., None] * inv_freq.to(torch.float32)
+    parts = freqs.split(list(section), dim=-1)
+    # Select the used axis and half before evaluating trig or rounding; the other five copies are discarded.
+    angles = torch.cat([part[i % 3, 0] for i, part in enumerate(parts)], dim=-1)
+    return angles.cos().to(DTYPE).float(), angles.sin().to(DTYPE).float()
 
 
 class OptimizedVision(nn.Module):

@@ -56,6 +56,8 @@
 
 在本模型的 BF16 形状下，除 expert 0 的 gate/up 外，xcompute 没有为 ViT 和 expert 0 的 GEMM 列出比 cuBLAS 更快的 kernel；这些 GEMM 受算力限制（约占 vision 和 prefill 阶段的 85 %）。收益来自融合的残差加法与归一化、expert 0 的 gate/up kernel，以及 action 阶段的 small-M kernel 和缓存注意力。
 
+优化后的 prompt 和 action 路径先为每段 M-RoPE 频带选择位置轴，再计算 cos/sin。它们只计算紧凑的半宽旋转表，经过 BF16 舍入后转回 FP32，保留参考实现所选频带的数值和舍入方式。
+
 与参考组合不同的算术：
 
 - **融合的尾处理**：QKV 的 bias 和 RoPE、GLU 的 SiLU-mul 以及 merger 的 GELU 作用在 FP32 累加器上，只舍入一次；参考组合先把 GEMM 输出舍入。残差和照旧舍入为 BF16。

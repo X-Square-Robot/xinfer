@@ -80,6 +80,10 @@ At this model's BF16 shapes xcompute lists no kernel faster than cuBLAS for the 
 expert-0 gate/up; they are compute-bound (about 85 % of the vision and prefill stages). The gains are the fused
 residual adds and norms, the expert-0 gate/up kernel and the action stage's small-M kernels and cache attention.
 
+The optimized prompt and action paths select each M-RoPE frequency band's position axis before computing cos/sin.
+Only the compact half tables are evaluated and rounded through BF16; the selected values and rounding match the
+expanded reference tables.
+
 Arithmetic that differs from the reference composition:
 
 - **Fused epilogues**: the QKV bias and RoPE, the GLU's SiLU-mul and the merger's GELU are applied to the FP32
