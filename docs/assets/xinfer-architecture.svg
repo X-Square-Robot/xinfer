@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="650" viewBox="0 0 1120 650" role="img" aria-labelledby="figure-title figure-desc">
+  <title id="figure-title">XInfer architecture</title>
+  <desc id="figure-desc">Vision produces image embeddings, prefill builds the prompt KV cache, and action denoising predicts a robot action chunk. The WebSocket service and Python Policy use the shared stage engine on NVIDIA RTX 5090 and Jetson AGX Thor, Ascend 950DT, and reference CPU. A separate experimental route from the in-process Python Policy uses a native runner and the Rhino Launch SDK on the Huixi Rhino RPU (R1).</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0L8 4L0 8Z" fill="#485868"/>
+    </marker>
+    <marker id="rpu-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0L8 4L0 8Z" fill="#855c34"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #182b3c; }
+      .title, .section { font-family: Georgia, "Times New Roman", serif; }
+      .title { font-size: 38px; font-weight: bold; }
+      .section { font-size: 26px; }
+      .letter { fill: #246f76; font-style: italic; }
+      .node { font-size: 21px; font-weight: bold; }
+      .meta { font-size: 16px; fill: #455969; }
+      .col { font-size: 17px; fill: #3f5361; font-weight: bold; }
+      .edge-label { font-size: 16px; fill: #3c6066; }
+      .exp-label { font-size: 16px; fill: #815731; font-style: italic; }
+      .flow, .branch { fill: none; stroke: #485868; stroke-width: 1.8; stroke-linejoin: round; }
+      .flow { marker-end: url(#arrow); }
+      .experimental { fill: none; stroke: #855c34; stroke-width: 1.8; stroke-dasharray: 6 5; stroke-linejoin: round; marker-end: url(#rpu-arrow); }
+      .stage { fill: #edf5f4; stroke: #639295; stroke-width: 1.4; }
+      .box { fill: #fff; stroke: #9aa9b4; stroke-width: 1.25; }
+      .engine { fill: #f0f4f8; stroke: #647b90; stroke-width: 1.4; }
+      .device { fill: #f8fafb; stroke: #9aa9b4; stroke-width: 1.25; }
+      .rpu { fill: #fcf8f2; stroke: #a3815c; stroke-width: 1.4; stroke-dasharray: 6 4; }
+    </style>
+  </defs>
+
+  <rect width="1120" height="650" fill="#fff"/>
+  <text class="title" x="40" y="51">XInfer architecture</text>
+  <path d="M40 71H1080" stroke="#344c5c" stroke-width="1.6"/>
+
+  <g id="model-stages">
+    <text class="section" x="40" y="110"><tspan class="letter">(a)</tspan><tspan dx="12">Model computation</tspan></text>
+    <rect class="stage" x="40" y="132" width="253" height="81" rx="4"/>
+    <rect class="stage" x="438" y="132" width="244" height="81" rx="4"/>
+    <rect class="stage" x="827" y="132" width="253" height="81" rx="4"/>
+    <g text-anchor="middle">
+      <text class="node" x="166.5" y="166">Vision</text>
+      <text class="meta" x="166.5" y="191">Encode camera views</text>
+      <text class="node" x="560" y="166">Prefill</text>
+      <text class="meta" x="560" y="191">Encode the multimodal prompt</text>
+      <text class="node" x="953.5" y="166">Action</text>
+      <text class="meta" x="953.5" y="191">Denoise an action chunk</text>
+      <text class="edge-label" x="365.5" y="161">Image tokens</text>
+      <text class="edge-label" x="754.5" y="161">Prompt KV cache</text>
+    </g>
+    <path class="flow" d="M293 175H434"/>
+    <path class="flow" d="M682 175H823"/>
+  </g>
+
+  <path d="M40 241H1080" stroke="#c7d1d4"/>
+  <g id="execution-paths">
+    <text class="section" x="40" y="282"><tspan class="letter">(b)</tspan><tspan dx="12">Execution paths</tspan></text>
+    <text class="col" x="40" y="324">Frontend interfaces</text>
+    <text class="col" x="363" y="324">Execution runtime</text>
+    <text class="col" x="766" y="324">Platform adapters and hardware</text>
+
+    <rect class="box" x="40" y="354" width="235" height="69" rx="4"/>
+    <text class="node" x="59" y="384">WebSocket service</text>
+    <text class="meta" x="59" y="408">Network clients</text>
+    <rect class="box" x="40" y="450" width="235" height="69" rx="4"/>
+    <text class="node" x="59" y="480">Python Policy</text>
+    <text class="meta" x="59" y="504">In-process inference</text>
+
+    <path class="flow" d="M275 388.5H317V417.5H359"/>
+    <path class="flow" d="M275 484.5H317V467.5H359"/>
+    <rect class="engine" x="363" y="383.5" width="290" height="118" rx="4"/>
+    <text class="node" x="383" y="422.5">XInfer Engine</text>
+    <text class="meta" x="383" y="451.5">Admission and per-stage queues</text>
+    <text class="meta" x="383" y="476.5">Batching and buffer lifetimes</text>
+
+    <path class="branch" d="M711 373.5V511.5"/>
+    <path class="flow" d="M711 373.5H762"/>
+    <path class="flow" d="M653 442.5H762"/>
+    <path class="flow" d="M711 511.5H762"/>
+    <circle cx="711" cy="442.5" r="2.8" fill="#485868"/>
+    <rect class="device" x="766" y="344" width="314" height="59" rx="4"/>
+    <text class="node" x="783" y="370">RTX 5090 · Jetson AGX Thor</text>
+    <text class="meta" x="783" y="392">NVIDIA CUDA · SM120 / SM110</text>
+    <rect class="device" x="766" y="413" width="314" height="59" rx="4"/>
+    <text class="node" x="783" y="439">Ascend 950DT</text>
+    <text class="meta" x="783" y="461">Ascend NPU · torch_npu / CANN</text>
+    <rect class="device" x="766" y="482" width="314" height="59" rx="4"/>
+    <text class="node" x="783" y="508">CPU</text>
+    <text class="meta" x="783" y="530">PyTorch reference execution</text>
+
+    <path class="experimental" d="M158 519V592H359"/>
+    <text class="exp-label" x="173" y="580">Experimental path</text>
+    <rect class="rpu" x="363" y="559" width="290" height="66" rx="4"/>
+    <text class="node" x="383" y="587">Native RPU runner</text>
+    <text class="meta" x="383" y="611">Rhino Launch SDK · AOT xcompute</text>
+    <path class="experimental" d="M653 592H762"/>
+    <rect class="rpu" x="766" y="559" width="314" height="66" rx="4"/>
+    <text class="node" x="783" y="587">Huixi Rhino RPU (R1)</text>
+    <text class="meta" x="783" y="611">Wall-X 2B · FP16 · TP8</text>
+  </g>
+</svg>
