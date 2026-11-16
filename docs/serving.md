@@ -99,6 +99,32 @@ exits 0. The server checks `Engine.health()` every 0.5 s; when the engine can
 no longer serve (its engine or completion thread has stopped), it shuts down
 the same way and exits 1, so that its supervisor can restart it.
 
+## Capacity knobs (Wall-X 2B fleets)
+
+`--max-batch` with `--allow-non-invariant-batching` trades per-request latency
+for fleet throughput on the action stage. The measured recipe on one Ascend
+950DT (CAPACITY-R3, 2026-11-16, the 150 ms rule ladder):
+
+```bash
+python -m xinfer.entrypoints.serve ... \
+  --max-batch action=4 --allow-non-invariant-batching
+```
+
+- The action stage pairs up to four single-robot requests per dispatch; the
+  zero-wait batcher only merges requests already waiting, never delays one.
+- `--allow-non-invariant-batching` is required because the stage's batched
+  gemm/attention contracts are tolerance-level (not bitwise) batch-invariant;
+  the single-request path is unchanged.
+- Throughput: 70.9 req/s unbatched → **77.5 req/s** with `action=4` at 14-15
+  robots (the pairing rate crosses over between 12 and 14 robots; below that
+  the knob queues without pairing). At 12 robots it still passes the 150 ms
+  rule at a +48 ms P50 cost -- deploy by target.
+- **Do not combine with action-stage `--lanes` ≥ 2**: the lanes4 arm measures
+  75.0 req/s (down from 77.5) -- parallel lanes drain the queue and starve the
+  batcher's pairing window. Lanes remain the better choice at 12-13 robots
+  when the vision/prefill stages queue deeply; batching wins from ~14 robots
+  on. Pick one per deployment, not both.
+
 ## Load testing
 
 `benchmarks/robot_load.py` runs virtual robots against the service in closed
