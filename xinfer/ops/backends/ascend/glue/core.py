@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import struct
 
 import torch
 
@@ -63,8 +64,11 @@ _CARRIED = {}
 
 
 def _bits(value: float) -> int:
-    """The double's IEEE-754 bit pattern, the AOT scalar ABI the kernels take."""
-    return ctypes.c_int64(ctypes.c_double(float(value)).value).value
+    """The float's IEEE-754 bit pattern, the AOT scalar ABI the kernels take.
+
+    The v22 convention (struct.pack("<f") -> unpack("<I"), as in the simdepi
+    and gdn glues): the int64 scalar's low word carries the float32 pattern."""
+    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 
 
 def _launch(lib, name, tensors, scalars, stream=None):
@@ -146,16 +150,16 @@ def _fia(bnsd: bool):
     return cache[bnsd]
 
 
-def cann_fia_v5_probe_workspace_size(out, q, k, v, drop_mask, scale, inner_precise):
+def cann_fia_v5_probe_workspace_size(out, q, k, v, drop_mask, scale, inner_precise=2, sparse_mode=0):
     pair = _fia(True)
     _require(pair is not None, "cann_fia_v5: the bridge is not in this build")
-    return pair[0](out, q, k, v, drop_mask, scale, inner_precise)
+    return pair[0](out, q, k, v, drop_mask, scale, sparse_mode, inner_precise)
 
 
-def cann_fia_v5_probe(out, workspace, q, k, v, drop_mask, scale, inner_precise):
+def cann_fia_v5_probe(out, workspace, q, k, v, drop_mask, scale, inner_precise=2, sparse_mode=0):
     pair = _fia(True)
     _require(pair is not None, "cann_fia_v5: the bridge is not in this build")
-    return pair[1](out, workspace, q, k, v, drop_mask, scale, inner_precise)
+    return pair[1](out, workspace, q, k, v, drop_mask, scale, sparse_mode, inner_precise)
 
 
 def cann_fia_vision_probe_workspace_size(out, q, k, v, endpoints, scale):
@@ -392,6 +396,7 @@ def denoise_input_embed(x, weight, *, head_index=None, extra=None, input_mask=No
                 x, x)
     _launch(lib, "denoise_input_embed", pointers,
             (b * m, a, n, heads, flags, len(addends)))
+    return out
 
 
 def denoise_output_euler(x, h, weight, *, dt, bias=None, prenorm="none", norm_weight=None,

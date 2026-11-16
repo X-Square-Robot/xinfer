@@ -231,7 +231,17 @@ class RawBridge:
 
     # ---- ACLNN Mm (cann_mm_fp32) -------------------------------------
     def mm_pair(self):
-        """``(query(out, x, w, math_type), launch(out, ws, x, w, math_type))``."""
+        """``(query(out, x, w, math_type), launch(out, ws, x, w, math_type))``.
+
+        Three-dimensional BNSD ``[16, rows, 128]`` o-projection inputs ride the
+        core library's Cube kernels instead of the ACLNN Mm bridge (the v22
+        bridge's SmallmBnsdRoute/BnsdM768Route, ported to the python side):
+        ``[16, rows in {16, 32, 64}, 128]`` over the ``[1024, 2048]`` weight
+        takes ``smallm_bnsd_o_proj{,_m32,_m64}`` with an FP32 ``[rows, 1024]``
+        out, and the prefill ``[16, 768, 128]`` form over the ``[2048, 2048]``
+        weight takes ``bnsd_o_proj_m768_bf16`` with a BF16 ``[768, 2048]``
+        out; both routes are workspace-free.
+        """
 
         pair = self._pair("xinfer_cann_mm_fp32_workspace_bytes",
                           "xinfer_cann_mm_fp32_launch",
@@ -241,13 +251,30 @@ class RawBridge:
         query, launch, error = pair
         error.restype = ctypes.c_char_p
         query.restype = ctypes.c_int64
-        query.argtypes = [ctypes.c_int32, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-                          ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
-                          ctypes.c_void_p, ctypes.c_int64]
+        # (device, bf16, in_dims*, w_dims*, out_dims*, in, w, out, weight_kn)
+        query.argtypes = [ctypes.c_int32, ctypes.c_int64, ctypes.POINTER(ctypes.c_int64),
+                          ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int64),
+                          ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64]
         launch.restype = ctypes.c_int
-        launch.argtypes = [ctypes.c_int32, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-                           ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
-                           ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64]
+        # (device, bf16, in_dims*, w_dims*, out_dims*, in, w, out, ws, ws_bytes, weight_kn)
+        launch.argtypes = [ctypes.c_int32, ctypes.c_int64, ctypes.POINTER(ctypes.c_int64),
+                           ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int64),
+                           ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                           ctypes.c_int64, ctypes.c_int64]
+
+        bnsd_entries = {}
+        for name in ("smallm_bnsd_o_proj", "smallm_bnsd_o_proj_m32",
+                     "smallm_bnsd_o_proj_m64", "bnsd_o_proj_m768_bf16"):
+            entry = self._pair(f"xinfer_aot_{name}_call",
+                               f"xinfer_aot_{name}_get_last_error",
+                               f"xinfer_aot_{name}_get_last_error")
+            if entry is None:
+                continue
+            call, _, kern_error = entry
+            call.restype = ctypes.c_int32
+            call.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_void_p]
+            kern_error.restype = ctypes.c_char_p
+            bnsd_entries[name] = (call, kern_error)
 
         def dims(x, w, out):
             m, k = x.shape
@@ -256,7 +283,41 @@ class RawBridge:
                     (ctypes.c_int64 * 2)(int(n), int(k)),
                     (ctypes.c_int64 * 2)(int(m), int(n)))
 
+        def bnsd_form(x, w, math_type):
+            """(kernel name, out dtype string) for a BNSD input, else None."""
+            if (math_type != 0 or x.ndim != 3 or not x.is_contiguous()
+                    or x.shape[0] != 16 or x.shape[2] != 128
+                    or w.ndim != 2 or not w.is_contiguous()
+                    or x.dtype != w.dtype or str(x.dtype) != "torch.bfloat16"
+                    or x.device.type != "npu" or w.device != x.device):
+                return None
+            rows = int(x.shape[1])
+            if rows in (16, 32, 64) and tuple(w.shape) == (1024, 2048):
+                return ("smallm_bnsd_o_proj" if rows == 16 else f"smallm_bnsd_o_proj_m{rows}",
+                        "torch.float32")
+            if rows == 768 and tuple(w.shape) == (2048, 2048):
+                return ("bnsd_o_proj_m768_bf16", "torch.bfloat16")
+            return None
+
+        def bnsd_validate(out, x, w, dtype_name):
+            import torch
+
+            rows = int(x.shape[1])
+            expected = (768, 2048) if dtype_name == "torch.bfloat16" else (rows, 1024)
+            dtype = getattr(torch, dtype_name.split(".")[-1])
+            if (out.dtype != dtype or tuple(out.shape) != expected or not out.is_contiguous()
+                    or out.device != x.device):
+                raise ValueError(
+                    f"BNSD o-projection out must be a contiguous {dtype} "
+                    f"{tuple(expected)} on the input NPU")
+
         def mm_query(out, x, w, math_type=0):
+            form = bnsd_form(x, w, math_type)
+            if form is not None:
+                if form[0] not in bnsd_entries:
+                    raise ValueError(f"this core library does not carry the {form[0]} BNSD kernel")
+                bnsd_validate(out, x, w, form[1])
+                return 0
             in_d, w_d, out_d = dims(x, w, out)
             size = query(x.get_device(), 1 if math_type == 0 else 0, in_d, w_d, out_d,
                          ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(w.data_ptr()),
@@ -266,6 +327,24 @@ class RawBridge:
             return int(size)
 
         def mm_launch(out, workspace, x, w, math_type=0):
+            form = bnsd_form(x, w, math_type)
+            if form is not None:
+                name = form[0]
+                if name not in bnsd_entries:
+                    raise ValueError(f"this core library does not carry the {name} BNSD kernel")
+                bnsd_validate(out, x, w, form[1])
+                call, kern_error = bnsd_entries[name]
+                import torch
+
+                stream = torch.npu.current_stream(x.device).npu_stream
+                status = call(ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(w.data_ptr()),
+                              ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(stream))
+                if status:
+                    message = kern_error()
+                    raise RuntimeError(
+                        f"{name} failed: "
+                        f"{message.decode('utf-8', 'replace') if message else 'unknown'}")
+                return
             in_d, w_d, out_d = dims(x, w, out)
             status = launch(x.get_device(), 1 if math_type == 0 else 0, in_d, w_d, out_d,
                             ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(w.data_ptr()),
@@ -421,10 +500,14 @@ def _fia_pair(pair, *, bnsd: bool):
                            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                            ctypes.POINTER(ctypes.c_int64), ctypes.c_double, ctypes.c_int64]
 
-        def bnsd_query(out, q, k, v, drop_mask, scale, inner_precise):
+        def bnsd_query(out, q, k, v, drop_mask, scale, inner_precise=2, sparse_mode=0):
             b, h, m, d = q.shape
             hkv, length = k.shape[1], k.shape[2]
             dims = (ctypes.c_int64 * 6)(int(b), int(h), int(m), int(d), int(hkv), int(length))
+            # The retired FFI face's trailing pair is (inner_precise,
+            # sparse_mode): the production glue always passes (2, 0). The
+            # static bridge's raw C-ABI takes inner_precise and has no sparse
+            # mode, so sparse_mode is accepted and dropped.
             size = query(q.get_device(), ctypes.c_void_p(out.data_ptr()), ctypes.c_void_p(q.data_ptr()),
                          ctypes.c_void_p(k.data_ptr()), ctypes.c_void_p(v.data_ptr()),
                          ctypes.c_void_p(drop_mask.data_ptr()), dims, float(scale), int(inner_precise))
@@ -432,7 +515,7 @@ def _fia_pair(pair, *, bnsd: bool):
                 raise RuntimeError(f"fia v5 workspace: {error().decode('utf-8', 'replace')}")
             return int(size)
 
-        def bnsd_launch(out, workspace, q, k, v, drop_mask, scale, inner_precise):
+        def bnsd_launch(out, workspace, q, k, v, drop_mask, scale, inner_precise=2, sparse_mode=0):
             b, h, m, d = q.shape
             hkv, length = k.shape[1], k.shape[2]
             dims = (ctypes.c_int64 * 6)(int(b), int(h), int(m), int(d), int(hkv), int(length))

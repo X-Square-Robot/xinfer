@@ -241,7 +241,11 @@ def _gqa_causal_bnsd(q, k, v, scale):
 @partial(_torch_attn.gated_causal_attention,
          check=lambda q, k, v, gate, *, scale=None: _packed_supported(q, k, v)
          and gate.dtype == torch.bfloat16 and gate.device == q.device
-         and gate.shape == (q.shape[0], q.shape[1] * q.shape[2])
+         # token-major [T, H, D] gates pack [T, H*D]; the GQA-GLUE knife's
+         # head-major [H, T, D] form (the BHSD qkv split's direct output)
+         # packs [T, H*D] the same way -- both spellings reach the gate.
+         and gate.shape in ((q.shape[0], q.shape[1] * q.shape[2]),
+                            (q.shape[1], q.shape[0] * q.shape[2]))
          and (_bridge_gated_causal is not None
               or _varlen_accepts(q, k, v, seg_len=q.shape[0], causal=True, out_gate=gate)))
 def gated_causal_attention(q, k, v, gate, *, scale=None):

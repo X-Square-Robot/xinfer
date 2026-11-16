@@ -31,6 +31,7 @@ swaps the R6D adafast objects 1:1 inside the final combined library.
 """
 
 import tilelang.ascend.language as T
+from ops.gemm.silu_and_mul import _store_rne
 
 ROWS, HIDDEN, WARP, LANES = 16, 1024, 32, 64
 
@@ -303,6 +304,151 @@ def action_fast(double):
     return main
 
 
+@T.macro
+def _action_add(residual, branch, gate):
+    product = _store_rne(T.cast(branch, "float32") * T.cast(gate, "float32"), "bfloat16")
+    return _store_rne(T.cast(residual, "float32") + T.cast(product, "float32"), "bfloat16")
+
+
+@T.macro
+def _action_norm(residual, modulation, inverse, col):
+    value = T.alloc_var(
+        "float32",
+        init=T.cast(residual, "float32") * inverse * (1.0 + modulation[col])
+        + modulation[1024 + col],
+    )
+    return _store_rne(value, "bfloat16")
+
+
+@T.macro
+def _action_norm_pin(residual, modulation, pinned_modulation, selected, inverse, col):
+    scale = T.Select(selected != 0, pinned_modulation[col], modulation[col])
+    shift = T.Select(selected != 0, pinned_modulation[1024 + col], modulation[1024 + col])
+    value = T.alloc_var(
+        "float32",
+        init=T.cast(residual, "float32") * inverse * (1.0 + scale) + shift,
+    )
+    return _store_rne(value, "bfloat16")
+
+
+def action_adarms_bf16_fp32_pinned(double):
+    """Pinned (RTC) variant of :func:`action_adarms_bf16_fp32`.
+
+    The Wall-X 2B RTC denoise pins its first ``pinned_rows[0]`` tokens to the
+    pinned modulations.  The generic kernels then read ``pinned_rows`` per row
+    from global memory while their row-per-thread grid degenerates on the
+    16-token action shape (one block, 16 of 128 threads active), which made
+    every pinned norm call ~100x the fused one and collapsed serving capacity.
+    This variant keeps the fused kernel's one-warp-per-token layout: both the
+    shared and the pinned modulation are staged into unified buffers once and
+    selected per token with ``T.Select``, exactly the selection the composed
+    generic path performs.  Gates are per token, as pinned requests require.
+    """
+    rows, hidden, warp = 16, 1024, 32
+
+    @T.prim_func
+    def main(
+        rh: T.handle, bh: T.handle, gh: T.handle, roh: T.handle, boh: T.handle,
+        goh: T.handle, m1h: T.handle, m2h: T.handle, pm1h: T.handle, pm2h: T.handle,
+        prh: T.handle, epsilon_bits: T.int64,
+    ):
+        residual = T.match_buffer(rh, (rows, hidden), "bfloat16")
+        branch = T.match_buffer(bh, (rows, hidden), "bfloat16")
+        previous_gate = T.match_buffer(gh, (rows, hidden), "bfloat16")
+        residual_out = T.match_buffer(roh, (rows, hidden), "bfloat16")
+        branch_out = T.match_buffer(boh, (rows, hidden), "bfloat16")
+        next_gate = T.match_buffer(goh, (rows, hidden), "bfloat16")
+        modulation1 = T.match_buffer(m1h, (3 * hidden,), "float32")
+        modulation2 = T.match_buffer(m2h, (3 * hidden,), "float32")
+        pinned_mod1 = T.match_buffer(pm1h, (3 * hidden,), "float32")
+        pinned_mod2 = T.match_buffer(pm2h, (3 * hidden,), "float32")
+        pinned_rows = T.match_buffer(prh, (rows,), "int32")
+        epsilon = T.reinterpret("float32", T.cast(epsilon_bits, "uint32"))
+        with T.Kernel(rows) as block:
+            row = T.cast(block, "int32")
+            selected = T.alloc_var("int32", init=0)
+            if pinned_rows[0] > row:
+                selected = T.int32(1)
+            r = T.alloc_shared((hidden,), "bfloat16")
+            b = T.alloc_shared((hidden,), "bfloat16")
+            gate = T.alloc_shared((hidden,), "bfloat16")
+            first = T.alloc_shared((3 * hidden,), "float32")
+            second = T.alloc_shared((3 * hidden,), "float32")
+            pinned_first = T.alloc_shared((3 * hidden,), "float32")
+            pinned_second = T.alloc_shared((3 * hidden,), "float32")
+            T.copy(residual[row, :], r)
+            T.copy(branch[row, :], b)
+            T.copy(previous_gate[row, :], gate)
+            T.copy(modulation1, first)
+            T.copy(pinned_mod1, pinned_first)
+            if double:
+                T.copy(modulation2, second)
+                T.copy(pinned_mod2, pinned_second)
+            with T.SimtVF(threads=warp):
+                for lane in T.Parallel(warp):
+                    square1 = T.alloc_var("float32", init=0)
+                    for step in T.serial(hidden // warp):
+                        col = step * warp + lane
+                        r[col] = _action_add(r[col], b[col], gate[col])
+                        value = T.cast(r[col], "float32")
+                        square1 += value * value
+                    inv1 = T.rsqrt(T.warp_reduce_sum(square1) / T.float32(hidden) + epsilon)
+                    if double:
+                        square2 = T.alloc_var("float32", init=0)
+                        for step in T.serial(hidden // warp):
+                            col = step * warp + lane
+                            norm = _action_norm_pin(r[col], first, pinned_first, selected, inv1, col)
+                            gate1 = _store_rne(
+                                T.Select(
+                                    selected != 0,
+                                    pinned_first[2 * hidden + col],
+                                    first[2 * hidden + col],
+                                ),
+                                "bfloat16",
+                            )
+                            r[col] = _action_add(r[col], norm, gate1)
+                            value = T.cast(r[col], "float32")
+                            square2 += value * value
+                        inv2 = T.rsqrt(T.warp_reduce_sum(square2) / T.float32(hidden) + epsilon)
+                        for step in T.serial(hidden // warp):
+                            col = step * warp + lane
+                            b[col] = _action_norm_pin(r[col], second, pinned_second, selected, inv2, col)
+                            gate[col] = _store_rne(
+                                T.Select(
+                                    selected != 0,
+                                    pinned_second[2 * hidden + col],
+                                    second[2 * hidden + col],
+                                ),
+                                "bfloat16",
+                            )
+                    else:
+                        for step in T.serial(hidden // warp):
+                            col = step * warp + lane
+                            b[col] = _action_norm_pin(r[col], first, pinned_first, selected, inv1, col)
+                            gate[col] = _store_rne(
+                                T.Select(
+                                    selected != 0,
+                                    pinned_first[2 * hidden + col],
+                                    first[2 * hidden + col],
+                                ),
+                                "bfloat16",
+                            )
+            T.copy(r, residual_out[row, :])
+            T.copy(b, branch_out[row, :])
+            T.copy(gate, next_gate[row, :])
+
+    return main
+
+
+
 def build_programs():
     yield "adarmsnorm_action_gated_bf16_f32", action_fast(False)
     yield "adarmsnorm_action_double_bf16_f32", action_fast(True)
+    # The pinned (RTC) twin pair: the 2B RTC denoise pins its first
+    # pinned_rows[0] tokens to the pinned modulations; the generic
+    # per-row kernels degenerate on the 16-token action shape, so the
+    # fused layout keeps the selection in-kernel (the v22 combined
+    # library carried these under the same names; vendored from the
+    # lib-port-2b tree's src/normalization/npu/adarmsnorm.py).
+    yield "adarmsnorm_action_gated_bf16_f32_pinned", action_adarms_bf16_fp32_pinned(False)
+    yield "adarmsnorm_action_double_bf16_f32_pinned", action_adarms_bf16_fp32_pinned(True)

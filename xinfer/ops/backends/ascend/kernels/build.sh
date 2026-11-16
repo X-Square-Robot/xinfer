@@ -107,9 +107,9 @@ link libxinfer_ascend_core.so core \
 gen smallm_r3 ops.gemm.smallm_r3 smallm_r3_gateup_glu smallm_r3_down smallm_r3_qkv
 link libsmallm_r3.so smallm_r3 smallm_r3_gateup_glu smallm_r3_down smallm_r3_qkv
 
-# ADANORM_R2 (wall2b)
-gen adanorm_r2 ops.norm.adanorm_r2 adarmsnorm_action_double_bf16_f32 adarmsnorm_action_gated_bf16_f32
-link libadanorm_r2.so adanorm_r2 adarmsnorm_action_double_bf16_f32 adarmsnorm_action_gated_bf16_f32
+# ADANORM_R2 (wall2b; the _pinned twins serve the RTC denoise's pinned rows)
+gen adanorm_r2 ops.norm.adanorm_r2 adarmsnorm_action_double_bf16_f32 adarmsnorm_action_gated_bf16_f32 adarmsnorm_action_double_bf16_f32_pinned adarmsnorm_action_gated_bf16_f32_pinned
+link libadanorm_r2.so adanorm_r2 adarmsnorm_action_double_bf16_f32 adarmsnorm_action_gated_bf16_f32 adarmsnorm_action_double_bf16_f32_pinned adarmsnorm_action_gated_bf16_f32_pinned
 
 # SOUPUNLOCK (wall2b)
 gen soupunlock ops.norm.soupunlock_kernels rmsnorm_full_c2048
