@@ -136,8 +136,9 @@ Single-request latency and capacity of each serving configuration, measured with
 | 1 | Wall-OSS | BF16, optimized | RTX 5090 | 49.0 ms | 4 | 128 ms | 142 ms | 25.6 req/s |
 | 2 | Wall-X 2B | BF16, optimized | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
 | 3 | Wall-OSS | BF16, optimized | Jetson AGX Thor | 95.4 ms | 2 | 123 ms | 141 ms | 11.5 req/s |
-| 4 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
-| 5 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+| 4 | Wall-X 2B | NVFP4 vision and prefill, optimized | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
+| 5 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 6 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## How it works
 
