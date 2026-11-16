@@ -473,6 +473,92 @@ def denoise_output_euler(x, h, weight, *, dt, bias=None, prenorm="none", norm_we
     return out
 
 
+# ---------------------------------------------------------------------------
+# Carried raw entries (S3): the binding layer's ``requires`` conditions probe
+# these names on the namespace (has_functions / getattr), and the binding
+# bodies call them as the general tail beyond their own knife envelopes. The
+# glue's full rmsnorm port (glue/rmsnorm.py) carries the v22 FFI classes, but
+# the wide/generic launcher surface they dispatch to is not part of the 45-
+# kernel set (the msprof ledger of both final stacks shows the non-knife norm
+# sites running vendor compositions); the shims below therefore compose the
+# reference numerics in torch, so the binding's internal knife mounts
+# (soupunlock rmsfull, simdepi, rmsfuse, the d64 rope) serve their audited
+# envelopes while every general tail matches the reference composition the
+# @partial fallback would have produced.
+def _reference_rmsnorm(input, weight, epsilon, zero_centered):
+    dtype = input.dtype
+    x = input.float()
+    stats = x.pow(2).mean(-1, keepdim=True)
+    y = x * torch.rsqrt(stats + float(epsilon))
+    if weight is not None:
+        y = y * (weight.float() + 1.0 if zero_centered else weight.float())
+    return y.to(dtype)
+
+
+def _reference_add_rmsnorm(residual, input, weight, epsilon, zero_centered):
+    dtype = input.dtype
+    s = residual.float() + input.float()
+    stats = s.pow(2).mean(-1, keepdim=True)
+    y = s * torch.rsqrt(stats + float(epsilon))
+    if weight is not None:
+        y = y * (weight.float() + 1.0 if zero_centered else weight.float())
+    return s.to(dtype), y.to(dtype)
+
+
+class _CarriedRmsnorm:
+    """The raw Rmsnorm entry over the reference composition (the wide/generic
+    launcher surface stayed out of the 45-kernel set; see the S3 notes)."""
+
+    def __call__(self, input, weight, epsilon, inference=False, zero_centered=False,
+                 use_wide=True, *, residual=None, quant=None, **_):
+        if quant is not None:
+            raise ValueError("the unified ascend library carries no quantized RMSNorm")
+        if residual is not None:
+            return _reference_add_rmsnorm(residual, input, weight, epsilon, zero_centered)
+        return _reference_rmsnorm(input, weight, epsilon, zero_centered)
+
+
+class _CarriedAddRmsnorm(_CarriedRmsnorm):
+    def __call__(self, residual, input, weight, epsilon, inference=False,
+                 zero_centered=False, **_):
+        return _reference_add_rmsnorm(residual, input, weight, epsilon, zero_centered)
+
+    def inplace(self, residual, input, weight, epsilon):
+        s, y = _reference_add_rmsnorm(residual, input, weight, epsilon, True)
+        residual.copy_(s)
+        input.copy_(y)
+
+
+class _CarriedRope:
+    """The raw Rope entry; ``full`` composes the reference rotation (the d64
+    and bhsd launchers ride the binding's own rope_full envelope)."""
+
+    def full(self, q, k, cos, sin, interleave, rotary_dim):
+        from xinfer.ops.reference.rope import rope_full
+
+        return rope_full(q, k, cos, sin, rotary_dim)
+
+
+def _carried_attention_varlen(q, k, v, cu_seqlens=None, max_seqlen=None, causal=False,
+                              softmax_scale=None, out_gate=None):
+    """The raw varlen entry over the glue's TND bridge (the packed vision
+    segments). The causal and gated varlen forms were routed=0 in both final
+    stacks (INVENTORY §8); the binding's own bridge paths (gated_causal,
+    prefix_kvcache) serve those sites, so this adapter rejects them."""
+    if causal or out_gate is not None:
+        raise ValueError("the unified ascend library carries no causal/gated varlen entry")
+    if cu_seqlens is None:
+        raise ValueError("the varlen entry requires cu_seqlens")
+    import xinfer.ops.backends.ascend.glue.cann_attention as _cann_attention
+
+    bridge = getattr(_carried_attention_varlen, "_bridge", None)
+    if bridge is None:
+        bridge = _cann_attention.CannAttention()
+        _carried_attention_varlen._bridge = bridge
+    return bridge.varlen_attention(q, k, v, tuple(int(i) for i in cu_seqlens),
+                                   scale=softmax_scale)
+
+
 # The namespace surface consumed through ``_support.xc`` / ``CORE``:
 _EXPORTS = {
     # carried class entries and bridge callables; the class imports resolve
@@ -484,6 +570,11 @@ _EXPORTS = {
     "cann_fia_v5_probe": cann_fia_v5_probe,
     "cann_fia_vision_probe_workspace_size": cann_fia_vision_probe_workspace_size,
     "cann_fia_vision_probe": cann_fia_vision_probe,
+    "Rmsnorm": _CarriedRmsnorm,
+    "AddRmsnorm": _CarriedAddRmsnorm,
+    "add_rmsnorm": _CarriedAddRmsnorm(),
+    "attention_varlen": _carried_attention_varlen,
+    "Rope": _CarriedRope,
     "gemm_qkv_cache_bias_rope_m16": gemm_qkv_cache_bias_rope_m16,
     "gemm_qkv_cache_bias_rope_prefill": gemm_qkv_cache_bias_rope_prefill,
     "gemm_qkv_vision_rope_finish": gemm_qkv_vision_rope_finish,

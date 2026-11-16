@@ -27,10 +27,29 @@ from xinfer.ops.backends.ascend import _provider
 # class-style entries. It is None when the provider is disabled or the core
 # library is absent (no library, no registrations), which keeps every
 # `requires=` None and the backend on the reference compositions.
+#
+# The namespace answers to the registry's library name ``xinfer_ascend``:
+# ``register(..., requires=xc)`` spells the selection report's library (and
+# the ``--op-backends <op>=ascend:xinfer_ascend`` pin, ARCH-DESIGN §4.3) from
+# ``requires.__name__``. The retired paired loader's module spelled it
+# ``xcompute``; forwarding attribute access to the glue core keeps the
+# absent-entry AttributeError semantics (getattr(xc, name, None) → None) the
+# class glues' fail-safes depend on.
+class _XinferAscendNamespace:
+    __name__ = "xinfer_ascend"
+
+    def __getattr__(self, name):
+        return getattr(_glue_core, name)
+
+    def __repr__(self):  # pragma: no cover - diagnostics only
+        return f"<xinfer_ascend namespace over {_glue_core!r}>"
+
+
 try:
     from xinfer.ops.backends.ascend.glue import core as _glue_core
 
-    xc = _glue_core if _provider.enabled() and _provider.core_library() is not None else None
+    xc = (_XinferAscendNamespace()
+          if _provider.enabled() and _provider.core_library() is not None else None)
 except Exception:  # noqa: BLE001 - the glue import never fails in-tree; stay safe for odd installs
     xc = None
 

@@ -235,7 +235,8 @@ def _gqa_causal_bnsd(q, k, v, scale):
     return out.transpose(1, 2)
 
 
-@register("gated_causal_attention", backend="ascend", requires=xc if callable(_attention_varlen) else None,
+@register("gated_causal_attention", backend="ascend",
+          requires=xc if (callable(_attention_varlen) or _bridge_gated_causal is not None) else None,
           version=VERSION)
 @partial(_torch_attn.gated_causal_attention,
          check=lambda q, k, v, gate, *, scale=None: _packed_supported(q, k, v)
