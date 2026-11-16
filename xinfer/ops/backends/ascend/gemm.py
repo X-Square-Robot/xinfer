@@ -184,3 +184,6 @@ def qkv_norm_rope_kvcache(x, weight, q_weight, k_weight, cos, sin, k_cache, v_ca
         extra_cols=weight.shape[0] - (num_heads + 2 * num_kv_heads) * head_dim,
         qk_norm=_qk_norm(q_weight, k_weight, float(eps), zero_centered=True),
         kv_cache=(k_cache, v_cache, int(start)), backend="auto")
+
+
+from xinfer.ops.backends.ascend import gemm_950dt  # noqa: E402, F401 - lists the 950DT kernels
