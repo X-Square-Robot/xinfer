@@ -15,7 +15,6 @@ import importlib
 import io
 import re
 import warnings
-from contextlib import ExitStack
 from threading import Lock
 
 import torch
@@ -183,6 +182,15 @@ def _rgb(luma: torch.Tensor, chroma: torch.Tensor | None, pixel_format: int) -> 
     return _quant_u8(rgb)
 
 
+def rgb_of(data, meta):
+    """``[3, H, W]`` uint8 RGB of one decoded plane buffer (``meta`` as ``_plane_meta`` builds it)."""
+    luma = data[:meta["luma_size"]].view(meta["hs"], meta["ws"])[:meta["h"], :meta["w"]]
+    chroma = None
+    if meta["fmt"] in _CHROMA:
+        chroma = data[meta["start"]:meta["end"]].view(meta["ch"], meta["cs"])
+    return _rgb(luma, chroma, meta["fmt"])
+
+
 class NpuJpegDecoder:
     """Decode JPEGs with a lazy DVPP lease shared by decoders on the same device."""
 
@@ -247,7 +255,13 @@ class NpuJpegDecoder:
         event.record(torch.npu.current_stream())
         self._copy_event = event
 
-    def __call__(self, jpegs):
+    def __call__(self, jpegs, planes=False):
+        """Decode JPEGs; with ``planes`` each result is ``(buffer, meta)`` instead of the RGB view.
+
+        With ``planes`` each result is the flat decoded planes copied onto the caller's stream and
+        the geometry of the views inside them, so a caller can run the RGB + resize chain as one
+        captured graph (:mod:`xinfer.engine.image_graphs`). The bytes are the same either way.
+        """
         with _MEDIA_LOCK:
             if self._closed:
                 raise RuntimeError("CANN JPEGD decoder is closed")
@@ -260,7 +274,7 @@ class NpuJpegDecoder:
                         _call(self.acl.himpi.sys_init)
                     _MEDIA_USERS[self.device] = users + 1
                     self._leased = True
-                return [self._decode(jpeg.contiguous()) for jpeg in jpegs]
+                return [self._decode(jpeg.contiguous(), planes) for jpeg in jpegs]
 
     def close(self) -> None:
         """Release this decoder's lease, ending the session on the last release."""
@@ -290,7 +304,7 @@ class NpuJpegDecoder:
         warnings.warn("CANN JPEGD does not support this JPEG; decoded on the CPU before NPU resize", stacklevel=2)
         return rgb.permute(2, 0, 1).contiguous().to(self.device)
 
-    def _decode(self, jpeg):
+    def _decode(self, jpeg, planes=False):
         if jpeg.device.type != "cpu" or jpeg.dtype != torch.uint8 or jpeg.ndim != 1 or not jpeg.numel():
             raise ValueError("CANN JPEGD needs a nonempty one-dimensional CPU uint8 tensor")
         media, runtime = self.acl.himpi, self.acl.rt
@@ -313,10 +327,10 @@ class NpuJpegDecoder:
                 if not (32 <= width <= 16384 and 32 <= height <= 16384):
                     return self._decode_on_host(jpeg)
                 if self._async_copy:
-                    fast = self._decode_fast(jpeg, info, size, width, height)
+                    fast = self._decode_fast(jpeg, info, size, width, height, planes)
                     if fast is not None:
                         return fast
-                return self._decode_binding(jpeg, info, stream, size, width, height, media, runtime)
+                return self._decode_binding(jpeg, info, stream, size, width, height, media, runtime, planes)
         info, status = media.dvpp_get_image_info(_JPEG, stream)
         if status & 0xFFFFFFFF == _FORMAT_UNSUPPORTED:
             return self._decode_on_host(jpeg)
@@ -324,9 +338,9 @@ class NpuJpegDecoder:
         width, height = info["width"], info["height"]
         if not (32 <= width <= 16384 and 32 <= height <= 16384):
             return self._decode_on_host(jpeg)
-        return self._decode_binding(jpeg, info, stream, size, width, height, media, runtime)
+        return self._decode_binding(jpeg, info, stream, size, width, height, media, runtime, planes)
 
-    def _decode_fast(self, jpeg, info, size, width, height):
+    def _decode_fast(self, jpeg, info, size, width, height, planes=False):
         """One JPEG's DVPP transaction through _aclfast (None = the binding chain).
 
         The start chain frees exactly what the binding chain's excepts free on
@@ -371,44 +385,67 @@ class NpuJpegDecoder:
         frame = dict(pixel_format=pixel_format, frame_flag=frame_flag,
                      virt_addr=[va0, va1, va2], width_stride=[ws0, ws1, ws2],
                      height_stride=[hs0, hs1, hs2])
-        view = self._frame_view(frame, output, out_size, height, width, data)
+        view = self._frame_view(frame, output, out_size, height, width, data, planes)
         # each failure phase above freed exactly what the binding chain's excepts
         # free (phase 2 leaves the channel holding the frame, like the campaign)
         self._deferred.append((source, output))
         self._record_copy_event()
         return view
 
-    def _decode_binding(self, jpeg, info, stream, size, width, height, media, runtime):
-        """The released binding transaction, unchanged."""
+    def _decode_binding(self, jpeg, info, stream, size, width, height, media, runtime, planes=False):
+        """The released binding transaction; the frame copy is stream-ordered when the runtime has it.
+
+        The frame's planes leave DVPP memory through ``memcpy_async`` on the caller's stream when
+        ``rt.memcpy_async`` exists -- the fast path's form -- and the source and output buffers
+        then wait in ``_deferred`` for the copy's recorded event instead of freeing here. Without
+        it the synchronous copy runs and the buffers free here, the released form.
+        """
         out_size = info["img_buf_size"]
-        with ExitStack() as stack:
-            source, status = media.dvpp_malloc(self.device.index, size)
-            _check(status, "dvpp_malloc input")
-            stack.callback(_call, media.dvpp_free, source)
+        source, status = media.dvpp_malloc(self.device.index, size)
+        _check(status, "dvpp_malloc input")
+        handed_off = False
+        try:
             _call(runtime.memcpy, source, size, jpeg.data_ptr(), size, _HOST_TO_DEVICE)
             stream["addr"] = source
             output, status = media.dvpp_malloc(self.device.index, out_size)
             _check(status, "dvpp_malloc output")
-            stack.callback(_call, media.dvpp_free, output)
-
-            channel = self._channel_for(width, height, size)
-            picture = dict(width=width, height=height, width_stride=info["width_stride"],
-                           height_stride=info["height_stride"], pixel_format=_SOURCE_FORMAT,
-                           vir_addr=output, buffer_size=out_size)
             try:
-                _call(media.vdec_send_stream, channel, stream, picture, _TIMEOUT_MS)
-                frame, _, _, status = media.vdec_get_frame(channel, _TIMEOUT_MS)
-                _check(status, "vdec_get_frame")
-            except Exception:
-                # a channel that failed mid-transaction is not trusted again: drop it so the
-                # next decode recreates a fresh one, as the per-JPEG lifecycle always did
-                self._drop_channel(self._channel_key(width, height, size))
-                raise
-            stack.callback(_call, media.vdec_release_frame, channel, frame)
-            view = frame["v_frame"]
-            if view["frame_flag"] != 0:
-                raise RuntimeError(f"CANN JPEGD rejected an image (frame_flag={view['frame_flag']})")
-            return self._copy_frame(view, output, out_size, height, width)
+                channel = self._channel_for(width, height, size)
+                picture = dict(width=width, height=height, width_stride=info["width_stride"],
+                               height_stride=info["height_stride"], pixel_format=_SOURCE_FORMAT,
+                               vir_addr=output, buffer_size=out_size)
+                try:
+                    _call(media.vdec_send_stream, channel, stream, picture, _TIMEOUT_MS)
+                    frame, _, _, status = media.vdec_get_frame(channel, _TIMEOUT_MS)
+                    _check(status, "vdec_get_frame")
+                except Exception:
+                    # a channel that failed mid-transaction is not trusted again: drop it so the
+                    # next decode recreates a fresh one, as the per-JPEG lifecycle always did
+                    self._drop_channel(self._channel_key(width, height, size))
+                    raise
+                try:
+                    view = frame["v_frame"]
+                    if view["frame_flag"] != 0:
+                        raise RuntimeError(f"CANN JPEGD rejected an image (frame_flag={view['frame_flag']})")
+                    data = torch.empty(out_size, dtype=torch.uint8, device=self.device)
+                    if self._async_copy:
+                        _call(self.acl.rt.memcpy_async, data.data_ptr(), out_size, output, out_size,
+                              _DEVICE_TO_DEVICE, torch.npu.current_stream().npu_stream)
+                    else:
+                        _call(self.acl.rt.memcpy, data.data_ptr(), out_size, output, out_size, _DEVICE_TO_DEVICE)
+                finally:
+                    _call(media.vdec_release_frame, channel, frame)
+                if self._async_copy:
+                    self._deferred.append((source, output))
+                    self._record_copy_event()
+                    handed_off = True
+                return self._frame_view(view, output, out_size, height, width, data, planes)
+            finally:
+                if not handed_off:
+                    _call(media.dvpp_free, output)
+        finally:
+            if not handed_off:
+                _call(media.dvpp_free, source)
 
     def _open_channel(self, attrs):
         # DVPP channel ids are dense and small (the driver's VDEC channel pool); 256 is the probe ceiling, not a
@@ -475,16 +512,28 @@ class NpuJpegDecoder:
         _call(self.acl.rt.memcpy, data.data_ptr(), out_size, output, out_size, _DEVICE_TO_DEVICE)
         return self._frame_view(frame, output, out_size, height, width, data)
 
-    def _frame_view(self, frame, output, out_size, height, width, data):
-        """Validate one frame's JPEGD output layout and return the RGB view inside ``data``."""
+    def _frame_view(self, frame, output, out_size, height, width, data, planes=False):
+        """Validate one frame's JPEGD output layout and return the RGB view, or its plane payload.
+
+        With ``planes`` the return is ``(data, meta)`` -- the flat decoded planes and the geometry
+        of the views inside them -- instead of the RGB view, so a caller can run the RGB + resize
+        chain as one captured graph (:mod:`xinfer.engine.image_graphs`). The bytes are the same
+        either way.
+        """
+        meta = self._plane_meta(frame, output, height, width, out_size)
+        return (data, meta) if planes else rgb_of(data, meta)
+
+    def _plane_meta(self, frame, output, height, width, out_size):
+        """Validate one frame's JPEGD output layout and return the plane geometry inside its buffer."""
         fmt, addresses = frame["pixel_format"], frame["virt_addr"]
         height_stride, width_stride = frame["height_stride"][0], frame["width_stride"][0]
         luma_size = height_stride * width_stride
         if addresses[0] != output or height > height_stride or width > width_stride or luma_size > out_size:
             raise RuntimeError("unexpected CANN JPEGD luma buffer layout")
-        luma = data[:luma_size].view(height_stride, width_stride)[:height, :width]
+        meta = dict(fmt=fmt, h=height, w=width, hs=height_stride, ws=width_stride, luma_size=luma_size,
+                    ch=0, cs=0, start=luma_size, end=luma_size, out_size=out_size)
         if fmt == 0:  # YUV400
-            return _rgb(luma, None, fmt)
+            return meta
         if fmt not in _CHROMA:
             raise RuntimeError(f"unsupported CANN JPEGD pixel format {fmt}")
         step_h, step_w, _ = _CHROMA[fmt]
@@ -496,4 +545,5 @@ class NpuJpegDecoder:
         end = start + chroma_height * chroma_stride
         if start < luma_size or chroma_width > chroma_stride or end > out_size:
             raise RuntimeError("unexpected CANN JPEGD chroma buffer layout")
-        return _rgb(luma, data[start:end].view(chroma_height, chroma_stride), fmt)
+        meta.update(ch=chroma_height, cs=chroma_stride, start=start, end=end)
+        return meta

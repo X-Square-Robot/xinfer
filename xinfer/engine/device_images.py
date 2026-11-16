@@ -9,6 +9,7 @@ slightly from libjpeg-turbo's (nvImageCodec's by at most one level; CANN JPEGD's
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -16,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from xinfer.engine.executor import _to_device
+from xinfer.engine.image_graphs import ResizeChainGraphs, chain_view
 from xinfer.models.interface import DeviceImage
 from xinfer.platforms.devices import jpeg_decoder_for
 
@@ -39,6 +41,14 @@ def _quant_u8(x):
     return x.add_(0.5).floor_().clamp_(0, 255).to(torch.uint8)
 
 
+def _image_graphs_enabled() -> bool:
+    """Whether the post-decode chain may be captured (``XINFER_IMAGE_GRAPHS``, default on)."""
+    if os.environ.get("XINFER_IMAGE_GRAPHS", "1") not in ("1", "true", "True"):
+        return False
+    npu = getattr(torch, "npu", None)
+    return callable(getattr(npu, "NPUGraph", None)) and callable(getattr(npu, "graph", None))
+
+
 class DeviceImageDecoder:
     """Turns the ``DeviceImage`` inputs of one request into ``[h, w, 3]`` uint8 views on the device.
 
@@ -55,10 +65,23 @@ class DeviceImageDecoder:
     def __init__(self, device):
         self._decode = jpeg_decoder_for(device)
         self.device = self._decode.device
+        # The YUV->RGB + resize chain of each view runs from a captured graph when the engine
+        # opens the capture window at the end of warmup (see image_graphs).
+        self._graphs = (ResizeChainGraphs(self.device, self._decode.acl)
+                        if self.device.type == "npu" and _image_graphs_enabled() else None)
 
     def close(self) -> None:
         """Release the platform decoder's resources on its owning thread."""
         self._decode.close()
+
+    def capture_image_graphs(self) -> int:
+        """Capture the post-decode chain graphs; the engine calls this in a capture-safe window."""
+        return 0 if self._graphs is None else self._graphs.capture_all()
+
+    @property
+    def image_graph_stats(self) -> dict:
+        """Counters of the captured chain (``{}`` when the chain is not captured)."""
+        return {} if self._graphs is None else dict(self._graphs.stats)
 
     def __call__(self, inputs: Mapping[str, Any]) -> dict[str, Any]:
         """``inputs`` with every ``DeviceImage`` replaced by its view on the device; other values are kept.
@@ -98,12 +121,20 @@ class DeviceImageDecoder:
         The engine's per-view prefetch and the admission-time fallback share this path: a JPEG
         takes one synchronous DVPP V2 transaction (the same transaction the former batched call
         ran, one JPEG at a time), a raw frame uploads through ``_to_device`` on the caller's
-        stream, and both then run ``_resize`` on that stream.
+        stream, and both then run ``_resize`` on that stream. A decoded JPEG's chain -- the RGB
+        conversion plus the resize steps -- runs from its captured graph when the engine captured
+        that shape bucket; a bucket without a graph runs :func:`image_graphs.chain_view` eagerly,
+        the very function the graph was captured from.
         """
         if self.device.type != "npu":
             raise RuntimeError("per-view decode is the NPU path; CUDA batches its JPEGs in __call__")
         if image.data.dim() == 1:
-            view = self._decode([image.data])[0]
+            decoded = self._decode([image.data], planes=self._graphs is not None)[0]
+            if isinstance(decoded, tuple):
+                data, meta = decoded
+                out = self._graphs.run(data, meta, image.sizes, image.resize)
+                return out if out is not None else chain_view(data, meta, image.sizes, image.resize)
+            view = decoded
         else:
             view = _to_device(image.data, self.device).permute(2, 0, 1)
         return _resize(view, image)

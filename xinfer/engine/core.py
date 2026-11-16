@@ -151,6 +151,21 @@ def _timing_event(lane):
     return event
 
 
+class _CaptureImageGraphs:
+    """Queue item: capture the device-image chain graphs now; the engine thread waits on ``done``.
+
+    Graph capture is device-wide on this stack (ACL fails any other stream's synchronize while one
+    stream captures: ``rtDeviceSynchronizeWithTimeout ... reason=stream is captured``, measured), so
+    the capture has to run in a window where no other thread captures or synchronizes — the end of
+    warmup, with the engine thread blocked on this item.
+    """
+
+    __slots__ = ("done",)
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+
+
 class Engine:
     """Serves one model on one device: admission, per-stage queues and lanes, batching and chained dispatch.
 
@@ -402,7 +417,24 @@ class Engine:
                         {stage: counters["graphs"] for stage, counters in stats.items()},
                         sum(counters["capture_ms"] for counters in stats.values()) / 1000,
                         self._device_module.memory_reserved(self.platform.device) / 2 ** 30)
+        self._capture_image_graphs()
         return outputs
+
+    def _capture_image_graphs(self) -> None:
+        """Capture the graphs of the device-image post-decode chain, if the thread is up.
+
+        Runs after the stage graphs are captured and after ``finish_warmup``, and blocks this thread
+        while the device-image thread captures: graph capture is device-wide on this stack (ACL
+        refuses another stream's synchronize during it), so it must not overlap any other thread's
+        capture or synchronize. Buckets seen during the warmup requests are the ones captured; a
+        shape first seen while serving keeps the eager chain.
+        """
+        if self._device_stream is None:
+            return
+        done = _CaptureImageGraphs()
+        self._device_requests.put(done)
+        if not done.done.wait(timeout=300):
+            logger.warning("device image chain: graph capture did not finish within 300 s")
 
     def cudagraph_stats(self) -> dict:
         """Per-stage CUDA graph counters, summed over the stage's lanes (read without locking: a snapshot).
@@ -736,6 +768,19 @@ class Engine:
             request = self._device_requests.get()
             if isinstance(request, image_prefetch.Ticket):
                 self._prefetch_view(request.image)
+                continue
+            if isinstance(request, _CaptureImageGraphs):
+                # The engine thread is blocked on ``done``: nothing else captures or synchronizes the
+                # device, which is what graph capture needs here (see the class docstring).
+                try:
+                    if self._decoder is not None:
+                        captured = self._decoder.capture_image_graphs()
+                        logger.info("device image chain: %d graphs captured (%s)",
+                                    captured, self._decoder.image_graph_stats)
+                except Exception:  # noqa: BLE001 - the chain keeps running eagerly
+                    logger.exception("could not capture the device image chain graphs")
+                finally:
+                    request.done.set()
                 continue
             if request is None:
                 if self._decoder is not None:

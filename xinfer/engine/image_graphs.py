@@ -1,0 +1,227 @@
+"""NPUGraph capture of the decoded-plane -> ``[h, w, 3]`` uint8 chain (the DVPP post-decode work).
+
+A decoded camera view costs ~15 small kernels in eager mode -- the YUV planes become RGB through
+a dozen elementwise ops and an antialiased bicubic resize -- and those kernels run on the
+``inputs_ready`` critical path, one launch gap each. This module replays the same chain from a
+captured graph: the decoded plane buffer is copied into a static input buffer, one graph replay
+runs the whole chain, and the result is copied out into a fresh tensor. The ops, their order and
+their dtype conversions are the eager chain's (:func:`chain_view` is both), so the output is
+bitwise identical (measured: 3 views x 5 frames, 0 differing bytes of 236,544 / 215,040).
+
+Capture is a device-wide operation on this stack: ACL fails a synchronize on any stream while
+another stream is capturing (``rtDeviceSynchronizeWithTimeout ... reason=stream is captured``),
+and :mod:`torch_npu` puts a device-wide synchronize inside every ``torch.npu.graph`` entry. Two
+threads therefore cannot capture at once, not even on separate streams (measured), so graphs are
+captured in one explicit window -- :meth:`ResizeChainGraphs.capture_all`, driven by
+``Engine._capture_image_graphs`` at the end of warmup while the engine thread waits -- and never
+while serving. Buckets not seen in that window keep the eager path.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections import OrderedDict
+
+import torch
+import torch.nn.functional as F
+
+from xinfer.platforms.npu import _CHROMA, _DEVICE_TO_DEVICE, _call, _rgb
+
+try:  # aa-resample (XINFER_AA_RESAMPLE, default off)
+    from xinfer.ops.backends.ascend.glue import aa_resample
+except Exception:  # pragma: no cover - optional mount
+    aa_resample = None
+
+
+def _quant_u8(x):
+    """SOUP2 quant knife: one kernel for add+floor+clamp+cast; falls back."""
+    try:
+        from xinfer.ops.backends.ascend.glue import soup2
+
+        if soup2.enabled("quant"):
+            out = soup2.quant_u8(x)
+            if out is not None:
+                return out
+    except Exception:  # noqa: BLE001 - any miss runs the released chain
+        pass
+    return x.add_(0.5).floor_().clamp_(0, 255).to(torch.uint8)
+
+
+logger = logging.getLogger(__name__)
+
+
+def chain_view(data, meta, sizes, resize):
+    """The eager chain: a flat decoded plane buffer -> ``[h, w, 3]`` uint8.
+
+    The ops of the platform decoder's ``rgb_of`` and ``device_images._resize`` in their order --
+    this function is both the eager path and what a captured graph records, so the two cannot
+    drift.
+    """
+    luma = data[:meta["luma_size"]].view(meta["hs"], meta["ws"])[:meta["h"], :meta["w"]]
+    chroma = None
+    if meta["fmt"] in _CHROMA:
+        chroma = data[meta["start"]:meta["end"]].view(meta["ch"], meta["cs"])
+    x = _rgb(luma, chroma, meta["fmt"]).unsqueeze(0)
+    for (mode, antialias), size in zip(resize, sizes):
+        if tuple(size) != tuple(x.shape[-2:]):
+            if (
+                aa_resample is not None and mode == "bicubic" and antialias
+                and x.dtype == torch.uint8
+            ):
+                routed = aa_resample.step(x, tuple(size))
+                if routed is not None:
+                    x = routed
+                    continue
+            x = F.interpolate(x.float(), size=tuple(size), mode=mode, antialias=antialias, align_corners=False)
+            x = _quant_u8(x)
+    return x[0].permute(1, 2, 0).contiguous()
+
+
+def bucket_key(meta, sizes, resize):
+    """What a captured chain depends on: the decoded buffer geometry and the resize recipe."""
+    return (meta["out_size"], meta["fmt"], meta["h"], meta["w"], meta["hs"], meta["ws"],
+            meta["luma_size"], meta["ch"], meta["cs"], meta["start"], meta["end"],
+            tuple(tuple(size) for size in sizes), tuple(tuple(step) for step in resize))
+
+
+def out_shape(meta, sizes):
+    """``[h, w, 3]`` of the last resize step of a view whose decoded size is ``meta``."""
+    height, width = meta["h"], meta["w"]
+    for size in sizes:
+        height, width = int(size[0]), int(size[1])
+    return height, width, 3
+
+
+class _Captured:
+    """One bucket: its graph, the static input the graph reads and the pooled tensor it writes."""
+
+    __slots__ = ("graph", "static_in", "out")
+
+    def __init__(self, graph, static_in, out):
+        self.graph = graph
+        self.static_in = static_in
+        self.out = out
+
+
+class ResizeChainGraphs:
+    """Graph replays of :func:`chain_view`, one graph per shape bucket.
+
+    Attributes:
+        stats: counters ``captures``, ``replays``, ``eager`` (no graph for the bucket),
+            ``misses`` (a bucket first seen after the capture window) and ``capture_ms``.
+    """
+
+    def __init__(self, device, acl, max_graphs: int = 8):
+        self.device = device
+        self._acl = acl
+        self._max_graphs = max_graphs
+        self._pending: OrderedDict = OrderedDict()   # key -> (meta, sizes, resize), seen eagerly
+        self._graphs: OrderedDict = OrderedDict()    # key -> _Captured
+        self._pool = None
+        self._stream = None
+        self._window_closed = False
+        self._failed = False
+        self._missing: set = set()
+        self._copy = callable(getattr(acl.rt, "memcpy_async", None))
+        self.stats = dict(captures=0, replays=0, eager=0, misses=0, capture_ms=0.0)
+
+    # ------------------------------------------------------------------ capture
+    def note(self, meta, sizes, resize) -> None:
+        """Record a bucket seen on the eager path so :meth:`capture_all` can capture it."""
+        if self._window_closed or self._failed:
+            return
+        key = bucket_key(meta, sizes, resize)
+        if key in self._graphs or key in self._pending:
+            return
+        if len(self._pending) >= self._max_graphs:
+            logger.warning("device image chain: more than %d shape buckets, %r runs eagerly",
+                           self._max_graphs, key)
+            return
+        self._pending[key] = (dict(meta), tuple(tuple(s) for s in sizes), tuple(tuple(s) for s in resize))
+
+    def capture_all(self) -> int:
+        """Capture one graph per recorded bucket and close the capture window.
+
+        Call it only when no other thread can be capturing or synchronizing the device (the engine
+        calls it from the device-image thread while its own thread waits): graph capture is
+        device-wide here, and ACL rejects any other stream's synchronize during it.
+        """
+        self._window_closed = True
+        if self._failed or not self._pending:
+            self._pending.clear()
+            return 0
+        captured = 0
+        try:
+            if self._pool is None:
+                self._pool = torch.npu.graph_pool_handle()
+                self._stream = torch.npu.Stream()
+            for key, (meta, sizes, resize) in list(self._pending.items()):
+                try:
+                    self._capture(meta, sizes, resize)
+                    captured += 1
+                except Exception:  # noqa: BLE001 - one bad bucket must not cost the others
+                    logger.exception("device image chain: could not capture %r; it stays eager", key)
+        finally:
+            self._pending.clear()
+        if captured:
+            logger.info("device image chain: captured %d graphs in %.1f ms; outputs %s",
+                        captured, self.stats["capture_ms"],
+                        [tuple(c.out.shape) for c in self._graphs.values()])
+        return captured
+
+    def _capture(self, meta, sizes, resize) -> None:
+        start = time.perf_counter()
+        static_in = torch.zeros(meta["out_size"], dtype=torch.uint8, device=self.device)
+        graph = torch.npu.NPUGraph()
+        # inference_mode, as LaneCUDAGraphs captures the stage graphs: torch_npu's capture_begin
+        # updates a graph-bookkeeping tensor in place, and once the engine's own captures (inside
+        # inference mode) have run in this process that tensor carries the inference bit -- an
+        # in-place update of it outside inference mode is rejected
+        # ("Inplace update to inference tensor outside InferenceMode is not allowed", measured).
+        with torch.inference_mode(), torch.npu.graph(graph, pool=self._pool, stream=self._stream,
+                                                     capture_error_mode="thread_local"):
+            out = chain_view(static_in, meta, sizes, resize)
+        shape = out_shape(meta, sizes)
+        if tuple(out.shape) != shape or out.dtype != torch.uint8:
+            raise RuntimeError("captured chain returned %s/%s, expected %s/uint8"
+                               % (tuple(out.shape), out.dtype, shape))
+        self._graphs[bucket_key(meta, sizes, resize)] = _Captured(graph, static_in, out)
+        self.stats["captures"] += 1
+        self.stats["capture_ms"] += (time.perf_counter() - start) * 1000
+
+    # ---------------------------------------------------------------------- run
+    def run(self, data, meta, sizes, resize):
+        """The captured chain's output for one decoded plane buffer, or ``None`` (run eagerly).
+
+        Returns a fresh tensor holding the bytes: the graph writes into its pooled output, which a
+        later replay overwrites, so the bytes are copied out on the caller's stream before the next
+        view's replay is enqueued.
+        """
+        key = bucket_key(meta, sizes, resize)
+        captured = self._graphs.get(key)
+        if captured is None:
+            self.stats["eager"] += 1
+            if self._window_closed or self._failed:
+                self.stats["misses"] += 1
+                if key not in self._missing:
+                    self._missing.add(key)
+                    logger.warning("device image chain: shape bucket %r appeared after the capture window; "
+                                   "it runs eagerly", key)
+            else:
+                self.note(meta, sizes, resize)
+            return None
+        self._copy_into(captured.static_in, data)
+        captured.graph.replay()
+        out = torch.empty(tuple(captured.out.shape), dtype=torch.uint8, device=self.device)
+        self._copy_into(out, captured.out)
+        self.stats["replays"] += 1
+        return out
+
+    def _copy_into(self, dst, src) -> None:
+        """Stream-ordered device-to-device copy of ``src``'s bytes into ``dst``."""
+        if self._copy:
+            _call(self._acl.rt.memcpy_async, dst.data_ptr(), dst.numel(), src.data_ptr(), src.numel(),
+                  _DEVICE_TO_DEVICE, torch.npu.current_stream().npu_stream)
+        else:
+            dst.copy_(src)
