@@ -43,6 +43,9 @@ from __future__ import annotations
 import torch
 
 from xinfer.ops.reference import mxfp8
+from xinfer.ops.reference.gemm import ACTIVATIONS, rope_qk_heads
+from xinfer.ops.reference.norm import add_zero_centered_rms_norm as bf16_add_zero_centered_rms_norm
+from xinfer.ops.reference.norm import layer_norm_cast
 from xinfer.ops.layout.nvfp4 import BLOCK, scale_elements, scale_offsets
 
 E2M1_MAX = 6.0
@@ -50,7 +53,6 @@ E4M3_MAX = 448.0
 MIN_SCALE = 2.0 ** -6  # smallest normal E4M3: the floor of an amax block scale
 NORM_THREADS = 256  # one CTA of 256 threads per row in the fused RMSNorm kernel
 _FLT_MAX = torch.finfo(torch.float32).max
-_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 
 
@@ -64,18 +66,22 @@ def e2m1_codes(v: torch.Tensor) -> torch.Tensor:
         uint8 codes ``0..15`` of the same shape: magnitude index in bits 0-2 (into 0, 0.5, ..., 6), sign in bit 3
         (set for negative values, including those that round to zero).
     """
-    mid = torch.tensor(_E2M1_MIDPOINTS, device=v.device)
     a = v.abs().clamp(max=E2M1_MAX)
-    down = torch.bucketize(a, mid)  # midpoints below a: the code when rounding ties down
-    tie = torch.bucketize(a, mid, right=True) > down
+    # comparisons with host scalars, so that the reference runs inside a CUDA graph capture
+    down = sum((a > m).to(torch.int64) for m in _E2M1_MIDPOINTS)  # midpoints below a: the code when ties round down
+    tie = sum((a == m).to(torch.int64) for m in _E2M1_MIDPOINTS) > 0
     code = torch.where(tie, down + (down & 1), down)
     return (code | (torch.signbit(v).to(code.dtype) << 3)).to(torch.uint8)
 
 
 def e2m1_values(codes: torch.Tensor) -> torch.Tensor:
     """FP32 values of E2M1 codes (``e2m1_codes``), any shape."""
-    table = torch.tensor(_E2M1_VALUES + tuple(-v for v in _E2M1_VALUES), device=codes.device)
-    return table[codes.long()]
+    c = codes.to(torch.int64)
+    exponent, mantissa = (c >> 1) & 3, (c & 1).to(torch.float32)
+    # 0.5·m for the subnormals (exponent 0), else 2^(exponent - 1)·(1 + 0.5·m); exact in FP32
+    magnitude = torch.where(exponent == 0, 0.5 * mantissa,
+                            torch.exp2((exponent - 1).to(torch.float32)) * (1.0 + 0.5 * mantissa))
+    return torch.where((c & 8) > 0, -magnitude, magnitude)
 
 
 def _block_sum(e: torch.Tensor) -> torch.Tensor:
@@ -126,7 +132,7 @@ def quantize_values(xf: torch.Tensor, *, global_scale: float = 1.0,
     if k % BLOCK:
         raise ValueError(f"K={k} must be divisible by {BLOCK}")
     x = xf.to(torch.float32).reshape(rows, k // BLOCK, BLOCK)
-    g = x.new_tensor(global_scale)  # a device tensor: CUDA divides by a host scalar via its reciprocal
+    g = torch.full((), global_scale, device=x.device)  # on the device: CUDA divides by a host scalar via a reciprocal
     if mse:
         scale = _mse_scales(x, g)
     else:
@@ -239,3 +245,102 @@ def silu_mul_quantize(gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
         raise ValueError("nvfp4 silu_mul_quantize expects a 2D BF16 [M, 2K] tensor")
     g, u = gate_up.to(torch.float32).chunk(2, dim=1)
     return quantize_values(mxfp8._silu_mul(g, u))
+
+
+# Forms of the CUDA backend's GEMM family with NVFP4 inputs: activations ``(q [M, K/2], scales)``, weights
+# ``(q [N, K/2], scales, global_scale)``. The GEMM rounds ``g · x̂·Ŵᵀ + bias`` once to BF16 (``gemm``); the epilogue
+# then works on that BF16 tensor in FP32 and rounds again, and a quantized output is ``quantize`` of the final BF16
+# tensor, so every quantized activation is a BF16 tensor quantized with ``quantize`` (the Wall-X NVFP4 recipe).
+
+def _act(name: str | None, y: torch.Tensor) -> torch.Tensor:
+    """``act(y)`` of a BF16 tensor computed in FP32 and rounded to BF16 (``"silu"``, ``"gelu"``, ``"gelu_tanh"``)."""
+    return y if name is None else ACTIVATIONS[name](y.float()).to(torch.bfloat16)
+
+
+def gemm_epilogue(x, weight, bias=None, *, activation: str | None = None, residual: torch.Tensor | None = None,
+                  out_quant: bool = False):
+    """NVFP4 ``x · weightᵀ`` with the epilogue of the CUDA backend's ``gemm``.
+
+    ``y = bf16(g · x̂·Ŵᵀ + bias)`` (``gemm``), then ``bf16(act(y))``; with ``residual`` ``bf16(y + residual)``; with
+    ``out_quant`` the NVFP4 ``quantize`` of the result.
+
+    Args:
+        x: ``(q [M, K/2], scales)``.
+        weight: ``(q [N, K/2], scales, global_scale)``.
+        bias: ``[N]`` or None.
+        activation: ``"silu"``, ``"gelu"`` (erf), ``"gelu_tanh"`` or None.
+        residual: BF16 ``[M, N]`` or None (not with ``out_quant``).
+        out_quant: return ``(q [M, N/2], scales)`` instead of BF16.
+
+    Returns:
+        BF16 ``[M, N]``, or ``(q, scales)`` with ``out_quant``.
+
+    Raises:
+        ValueError: ``residual`` with ``out_quant``.
+    """
+    if residual is not None and out_quant:
+        raise ValueError("nvfp4 gemm_epilogue: residual and out_quant exclude each other")
+    w_q, w_scales, g = weight
+    y = _act(activation, gemm(*x, w_q, w_scales, bias, alpha=g))
+    if out_quant:
+        return quantize(y)
+    if residual is not None:
+        y = (y.float() + residual.float()).to(torch.bfloat16)
+    return y
+
+
+def gemm_glu_quantize(x, weight) -> tuple[torch.Tensor, torch.Tensor]:
+    """NVFP4 of ``bf16(silu(y_gate) · y_up)``, ``y = bf16(g · x̂·Ŵᵀ)`` (the CUDA backend's ``gemm_glu`` with
+    ``out_quant``).
+
+    Args:
+        x: ``(q [M, K/2], scales)``.
+        weight: ``(q [2N, K/2], scales, global_scale)``, the gate rows then the up rows.
+
+    Returns:
+        ``(q [M, N/2], scales)``.
+    """
+    w_q, w_scales, g = weight
+    y = gemm(*x, w_q, w_scales, alpha=g).float()
+    n = y.shape[1] // 2
+    return quantize((torch.nn.functional.silu(y[:, :n]) * y[:, n:]).to(torch.bfloat16))
+
+
+def qkv_rope_epilogue(x, weight, bias: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, num_heads: int,
+                      head_dim: int) -> torch.Tensor:
+    """NVFP4 ``[Q | K | V]``: ``y = bf16(g · x̂·Ŵᵀ + bias)``, then rotate-half RoPE on every Q and K head of ``y`` in
+    FP32, rounded to BF16 (the CUDA backend's ``qkv_proj_rope``; equal Q, K and V heads, the rotation covers
+    ``2·cos.shape[-1]`` channels of a head).
+
+    Args:
+        x: ``(q [M, K/2], scales)``.
+        weight: ``(q [3·H·D, K/2], scales, global_scale)``.
+        bias: ``[3·H·D]``.
+        cos: FP32 ``[M, R/2]``.
+        sin: FP32 ``[M, R/2]``.
+        num_heads: Heads ``H``.
+        head_dim: Head dimension ``D``.
+
+    Returns:
+        BF16 ``[M, 3·H·D]``.
+    """
+    w_q, w_scales, g = weight
+    y = gemm(*x, w_q, w_scales, bias, alpha=g).float()
+    return rope_qk_heads(y, cos, sin, num_heads, head_dim).to(torch.bfloat16)
+
+
+def layer_norm_quantize(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+                        eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """NVFP4 of the BF16 LayerNorm (``layer_norm_cast``): ``(q [M, K/2], scales)``, ``M`` the leading dims."""
+    return quantize(layer_norm_cast(x, weight, bias, eps).reshape(-1, x.shape[-1]))
+
+
+def add_zero_centered_rms_norm_quantize(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float):
+    """``add_zero_centered_rms_norm`` with its BF16 norm quantized.
+
+    Returns:
+        ``(s, (q [M, K/2], scales))``: ``s = residual + x`` as ``add_zero_centered_rms_norm`` gives it, ``M`` the
+        leading dims.
+    """
+    s, normed = bf16_add_zero_centered_rms_norm(x, residual, weight, eps)
+    return s, quantize(normed.reshape(-1, x.shape[-1]))

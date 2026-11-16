@@ -193,6 +193,28 @@ def nvfp4_gemm(a_q, a_scales, w_q, w_scales, bias=None, *, alpha=1.0) -> OpCost:
     return _gemm("nvfp4", a_q, a_scales, w_q, w_scales, bias, 2 * a_q.shape[1], w_q.shape[0])
 
 
+def _nvfp4_out(cost: OpCost, quantized: bool) -> OpCost:
+    """``cost`` writing NVFP4 instead of BF16: half a byte per element and a byte per 16 (9/32 of the BF16 bytes)."""
+    return OpCost(cost.flops, cost.read_bytes, cost.write_bytes * 9 // 32 if quantized else cost.write_bytes, "nvfp4")
+
+
+def nvfp4_gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, out_quant=False) -> OpCost:
+    """As ``nvfp4_gemm``, also reading the residual; with ``out_quant`` writing NVFP4."""
+    cost = _gemm("nvfp4", x[0], x[1], weight[0], weight[1], bias, 2 * x[0].shape[1], weight[0].shape[0], (residual,))
+    return _nvfp4_out(cost, out_quant)
+
+
+def nvfp4_gemm_glu_quantize(x, weight) -> OpCost:
+    """As ``nvfp4_gemm``, writing NVFP4 ``[M, N/2]``."""
+    return _nvfp4_out(_gemm("nvfp4", x[0], x[1], weight[0], weight[1], None, 2 * x[0].shape[1],
+                            weight[0].shape[0] // 2), True)
+
+
+def nvfp4_qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim) -> OpCost:
+    """As ``nvfp4_gemm``, also reading the RoPE tables."""
+    return _gemm("nvfp4", x[0], x[1], weight[0], weight[1], bias, 2 * x[0].shape[1], weight[0].shape[0], (cos, sin))
+
+
 # ------------------------------------------------------------ fused operators (xinfer/ops/reference/)
 def gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, residual_gate=None, row_class=None,
                   row_scale=None) -> OpCost:
@@ -257,8 +279,9 @@ FORMULAS: dict[str, Callable[..., OpCost]] = {formula.__name__: formula for form
     linear, conv2d, chunk_gated_delta_rule, causal_attention, action_attention, masked_joint_attention,
     kvcache_attention, prefix_attention, varlen_attention, mxfp8_gemm, mxfp8_gemm_rope, mxfp8_gemm_silu_mul,
     mxfp8_gemm_residual, mxfp8_gemm_epilogue, mxfp8_gemm_glu_quantize, mxfp8_qkv_rope_epilogue,
-    nvfp4_gemm, gemm_epilogue, gemm_glu_epilogue, gemm_add_rms_norm, mlp_add_rms_norm, qkv_rope_epilogue,
-    qkv_rope_kvcache, prefix_kvcache_attention, flow_velocity_euler)}
+    nvfp4_gemm, nvfp4_gemm_epilogue, nvfp4_gemm_glu_quantize, nvfp4_qkv_rope_epilogue, gemm_epilogue,
+    gemm_glu_epilogue, gemm_add_rms_norm, mlp_add_rms_norm, qkv_rope_epilogue, qkv_rope_kvcache,
+    prefix_kvcache_attention, flow_velocity_euler)}
 
 
 def op_cost(name: str, args: tuple, kwargs: Mapping[str, object], outputs) -> OpCost:

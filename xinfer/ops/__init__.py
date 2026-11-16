@@ -284,6 +284,24 @@ for _spec in (
         "nvfp4_silu_mul_quantize(gate_up_bf16[M, 2K]) -> (e2m1x2[M, K/2], scales)",
         nvfp4.silu_mul_quantize,
     ),
+    # Forms of the CUDA backend's GEMM family (xinfer/ops/reference/nvfp4.py): NVFP4 pairs (q, scales), weights
+    # (q[N, K/2], scales, global_scale); the GEMM rounds to BF16 before the epilogue, and a quantized output is the
+    # final BF16 tensor quantized.
+    OpSpec("nvfp4_layer_norm_quantize",
+           "nvfp4_layer_norm_quantize(x[..., K], weight, bias, eps) -> (q[M, K/2], s)  # the BF16 LayerNorm, quantized",
+           nvfp4.layer_norm_quantize),
+    OpSpec("nvfp4_add_zero_centered_rms_norm_quantize",
+           "nvfp4_add_zero_centered_rms_norm_quantize(x, residual, w, eps) -> (residual + x, (q, s))"
+           "  # add_zero_centered_rms_norm, its BF16 norm quantized", nvfp4.add_zero_centered_rms_norm_quantize),
+    OpSpec("nvfp4_gemm_epilogue",
+           "nvfp4_gemm_epilogue(x(q, s), weight(q[N, K/2], s, g), bias=None, *, activation=None, residual=None,"
+           " out_quant=False) -> bf16[M, N] | (q, s)", nvfp4.gemm_epilogue),
+    OpSpec("nvfp4_gemm_glu_quantize",
+           "nvfp4_gemm_glu_quantize(x(q, s), weight(q[2N, K/2], s, g)) -> (q[M, N/2], s)  # bf16(silu(gate)·up)",
+           nvfp4.gemm_glu_quantize),
+    OpSpec("nvfp4_qkv_rope_epilogue",
+           "nvfp4_qkv_rope_epilogue(x(q, s), weight(q[3HD, K/2], s, g), bias, cos[M, R/2], sin, num_heads, head_dim)"
+           " -> bf16[M, 3HD]", nvfp4.qkv_rope_epilogue),
 ):
     registry.define(_spec)
 del _spec

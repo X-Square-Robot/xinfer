@@ -318,3 +318,84 @@ def test_reference_quantizers_give_the_same_bits_on_cuda():
     for tensor, kwargs in ((x, {}), (w, dict(global_scale=g, mse=True))):
         (q, s), (rq, rs) = nvfp4.quantize(tensor.cuda(), **kwargs), nvfp4.quantize(tensor, **kwargs)
         assert torch.equal(q.cpu(), rq) and torch.equal(s.view(torch.uint8).cpu(), rs.view(torch.uint8))
+
+
+def _qkv(m, n, k, seed):
+    torch.manual_seed(seed)
+    x = nvfp4.quantize(torch.randn(m, k).bfloat16())
+    w = (torch.randn(n, k) * k ** -0.5).bfloat16()
+    g = global_scale(w)
+    return x, (*nvfp4.quantize(w, global_scale=g, mse=True), g)
+
+
+def test_gemm_family_forms_round_the_gemm_to_bf16_before_the_epilogue():
+    """Each form is the BF16 GEMM result ``gemm(..., alpha=g)`` followed by its epilogue on that BF16 tensor; a
+    quantized output is ``quantize`` of the final BF16 tensor."""
+    x, w = _qkv(40, 64, 96, 1)
+    bias, residual = torch.randn(64).bfloat16(), torch.randn(40, 64).bfloat16()
+    y = nvfp4.gemm(*x, w[0], w[1], bias, alpha=w[2])
+    act = torch.nn.functional.gelu(y.float(), approximate="tanh").bfloat16()
+    assert torch.equal(nvfp4.gemm_epilogue(x, w, bias, activation="gelu_tanh"), act)
+    assert torch.equal(nvfp4.gemm_epilogue(x, w, bias, residual=residual), (y.float() + residual.float()).bfloat16())
+    for got, want in zip(nvfp4.gemm_epilogue(x, w, bias, activation="gelu_tanh", out_quant=True), nvfp4.quantize(act)):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    with pytest.raises(ValueError):
+        nvfp4.gemm_epilogue(x, w, residual=residual, out_quant=True)
+    g_u = nvfp4.gemm(*x, w[0], w[1], alpha=w[2]).float()
+    h = (torch.nn.functional.silu(g_u[:, :32]) * g_u[:, 32:]).bfloat16()
+    for got, want in zip(nvfp4.gemm_glu_quantize(x, w), nvfp4.quantize(h)):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+def test_qkv_rope_epilogue_rotates_q_and_k_of_the_bf16_gemm():
+    x, w = _qkv(12, 96, 64, 2)  # 2 heads of 16 for Q, K and V
+    bias = torch.randn(96).bfloat16()
+    y = nvfp4.gemm(*x, w[0], w[1], bias, alpha=w[2])
+    angles = torch.rand(12, 4)  # rotary dim 8 of 16
+    out = nvfp4.qkv_rope_epilogue(x, w, bias, angles.cos(), angles.sin(), 2, 16)
+    assert torch.equal(out[:, 64:], y[:, 64:])  # V unchanged
+    heads = y.float().view(12, 6, 16)
+    a, b = heads[:4, :, :4], heads[:4, :, 4:8]  # rows 0..3, every Q/K head
+    c, s = angles.cos()[:4, None], angles.sin()[:4, None]
+    rotated = torch.cat((a * c - b * s, b * c + a * s, heads[:4, :, 8:]), -1).bfloat16()
+    assert torch.equal(out[:4, :64].view(4, 4, 16), rotated[:, :4])
+    assert torch.equal(nvfp4.qkv_rope_epilogue(x, w, bias, torch.ones(12, 4), torch.zeros(12, 4), 2, 16), y)
+
+
+@pytest.fixture(scope="module")
+def nvfp4_backends():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    ops.registry.load_plugins()
+    if "nvfp4_gemm_epilogue" not in ops.registry.backend_ops("cuda:kernels"):
+        pytest.skip("needs NVFP4 kernels in the CUDA kernel library")
+    return ops.registry.build_table(resolve_platform("cuda"))
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("m,n,k", [(868, 4096, 1024), (464, 2048, 6144), (217, 2048, 4096)])
+def test_xcompute_backends_follow_the_references(nvfp4_backends, m, n, k):
+    """xcompute against the references: the quantizer divides as the Wall-X kernels (``a · rcp.approx(b)``), so its
+    elements may differ at rounding ties only; GEMMs differ by summation order only."""
+    torch.manual_seed(m + n)
+    t = nvfp4_backends
+    a = torch.randn(m, k, device="cuda").bfloat16()
+    q, s = t.nvfp4_quantize(a)
+    rq, rs = nvfp4.quantize(a)
+    assert float((nvfp4.dequantize(q, s) == nvfp4.dequantize(rq, rs)).float().mean()) > 0.995
+    w = (torch.randn(n, k, device="cuda") * k ** -0.5).bfloat16()
+    g = global_scale(w)
+    weight = (*t.nvfp4_quantize(w, global_scale=g, mse=True), g)
+    x = (q, s)
+    bias = torch.randn(n, device="cuda").bfloat16()
+    for kwargs in (dict(), dict(activation="gelu_tanh"), dict(residual=torch.randn(m, n, device="cuda").bfloat16())):
+        out = t.nvfp4_gemm_epilogue(x, weight, bias, **kwargs)
+        ref = nvfp4.gemm_epilogue(x, weight, bias, **kwargs)
+        assert float((out.float() - ref.float()).abs().max()) <= 4 * float(ref.float().abs().max()) * 2 ** -8
+        assert float((out == ref).float().mean()) > 0.95
+    hq, hs = t.nvfp4_gemm_epilogue(x, weight, bias, activation="gelu_tanh", out_quant=True)
+    eq, es = t.nvfp4_quantize(t.nvfp4_gemm_epilogue(x, weight, bias, activation="gelu_tanh"))
+    assert torch.equal(hq, eq) and torch.equal(hs.view(torch.uint8), es.view(torch.uint8))
+    glu = t.nvfp4_gemm_glu_quantize(x, weight)
+    ref = nvfp4.gemm_glu_quantize(x, weight)
+    assert float((nvfp4.dequantize(*glu) == nvfp4.dequantize(*ref)).float().mean()) > 0.95

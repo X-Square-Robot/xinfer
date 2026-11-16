@@ -31,7 +31,7 @@ The design and its evaluation are described in our paper, [Scaling VLA Serving U
 - **Multi-robot serving on one accelerator.** Robots share model weights, and vision encoding can overlap with action generation across requests.
 - **Low-precision quantization.** Apply MXFP8 or NVFP4 to selected groups of linear layers.
 - **Hardware backends.** NVIDIA RTX 5090, Jetson Thor, Ascend 950DT, and Huixi Rhino RPU (R1) support in development.
-- **High-performance kernels.** Use xcompute fused kernels and FlashAttention, or plug in another kernel library.
+- **High-performance kernels.** Use Xcompute fused kernels and FlashAttention, or plug in another kernel library.
 
 ## Why XInfer
 
@@ -107,15 +107,15 @@ and action representations are documented in each model guide.
 
 | Model | Model ID | Precision | Real-time chunking | Guide |
 |---|---|---|---|---|
-| Wall-OSS · internal checkpoints | `wall_oss` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wall_oss.md) |
-| Wall-X 2B | `wallx2b` | BF16; optional MXFP8 for vision and prefill (action stays BF16) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
+| Wall-OSS · internal checkpoints | `wall_oss` | BF16 (Xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wall_oss.md) |
+| Wall-X 2B | `wallx2b` | BF16; optional MXFP8 or NVFP4 for vision and prefill (action stays BF16) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
 
 Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for both models on an RTX 5090 and on an Ascend 950DT; the [Ascend guide](docs/ascend950dt.md#wall-x-2b-operator-list) lists which operators each model runs there.
 
 | Hardware | Device | Runtime |
 |---|---|---|
 | NVIDIA GPUs · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
-| NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA, optional Wall-OSS xcompute kernels |
+| NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA, optional Wall-OSS Xcompute kernels |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
 | CPU | `cpu` | Reference implementations and tests |
 
@@ -136,20 +136,24 @@ Single-request latency and capacity of each serving configuration, measured with
 | 1 | Wall-OSS | BF16, optimized | RTX 5090 | 49.0 ms | 4 | 128 ms | 142 ms | 25.6 req/s |
 | 2 | Wall-X 2B | BF16, optimized | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
 | 3 | Wall-OSS | BF16, optimized | Jetson AGX Thor | 95.4 ms | 2 | 123 ms | 141 ms | 11.5 req/s |
-| 4 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
-| 5 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+| 4 | Wall-X 2B | NVFP4 vision and prefill, optimized | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
+| 5 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 6 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.webp" alt="Robot clients connect through a Frontend for input and output processing to the XInfer Engine, which runs Vision, Prefill, and Action. Platform adapters branch to NVIDIA GPUs and Ascend 950DT NPUs, identified by their brand logos, plus CPU reference execution. A dashed More chips box represents additional hardware backends." width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. X-Square Robot’s Xcompute library provides fused kernels alongside optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. Huixi R1 uses a separate experimental native path from Python Policy." width="100%">
 </p>
 
 The Frontend handles input and output processing. Models define stage
 computation and tensor handoffs; the Engine manages admission, queues,
-batching, and resource lifetimes. Platform adapters provide device execution,
-while operator backends supply optimized kernels. The Python API and network
-service share the same Engine and configuration rules. See the
+batching, and resource lifetimes. At model load, the operator registry binds an implementation for each operator on the target device.
+X-Square Robot’s **Xcompute** library provides fused kernels such as QKV projection with RoPE and residual
+addition with RMSNorm. The same registry supports optional CUDA FlashAttention, PyTorch references and
+third-party kernels. Platform adapters handle device execution. On CUDA, Ascend and CPU, the Python API and network
+service share the same Engine. The dashed Huixi R1 path shows the proposed in-process
+Wall-X 2B backend using the Rhino Launch SDK. See the
 [Engine guide](docs/engine.md) for the execution model and
 [configuration](docs/configuration.md) for defaults and overrides.
 
