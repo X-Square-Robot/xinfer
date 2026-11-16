@@ -143,13 +143,15 @@ Single-request latency and capacity of each serving configuration, measured with
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.svg" alt="Vision, prefill and action stages above the execution paths. WebSocket and Python clients use the XInfer Engine on RTX 5090, Jetson AGX Thor, Ascend 950DT or CPU. A dashed branch connects only Python Policy to the experimental Huixi R1 native runner." width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. X-Square Robot’s xcompute library provides fused kernels alongside optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. Huixi R1 uses a separate experimental native path from Python Policy." width="100%">
 </p>
 
 The Frontend handles input and output processing. Models define stage
 computation and tensor handoffs; the Engine manages admission, queues,
-batching, and resource lifetimes. Platform adapters provide device execution,
-while operator backends supply optimized kernels. On CUDA, Ascend and CPU, the Python API and network
+batching, and resource lifetimes. At model load, the operator registry binds an implementation for each operator on the target device.
+X-Square Robot’s **xcompute** library provides fused kernels such as QKV projection with RoPE and residual
+addition with RMSNorm. The same registry supports optional CUDA FlashAttention, PyTorch references and
+third-party kernels. Platform adapters handle device execution. On CUDA, Ascend and CPU, the Python API and network
 service share the same Engine. The dashed Huixi R1 path shows the proposed in-process
 Wall-X 2B backend using the Rhino Launch SDK. See the
 [Engine guide](docs/engine.md) for the execution model and

@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="650" viewBox="0 0 1120 650" role="img" aria-labelledby="figure-title figure-desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="875" viewBox="0 0 1120 875" role="img" aria-labelledby="figure-title figure-desc">
   <title id="figure-title">XInfer architecture</title>
-  <desc id="figure-desc">Vision produces image embeddings, prefill builds the prompt KV cache, and action denoising predicts a robot action chunk. The WebSocket service and Python Policy use the shared stage engine on NVIDIA RTX 5090 and Jetson AGX Thor, Ascend 950DT, and reference CPU. A separate experimental route from the in-process Python Policy uses a native runner and the Rhino Launch SDK on the Huixi Rhino RPU (R1).</desc>
+  <desc id="figure-desc">Vision produces image embeddings, prefill builds the prompt KV cache, and action denoising predicts a robot action chunk. On the shared engine path, model stages bind operator implementations at model load. X-Square Robot’s xcompute library provides fused kernels. Other options include CUDA FlashAttention, PyTorch references and plugins. The WebSocket service and Python Policy use the shared stage engine on NVIDIA RTX 5090 and Jetson AGX Thor, Ascend 950DT, and reference CPU. A separate experimental route from the in-process Python Policy uses a native runner and the Rhino Launch SDK on the Huixi Rhino RPU (R1).</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M0 0L8 4L0 8Z" fill="#485868"/>
@@ -30,7 +30,7 @@
     </style>
   </defs>
 
-  <rect width="1120" height="650" fill="#fff"/>
+  <rect width="1120" height="875" fill="#fff"/>
   <text class="title" x="40" y="51">XInfer architecture</text>
   <path d="M40 71H1080" stroke="#344c5c" stroke-width="1.6"/>
 
@@ -53,9 +53,41 @@
     <path class="flow" d="M682 175H823"/>
   </g>
 
-  <path d="M40 241H1080" stroke="#c7d1d4"/>
-  <g id="execution-paths">
-    <text class="section" x="40" y="282"><tspan class="letter">(b)</tspan><tspan dx="12">Execution paths</tspan></text>
+  <g id="operator-backends">
+    <text class="section" x="40" y="283"><tspan class="letter">(b)</tspan><tspan dx="12">Operator backends</tspan></text>
+    <path class="branch" d="M166.5 213V232H953.5V213 M560 213V232"/>
+    <circle cx="560" cy="232" r="2.8" fill="#485868"/>
+    <path class="flow" d="M560 232V245"/>
+    <rect class="engine" x="364" y="249" width="392" height="62" rx="4"/>
+    <text class="node" text-anchor="middle" x="560" y="275">Operator registry</text>
+    <text class="meta" text-anchor="middle" x="560" y="298">Load-time binding · CUDA / Ascend / CPU</text>
+
+    <path class="branch" d="M560 311V328 M230 328H976"/>
+    <path class="flow" d="M230 328V343"/>
+    <path class="flow" d="M541 328V343"/>
+    <path class="flow" d="M758 328V343"/>
+    <path class="flow" d="M976 328V343"/>
+
+    <rect x="40" y="347" width="380" height="96" rx="4" fill="#23555d"/>
+    <text x="58" y="379" style="font-size:27px;font-weight:bold;fill:#fff">xcompute</text>
+    <text x="402" y="377" text-anchor="end" style="font-size:15px;fill:#d8eeee">CUDA · Ascend</text>
+    <text x="58" y="405" style="font-size:17px;fill:#fff">X-Square Robot’s kernel library</text>
+    <text x="58" y="428" style="font-size:15px;fill:#d8eeee">QKV projection + RoPE · Residual add + RMSNorm</text>
+
+    <rect class="box" x="438" y="347" width="206" height="96" rx="4"/>
+    <text class="node" x="453" y="385">FlashAttention</text>
+    <text class="meta" x="453" y="412">Optional CUDA attention</text>
+    <rect class="box" x="662" y="347" width="192" height="96" rx="4"/>
+    <text class="node" x="677" y="385">PyTorch</text>
+    <text class="meta" x="677" y="412">Reference operators</text>
+    <rect class="box" x="872" y="347" width="208" height="96" rx="4"/>
+    <text class="node" x="887" y="385">Kernel plugins</text>
+    <text class="meta" x="887" y="412">Register via xinfer.ops</text>
+  </g>
+
+  <path d="M40 466H1080" stroke="#c7d1d4"/>
+  <g id="execution-paths" transform="translate(0,225)">
+    <text class="section" x="40" y="282"><tspan class="letter">(c)</tspan><tspan dx="12">Execution paths</tspan></text>
     <text class="col" x="40" y="324">Frontend interfaces</text>
     <text class="col" x="363" y="324">Execution runtime</text>
     <text class="col" x="766" y="324">Platform adapters and hardware</text>
