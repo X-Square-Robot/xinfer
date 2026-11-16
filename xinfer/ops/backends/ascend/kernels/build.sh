@@ -88,7 +88,7 @@ gen core ops.gemm.qkv_bnsdq          gemm_qkv_2b_norm_gate_cache_bnsdq
 gen core ops.gemm.gemm_smallm_action bnsd_o_proj_m768_bf16 smallm_bnsd_o_proj smallm_bnsd_o_proj_m32 smallm_bnsd_o_proj_m64
 gen core ops.gemm.gemm_qkv_cache     gemm_qkv_cache_bias_rope_m16 gemm_qkv_cache_bias_rope_prefill
 gen core ops.gemm.gemm_qkv_bf16_wide gemm_qkv_vision_rope_finish
-gen core ops.gemm.gemm_glu_fp32_finish gemm_glu_fp32_finish_split_11008
+gen core ops.gemm.gemm_glu_fp32_finish gemm_glu_fp32_finish_split_11008 gemm_glu_fp32_finish_split_6144
 gen core ops.norm.qkv_bhsd qkv_split_vec_bhsd_h256
 gen core ops.norm.rope_bhsd rope_half_d64_bhsd
 link libxinfer_ascend_core.so core \
@@ -98,14 +98,15 @@ link libxinfer_ascend_core.so core \
      smallm_bnsd_o_proj smallm_bnsd_o_proj_m32 smallm_bnsd_o_proj_m64 \
      gemm_qkv_cache_bias_rope_m16 gemm_qkv_cache_bias_rope_prefill \
      gemm_qkv_vision_rope_finish gemm_glu_fp32_finish_split_11008 \
+     gemm_glu_fp32_finish_split_6144 \
      qkv_split_vec_bhsd_h256 rope_half_d64_bhsd
 
 # ---------------------------------------------------------------- knife libraries
 # One library per routed family; env names XINFER_<FAMILY>_LIB unchanged.
 
 # SMALLM_R3 (both models; + the day-one try-on qkv kernel, flag default off)
-gen smallm_r3 ops.gemm.smallm_r3 smallm_r3_gateup_glu smallm_r3_down smallm_r3_qkv
-link libsmallm_r3.so smallm_r3 smallm_r3_gateup_glu smallm_r3_down smallm_r3_qkv
+gen smallm_r3 ops.gemm.smallm_r3 smallm_r3_o_proj smallm_r3_gateup_glu smallm_r3_down smallm_r3_qkv
+link libsmallm_r3.so smallm_r3 smallm_r3_o_proj smallm_r3_gateup_glu smallm_r3_down smallm_r3_qkv
 
 # ADANORM_R2 (wall2b; the _pinned twins serve the RTC denoise's pinned rows)
 gen adanorm_r2 ops.norm.adanorm_r2 adarmsnorm_action_double_bf16_f32 adarmsnorm_action_gated_bf16_f32 adarmsnorm_action_double_bf16_f32_pinned adarmsnorm_action_gated_bf16_f32_pinned
@@ -116,8 +117,8 @@ gen soupunlock ops.norm.soupunlock_kernels rmsnorm_full_c2048
 link libsoupunlock.so soupunlock rmsnorm_full_c2048
 
 # SOUPFORM (wall2b)
-gen soupform ops.norm.soupform_kernels vision_qkv_rope_v3p
-link libsoupform.so soupform vision_qkv_rope_v3p
+gen soupform ops.norm.soupform_kernels normprep_c2048 apply_rstd_c2048 zbasplit_c8224 mulcast_c6144 vision_qkv_rope_v3p
+link libsoupform.so soupform normprep_c2048 apply_rstd_c2048 zbasplit_c8224 mulcast_c6144 vision_qkv_rope_v3p
 
 # SOUPKILL (wall2b)
 gen soupkill ops.finish.soupkill_r1 finish_br_c1024
@@ -219,7 +220,7 @@ if compgen -G "$STATIC_SRC_DIR/*.cc" > /dev/null; then
     done
     g++ -shared -o "$WORK/libxinfer_ascend_core.so" \
         "$WORK"/out/static/*.o \
-        "$WORK"/out/core/{rms_apply_rstd_h2048,rms_consistent_ubv_h1280,rms_consistent_generic_h1024_f32in,denoise_input_embed,denoise_fp32head_cube,denoise_fp32head_prep,gemm_qkv_2b_norm_gate_cache_bnsdq,bnsd_o_proj_m768_bf16,smallm_bnsd_o_proj,smallm_bnsd_o_proj_m32,smallm_bnsd_o_proj_m64,gemm_qkv_cache_bias_rope_m16,gemm_qkv_cache_bias_rope_prefill,gemm_qkv_vision_rope_finish,gemm_glu_fp32_finish_split_11008,qkv_split_vec_bhsd_h256,rope_half_d64_bhsd}.o \
+        "$WORK"/out/core/{rms_apply_rstd_h2048,rms_consistent_ubv_h1280,rms_consistent_generic_h1024_f32in,denoise_input_embed,denoise_fp32head_cube,denoise_fp32head_prep,gemm_qkv_2b_norm_gate_cache_bnsdq,bnsd_o_proj_m768_bf16,smallm_bnsd_o_proj,smallm_bnsd_o_proj_m32,smallm_bnsd_o_proj_m64,gemm_qkv_cache_bias_rope_m16,gemm_qkv_cache_bias_rope_prefill,gemm_qkv_vision_rope_finish,gemm_glu_fp32_finish_split_11008,gemm_glu_fp32_finish_split_6144,qkv_split_vec_bhsd_h256,rope_half_d64_bhsd}.o \
         -L"$RUNTIME/lib64" -lascendcl -lopapi -lruntime -lnnopbase \
         -L"$TORCH_LIB" -L"$NPU_LIB_DIR" -lc10 -ltorch_cpu -ltorch_npu
 fi
