@@ -2,7 +2,7 @@
 
 English | [简体中文](wallx2b.zh-CN.md)
 
-Use the model ID `wallx2b` to serve a BF16 Wall-X 2B checkpoint on a CUDA GPU or on an Ascend 950DT NPU; the [Ascend guide](../ascend950dt.md#wall-x-2b-operator-list) covers the operator list and the device setup for the latter, and the commands below use `--device cuda`. The model takes three camera views, the state of a desktop dual-arm robot and a task instruction. Each call predicts 16 steps for both arms. Real-time chunking (RTC) can pin part of the previous action so consecutive predictions overlap.
+Use the model ID `wallx2b` to serve a BF16 Wall-X 2B checkpoint on a CUDA GPU or on an Ascend 950DT NPU; the [Ascend guide](../ascend950dt.md) covers its build and device setup, and the commands below use `--device cuda`. The model takes three camera views, the state of a desktop dual-arm robot and a task instruction. Each call predicts 16 steps for both arms. Real-time chunking (RTC) can pin part of the previous action so consecutive predictions overlap.
 
 See the [validation results](wallx2b_validation.md) for latency, single-GPU capacity and open-loop accuracy on the RTX 5090.
 

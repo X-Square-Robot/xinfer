@@ -78,6 +78,10 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkp
 
 SIGINT/SIGTERM 会停止前端，释放 graph 和锁页缓冲区，并以 0 退出。服务每 0.5 s 检查一次 `Engine.health()`；当引擎无法继续服务（引擎线程或完成线程已停止）时，它以同样的方式关闭并以 1 退出，以便其监管进程重启它。
 
+## 组批和通道
+
+`--max-batch` 限制模型声明的批大小，不会启用未经验证的批大小。`--lanes` 控制每个阶段的流与图池数量。两者都可能改变延迟、吞吐和显存使用。每次基准结果应保留解析后的设置，调整部署前先测量目标负载。
+
 ## 压测
 
 `benchmarks/robot_load.py` 以闭环方式让虚拟机器人向服务发送请求。见 [benchmark.md](benchmark.zh-CN.md)。
