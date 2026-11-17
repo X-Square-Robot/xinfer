@@ -3,13 +3,19 @@
 Wall-OSS needs ``add_rms_norm`` and ``rms_norm`` (the vision, prompt and action streams' input norms); Wall-X 2B
 also needs the zero-centered VoT norms, the ViT's layer norm and the AdaRMS family (``modulated_rms_norm``,
 ``gated_residual_modulated_rms_norm``, ``identity_layer_norms_``). Each registration names one OpSpec and delegates
-to the xcompute entry that implements that semantics; entries reject unsupported layouts with ``ValueError`` (or
+to the glue entry that implements that semantics; entries reject unsupported layouts with ``ValueError`` (or
 fail the ``check`` predicate) and the reference runs instead.
+Contracts against the torch references: the fused mounts bitwise (the audited
+production gates), the vendor entries tolerance.
 """
+
+from functools import wraps
 
 import torch
 
-from xinfer.ops.backends.ascend._support import VERSION, canonical, entry, has_functions, partial, xc
+from xinfer.ops.backends.ascend._support import (
+    PLATFORMS, PRIORITY, VERSION, canonical, entry, has_functions, partial, xc,
+)
 from xinfer.ops.reference.norm import (
     add_rms_norm as reference_add_rms_norm,
     add_zero_centered_rms_norm as reference_add_zero_centered_rms_norm,
@@ -38,10 +44,64 @@ def _supported(x, residual, weight, eps):
             and 0 < eps <= torch.finfo(torch.float32).max)
 
 
-@register("add_rms_norm", backend="ascend", requires=norm_library,
+@register("add_rms_norm", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=norm_library,
           version=VERSION)
 @partial(reference_add_rms_norm, check=_supported)
 def add_rms_norm(x, residual, weight, eps):
+    # SIMD-EPILOGUE R1 fused-after route (default off): the released ubv plans with buf2/f32direct
+    # scheduling, launched back-to-back with the GEMM in the same stream (probe-se1: sum+norm bitwise,
+    # the family-O chain 36.78 -> 34.82 us). XINFER_SIMDEPI selects the families (v1280: the vision
+    # and merger [rows, 1280] rows, p2048: the prompt [1, P, 2048] rows) and XINFER_SIMDEPI_LIB the
+    # library; the module is absent without that delivery and these guards fall through to the entries
+    # below, so the composition is unchanged.
+    try:
+        from xinfer.ops.backends.ascend import simdepi_r1
+        if (simdepi_r1.enabled("v1280")
+                and x.dim() == 2 and x.shape[-1] == 1280
+                and x.dtype == residual.dtype == torch.bfloat16
+                and residual.shape == x.shape and residual.device == x.device
+                and x.is_contiguous() and residual.is_contiguous()
+                and weight.dtype in (torch.float32, torch.bfloat16)
+                and weight.device == x.device
+                and tuple(weight.shape) == (1280,) and 0 < eps <= torch.finfo(torch.float32).max):
+            return simdepi_r1.add_rms_v1280(x, residual, weight, eps)
+        if (simdepi_r1.enabled("p2048")
+                and x.dim() == 3 and x.shape[0] == 1 and x.shape[-1] == 2048
+                and x.shape[1] % 4 == 0
+                and x.dtype == residual.dtype == torch.bfloat16
+                and residual.shape == x.shape and residual.device == x.device
+                and x.is_contiguous() and residual.is_contiguous()
+                and weight.dtype in (torch.float32, torch.bfloat16)
+                and weight.device == x.device
+                and tuple(weight.shape) == (2048,) and 0 < eps <= torch.finfo(torch.float32).max):
+            return simdepi_r1.add_rms_p2048(x, residual, weight, eps)
+    except (ImportError, OSError):
+        pass
+    # RMSFUSE-r4 RF1 (the [1, 16, 1024] action norm and the wide [1, T, 2048] prompt norm) rides the
+    # delivered package's AOT kernels; the module is absent without that delivery and these guards
+    # fall through to the entries below, so the composition is unchanged.
+    try:
+        from xinfer.ops.backends.ascend import rmsfuse_r4
+        if (rmsfuse_r4.enabled("m16")
+                and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
+                and x.dtype == residual.dtype == torch.bfloat16
+                and residual.shape == x.shape and residual.device == x.device
+                and x.is_contiguous() and residual.is_contiguous()
+                and weight.dtype == torch.float32 and weight.device == x.device
+                and tuple(weight.shape) == (1024,) and 0 < eps <= torch.finfo(torch.float32).max):
+            return rmsfuse_r4.add_rms_m16(x, residual, weight, eps)
+        if (rmsfuse_r4.enabled("h2048w")
+                and x.dim() == 3 and x.shape[0] == 1 and x.shape[-1] == 2048
+                and x.shape[1] % 4 == 0
+                and x.dtype == residual.dtype == torch.bfloat16
+                and residual.shape == x.shape and residual.device == x.device
+                and x.is_contiguous() and residual.is_contiguous()
+                and weight.dtype == torch.float32 and weight.device == x.device
+                and tuple(weight.shape) == (2048,) and 0 < eps <= torch.finfo(torch.float32).max):
+            return rmsfuse_r4.add_rms_h2048w(x, residual, weight, eps)
+    except (ImportError, OSError):
+        pass
     if canonical_norm is not None:
         return canonical_norm(x, residual, weight, eps)
     # The legacy raw entry takes (residual, x) — the reverse of the OpSpec's (x, residual). The sum is commutative
@@ -50,7 +110,7 @@ def add_rms_norm(x, residual, weight, eps):
 
 
 # ---------------------------------------------------------------- Wall-X 2B normalization family
-# The xcompute entries below are classes with a stateful call, or functions that overwrite their first tensors.
+# The glue entries below are classes with a stateful call, or functions that overwrite their first tensors.
 _rmsnorm = getattr(xc, "Rmsnorm", None) if xc is not None else None
 _add_rmsnorm = getattr(xc, "AddRmsnorm", None) if xc is not None else None
 _adarmsnorm = getattr(xc, "Adarmsnorm", None) if xc is not None else None
@@ -68,12 +128,37 @@ def _plain_supported(x, weight, eps):
             and x.dtype in (torch.bfloat16, torch.float16, torch.float32) and weight.shape == (x.shape[-1],))
 
 
-@register("rms_norm", backend="ascend", requires=xc if _rms is not None else None,
+@register("rms_norm", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=xc if _rms is not None else None,
           version=VERSION)
 @partial(reference_rms_norm, check=_plain_supported)
 def rms_norm(x, weight, eps):
-    # Wall-OSS's vision, prompt and action input norms; the entry's inference path with the plain (not
-    # zero-centered) weight, as the CUDA backend registers it.
+    # Wall-OSS's vision, prompt and action input norms. R5: the plain-norm mounts of the 38.82 stack's
+    # ``rms_norm_cast`` -- its RMSFUSE-r4 RF1 m16 knife for the [1, 16, 1024] action input norms, then the
+    # v22 rmsnorm FFI's rms_consistent plans (the core library's launchers) for the [rows, 1280] ViT patch
+    # norm and the [rows, 2048] prefill input norm. An envelope miss (or a build without the kernels) keeps
+    # the reference composition below, exactly as a v22 build without those kernels would.
+    try:
+        from xinfer.ops.backends.ascend import rmsfuse_r4
+
+        if (rmsfuse_r4.enabled("m16")
+                and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
+                and x.dtype == torch.bfloat16 and x.is_contiguous()
+                and weight.dtype == torch.float32 and weight.device == x.device
+                and tuple(weight.shape) == (1024,)
+                and 0 < eps <= torch.finfo(torch.float32).max):
+            return rmsfuse_r4.rms_m16(x, weight, eps)
+    except (ImportError, OSError):
+        pass
+    try:
+        from xinfer.ops.backends.ascend import rms_plans
+
+        plan = rms_plans.plain_rms(x, weight, eps)
+        if plan is not None:
+            return plan
+    except (ImportError, OSError):
+        pass
+    # The entry's inference path with the plain (not zero-centered) weight, as the CUDA backend registers it.
     return _rms(x, weight, float(eps), True, False)
 
 
@@ -93,10 +178,19 @@ def _layer_norm_supported(x, weight, bias, eps):
             and weight.dtype in _WEIGHT_DTYPES and bias.dtype in _WEIGHT_DTYPES)
 
 
-@register("layer_norm_cast", backend="ascend", requires=xc if callable(_layernorm_inplace) else None,
+@register("layer_norm_cast", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=xc,
           version=VERSION)
 @partial(reference_layer_norm_cast, check=_layer_norm_supported)
 def layer_norm_cast(x, weight, bias, eps):
+    from xinfer.ops.backends.ascend import soupunlock
+
+    if soupunlock.enabled("visionln"):
+        result = soupunlock.layernorm_c1024(x, weight, bias, eps)
+        if result is not None:
+            return result
+    if not callable(_layernorm_inplace):
+        return reference_layer_norm_cast(x, weight, bias, eps)
     # The entry normalizes in place and returns its first tensor, while this operator's contract is functional:
     # the caller keeps using ``x`` as its residual. Clone so the entry overwrites the copy (the e2e action gate
     # isolates this exact mismatch: with the input passed through, the residual stream is polluted and the action
@@ -108,7 +202,8 @@ def _zero_centered_supported(x, weight, eps):
     return _npu_same_device(x, weight) and weight.dtype in _WEIGHT_DTYPES
 
 
-@register("zero_centered_rms_norm", backend="ascend", requires=xc if _rms is not None else None,
+@register("zero_centered_rms_norm", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=xc if _rms is not None else None,
           version=VERSION)
 @partial(reference_zero_centered_rms_norm, check=_zero_centered_supported)
 def zero_centered_rms_norm(x, weight, eps):
@@ -121,12 +216,47 @@ def _add_zero_centered_supported(x, residual, weight, eps):
             and weight.dtype in _WEIGHT_DTYPES)
 
 
-@register("add_zero_centered_rms_norm", backend="ascend", requires=xc if _add_rms is not None else None,
+@register("add_zero_centered_rms_norm", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=xc,
           version=VERSION)
 @partial(reference_add_zero_centered_rms_norm, check=_add_zero_centered_supported)
 def add_zero_centered_rms_norm(x, residual, weight, eps):
+    if _add_rms is None:
+        return reference_add_zero_centered_rms_norm(x, residual, weight, eps)
     # (residual, input) order, as the entry documents, and the tuple is (sum, normalized).
+    # SOUP-FORM normprep: one pass computes s = rne(res+x) and sq = f32(s)^2,
+    # the aclnn statistics chain runs over the identical sq values, and the
+    # apply is the elementwise (s*rstd)*(1+w) with a single RNE. Opt-in through
+    # ``XINFER_SOUPFORM=normprep`` (the soupform mount, default off);
+    # every miss -- flag off, absent knife library, an envelope mismatch or a
+    # fused-path error -- falls back to the entry chain below.
+    try:
+        from xinfer.ops.backends.ascend import soupform
+
+        if soupform.enabled("normprep"):
+            fused = soupform.normprep_norm(x, residual, weight, eps)
+            if fused is not None:
+                return fused
+    except Exception:  # noqa: BLE001 - the mount is optional
+        pass
     return _add_rms(residual, x, weight, float(eps), True, True)
+
+
+def _bind_add_zero_centered_rms_norm(*, layer_index):
+    from xinfer.ops.backends.ascend import soupunlock
+
+    if not soupunlock.enabled("rmsfull") or layer_index < soupunlock.from_layer():
+        return add_zero_centered_rms_norm
+
+    @wraps(add_zero_centered_rms_norm)
+    def fused(x, residual, weight, eps):
+        result = soupunlock.rmsnorm_full(x, residual, weight, eps)
+        return add_zero_centered_rms_norm(x, residual, weight, eps) if result is None else result
+
+    return fused
+
+
+add_zero_centered_rms_norm.bind = _bind_add_zero_centered_rms_norm
 
 
 def _modulated_supported(x, modulation, eps, pinned_modulation=None, pinned_rows=None):
@@ -135,15 +265,54 @@ def _modulated_supported(x, modulation, eps, pinned_modulation=None, pinned_rows
             and modulation.shape[-1] == 3 * x.shape[-1])
 
 
-@register("modulated_rms_norm", backend="ascend", requires=xc if _adarms is not None else None,
+_identity_operands = {}  # (device, pinned) -> (zero residual [1, 16, 1024], one branch gate)
+
+
+def _modulated_identity_operands(x, pinned):
+    """The 2B action shape's identity operands, cached per device and pinned state.
+
+    The plain Ada call has no fused plan of its own: at ``[1, 16, 1024]`` with an FP32
+    ``[1, 3072]`` modulation the generic statistics + pair programs measure ~424us while
+    the gated-residual entry dispatches the fused action kernel (~8us) for exactly this
+    shape. A zero residual and a one branch gate reduce that entry to the plain
+    semantics -- ``residual_output = 0 + x * 1`` is exact in BF16 -- and the probe shows
+    the outputs and gate bit for bit equal to the plain programs. With a pinned
+    modulation the entry takes the branch gate per token (gate rows = the input rows),
+    so the one buffer follows the pinned state.
+    """
+    key = (x.device, bool(pinned))
+    pair = _identity_operands.get(key)
+    if pair is None:
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("warm up the identity operands on this stream before graph capture")
+        gate = (torch.ones(1, 16, 1024, dtype=torch.bfloat16, device=x.device) if pinned
+                else torch.ones(1, 1, 1024, dtype=torch.bfloat16, device=x.device))
+        pair = (torch.zeros(1, 16, 1024, dtype=torch.bfloat16, device=x.device), gate)
+        _identity_operands[key] = pair
+    return pair
+
+
+@register("modulated_rms_norm", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=xc if _adarms is not None else None,
           version=VERSION)
 @partial(reference_modulated_rms_norm, check=_modulated_supported)
 def modulated_rms_norm(x, modulation, eps, pinned_modulation=None, pinned_rows=None):
+    if (x.dim() == 3 and modulation.dim() == 2
+            and tuple(x.shape) == (1, 16, 1024) and tuple(modulation.shape) == (1, 3072)
+            and x.dtype == torch.bfloat16 and modulation.dtype == torch.float32
+            and x.is_contiguous() and modulation.is_contiguous()):
+        zeros, ones = _modulated_identity_operands(
+            x, pinned_modulation is not None or pinned_rows is not None)
+        out, gate, _ = _adarms(x, modulation, float(eps), True,
+                               pinned_modulation=pinned_modulation, pinned_rows=pinned_rows,
+                               residual=zeros, branch_gate=ones)
+        return out, gate
     return _adarms(x, modulation, float(eps), True,
                    pinned_modulation=pinned_modulation, pinned_rows=pinned_rows)
 
 
-@register("gated_residual_modulated_rms_norm", backend="ascend", requires=xc if _adarms is not None else None,
+@register("gated_residual_modulated_rms_norm", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=xc if _adarms is not None else None,
           version=VERSION)
 @partial(reference_gated_residual_modulated_rms_norm,
          check=lambda residual, branch, branch_gate, modulation, eps, pinned_modulation=None, pinned_rows=None:
@@ -158,7 +327,8 @@ def gated_residual_modulated_rms_norm(residual, branch, branch_gate, modulation,
                    residual=residual, branch_gate=branch_gate)
 
 
-@register("identity_layer_norms_", backend="ascend", requires=xc if callable(_double_adarmsnorm) else None,
+@register("identity_layer_norms_", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=xc if callable(_double_adarmsnorm) else None,
           version=VERSION, deterministic=True)
 @partial(reference_identity_layer_norms_,
          check=lambda residual, branch, branch_gate, input_modulation, post_modulation, eps,

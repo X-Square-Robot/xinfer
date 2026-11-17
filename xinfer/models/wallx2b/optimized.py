@@ -21,6 +21,8 @@ Differences to the reference:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -107,6 +109,15 @@ class OptimizedAction(nn.Module):
             sin: FP32 ``[H, rotary_dim / 2]`` compact sines.
             out: Output ``[1, H, D]`` FP32.
         """
+        # The cache-attention metadata scope of the 2B action bridge: one open scope per forward
+        # lets every flow step's ``gated_kvcache_attention`` call share the dense drop mask the
+        # bridge builds from the live flash mask, instead of each call rebuilding it. The torch
+        # composition exposes no scope and keeps the getattr default (a null context).
+        scope = getattr(self.ops.gated_kvcache_attention, "action_scope", nullcontext)
+        with scope():
+            return self._forward_inner(x, prompt_kv, cos, sin, out)
+
+    def _forward_inner(self, x, prompt_kv, cos, sin, out):
         c, ops, m = self.config, self.ops, self.config.model
         heads, kv_heads, d, eps = m.num_attention_heads, m.num_key_value_heads, m.head_dim, m.rms_norm_eps
         noise, dof = x["noise"].to(torch.float32), x["dof_mask"].to(torch.float32)
@@ -147,10 +158,20 @@ class OptimizedAction(nn.Module):
                     keys, vals = cache[full.index(i), 0], cache[full.index(i), 1]  # [1, KV, P + H, D]
                     packed = ops.qkv_norm_rope_kvcache(normed[0], layer.qkv, layer.q_norm, layer.k_norm, cos, sin,
                                                        keys[0], vals[0], p, heads, kv_heads, d, eps)
-                    o = ops.gated_kvcache_attention(packed[:, :heads * d].view(1, rows, heads, d),
-                                                    keys.transpose(1, 2), vals.transpose(1, 2), start, p,
-                                                    packed[None, :, heads * d:], flash_mask=flash_mask,
-                                                    scale=d ** -0.5)
+                    if isinstance(packed, tuple):
+                        # R6B-BRIDGE B1: the pinned 2B QKV tail returns the per-request
+                        # (q_bnsd [1, H, M, D], gate [1, M, H*D]) pair; the head-major
+                        # query feeds FIA without the token-major materialization (the
+                        # v22 model-side pairing, ported).
+                        q_attn, gate_rows = packed
+                        o = ops.gated_kvcache_attention(q_attn, keys.transpose(1, 2), vals.transpose(1, 2),
+                                                        start, p, gate_rows, flash_mask=flash_mask,
+                                                        scale=d ** -0.5)
+                    else:
+                        o = ops.gated_kvcache_attention(packed[:, :heads * d].view(1, rows, heads, d),
+                                                        keys.transpose(1, 2), vals.transpose(1, 2), start, p,
+                                                        packed[None, :, heads * d:], flash_mask=flash_mask,
+                                                        scale=d ** -0.5)
                     mixed = ops.gemm_epilogue(o[0], layer.o_t.t())[None]
                     normed, gate, h = ops.gated_residual_modulated_rms_norm(h, mixed, gate_in, eps=eps,
                                                                             **mod(mods, 2 * i + 1))
