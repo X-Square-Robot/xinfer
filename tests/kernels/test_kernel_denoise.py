@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from xinfer.ops.backends.cuda import _native, flow
+from xinfer.ops.backends.cuda import flow
 from conftest import DEVICE, sm
 
 
@@ -33,9 +33,6 @@ def test_matches_reference(b, m, a, h_dtype, w_dtype, options, rnd):
         kw.update(pinned=torch.full((b,), min(5, m), dtype=torch.int32, device=DEVICE))
     if "values" in options:
         kw.update(pinned_values=rnd(b, m, a, dtype=torch.float32))
-    if _native.arch(DEVICE) == 110 and b > 2 and h_dtype == w_dtype == torch.bfloat16:  # not listed on SM110
-        assert not flow.denoise_output_euler_takes(x, h, weight)
-        return
     assert flow.denoise_output_euler_takes(x, h, weight)
     expected = reference(x, h, weight, 0.2, **kw)
     out = flow.denoise_output_euler(x, h, weight, dt=0.2, out=torch.empty_like(x), **kw)

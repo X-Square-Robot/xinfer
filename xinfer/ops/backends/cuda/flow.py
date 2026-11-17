@@ -25,11 +25,10 @@ from xinfer.ops.backends.cuda._native import BUILD_ARCHS, NATIVE, arch, lib
 from xinfer.ops.reference import flow as reference_flow
 from xinfer.ops.registry import register
 
-# arch -> K (hidden width) -> inclusive ranges of batch, M (rows) and A (action width), and of the batch with a BF16
-# weight and a BF16 h where that is narrower
+# arch -> K (hidden width) -> inclusive ranges of batch, M (rows) and A (action width)
 SHAPES = {
     120: {1024: dict(batch=(1, 4), m=(1, 32), a=(26, 32))},
-    110: {1024: dict(batch=(1, 4), m=(1, 32), a=(26, 32), bf16_batch=(1, 2))},
+    110: {1024: dict(batch=(1, 4), m=(1, 32), a=(26, 32))},
 }
 
 
@@ -46,8 +45,7 @@ def denoise_output_euler_takes(x, h, weight) -> bool:
     if ranges is None:
         return False
     b, m, a = x.shape
-    batch = ranges.get("bf16_batch", ranges["batch"]) if weight.dtype == torch.bfloat16 else ranges["batch"]
-    return all(lo <= v <= hi for v, (lo, hi) in ((b, batch), (m, ranges["m"]), (a, ranges["a"])))
+    return all(lo <= v <= hi for v, (lo, hi) in ((b, ranges["batch"]), (m, ranges["m"]), (a, ranges["a"])))
 
 
 def denoise_output_euler(x, h, weight, *, dt, dof_mask=None, padding_velocity=None, pinned=None,
