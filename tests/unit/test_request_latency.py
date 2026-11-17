@@ -44,3 +44,26 @@ def test_single_request_latency_is_measured_per_run(tmp_path, monkeypatch):
     for total, *steps in zip(samples["total_ms"], samples["prepare_ms"], samples["engine_ms"], samples["output_ms"]):
         assert abs(total - sum(steps)) < 1e-6  # the end-to-end time is the sum of the three steps
     assert result["captures_after_warmup"] == {}  # no CUDA graphs on the CPU
+
+
+def test_reference_cli_option_reaches_policy_and_keeps_operator_pins(tmp_path, monkeypatch):
+    import xinfer
+
+    create_policy = xinfer.Policy
+    passed = []
+
+    def policy(*args, **kwargs):
+        passed.append(kwargs)
+        return create_policy(*args, **kwargs)
+
+    monkeypatch.setattr(xinfer, "Policy", policy)
+    requests = tmp_path / "requests.msgpack"
+    requests.write_bytes(packb({"x": np.zeros(3, np.float32)}))
+    out = tmp_path / "latency.json"
+    assert request_latency.main([
+        "--model", "echo_model:EchoModel", "--checkpoint", "unused", "--device", "cpu",
+        "--requests-file", str(requests), "--runs", "1", "--warmup-runs", "0",
+        "--reference-ops", "--op-backends", "rms_norm=reference", "--out", str(out)]) == 0
+    assert passed[0]["reference_ops"] is True and passed[0]["op_backends"] == {"rms_norm": "reference"}
+    report = json.loads(out.read_text())["policy"]["ops"]
+    assert all(row["backend"] == "reference" for row in report)
