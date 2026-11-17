@@ -30,7 +30,7 @@ bench-fusion*.json, prof-dissect.json (wave-1/2, card 0, rot-16 graph p50).
 
 import tilelang.ascend.language as T
 
-from ..gemm.silu_and_mul import _store_rne
+from .silu_and_mul import _store_rne
 
 HEADS, HEAD_DIM = 16, 128
 

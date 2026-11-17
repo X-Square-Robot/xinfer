@@ -26,7 +26,7 @@ to the torch tail.
 
 import tilelang.ascend.language as T
 
-from ..gemm.silu_and_mul import _store_rne
+from gemm.silu_and_mul import _store_rne
 
 CORES = 64
 THREADS = 256
