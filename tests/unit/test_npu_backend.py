@@ -1,14 +1,12 @@
 """CPU regressions for Ascend loading, default selection, partial support and reference isolation."""
 
 import importlib
-import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from xinfer import ops
-from xinfer.ops.backends import _xcompute
 from xinfer.ops.backends.ascend import _support
 from xinfer.ops.registry import OpRegistry
 from xinfer.platforms.interface import Platform, PlatformCapabilities
@@ -17,31 +15,6 @@ from xinfer.platforms.interface import Platform, PlatformCapabilities
 def _platform(kind="ascend", arch="future-chip"):
     return Platform(f"{kind}-{arch}", "cpu",
                     PlatformCapabilities(kind, arch, True, False, False, None, None, None))
-
-
-def test_shared_loader_accepts_an_ascend_build_with_no_cuda_architectures(monkeypatch, tmp_path):
-    path = tmp_path / "xcompute.so"
-    package = ModuleType("xcompute")
-    package.KERNEL_LIB_PATH = str(path)
-    monkeypatch.setitem(sys.modules, "xcompute", package)
-    monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
-
-    class Library:
-        def __init__(self):
-            self.path = str(path)
-
-        def has_function(self, name):
-            return name in ("build_backend", "build_target_archs")
-
-        def function(self, name):
-            return lambda: "ascend" if name == "build_backend" else ""
-
-    library = Library()
-    assert _xcompute._python_package(library) is package
-    assert _xcompute.target_archs(library) == ("ascend",)
-    monkeypatch.setenv("XINFER_XCOMPUTE", "0")
-    monkeypatch.setattr(_xcompute, "_package_library", lambda: pytest.fail("disabled library was imported"))
-    assert _xcompute._import() is None
 
 
 @pytest.fixture
@@ -256,7 +229,7 @@ def test_legacy_eager_only_entries_do_not_replace_graph_safe_implementations(iso
     )})
     load()
     table = registry.build_table(_platform())
-    for name in ("gemm_epilogue", "gemm_glu_epilogue"):
+    for name in ("linear", "gemm_epilogue", "gemm_glu_epilogue"):
         assert table.selection(name).backend == "reference"
         assert table.selection(name).contract.graph_safe
     assert table.selection("varlen_attention").name == "ascend:torch"

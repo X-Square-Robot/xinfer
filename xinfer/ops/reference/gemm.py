@@ -41,7 +41,8 @@ def gemm_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     ``bf16(residual + bf16(y · residual_gate[row_class]))``.
 
     Args:
-        x: ``[M, K]`` BF16.
+        x: ``[M, K]`` BF16, or the head-major attention output ``[H, M, D]`` (the native form the attention
+            kernels return; equivalent to its packed ``[M, H·D]`` flatten).
         weight: ``[N, K]`` BF16.
         bias: ``[N]`` or None.
         activation: ``"silu"``, ``"gelu"`` (erf), ``"gelu_tanh"`` or None.
@@ -53,6 +54,8 @@ def gemm_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     Returns:
         ``[M, N]`` in ``x.dtype``.
     """
+    if x.ndim == 3:
+        x = x.transpose(0, 1).reshape(x.shape[1], -1)
     y = x.float() @ weight.float().t()
     if bias is not None:
         y = y + bias.float()
@@ -65,6 +68,18 @@ def gemm_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     if residual_gate is not None:
         y = (y * residual_gate[row_class].float()).to(x.dtype).float()
     return (residual.float() + y).to(x.dtype)
+
+
+def gemm_split(x: torch.Tensor, weight: torch.Tensor, split_size: int, *,
+               row_scale: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """``gemm_epilogue`` split at output column ``split_size``; each result may have any stride.
+
+    ``x [M, K]``, ``weight [N, K]``, optional FP32 ``row_scale [M]`` -> BF16
+    ``([M, split_size], [M, N - split_size])``. The product and row scale are applied in FP32
+    before the same single output rounding as ``gemm_epilogue``. Neither input is modified.
+    """
+    out = gemm_epilogue(x, weight, row_scale=row_scale)
+    return out[:, :split_size], out[:, split_size:]
 
 
 def gemm_glu_epilogue(x: torch.Tensor, weight: torch.Tensor, *, bias: torch.Tensor | None = None,
@@ -123,6 +138,19 @@ def qkv_rope_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
         raise ValueError(f"qkv_rope_epilogue: qk_order must be 'standard' or 'any', got {qk_order!r}")
     y = x.float() @ weight.float().t() + bias.float()
     return rope_qk_heads(y, cos, sin, num_heads, head_dim).to(x.dtype)
+
+
+def qkv_rope_split(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, cos: torch.Tensor,
+                    sin: torch.Tensor, num_heads: int, head_dim: int, *,
+                    qk_order: str = "standard") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``qkv_rope_epilogue`` as three ``[M, H, D]`` tensors, with no prescribed storage strides.
+
+    Inputs, FP32 accumulation and output rounding follow ``qkv_rope_epilogue`` exactly; the
+    projection may write separate Q/K/V planes directly. RoPE tables are immutable while reused
+    across a forward, so a backend may cache their expanded representation for their lifetime.
+    """
+    out = qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+    return out.view(x.shape[0], 3, num_heads, head_dim).unbind(1)
 
 
 def rope_qk_heads(y: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, num_heads: int,
@@ -236,6 +264,9 @@ def qkv_rope_kvcache(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
 
     Returns:
         ``[M, H·D]`` BF16: ``Q``, rotated.
+
+    This reference and CUDA return packed rows. An Ascend fused implementation may return
+    head-major ``[H, M, D]`` instead; model callers distinguish that three-dimensional form.
     """
     y = x.float() @ weight.float().t()
     if bias is not None:
@@ -284,6 +315,10 @@ def qkv_norm_split(packed: torch.Tensor, q_weight: torch.Tensor, k_weight: torch
 def qkv_norm_rope_kvcache(x: torch.Tensor, weight: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
                           cos: torch.Tensor, sin: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                           start: int, num_heads: int, num_kv_heads: int, head_dim: int, eps: float) -> torch.Tensor:
-    """Project normalized rows, normalize and rotate Q/K, append K/V to the head-major cache, and return Q and gate."""
+    """Project rows, normalize/rotate Q/K, append K/V, and return packed ``[M, HD + G]`` Q/gate.
+
+    This reference and CUDA keep packed rows. An Ascend fused implementation may return
+    ``(q[1, H, M, D], gate[1, M, G])`` instead; model callers distinguish the tuple form.
+    """
     return _qk_norm_rope_kvcache(x.float() @ weight.float().t(), x.dtype, q_weight, k_weight, cos, sin, k_cache,
                                  v_cache, start, num_heads, num_kv_heads, head_dim, eps)
