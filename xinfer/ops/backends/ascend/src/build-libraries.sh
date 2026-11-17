@@ -85,7 +85,10 @@ link() {  # link <libname> <out-subdir> <objects...>
 # reaches through the provider. Model-owned knife kernels live in their own
 # libraries below; this core carries only what glue/core dispatch launches.
 gen core norm.rms_apply          rms_apply_rstd_h2048
-gen core norm.rms_consistent     rms_consistent_ubv_h1280 rms_consistent_generic_h1024_f32in
+# The R5 plain-plan kernels (the rms_norm_cast mounts of the 38.82 stack, a22f865): the R5 delivery
+# relinked them into the core out-of-band (r5-probes/r5_rebuild.sh); the tree build carries them
+# in-band so the recipe reproduces the delivered core library alone.
+gen core norm.rms_consistent     rms_consistent_ubv_h1280 rms_consistent_generic_h1024_f32in rms_consistent_ub_h1280 rms_consistent_generic_h1280 rms_consistent_ub_h2048 rms_consistent_generic_h1024
 gen core denoise.denoise_output denoise_input_embed denoise_fp32head_cube denoise_fp32head_prep
 gen core gemm.qkv_bnsdq          gemm_qkv_2b_norm_gate_cache_bnsdq
 gen core gemm.gemm_smallm_action bnsd_o_proj_m768_bf16 smallm_bnsd_o_proj smallm_bnsd_o_proj_m32 smallm_bnsd_o_proj_m64
@@ -96,6 +99,7 @@ gen core norm.qkv_bhsd qkv_split_vec_bhsd_h256
 gen core norm.rope_bhsd rope_half_d64_bhsd
 link libxinfer_ascend_core.so core \
      rms_apply_rstd_h2048 rms_consistent_ubv_h1280 rms_consistent_generic_h1024_f32in \
+     rms_consistent_ub_h1280 rms_consistent_generic_h1280 rms_consistent_ub_h2048 rms_consistent_generic_h1024 \
      denoise_input_embed denoise_fp32head_cube denoise_fp32head_prep \
      gemm_qkv_2b_norm_gate_cache_bnsdq bnsd_o_proj_m768_bf16 \
      smallm_bnsd_o_proj smallm_bnsd_o_proj_m32 smallm_bnsd_o_proj_m64 \
@@ -226,7 +230,7 @@ if compgen -G "$STATIC_SRC_DIR/*.cc" > /dev/null; then
     done
     g++ -shared -o "$WORK/libxinfer_ascend_core.so" \
         "$WORK"/out/static/*.o \
-        "$WORK"/out/core/{rms_apply_rstd_h2048,rms_consistent_ubv_h1280,rms_consistent_generic_h1024_f32in,denoise_input_embed,denoise_fp32head_cube,denoise_fp32head_prep,gemm_qkv_2b_norm_gate_cache_bnsdq,bnsd_o_proj_m768_bf16,smallm_bnsd_o_proj,smallm_bnsd_o_proj_m32,smallm_bnsd_o_proj_m64,gemm_qkv_cache_bias_rope_m16,gemm_qkv_cache_bias_rope_prefill,gemm_qkv_vision_rope_finish,gemm_glu_fp32_finish_split_11008,gemm_glu_fp32_finish_split_6144,qkv_split_vec_bhsd_h256,rope_half_d64_bhsd}.o \
+        "$WORK"/out/core/{rms_apply_rstd_h2048,rms_consistent_ubv_h1280,rms_consistent_generic_h1024_f32in,rms_consistent_ub_h1280,rms_consistent_generic_h1280,rms_consistent_ub_h2048,rms_consistent_generic_h1024,denoise_input_embed,denoise_fp32head_cube,denoise_fp32head_prep,gemm_qkv_2b_norm_gate_cache_bnsdq,bnsd_o_proj_m768_bf16,smallm_bnsd_o_proj,smallm_bnsd_o_proj_m32,smallm_bnsd_o_proj_m64,gemm_qkv_cache_bias_rope_m16,gemm_qkv_cache_bias_rope_prefill,gemm_qkv_vision_rope_finish,gemm_glu_fp32_finish_split_11008,gemm_glu_fp32_finish_split_6144,qkv_split_vec_bhsd_h256,rope_half_d64_bhsd}.o \
         -L"$RUNTIME/lib64" -lascendcl -lopapi -lruntime -lnnopbase \
         -L"$TORCH_LIB" -L"$NPU_LIB_DIR" -lc10 -ltorch_cpu -ltorch_npu
 fi
