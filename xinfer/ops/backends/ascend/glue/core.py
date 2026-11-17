@@ -186,9 +186,13 @@ def gemm_qkv_cache_bias_rope_m16(out, key, value, accumulator, bias, cosine, sin
     """
     lib = _provider.core_library()
     _require(lib is not None, "gemm_qkv_cache: no core library")
-    _require(out.ndim == 2 and tuple(out.shape) == (16, 2048)
-             and out.dtype == torch.bfloat16 and out.is_contiguous(),
-             "M16 QKV epilogue requires a contiguous BF16 [16,2048] output")
+    # The .cc's Prepare contract (gemm_qkv_cache.cc): a packed 2-D [16, 2048] Q
+    # or the r3 BNSD form -- 3-D [16, 16, 128], the head-major [H, M, D] order
+    # the kernel writes so the ACLNN FIA query needs no per-call transpose copy.
+    _require(out.dtype == torch.bfloat16 and out.is_contiguous()
+             and ((out.ndim == 2 and tuple(out.shape) == (16, 2048))
+                  or (out.ndim == 3 and tuple(out.shape) == (16, 16, 128))),
+             "M16 QKV epilogue requires a contiguous BF16 [16,2048] or BNSD [16,16,128] output")
     _require(key.ndim == 3 and value.ndim == 3 and key.shape == value.shape
              and key.is_contiguous() and value.is_contiguous() and start >= 0,
              "M16 QKV epilogue requires dense matching head-major caches")
@@ -197,6 +201,8 @@ def gemm_qkv_cache_bias_rope_m16(out, key, value, accumulator, bias, cosine, sin
              "M16 QKV epilogue requires an FP32 [16,2560] accumulator")
     _require(bias.ndim == 1 and tuple(bias.shape) == (2560,) and bias.dtype == torch.bfloat16,
              "M16 QKV epilogue requires a BF16 [2560] bias")
+    _require(key.shape[1] >= 16 and start <= key.shape[1] - 16,
+             "M16 QKV cache start + 16 exceeds capacity")
     for table in (cosine, sine):
         _require(table.ndim == 2 and tuple(table.shape) == (16, 64)
                  and table.dtype == torch.float32 and table.is_contiguous(),
@@ -212,9 +218,14 @@ def gemm_qkv_cache_bias_rope_prefill(out, key, value, accumulator, bias, cosine,
     _require(lib is not None, "gemm_qkv_cache: no core library")
     rows = accumulator.shape[0]
     _require(rows % 4 == 0 and rows > 0, "prefill QKV epilogue requires rows % 4 == 0")
-    _require(out.ndim == 2 and out.shape[0] == rows and out.shape[1] == 2048
-             and out.dtype == torch.bfloat16 and out.is_contiguous(),
-             "prefill QKV epilogue requires a contiguous BF16 [rows,2048] output")
+    # The .cc's Prepare contract: a packed [rows, 2048] Q or the r7 BNSD form --
+    # 3-D [16, rows, 128], the head-major layout the prefill causal attention
+    # consumes (the callers have allocated this form since the walloss r7).
+    _require(out.dtype == torch.bfloat16 and out.is_contiguous()
+             and ((out.ndim == 2 and out.shape[0] == rows and out.shape[1] == 2048)
+                  or (out.ndim == 3 and out.shape[0] == 16 and out.shape[1] == rows
+                      and out.shape[2] == 128)),
+             "prefill QKV epilogue requires a contiguous BF16 [rows,2048] or BNSD [16,rows,128] output")
     _require(key.ndim == 3 and value.ndim == 3 and key.shape == value.shape
              and key.is_contiguous() and value.is_contiguous() and start >= 0,
              "prefill QKV epilogue requires dense matching head-major caches")
@@ -223,6 +234,8 @@ def gemm_qkv_cache_bias_rope_prefill(out, key, value, accumulator, bias, cosine,
              "prefill QKV epilogue requires an FP32 [rows,2560] accumulator")
     _require(bias.ndim == 1 and tuple(bias.shape) == (2560,) and bias.dtype == torch.bfloat16,
              "prefill QKV epilogue requires a BF16 [2560] bias")
+    _require(key.shape[1] >= rows and start <= key.shape[1] - rows,
+             "prefill QKV cache start + rows exceeds capacity")
     for table in (cosine, sine):
         _require(table.ndim == 2 and table.shape[0] == rows and table.shape[1] == 64
                  and table.dtype == torch.float32 and table.is_contiguous(),
@@ -230,6 +243,28 @@ def gemm_qkv_cache_bias_rope_prefill(out, key, value, accumulator, bias, cosine,
     _launch(lib, "gemm_qkv_cache_bias_rope_prefill",
             (out, key, value, accumulator, bias, cosine, sine),
             (key.shape[1], start, rows))
+
+
+def action_qkv_gemm_norm_rope(output, input, weight, bias, q_weight, k_weight,
+                              cosine, sine, rotary, epsilon):
+    """The merged M16 cache-append entry (the v22 ``ActionQkvGemmNormRope``).
+
+    The walloss r5 form: an FP32 ``input`` marks the M16 cache-append route --
+    the input slot carries the FP32 [16, 2560] CANN projection accumulator,
+    ``q_weight``/``k_weight`` the head-major K/V caches, the ``rotary`` slot
+    the cache start row (768 lies outside the NV rotary range) and ``weight``
+    the projection weight already consumed into the accumulator (not re-read).
+    ``epsilon`` carries no norm (0). This is the same launch the m16 finish
+    serves (the v22 merged that export into this entry to hold the FFI surface
+    at the NV subset); the BF16-input NV form is not carried by the unified
+    core, so it raises here exactly like a build without the bridge would.
+    """
+    lib = _provider.core_library()
+    _require(lib is not None, "gemm_qkv_cache: no core library")
+    _require(isinstance(input, torch.Tensor) and input.dtype == torch.float32,
+             "action_qkv_gemm_norm_rope: the unified core carries the FP32 M16 cache-append form only")
+    gemm_qkv_cache_bias_rope_m16(output, q_weight, k_weight, input, bias, cosine, sine,
+                                 int(rotary))
 
 
 def gemm_qkv_vision_rope_finish(out, accumulator, bias, cosine, sine):
@@ -651,6 +686,7 @@ _EXPORTS = {
     "Rope": _CarriedRope,
     "gemm_qkv_cache_bias_rope_m16": gemm_qkv_cache_bias_rope_m16,
     "gemm_qkv_cache_bias_rope_prefill": gemm_qkv_cache_bias_rope_prefill,
+    "action_qkv_gemm_norm_rope": action_qkv_gemm_norm_rope,
     "gemm_qkv_vision_rope_finish": gemm_qkv_vision_rope_finish,
     "gdr_cann_chunk_workspace_size": gdr_cann_chunk_workspace_size,
     "gdr_cann_chunk": gdr_cann_chunk,
