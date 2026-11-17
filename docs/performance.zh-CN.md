@@ -18,7 +18,7 @@
 
 ## 条件
 
-第 1、2 行：RTX 5090（SM120），torch 2.10.0+cu130，flash-attn 2.8.3.post1，xcompute `7336b0d`（`layout="kn"`），于 2026-11-13 测量，GPU 上没有其他任务。第 3 行：Jetson AGX Thor（SM110，JetPack 7，功耗模式 MAXN），torch 2.10.0+cu130，flash-attn 2.8.3，为 SM110 编译的 xcompute `c0d03ca`，于 2026-11-13 测量，GPU 上没有其他任务。第 4 行：RTX 5090（SM120），torch 2.10.0+cu130，flash-attn 2.8.3.post1，带 NVFP4 输入的 xcompute `3a2bee6`（NVFP4 kernel 合入为 `7034bdf` 之前的提交，动作逐位相同），于 2026-11-13 测量，GPU 上没有其他任务。本仓库为 SM110 编译的 CUDA kernel 库（第 3 行）在 Wall-OSS 和 Wall-X 2B 的每次 GEMM 调用上选中 xcompute `main` `f2b553b` 的 kernel，在参考请求上输出逐位相同，单请求 P50 也相同（同一台 Jetson AGX Thor 上交替四轮的中位数：Wall-OSS 97.3 对 97.3 ms，Wall-X 2B 75.1 对 74.2 ms）。
+第 1、2 行：RTX 5090（SM120），torch 2.10.0+cu130，flash-attn 2.8.3.post1，xcompute `7336b0d`（`layout="kn"`），于 2026-11-13 测量，GPU 上没有其他任务。第 3 行：Jetson AGX Thor（SM110，JetPack 7，功耗模式 MAXN），torch 2.10.0+cu130，flash-attn 2.8.3，为 SM110 编译的 xcompute `c0d03ca`，于 2026-11-13 测量，GPU 上没有其他任务。第 4 行：RTX 5090（SM120），torch 2.10.0+cu130，flash-attn 2.8.3.post1，带 NVFP4 输入的 xcompute `3a2bee6`（NVFP4 kernel 合入为 `7034bdf` 之前的提交，动作逐位相同），于 2026-11-13 测量，GPU 上没有其他任务。本仓库编译的 CUDA kernel 库给出的第 1、2、4 行输出逐位相同（对照包含这些构建所用 kernel 的 xcompute `main` `f43f778`，在各模型的参考请求上），单请求 P50 也相同（同一块 RTX 5090 上交替三轮的中位数：Wall-OSS 46.5 对 46.4 ms，Wall-X 2B 20.5 对 20.5 ms，Wall-X 2B NVFP4 13.7 对 13.7 ms）。为 SM110 编译时（第 3 行），它在两个模型的每次 GEMM 调用上选中 xcompute `main` `f2b553b` 的 kernel，在参考请求上输出逐位相同，单请求 P50 也相同（同一台 Jetson AGX Thor 上交替四轮的中位数：Wall-OSS 97.3 对 97.3 ms，Wall-X 2B 75.1 对 74.2 ms）。
 
 | # | 模型选项 | 单请求输入集 | 压测负载 | 服务预热 | 验证 |
 |---|---|---|---|---|---|

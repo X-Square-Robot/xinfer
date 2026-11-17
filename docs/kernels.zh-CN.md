@@ -10,7 +10,7 @@ Wall-OSS 和 Wall-X 2B 的默认组合在 CUDA 上使用融合算子。它们的
 
 kernel 库针对一种 GPU 架构编译，只在这种架构上注册算子。本仓库有 SM120（RTX 50 系列）和 SM110（Jetson Thor）的 kernel。
 
-GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`、`gemm_sm110.py`）：在 RTX 5090 上是实测不慢于 cuBLASLt 路径的行数区间；在 Jetson AGX Thor 上是连续三个或更多扫描点都快至少 5% 的行数区间，即测得[性能表](performance.zh-CN.md)数据时所用 xcompute 构建的选路，本库在参考请求上的输出与该构建逐位相同。在 SM110 上本库覆盖 Wall-OSS 和 Wall-X 2B 的 BF16 计算组合。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
+GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`、`gemm_sm110.py`）：在 RTX 5090 或 Jetson AGX Thor 上连续三个或更多扫描点都比 cuBLASLt 路径快至少 5% 的行数区间。这就是测得[性能表](performance.zh-CN.md)数据时所用 xcompute 构建的选路；在两种 GPU 上，本库在参考请求上的输出都与那些构建逐位相同。本库在 SM120 上覆盖 Wall-OSS 和 Wall-X 2B 的 BF16、MXFP8 和 NVFP4 计算组合，在 SM110 上覆盖它们的 BF16 计算组合。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
 
 ## 编译
 
@@ -32,7 +32,7 @@ xinfer-serve --model wall_oss --checkpoint /path/to/checkpoint --device cuda \
   --warmup observation.msgpack --port 33985
 ```
 
-XInfer 从自己的包目录加载 `xinfer_kernels.so`。设置 `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` 时改为加载在别处用同一份源码编译的库。`XINFER_KERNELS=0` 关闭这个后端。同样的环境变量也适用于 `Policy`、测试和 benchmark。
+XInfer 从自己的包目录加载 `xinfer_kernels.so`。设置 `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` 时改为加载在别处用同一份源码编译的库。`XINFER_KERNELS=0` 关闭这个后端（`XINFER_XCOMPUTE=0` 只作用于昇腾后端的 xcompute）。同样的环境变量也适用于 `Policy`、测试和 benchmark。加载不了的库（用别的 CUDA 版本编译或与驱动不匹配）会记一条警告，算子改用 torch 参考实现；由 `XINFER_KERNELS_LIBRARY` 指定的库加载失败则直接报错。库比 `xinfer/ops/backends/cuda/src` 里的某个文件旧（拉取了新源码但没重新编译）时照常加载，并警告需要重新编译。kernel 运行在 PyTorch 的当前 stream 上，由 `apache-tvm-ffi` 0.1.9 至 0.1.x 随张量传入。
 
 ## 检查
 

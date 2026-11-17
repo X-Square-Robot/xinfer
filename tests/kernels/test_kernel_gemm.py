@@ -5,7 +5,8 @@ import torch.nn.functional as F
 
 from xinfer.ops.backends.cuda import _native, gemm
 from xinfer.ops.layout import mxfp8 as layout
-from conftest import MXFP8_TOLERANCE, close, dequantize, sm
+from xinfer.ops.layout import nvfp4 as nvfp4_layout
+from conftest import MXFP8_TOLERANCE, NVFP4_TOLERANCE, close, dequantize, sm
 
 ACT = {None: lambda y: y, "silu": F.silu, "gelu": F.gelu, "gelu_tanh": lambda y: F.gelu(y, approximate="tanh")}
 
@@ -22,6 +23,39 @@ def tuned_calls():
 
 def fp32(t):
     return dequantize(t) if isinstance(t, tuple) else t.float()
+
+
+def fmt(cls):
+    """The operand format of a kernel: "bf16", "mxfp8" or "nvfp4"."""
+    return getattr(cls, "FORMAT", "mxfp8" if "mxfp8" in getattr(cls, "FEATURES", ()) else "bf16")
+
+
+def operands(fmt_, x, weight):
+    """BF16 ``x`` and ``weight`` in the format: MXFP8 pairs, or an NVFP4 pair and an NVFP4 weight triple with MSE
+    block scales under its global scale (the prompt-stream recipe of Wall-X 2B)."""
+    if fmt_ == "mxfp8":
+        return gemm.quantize_mxfp8(x), gemm.quantize_mxfp8(weight)
+    if fmt_ == "nvfp4":
+        g = weight.float().abs().amax().item() / (448 * 6)
+        return gemm.quantize_nvfp4(x), (*gemm.quantize_nvfp4(weight, global_scale=g, mse=True), g)
+    return x, weight
+
+
+def like(x, t):
+    """BF16 ``t`` in the format of the operand ``x``."""
+    if not isinstance(x, tuple):
+        return t
+    return gemm.quantize_mxfp8(t) if x[0].dtype == torch.float8_e4m3fn else gemm.quantize_nvfp4(t)
+
+
+def parts(t):
+    """A BF16 tensor, or the values and the scales (without their padding) of an MXFP8 or NVFP4 pair."""
+    if not isinstance(t, tuple):
+        return (t,)
+    if t[0].dtype == torch.uint8:
+        rows, k = t[0].shape[0], 2 * t[0].shape[1]
+        return t[0], t[1].view(torch.uint8)[nvfp4_layout.scale_offsets(rows, k, t[0].device)][:, : k // 16]
+    return t[0], t[1][layout.scale_offsets(*t[0].shape, t[0].device)]
 
 
 def reference(op, x, weight, bias, activation, residual=None, row_scale=None, quantize=False):
@@ -42,9 +76,9 @@ def arguments(op, cls, m, n, k, rnd):
     """Inputs with the epilogue ``cls`` implements (found by asking ``takes`` on the candidates): x, weight, bias
     and the keyword arguments."""
     rows = 2 * n if op == "gemm_glu" else n
-    x, weight = rnd(m, k), rnd(rows, k, scale=0.05)
-    if "mxfp8" in getattr(cls, "FEATURES", ()):
-        x, weight = gemm.quantize_mxfp8(x), gemm.quantize_mxfp8(weight)
+    x, weight = operands(fmt(cls), rnd(m, k), rnd(rows, k, scale=0.05))
+    if getattr(cls, "LAYOUT", None) == "kn":  # a kernel that takes weights stored [K, N]
+        weight = weight.t().contiguous().t()
     for bias in (None, rnd(rows)):
         for activation in (("silu",) if op == "gemm_glu" else (None, "gelu", "gelu_tanh")):
             extras = ({},) if op == "gemm_glu" or activation else \
@@ -58,7 +92,9 @@ def arguments(op, cls, m, n, k, rnd):
 
 
 def tolerance(cls, quantized):
-    return MXFP8_TOLERANCE if quantized else getattr(cls, "TOLERANCE", 5e-3)
+    if quantized:
+        return NVFP4_TOLERANCE if fmt(cls) == "nvfp4" else MXFP8_TOLERANCE
+    return getattr(cls, "TOLERANCE", 5e-3)
 
 
 @pytest.mark.parametrize("op,cls,m,n,k", list(tuned_calls()))
@@ -69,10 +105,12 @@ def test_kernel_matches_reference_and_generic(op, cls, m, n, k, rnd):
     quantized = kw.get("quantize", False)
     assert close(fp32(out), reference(op, x, weight, bias, **kw), tolerance(cls, quantized))
     # the generic path on the same call: the same value up to rounding (it rounds the GEMM result to BF16 before
-    # the epilogue, a fused kernel rounds once)
+    # the epilogue, a fused kernel rounds once); the NVFP4 kernel rounds as the generic path does: the same bits
     call = gemm._call(op, x, weight, bias, kw["activation"], kw.get("residual"), kw.get("row_scale"), quantized)
     generic = gemm._out(None, (m, n), call)
     (gemm._generic_glu if op == "gemm_glu" else gemm._generic_gemm)(call, generic)
+    if fmt(cls) == "nvfp4":
+        assert all(torch.equal(a, b) for a, b in zip(parts(out), parts(generic)))
     assert close(fp32(out), fp32(generic), tolerance(cls, quantized))
     if isinstance(x, tuple):
         return
@@ -94,7 +132,7 @@ def test_outside_the_tuned_range_runs_generic(op, cls, m, n, k, rnd):
         if rows >= 1 and not any(lo <= rows <= hi for lo, hi in ranges):
             other = dict(kw, **{name: rnd(rows, n) if name == "residual" else row_scale(rows, rnd)
                                 for name in ("residual", "row_scale") if name in kw})
-            shorter = gemm.quantize_mxfp8(rnd(rows, k)) if isinstance(x, tuple) else rnd(rows, k)
+            shorter = like(x, rnd(rows, k))
             assert gemm.kernel_name(op, shorter, weight, bias, **other) != cls.__name__
 
 
@@ -159,11 +197,6 @@ def test_repeat_calls_are_bitwise_equal_and_replay_in_a_cuda_graph(rnd):
         x, weight, bias, kw = arguments(op, cls, m, n, k, rnd)
         entry = getattr(gemm, op)
 
-        def parts(t):  # a BF16 tensor, or the values and the scales (without their padding) of an MXFP8 pair
-            if not isinstance(t, tuple):
-                return (t,)
-            return t[0], t[1][layout.scale_offsets(*t[0].shape, t[0].device)]
-
         def same(a, b):
             return torch.equal(a, b) if getattr(cls, "DETERMINISTIC", True) else close(a, b, tolerance(cls, False))
 
@@ -175,7 +208,7 @@ def test_repeat_calls_are_bitwise_equal_and_replay_in_a_cuda_graph(rnd):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             entry(x, weight, bias, out=out, **kw)
-        x2 = gemm.quantize_mxfp8(rnd(m, k)) if isinstance(x, tuple) else rnd(m, k)
+        x2 = like(x, rnd(m, k))
         expected = entry(x2, weight, bias, **kw)
         for old, new in zip(x if isinstance(x, tuple) else (x,), x2 if isinstance(x2, tuple) else (x2,)):
             old.copy_(new)

@@ -58,7 +58,7 @@ checkpoint 加载完成后，`process_weights(model)` 在权重被共享或 grap
 
 GEMM 始终是输出 BF16 的 `nvfp4_gemm`。其余部分都在该输出上运行普通组合：残差加法、`QKVLinear` 的 eager rotary，以及 `GatedLinear` 的 `silu_and_mul`。权重行保持 checkpoint 中的顺序。该服务在 down 投影的输入量化中计算 expert-0 的门控激活，对应 `GatedMLP(act_fused_into="down")`。
 
-Wall-X 2B 的各阶段不经线性层，直接调用 xcompute GEMM 系列的 NVFP4 形式。激活是 `(q, scales)`，权重是
+Wall-X 2B 的各阶段不经线性层，直接调用 GEMM 入口的 NVFP4 形式。激活是 `(q, scales)`，权重是
 `(q, scales, global_scale)`。GEMM 把 `g · x̂·Ŵᵀ + bias` 舍入一次到 BF16，epilogue 在这个 BF16 张量上计算后再舍入一次；
 量化输出是最终 BF16 张量的 `nvfp4_quantize`。所以每个 NVFP4 GEMM 的输入都是按激活方案量化的 BF16 张量：
 
@@ -102,13 +102,13 @@ Wall-X 2B 的各阶段不经线性层，直接调用 xcompute GEMM 系列的 NVF
 
 ## 后端
 
-PyTorch 提供 MXFP8 和 NVFP4 的参考算子。在 CUDA（SM120）上，kernel 库可以加速 Wall-X 2B 的 MXFP8 预设；NVFP4 预设运行参考算子。编译和所选算子的检查方法见 [kernel 指南](kernels.zh-CN.md)。
+PyTorch 提供 MXFP8 和 NVFP4 的参考算子。在 CUDA（SM120）上，kernel 库可以加速 Wall-X 2B 的 MXFP8 和 NVFP4 预设。它的 NVFP4 量化器按 Wall-X kernel 的方式做除法（`a · rcp.approx(b)`），所以在舍入的平局处可能与参考实现不同（随机 BF16 输入中约 0.05 % 的元素）。编译和所选算子的检查方法见 [kernel 指南](kernels.zh-CN.md)。
 
 ## 测试
 
 | 测试 | 检查内容 |
 |---|---|
 | `tests/unit/test_mxfp8.py` | 参考格式、误差界和融合参考实现（CPU）；可融合形式：BF16 与 eager 组合逐位一致，MXFP8 贴近 BF16（CPU） |
-| `tests/unit/test_nvfp4.py` | 参考格式对照手算的编码和缩放因子、MSE 缩放值搜索、融合参考实现、GEMM epilogue（CPU）；`nvfp4` 和 `nvfp4_mse` 层及其可融合形式（CPU）；GEMM 系列形式对照其定义（CPU）；参考 GEMM 对比 `torch._scaled_mm` NVFP4，即 Wall-X 服务在没有 CUTLASS kernel 的形状上所用的 GEMM（GPU，sm100 或更新）；xcompute 的 NVFP4 算子在 Wall-X 2B 的形状上对照参考实现（GPU） |
+| `tests/unit/test_nvfp4.py` | 参考格式对照手算的编码和缩放因子、MSE 缩放值搜索、融合参考实现、GEMM epilogue（CPU）；`nvfp4` 和 `nvfp4_mse` 层及其可融合形式（CPU）；GEMM 系列形式对照其定义（CPU）；参考 GEMM 对比 `torch._scaled_mm` NVFP4，即 Wall-X 服务在没有 CUTLASS kernel 的形状上所用的 GEMM（GPU，sm100 或更新）；CUDA kernel 的 NVFP4 算子在 Wall-X 2B 的形状上对照参考实现（GPU） |
 
 量化改动按[精度](precision.zh-CN.md)中的方式检查：与参考组合的一致性，以及内部精度门禁。

@@ -31,7 +31,7 @@ gpu-image = [
 # The CUDA kernel library (xinfer/ops/backends/cuda/src) is called through TVM-FFI; building it also needs CMake, the
 # CUDA toolkit and the CUTLASS submodule (docs/kernels.md).
 kernels = [
-    "apache-tvm-ffi>=0.1",
+    "apache-tvm-ffi>=0.1.9,<0.2",
 ]
 serve = [
     "websockets>=12",

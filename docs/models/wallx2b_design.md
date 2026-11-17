@@ -24,7 +24,7 @@ BF16 is the default. With the optimized composition, `quantization="mxfp8"` conv
 | Prefill | The prompt's full-attention and DeltaNet projections and its MLP projections use MXFP8 operands. The prompt KV cache remains BF16. |
 | Action | The action expert uses its original computation and consumes the prompt KV cache. |
 
-To enable only prefill, pass `quantization={"groups":{"prefill":"mxfp8"}}` to `Policy`. Use the group `vision` for vision only. The preset requires `numerics="optimized"`. The native path requires SM120 and an xcompute build with MXFP8 GEMM and quantized norm kernels. xcompute selects a specialized or generic block-scaled kernel for each projection. Other devices and older builds use the PyTorch MXFP8 operators. Use `Policy.describe()["ops"]` to check the selected implementations, including `mxfp8_gemm_epilogue` and `mxfp8_gemm_glu_quantize`. The [quantization guide](../quantization.md) describes the E4M3 values and scale layout.
+To enable only prefill, pass `quantization={"groups":{"prefill":"mxfp8"}}` to `Policy`. Use the group `vision` for vision only. The preset requires `numerics="optimized"`. The native path requires SM120 and the CUDA kernel library ([kernels](../kernels.md)), which selects a specialized or generic block-scaled kernel for each projection. Other devices use the PyTorch MXFP8 operators. Use `Policy.describe()["ops"]` to check the selected implementations, including `mxfp8_gemm_epilogue` and `mxfp8_gemm_glu_quantize`. The [quantization guide](../quantization.md) describes the E4M3 values and scale layout.
 
 ## NVFP4
 
@@ -42,10 +42,10 @@ write it directly.
 | Action | The action expert uses its original computation and consumes the prompt KV cache. |
 
 The groups also take `nvfp4` and `nvfp4_mse` separately, for example `quantization={"groups":{"prefill":"nvfp4_mse"}}`.
-The preset requires `numerics="optimized"`. The native path requires SM120 and an xcompute build with NVFP4 inputs:
-xcompute runs the projections with a residual, the prompt projections and the vision fc1 with its quantized output in
-its CUTLASS NVFP4 kernels, and the QKV with RoPE and the gate/up projection on its generic block-scaled path, with the
-same values. Other devices and builds without NVFP4 use the PyTorch NVFP4 operators. Use `Policy.describe()["ops"]`
+The preset requires `numerics="optimized"`. The native path requires SM120 and the CUDA kernel library: it runs the
+projections with a residual, the prompt projections and the vision fc1 with its quantized output in its CUTLASS NVFP4
+kernel, and the QKV with RoPE and the gate/up projection on its generic block-scaled path, with the same values.
+Other devices use the PyTorch NVFP4 operators. Use `Policy.describe()["ops"]`
 to check `nvfp4_gemm_epilogue` and the other `nvfp4_*` operators. The [quantization guide](../quantization.md#nvfp4-format)
 describes the E2M1 values, the scales and the operator forms.
 
@@ -56,7 +56,7 @@ The [small checkpoint tests](../../tests/models/test_wallx2b_tiny.py) compare th
 On an RTX 5090 with xcompute `536ea8f` (which has the MXFP8 GEMM family), MXFP8 measured a single-request P50 of 17.0 ms from serialized request to response in process (`benchmarks/request_latency.py`, GPU image decoding and resizing): 3.4 ms of host input and output processing and 13.6 ms in the engine. BF16 on the same build measured 22.3 ms (3.5 + 18.9). Under robot load (`benchmarks/performance.py`, eight rounds per count, 14–24 robots in steps of two), MXFP8 served 22 robots at a median server P50 / P95 of 76 / 116 ms, and 24 robots took 151 ms. BF16 measured 86 / 103 ms at 14 robots, its capacity on xcompute `7336b0d`, where 15 robots took 170 ms. MXFP8 changes the actions by more than rounding. Assess accuracy on the intended robot task before enabling MXFP8.
 
 For NVFP4 the [operator tests](../../tests/unit/test_nvfp4.py) check the forms against their definitions and, on a GPU with
-a compatible xcompute build, xcompute's NVFP4 operators against the PyTorch operators at Wall-X 2B projection sizes;
+the kernel library, its NVFP4 operators against the PyTorch operators at Wall-X 2B projection sizes;
 the small checkpoint tests run the three stages with `quantization="nvfp4"`. On an RTX 5090 with xcompute `3a2bee6`
 (the NVFP4 kernels before their merge as `7034bdf`, which gives the same actions bit for bit), the stage graphs took
 vision 1.5, prefill 3.1 and action 5.2 ms (9.8 ms; BF16 16.6 ms), and the single-request P50 was 15.2 ms (3.5 + 11.7).

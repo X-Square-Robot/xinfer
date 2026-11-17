@@ -1,9 +1,12 @@
 """The native kernel library of the CUDA backend and the memory its kernels need.
 
 ``xinfer_kernels.so`` is built from ``src/`` with CMake (docs/kernels.md) and loaded through TVM-FFI: ``lib`` is the
-loaded module, or None when it was not built, ``tvm_ffi`` is not installed or ``XINFER_KERNELS=0``; the operators
-registered with ``NATIVE`` then run on other implementations, at the end their torch references.
-``XINFER_KERNELS_LIBRARY`` names a library built elsewhere from the same sources.
+loaded module, or None when it was not built, ``tvm_ffi`` is not installed, it does not load (logged as a warning)
+or ``XINFER_KERNELS=0``; the operators registered with ``NATIVE`` then run on other implementations, at the end their
+torch references. ``XINFER_KERNELS_LIBRARY`` names a library built elsewhere from the same sources; a library given
+that way that does not load is an error. A library older than a file of ``src/`` is loaded with a warning to rebuild
+it. The kernels run on torch's current stream, which TVM-FFI passes with the tensors (``apache-tvm-ffi`` 0.1.9 to
+0.1.x).
 
 Buffers: scratch memory per (device, stream) and tensors derived once from a weight. A CUDA graph keeps the
 addresses it captured, so a buffer never moves once a graph may point at it: growing one while its stream captures
@@ -22,39 +25,65 @@ from pathlib import Path
 import torch
 
 from xinfer.ops.layout import mxfp8 as mxfp8_layout
+from xinfer.ops.layout import nvfp4 as nvfp4_layout
 
 logger = logging.getLogger(__name__)
 
 ENV = "XINFER_KERNELS_LIBRARY"
 
 
+SOURCES = Path(__file__).with_name("src")
+
+
+def _stale(path):
+    """Whether a file of ``src/`` (when the sources are there) is newer than the library at ``path``."""
+    if not SOURCES.is_dir():
+        return False
+    built = path.stat().st_mtime
+    return any(f.is_file() and f.stat().st_mtime > built for f in SOURCES.rglob("*"))
+
+
 def _load():
-    """``(module, path)`` of the kernel library, or ``(None, None)`` (the reason is logged).
+    """``(module, path, architectures)`` of the kernel library, or ``(None, None, ())`` (the reason is logged).
 
     Raises:
         FileNotFoundError: ``$XINFER_KERNELS_LIBRARY`` does not exist.
+        RuntimeError: the library ``$XINFER_KERNELS_LIBRARY`` names does not load.
     """
     if os.environ.get("XINFER_KERNELS", "1") == "0":
-        return None, None
+        return None, None, ()
     explicit = os.environ.get(ENV)
     path = Path(explicit) if explicit else Path(__file__).with_name("xinfer_kernels.so")
     if not path.exists():
         if explicit:
             raise FileNotFoundError(f"{ENV}={explicit} does not exist")
         logger.info("the CUDA kernel library is not built (%s): docs/kernels.md", path)
-        return None, None
+        return None, None, ()
     try:
         import tvm_ffi
     except ImportError:
+        if explicit:
+            raise
         logger.info("the CUDA kernel library needs the apache-tvm-ffi package: docs/kernels.md")
-        return None, None
-    return tvm_ffi.load_module(str(path)), str(path.resolve())
+        return None, None, ()
+    try:
+        module = tvm_ffi.load_module(str(path))
+        archs = tuple(int(a) for a in str(module.build_target_archs()).split(",") if a.isdigit())
+    except Exception as error:  # a library of another toolkit, driver or source revision
+        if explicit:
+            raise RuntimeError(f"{ENV}={explicit} does not load: {error}") from error
+        logger.warning("the CUDA kernel library %s does not load (%s); the CUDA operators run on their torch "
+                       "references. Rebuild it: docs/kernels.md", path, error)
+        return None, None, ()
+    if not explicit and _stale(path):
+        logger.warning("the CUDA kernel library %s is older than its sources (%s): rebuild it, docs/kernels.md",
+                       path, SOURCES)
+    return module, str(path.resolve()), archs
 
 
-lib, LIBRARY_PATH = _load()
 # Architectures the library was built for, e.g. (120,): kernels of other architectures are not in it. A library of
 # another device family (it reports no compute capability) registers nothing here.
-BUILD_ARCHS = () if lib is None else tuple(int(a) for a in str(lib.build_target_archs()).split(",") if a.isdigit())
+lib, LIBRARY_PATH, BUILD_ARCHS = _load()
 if not BUILD_ARCHS:
     lib = None
 # ``register`` arguments of every operator that calls the library
@@ -97,6 +126,12 @@ def empty_mxfp8(rows, columns, device):
     """An uninitialized MXFP8 pair ``(E4M3 values [rows, columns], uint8 scales)``."""
     return (torch.empty((rows, columns), dtype=torch.float8_e4m3fn, device=device),
             torch.empty(mxfp8_layout.scale_elements(rows, columns), dtype=torch.uint8, device=device))
+
+
+def empty_nvfp4(rows, columns, device):
+    """An uninitialized NVFP4 pair ``(packed E2M1 uint8 [rows, columns / 2], E4M3 scales)``."""
+    return (torch.empty((rows, columns // 2), dtype=torch.uint8, device=device),
+            torch.empty(nvfp4_layout.scale_elements(rows, columns), dtype=torch.float8_e4m3fn, device=device))
 
 
 _scratch = {}  # (name, device index, stream) -> uint8 tensor

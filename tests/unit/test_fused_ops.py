@@ -135,6 +135,8 @@ def _fake_package(monkeypatch, tmp_path):
 MXFP8 = ("mxfp8_quantize", "mxfp8_layer_norm_quantize", "mxfp8_zero_centered_rms_norm_quantize",
          "mxfp8_add_zero_centered_rms_norm_quantize", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
          "mxfp8_qkv_rope_epilogue")
+NVFP4 = ("nvfp4_quantize", "nvfp4_gemm", "nvfp4_gemm_epilogue", "nvfp4_gemm_glu_quantize", "nvfp4_qkv_rope_epilogue",
+         "nvfp4_layer_norm_quantize", "nvfp4_add_zero_centered_rms_norm_quantize")
 FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm",
          "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler")
 WALLX2B = ("layer_norm_cast", "zero_centered_rms_norm", "add_zero_centered_rms_norm", "modulated_rms_norm",
@@ -170,7 +172,7 @@ def test_the_cuda_modules_register_their_operators_when_the_kernel_library_loads
     try:
         registry = registered(dict(requires=library, platforms=("sm120",), version="sha256:0"))
         names = registry.backend_ops("cuda:kernels")
-        assert set(names) == set(FUSED) | set(WALLX2B) | set(MXFP8) | set(PREFETCH)
+        assert set(names) == set(FUSED) | set(WALLX2B) | set(MXFP8) | set(NVFP4) | set(PREFETCH)
         # Filter by implementation: the Ascend backend registers some of the same operators after the CUDA modules.
         assert {i.platforms for name in names for i in registry.implementations(name)
                 if i.name == "cuda:kernels"} == {("sm120",)}
@@ -219,6 +221,61 @@ def test_xinfer_xcompute_0_skips_xcompute(monkeypatch):
     monkeypatch.setattr(_xcompute, "_package_library", lambda: calls.append(True))
     monkeypatch.setenv("XINFER_XCOMPUTE", "0")
     assert _xcompute._import() is None and calls == []
+
+
+def _fake_tvm_ffi(monkeypatch, load_module):
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "tvm_ffi", types.SimpleNamespace(load_module=load_module))
+
+
+def test_a_kernel_library_that_does_not_load_leaves_the_references(monkeypatch, tmp_path, caplog):
+    """A built library of another toolkit or driver: a warning and no library (the CUDA operators run on their
+    references) instead of a failed import, unless XINFER_KERNELS_LIBRARY names it."""
+    from xinfer.ops.backends.cuda import _native
+
+    def fail(path):
+        raise OSError("undefined symbol")
+
+    _fake_tvm_ffi(monkeypatch, fail)
+    (tmp_path / "xinfer_kernels.so").write_bytes(b"")
+    monkeypatch.setattr(_native, "__file__", str(tmp_path / "_native.py"))
+    monkeypatch.delenv("XINFER_KERNELS_LIBRARY", raising=False)
+    monkeypatch.delenv("XINFER_KERNELS", raising=False)
+    with caplog.at_level("WARNING"):
+        assert _native._load() == (None, None, ())
+    assert "does not load" in caplog.text
+    monkeypatch.setenv("XINFER_KERNELS_LIBRARY", str(tmp_path / "xinfer_kernels.so"))
+    with pytest.raises(RuntimeError, match="does not load"):
+        _native._load()
+
+
+def test_a_kernel_library_older_than_its_sources_loads_with_a_warning(monkeypatch, tmp_path, caplog):
+    import os
+    import types
+
+    from xinfer.ops.backends.cuda import _native
+
+    _fake_tvm_ffi(monkeypatch, lambda path: types.SimpleNamespace(build_target_archs=lambda: "120"))
+    library, source = tmp_path / "xinfer_kernels.so", tmp_path / "src" / "gemm" / "generic.cc"
+    source.parent.mkdir(parents=True)
+    library.write_bytes(b"")
+    source.write_text("")
+    os.utime(library, (1, 1))
+    monkeypatch.setattr(_native, "__file__", str(tmp_path / "_native.py"))
+    monkeypatch.setattr(_native, "SOURCES", tmp_path / "src")
+    monkeypatch.delenv("XINFER_KERNELS_LIBRARY", raising=False)
+    monkeypatch.delenv("XINFER_KERNELS", raising=False)
+    with caplog.at_level("WARNING"):
+        module, path, archs = _native._load()
+    assert archs == (120,) and "older than its sources" in caplog.text
+    caplog.clear()
+    os.utime(library, None)
+    os.utime(source, (1, 1))
+    with caplog.at_level("WARNING"):
+        _native._load()
+    assert "older than its sources" not in caplog.text
 
 
 # --------------------------------------------------------------------------- the kernel library (GPU, RTX 5090)

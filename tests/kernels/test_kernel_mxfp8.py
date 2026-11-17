@@ -73,7 +73,7 @@ def test_qkv_proj_rope(m, table, rnd):
     cos, sin = angles(m, d)
     tables = dict(rope_table=layout.rope_table(cos, sin)) if table else dict(cos=cos, sin=sin)
     name = gemm.kernel_name("qkv_proj_rope", x, weight, bias, num_heads=heads, head_dim=d, **tables)
-    assert name == ("tile_qkv_rope_mxfp8_sm120" if table and 16 <= m <= 2240 else "generic")
+    assert name == ("tile_qkv_rope_mxfp8_sm120" if table and 1 <= m <= 2240 else "generic")
     out = gemm.qkv_proj_rope(x, weight, bias, num_heads=heads, head_dim=d, **tables)
     expected = qkv_reference(dequantize(x), dequantize(weight), bias, cos, sin, heads, heads, d)
     assert close(out, expected)

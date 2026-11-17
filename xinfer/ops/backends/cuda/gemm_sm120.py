@@ -1,10 +1,11 @@
 """GEMM kernels for SM120 (RTX 50 series): the calls each one takes, and how it is launched.
 
 A kernel takes a call when the call has the epilogue the kernel implements and its shape is one the kernel was
-tuned on: ``SHAPES`` maps ``(N, K)`` to the inclusive ranges of ``M`` over which the kernel was measured against
-the generic path at every step of 16 rows, on an RTX 5090, and was not slower (within 1%, the noise of the
-measurement). Any other call runs the generic path. The ranges have gaps because the generic path's time grows in
-steps of M (whole waves of its tiles over the SMs), a kernel's more evenly.
+tuned on: ``SHAPES`` maps ``(N, K)`` to the inclusive ranges of ``M`` over which it was measured at least 5% faster
+than the generic path on an RTX 5090 at three or more consecutive scan points (the selection table of the xcompute
+builds the published measurements used, so the calls run the kernels they ran there). Any other call runs the
+generic path. The ranges have gaps because the generic path's time grows in steps of M (whole waves of its tiles
+over the SMs), a kernel's more evenly.
 
 ``Call.features`` names what a call asks for beyond the BF16 product, e.g. ``{"bias", "gelu"}`` or
 ``{"mxfp8", "bias", "residual"}``.
@@ -15,7 +16,7 @@ from __future__ import annotations
 import torch
 
 from xinfer.ops.backends.cuda._native import derived, kernel, lib, scratch
-from xinfer.ops.backends.cuda.gemm import weight_kn, weight_nk
+from xinfer.ops.backends.cuda.gemm import ACTIVATIONS, weight_kn, weight_nk
 from xinfer.ops.layout import mxfp8 as layout
 
 
@@ -27,13 +28,17 @@ def _tuned(shapes, c):
 class smallm_bf16_sm120:
     """Tensor-core split-K GEMM for a few rows: the CTAs of a cluster each take a slice of K and add their FP32
     sums in a fixed order through distributed shared memory. The split depends on (K, N) only, so a row's result
-    does not depend on M. Reads the weight as ``[K, N]``."""
+    does not depend on M. Takes weights stored ``[K, N]`` (passed as the transposed view), which it reads as they
+    are."""
 
-    SHAPES = {(1024, 2048): [(1, 32)]}
+    SHAPES = {(2560, 1024): [(1, 32)], (1024, 1024): [(1, 32)], (1024, 2048): [(1, 32)], (2048, 1024): [(1, 32)],
+              (4096, 1024): [(2, 32)]}
+    LAYOUT = "kn"
 
     @classmethod
     def takes(cls, c):
-        return c.features <= {"bias"} and _tuned(cls.SHAPES, c)
+        stored_kn = not c.weight.is_contiguous() and c.weight.t().is_contiguous()
+        return stored_kn and c.features <= {"bias"} and _tuned(cls.SHAPES, c)
 
     @staticmethod
     def run(c, out):
@@ -45,12 +50,13 @@ class streamk_bf16_sm120:
     """Stream-K GEMM over all SMs. A tile split between CTAs is finished by the one that owns it, which waits
     only on earlier CTAs; the barriers live in a zeroed buffer the kernel leaves zeroed."""
 
-    SHAPES = {(2048, 2048): [(336, 512), (656, 1152), (1296, 2048)], (2048, 11008): [(648, 800)]}
+    SHAPES = {(2048, 2048): [(352, 512), (648, 1088), (1376, 1920)],
+              (2048, 11008): [(480, 576), (648, 800), (928, 1088), (1376, 2048)]}
     FEATURES = frozenset()
 
     @classmethod
     def takes(cls, c):
-        return c.features == cls.FEATURES and _tuned(cls.SHAPES, c)
+        return c.features <= cls.FEATURES and _tuned(cls.SHAPES, c)
 
     @staticmethod
     def run(c, out):
@@ -63,9 +69,9 @@ class streamk_bf16_sm120:
 
 @kernel("gemm", 120)
 class streamk_residual_bf16_sm120(streamk_bf16_sm120):
-    """The same kernel with the bias and a BF16 residual added in its epilogue (one rounding of the sum)."""
+    """The same kernel where a bias and a BF16 residual may be added in its epilogue (one rounding of the sum)."""
 
-    SHAPES = {(1024, 4096): [(352, 1152), (1360, 2048)]}
+    SHAPES = {(1024, 4096): [(512, 1600)]}
     FEATURES = frozenset({"bias", "residual"})
 
 
@@ -75,7 +81,7 @@ class interleaved_streamk_gelu_bf16_sm120:
     into the main loop of the next one. A tile spans at most two CTAs; its owner merges the other's FP32 partial
     sum after a bounded wait, with a wait-free fallback in the same summation order."""
 
-    SHAPES = {(4096, 1024): [(656, 4096)]}
+    SHAPES = {(4096, 1024): [(704, 4096)]}
 
     @classmethod
     def takes(cls, c):
@@ -95,7 +101,7 @@ class tma_tile_bf16_sm120:
     """GEMM + bias + exact GELU on 80 x 128 output tiles, one CTA per tile, operands loaded with TMA: no
     workspace and no synchronisation between CTAs."""
 
-    SHAPES = {(5120, 5120): [(520, 640)]}
+    SHAPES = {(5120, 5120): [(520, 640), (800, 960), (1120, 1184), (1280, 1344), (1888, 1984)]}
 
     @classmethod
     def takes(cls, c):
@@ -112,7 +118,7 @@ class tma_streamk_glu_bf16_sm120:
     tiles are merged after a bounded wait (with a wait-free fallback in the same summation order, so the result
     is deterministic)."""
 
-    SHAPES = {(11008, 2048): [(528, 2016)], (6144, 2048): [(464, 480), (528, 1760), (1808, 2032)]}
+    SHAPES = {(11008, 2048): [(160, 288), (416, 2016)], (6144, 2048): [(416, 608), (928, 1248), (1376, 2016)]}
 
     @classmethod
     def takes(cls, c):
@@ -132,7 +138,7 @@ class gateup_silu:
     """CUTLASS gate/up GEMM with SiLU(gate) * up in the epilogue. Reads the weight as ``[K, 2 N]`` with the gate
     and up columns of one output adjacent."""
 
-    SHAPES = {(2048, 1024): [(1, 256)]}
+    SHAPES = {(2048, 1024): [(1, 1024)]}
 
     @classmethod
     def takes(cls, c):
@@ -207,7 +213,7 @@ class tile_gelu_quantize_mxfp8_sm120(_tile_mxfp8_sm120):
     """GEMM + bias + tanh GELU on 256-column tiles, the result written as MXFP8 with one scale per 128 columns
     (K up to 1024)."""
 
-    SHAPES = {(4096, 1024): [(16, 1600)]}
+    SHAPES = {(4096, 1024): [(1, 1600)]}
     FEATURES = frozenset({"mxfp8", "bias", "gelu_tanh", "quantize"})
 
     @classmethod
@@ -220,7 +226,7 @@ class tile_residual_mxfp8_sm120(_tile_mxfp8_sm120):
     """GEMM + bias + BF16 residual on 128-column tiles, BF16 result with the bits of the generic path
     (``bf16(bf16(product + bias) + residual)``)."""
 
-    SHAPES = {(1024, 1024): [(16, 3360)], (1024, 4096): [(16, 3360)]}
+    SHAPES = {(1024, 1024): [(1, 3360)], (1024, 4096): [(1, 3360)]}
     FEATURES = frozenset({"mxfp8", "bias", "residual"})
     RESIDUAL = True
 
@@ -234,7 +240,7 @@ class tile_qkv_rope_mxfp8_sm120(_tile_mxfp8_sm120):
     """The Q | K | V GEMM + bias with rotate-half RoPE on Q and K in the epilogue, for heads of 64 rotated over
     all their dims with a packed table; BF16 result with the bits of the generic path."""
 
-    SHAPES = {(3072, 1024): [(16, 2240)]}
+    SHAPES = {(3072, 1024): [(1, 2240)]}
     FEATURES = frozenset({"mxfp8", "bias"})
 
     @classmethod
@@ -248,3 +254,45 @@ class tile_qkv_rope_mxfp8_sm120(_tile_mxfp8_sm120):
         rope_columns = (c.rope[0] + c.rope[1]) * 64
         lib.tile_mxfp8_qkv_rope_sm120(out, c.x, c.x_scale, cls.weight(c, rope_columns), c.bias, c.rope[4],
                                       rope_columns)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 operands
+# ---------------------------------------------------------------------------
+@kernel("gemm", 120)
+class cutlass_nvfp4_sm120:
+    """CUTLASS block-scaled NVFP4 GEMM (no split-K) with the global scale and the bias on the FP32 accumulator,
+    rounded to BF16, then in the same kernel a BF16 residual added after that rounding, or a GELU and the NVFP4
+    output: the generic path's result bit for bit. The kernel picks its tile from the shape and the SM count.
+
+    ``ENTRIES``: the calls taken, as (features, whether a bias may be added to them, ``(N, K)`` -> ranges of M).
+    """
+
+    ENTRIES = (
+        (frozenset({"nvfp4"}), False, {(512, 2048): [(1, 1280)], (2048, 2048): [(1, 832), (960, 1152), (1408, 2048)],
+                                       (2048, 6144): [(1, 512), (1408, 2048)], (4096, 2048): [(64, 512), (704, 1280)],
+                                       (6144, 2048): [(96, 256), (448, 768)]}),
+        (frozenset({"nvfp4", "bias"}), False, {(2048, 4096): [(1, 640), (1408, 2048)]}),
+        (frozenset({"nvfp4", "residual"}), True, {(1024, 1024): [(1, 2048)], (1024, 4096): [(1, 2048)]}),
+        (frozenset({"nvfp4", "gelu_tanh", "quantize"}), True, {(4096, 1024): [(1, 2048)]}),
+        (frozenset({"nvfp4", "gelu", "quantize"}), True, {(4096, 4096): [(64, 1920)]}),
+    )
+
+    FORMAT = "nvfp4"
+    SHAPES = {shape: ranges for _, _, shapes in ENTRIES for shape, ranges in shapes.items()}
+
+    @classmethod
+    def takes(cls, c):
+        return any((c.features == features or bias and c.features == features | {"bias"}) and _tuned(shapes, c)
+                   for features, bias, shapes in cls.ENTRIES)
+
+    @staticmethod
+    def run(c, out):
+        # the kernel reads the bias and the residual 16 bytes at a time: an unaligned view is copied
+        bias, residual = (t.clone() if t is not None and t.data_ptr() % 16 else t for t in (c.bias, c.residual))
+        if c.quantize:
+            lib.nvfp4_gemm_act_quant_cutlass_sm120(out[0], out[1], c.x, c.x_scale, c.weight, c.weight_scale, bias,
+                                                   float(c.alpha), ACTIVATIONS[c.activation], -1)
+        else:
+            lib.nvfp4_gemm_cutlass_sm120(out, c.x, c.x_scale, c.weight, c.weight_scale, bias, residual,
+                                         float(c.alpha), -1)

@@ -245,11 +245,12 @@ def action_attention(q, k, v, k_prompt, v_prompt, num_pinned, prompt_lengths=Non
 # ---------------------------------------------------------------------------
 # Kernels of this backend
 # ---------------------------------------------------------------------------
-# arch -> (query heads, KV heads, head dim) -> inclusive ranges of batch, M (query rows) and L (cache rows); a list of
-# such boxes where the measured ranges are not one box
+# arch -> (query heads, KV heads, head dim) -> inclusive ranges of batch, M (query rows) and L (cache rows), and
+# per batch range the largest L (wider batches fill more than one wave of CTAs at long L); a list of such boxes
+# where the measured ranges are not one box
 KVCACHE_SHAPES = {
     120: {(16, 2, 128): [dict(batch=(1, 8), m=(1, 32), l=(64, 1984))],
-          (8, 2, 256): [dict(batch=(1, 2), m=(1, 32), l=(64, 1984))]},
+          (8, 2, 256): [dict(batch=(1, 4), m=(1, 32), l=(64, 1984), batch_l=((3, 4, 960),))]},
     110: {(16, 2, 128): [dict(batch=(1, 1), m=(1, 32), l=(192, 2048))],
           (8, 2, 256): [dict(batch=(1, 1), m=(1, 32), l=(128, 256)), dict(batch=(1, 1), m=(1, 16), l=(257, 832)),
                         dict(batch=(1, 1), m=(1, 9), l=(833, 1280)), dict(batch=(1, 1), m=(2, 4), l=(1281, 2048))]},
@@ -274,8 +275,11 @@ def attention_kvcache_takes(q, k_cache) -> bool:
     device_arch = arch(q.device)
     b, m, heads, d = q.shape
     boxes = KVCACHE_SHAPES.get(device_arch, {}).get((heads, k_cache.shape[2], d)) if device_arch in BUILD_ARCHS else None
-    return any(all(lo <= v <= hi for v, (lo, hi) in ((b, box["batch"]), (m, box["m"]), (k_cache.shape[1], box["l"])))
-               for box in boxes or ())
+    cache_rows = k_cache.shape[1]
+    return any(
+        all(lo <= v <= hi for v, (lo, hi) in ((b, box["batch"]), (m, box["m"]), (cache_rows, box["l"])))
+        and not any(lo <= b <= hi and cache_rows > longest for lo, hi, longest in box.get("batch_l", ()))
+        for box in boxes or ())
 
 
 def attention_kvcache(q, k_cache, v_cache, *, prefix_len, new_pos=None, flash_mask=None, softmax_scale=None,

@@ -14,14 +14,16 @@ xinfer/ops/
   spec.py          OpSpec (name, signature, reference) and Contract (numerics, deterministic, graph_safe)
   registry.py      register, OpRegistry, OpTable, use_ops / active_ops
   reference/       torch implementations; they define the semantics and run on every platform
-    __init__.py      basic operators: linear, norms, rotary, attention, ...
-    fused.py         fused BF16 operators
+    __init__.py      basic operators: linear, ...
+    attn.py, conv.py, elementwise.py, flow.py, gemm.py, norm.py, rope.py
+                     BF16 operators by category, fused ones included
     mxfp8.py         MXFP8 operators
     nvfp4.py         NVFP4 operators
   layout/          storage layouts of the low-precision formats (scale swizzle, weight row orders, rope table)
   backends/        one package per backend (hardware), one module per operator category
-    _xcompute.py     imports the xcompute library once (shared by every backend that calls it)
-    cuda/            attn.py, gemm.py (with gemm_sm120.py, gemm_sm110.py), norm.py, flow.py, position.py
+    _xcompute.py     imports the external xcompute library of the ascend backend
+    cuda/            attn.py, gemm.py (with gemm_sm120.py, gemm_sm110.py), norm.py, flow.py, position.py; _native.py loads the kernel
+                     library built from src/ (xinfer_kernels.so)
     ascend/          attn.py, gemm.py, norm.py; graph-safe Torch attention when NPU graphs are enabled
 
 ```
@@ -34,7 +36,7 @@ xinfer/ops/
             │                                         │  library missing (None) → not registered
             ▼                                         ▼
  ┌──────────────────────────── registry (process-wide OpRegistry) ───────────────────────────┐
- │  op → [reference (platforms "*", priority -1), cuda:flash_attn, cuda:xcompute, ...]       │
+ │  op → [reference (platforms "*", priority -1), cuda:flash_attn, cuda:kernels, ...]        │
  └──────────────────────────────────────────┬────────────────────────────────────────────────┘
                                             │ build_table(platform, backends=pins, reference_only)
                                             ▼
@@ -50,8 +52,8 @@ xinfer/ops/
 |---|---|---|
 | Operator | A name, a signature and a torch reference that defines the semantics | `rms_norm` |
 | Backend | The hardware an implementation runs on; `reference` runs on every platform | `cuda`, `reference` |
-| Library | The kernel library an implementation calls; `register(..., requires=lib)` records its name | `flash_attn`, `xcompute` |
-| Implementation name | `backend:library`, or the backend alone when it calls no library | `cuda:xcompute` |
+| Library | The kernel library an implementation calls; `register(..., requires=lib)` records its name | `flash_attn`, `kernels` |
+| Implementation name | `backend:library`, or the backend alone when it calls no library | `cuda:kernels` |
 | Platform | The resolved device (`xinfer.platforms`); its name, device type and arch are matched against `platforms` | `cuda-sm120` (`cuda`, `sm120`) |
 | Contract | What an implementation guarantees against the reference | `numerics="tolerance"`, `deterministic=False` |
 
@@ -76,7 +78,8 @@ def varlen_attention(q, k, v, cu_seqlens, *, scale=None):
 - `requires=None` (the library did not import) registers nothing, so the operator runs on its next implementation,
   in the end the reference.
 - `platforms` defaults to `(backend,)`, which matches every platform of that device type. Pass arch names to narrow
-  it: xcompute passes the architectures its build targets (`XCOMPUTE = dict(requires=xc, platforms=archs, version=...)`).
+  it: the kernel library passes the architectures it was built for (`NATIVE` in `cuda/_native.py`, platforms
+  `("sm120",)`).
 - `version` defaults to `"<library> <library.__version__>"`; it is printed in the selection table.
 - `priority` (default 10) ranks implementations; the reference has -1. When two backends tie, the first registered
   wins.
@@ -93,7 +96,7 @@ named by the `xinfer.ops` entry point group. The process-wide registry calls it 
 `registry.build_table(platform, backends=None, reference_only=False)` builds the `OpTable` once per model:
 
 1. Keep the implementations whose `platforms` match the platform name, device type or arch (`"*"` matches all).
-2. A pin (`backends={"rms_norm": "cuda:xcompute"}`, or `--op-backends` on the command line) selects the
+2. A pin (`backends={"rms_norm": "cuda:kernels"}`, or `--op-backends` on the command line) selects the
    highest-priority implementation whose backend, library or full name equals it; a pin that matches nothing is an
    error. `reference_only=True` selects the reference for every operator that is not pinned.
 3. Otherwise the highest-priority implementation is selected.
@@ -107,7 +110,7 @@ reference itself. Decide once per call key and cache the answer, so the check ru
 key and never under CUDA graph capture (the engine runs each graph key eagerly before capturing it):
 
 ```python
-@register("prefix_kvcache_attention", backend="cuda", **XCOMPUTE)
+@register("prefix_kvcache_attention", backend="cuda", **NATIVE)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
     if not _kvcache_listed(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):  # cached per shape key
         return fused.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask,
@@ -125,8 +128,8 @@ reference; say which calls those are in its module docstring.
 - `ops.warn_slow_fallbacks(...)` warns, on a CUDA device, when operators the model calls run on a fused reference
   (`reference/fused.py`), which composes torch operations in place of a kernel.
 - `XINFER_OPS_STRICT=1` turns that warning into an error (CI and benchmarks).
-- `XINFER_XCOMPUTE=0` and `XINFER_FLASH_ATTN=0` leave a library out; `XINFER_<NAME>=0` skips the entry point
-  `<name>`.
+- `XINFER_KERNELS=0` (the CUDA kernel library), `XINFER_XCOMPUTE=0` (the ascend backend's xcompute) and
+  `XINFER_FLASH_ATTN=0` leave a library out; `XINFER_<NAME>=0` skips the entry point `<name>`.
 
 ## Adding an operator
 
@@ -171,17 +174,20 @@ layer.
    or add a module for a new category and list it in `BUILTIN_MODULES`.
 2. Import the library it calls at the top of the module, None when it does not import. A library that needs more
    than an import (a configured path, a build check, the architectures it targets) gets one module at the
-   `backends/` level that every backend shares, as `_xcompute.py` does. Honour `XINFER_<LIBRARY>=0` there.
+   `backends/` level that every backend shares, as `_xcompute.py` does (`cuda/_native.py` for the CUDA kernel
+   library built in this repository). Honour `XINFER_<LIBRARY>=0` there.
 3. Register it with the same parameters as the reference:
 
    ```python
-   from xinfer.ops.backends._xcompute import XCOMPUTE, xc
+   from xinfer.ops.backends.cuda._native import NATIVE, lib
    from xinfer.ops.registry import register
 
 
-   @register("rms_norm", backend="cuda", **XCOMPUTE)
+   @register("rms_norm", backend="cuda", **NATIVE)
    def rms_norm(x, weight, eps):
-       return xc.rmsnorm(x, weight, float(eps), True)
+       out = torch.empty_like(x)
+       lib.rmsnorm(out, x, weight, float(eps), True)
+       return out
    ```
 
 4. Declare its contract truthfully: `numerics="bitwise"` only when it equals the reference bit for bit on the same
@@ -208,7 +214,7 @@ layer.
    vendor_attn = "vendor_xinfer.attn"
    ```
 
-4. **Shared libraries.** A library that serves several backends (xcompute) is imported once in `backends/_<name>.py`
+4. **Shared libraries.** A library that serves several backends is imported once in `backends/_<name>.py`
    and passes each backend the platforms its build targets.
 5. **Check the selection** on the device: `registry.build_table(platform).report()` should list the new backend for
    the operators it implements, and `XINFER_OPS_STRICT=1` should pass for the models it targets.

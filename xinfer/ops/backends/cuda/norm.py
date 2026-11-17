@@ -11,6 +11,8 @@
 | ``mxfp8_layer_norm_quantize`` | ``layernorm`` (``quantize``) |
 | ``mxfp8_zero_centered_rms_norm_quantize`` | ``rmsnorm`` (``zero_centered``, ``quantize``) |
 | ``mxfp8_add_zero_centered_rms_norm_quantize`` | ``add_rmsnorm`` (``zero_centered``, ``quantize``) |
+| ``nvfp4_layer_norm_quantize`` | ``layernorm`` (``quantize="nvfp4"``) |
+| ``nvfp4_add_zero_centered_rms_norm_quantize`` | ``add_rmsnorm`` (``zero_centered``, ``quantize="nvfp4"``) |
 
     rmsnorm(x, weight, eps, quantize=)          x * rsqrt(mean(x^2) + eps) * weight
     add_rmsnorm(residual, x, weight, eps, ...)  (residual + x, rmsnorm(residual + x))
@@ -20,8 +22,9 @@
 
 The kernels run on any CUDA GPU. Sums are taken in FP32 and every result is rounded once to the input dtype;
 ``zero_centered=True`` scales by ``1 + weight`` instead of ``weight``. With ``quantize=True`` the BF16 result is
-written as an MXFP8 pair (``xinfer.ops.layout.mxfp8``) with one scale per 128 columns, by the same kernel where it
-has that form: the bits of the norm followed by a separate quantization.
+written as an MXFP8 pair (``xinfer.ops.layout.mxfp8``) with one scale per 128 columns, with ``quantize="nvfp4"`` as
+an NVFP4 pair (``xinfer.ops.layout.nvfp4``, amax scales), by the same kernel where it has that form: the bits of the
+norm followed by a separate quantization.
 
 Contracts against the torch references: tolerance. ``qkv_norm_split`` creates constant index tensors on the first
 call for a batch size, which must therefore be eager (before a capture).
@@ -31,7 +34,7 @@ from __future__ import annotations
 
 import torch
 
-from xinfer.ops.backends.cuda._native import NATIVE, empty_mxfp8, lib
+from xinfer.ops.backends.cuda._native import NATIVE, empty_mxfp8, empty_nvfp4, lib
 from xinfer.ops.registry import register
 
 
@@ -59,6 +62,26 @@ def _rmsnorm_quantized(x, residual, weight, eps, zero_centered):
     return (values, scales) if residual is None else (total.reshape(x.shape), (values, scales))
 
 
+def _add_rmsnorm_nvfp4(residual, x, weight, eps):
+    """The NVFP4 pair of the BF16 zero-centered norm of ``residual + x``, and the BF16 sum: the wide add + RMSNorm
+    kernel quantizing what it writes where it takes the rows, else ``add_rmsnorm`` and the quantization."""
+    k = x.shape[-1]
+    if x.dtype != torch.bfloat16 or k % 16:
+        raise ValueError("add_rmsnorm: quantize='nvfp4' needs BF16 rows of a multiple of 16 columns")
+    rows, residual = x.reshape(-1, k), residual.reshape(-1, k)
+    weight = weight.contiguous()
+    data, scales = empty_nvfp4(rows.shape[0], k, x.device)
+    if (k % 64 == 0 and k <= 4096 * 8 and weight.dim() == 1 and weight.dtype in (torch.float32, torch.bfloat16)
+            and rows.is_contiguous() and residual.is_contiguous()
+            and all(t.data_ptr() % 16 == 0 for t in (rows, residual, weight))):
+        total = torch.empty_like(rows)
+        lib.add_rmsnorm_zero_centered_nvfp4(total, None, data, scales, residual, rows, weight, float(eps))
+    else:
+        total, normed = add_rmsnorm(residual, rows, weight, eps, zero_centered=True)
+        lib.quantize_nvfp4_into(data, scales, normed.contiguous(), 1.0, False)
+    return total.reshape(x.shape), (data, scales)
+
+
 def rmsnorm(x, weight, eps, *, zero_centered=False, quantize=False):
     """``x * rsqrt(mean(x^2, -1) + eps) * weight``: x ``[..., K]``, weight ``[K]``; a new tensor like ``x``, or
     its MXFP8 pair with ``quantize=True``."""
@@ -72,9 +95,14 @@ def rmsnorm(x, weight, eps, *, zero_centered=False, quantize=False):
 
 def add_rmsnorm(residual, x, weight, eps, *, zero_centered=False, quantize=False):
     """``(residual + x, rmsnorm(residual + x))`` in one pass over the two inputs; the sum is the BF16 sum. With
-    ``quantize=True`` the norm is returned as its MXFP8 pair."""
+    ``quantize=True`` the norm is returned as its MXFP8 pair, with ``quantize="nvfp4"`` (``zero_centered``) as its
+    NVFP4 pair."""
     if residual.shape != x.shape:
         raise ValueError(f"add_rmsnorm: residual {tuple(residual.shape)} does not match x {tuple(x.shape)}")
+    if quantize == "nvfp4":
+        if not zero_centered:
+            raise ValueError("add_rmsnorm: quantize='nvfp4' is zero-centered")
+        return _add_rmsnorm_nvfp4(residual, x, weight, eps)
     if quantize:
         return _rmsnorm_quantized(x, residual, weight, eps, zero_centered)
     residual, x = _rows(residual), _rows(x)
@@ -86,12 +114,25 @@ def add_rmsnorm(residual, x, weight, eps, *, zero_centered=False, quantize=False
 
 def layernorm(x, weight, bias, eps, *, quantize=False):
     """``torch.nn.functional.layer_norm`` over the last dimension: x ``[..., K]``, weight and bias ``[K]``; a new
-    tensor like ``x``, or its MXFP8 pair with ``quantize=True``."""
+    tensor like ``x``, or its MXFP8 pair with ``quantize=True``, its NVFP4 pair with ``quantize="nvfp4"``."""
     if not quantize:
         out = torch.empty_like(x)
         lib.layernorm(out, x, weight, bias, float(eps))
         return out
     k = x.shape[-1]
+    if quantize == "nvfp4":
+        if x.dtype != torch.bfloat16 or k % 16:
+            raise ValueError("layernorm: quantize='nvfp4' needs BF16 rows of a multiple of 16 columns")
+        rows = x.reshape(-1, k)
+        data, scales = empty_nvfp4(rows.shape[0], k, x.device)
+        if (k % 128 == 0 and k <= 2048 and rows.is_contiguous() and weight.dtype == bias.dtype == torch.bfloat16
+                and all(t.data_ptr() % 16 == 0 for t in (rows, weight, bias))):  # one kernel for both
+            lib.layernorm_quant_nvfp4(data, scales, None, rows, weight, bias, float(eps))
+        else:
+            normed = torch.empty_like(rows)
+            lib.layernorm(normed, rows, weight, bias, float(eps))
+            lib.quantize_nvfp4_into(data, scales, normed, 1.0, False)
+        return data, scales
     if x.dtype != torch.bfloat16 or k % 32:
         raise ValueError("layernorm: quantize needs BF16 rows of a multiple of 32 columns")
     rows = x.reshape(-1, k)
@@ -226,6 +267,16 @@ def mxfp8_add_zero_centered_rms_norm_quantize(x, residual, weight, eps):
     summed, quantized = add_rmsnorm(residual.reshape(-1, k), x.reshape(-1, k), weight, eps, zero_centered=True,
                                        quantize=True)
     return summed.view(x.shape), quantized
+
+
+@register("nvfp4_layer_norm_quantize", backend="cuda", **NATIVE)
+def nvfp4_layer_norm_quantize(x, weight, bias, eps):
+    return layernorm(x.reshape(-1, x.shape[-1]), weight, bias, eps, quantize="nvfp4")
+
+
+@register("nvfp4_add_zero_centered_rms_norm_quantize", backend="cuda", **NATIVE)
+def nvfp4_add_zero_centered_rms_norm_quantize(x, residual, weight, eps):
+    return add_rmsnorm(residual, x, weight, eps, zero_centered=True, quantize="nvfp4")
 
 
 _no_rows = {}  # (batch, device) -> (int64 zeros [B], int64 zeros [B + 1])

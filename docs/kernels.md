@@ -10,7 +10,7 @@ The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the kerne
 
 The kernel library is built for one GPU architecture and registers its operators on that architecture only. This repository has kernels for SM120 (RTX 50 series) and SM110 (Jetson Thor).
 
-A GEMM runs on a kernel written for its architecture when the call is one that kernel was tuned on, and otherwise on cuBLASLt with the epilogue as a separate kernel. Each kernel lists the shapes it takes next to the code that launches it (`xinfer/ops/backends/cuda/gemm_sm120.py`, `gemm_sm110.py`): on an RTX 5090 the ranges of rows over which it was measured not slower than the cuBLASLt path; on a Jetson AGX Thor the ranges over which it was measured at least 5% faster at three or more consecutive scan points, the selection of the xcompute build of the [performance table](performance.md), whose outputs the library gives bit for bit on the reference requests. On SM110 the library covers the BF16 compositions of Wall-OSS and Wall-X 2B. The attention and flow kernels list their shapes the same way (`attn.py`, `flow.py`), and the calls outside them run on the torch reference.
+A GEMM runs on a kernel written for its architecture when the call is one that kernel was tuned on, and otherwise on cuBLASLt with the epilogue as a separate kernel. Each kernel lists the shapes it takes next to the code that launches it (`xinfer/ops/backends/cuda/gemm_sm120.py`, `gemm_sm110.py`): the ranges of rows over which it was measured at least 5% faster than the cuBLASLt path on an RTX 5090 or a Jetson AGX Thor at three or more consecutive scan points. These are the selections of the xcompute builds the [performance table](performance.md) was measured with: on both GPUs the library gives their outputs bit for bit on the reference requests. The library covers the BF16, MXFP8 and NVFP4 compositions of Wall-OSS and Wall-X 2B on SM120, and their BF16 compositions on SM110. The attention and flow kernels list their shapes the same way (`attn.py`, `flow.py`), and the calls outside them run on the torch reference.
 
 ## Build
 
@@ -32,7 +32,7 @@ xinfer-serve --model wall_oss --checkpoint /path/to/checkpoint --device cuda \
   --warmup observation.msgpack --port 33985
 ```
 
-XInfer loads `xinfer_kernels.so` from its package directory. `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` loads a library built elsewhere from the same sources. `XINFER_KERNELS=0` turns the backend off. The same variables apply to `Policy`, the tests and the benchmarks.
+XInfer loads `xinfer_kernels.so` from its package directory. `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` loads a library built elsewhere from the same sources. `XINFER_KERNELS=0` turns the backend off (`XINFER_XCOMPUTE=0` applies to the Ascend backend's xcompute only). The same variables apply to `Policy`, the tests and the benchmarks. A library that does not load (built with another CUDA toolkit or for another driver) logs a warning and leaves the operators on their torch references; one named by `XINFER_KERNELS_LIBRARY` is an error instead. A library older than a file of `xinfer/ops/backends/cuda/src` (sources pulled without a rebuild) loads with a warning to rebuild it. The kernels run on PyTorch's current stream, which `apache-tvm-ffi` 0.1.9 to 0.1.x passes with the tensors.
 
 ## Check
 

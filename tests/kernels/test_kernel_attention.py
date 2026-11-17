@@ -28,7 +28,8 @@ def reference(q, k_cache, v_cache, prefix_len, new_pos, flash_mask):
 
 
 @sm(120)
-@pytest.mark.parametrize("b,m,rows,prefix", [(1, 16, 784, 768), (1, 1, 64, 40), (2, 32, 600, 500), (1, 16, 1984, 1900)])
+@pytest.mark.parametrize("b,m,rows,prefix", [(1, 16, 784, 768), (1, 1, 64, 40), (2, 32, 600, 500), (1, 16, 1984, 1900),
+                                             (4, 16, 960, 900)])
 @pytest.mark.parametrize("heads,d", [(16, 128), (8, 256)])
 @pytest.mark.parametrize("masked", [False, True])
 def test_matches_reference(b, m, rows, prefix, heads, d, masked, rnd):
@@ -117,3 +118,11 @@ def test_takes_only_listed_calls(rnd):
     with pytest.raises(ValueError):
         attn.attention_kvcache(rnd(1, 64, 16, 128), k_cache, k_cache,
                              prefix_len=torch.zeros(1, dtype=torch.int32, device=DEVICE))
+
+
+@sm(120)
+def test_wider_batches_take_shorter_caches(rnd):
+    """8 query / 2 KV heads of 256: batches of 3 and 4 only up to 960 cache rows, where they still fit one wave."""
+    assert attn.attention_kvcache_takes(rnd(4, 16, 8, 256), rnd(4, 960, 2, 256))
+    assert not attn.attention_kvcache_takes(rnd(3, 16, 8, 256), rnd(3, 1024, 2, 256))
+    assert attn.attention_kvcache_takes(rnd(2, 16, 8, 256), rnd(2, 1024, 2, 256))
