@@ -122,7 +122,7 @@ Three layers take three words, and one object never takes two names inside one l
 | Layer | Word | Written as | Not used for |
 |---|---|---|---|
 | torch device | `npu` | device strings `npu:0`, the `torch.npu` / `torch_npu` API, `platforms/npu.py` (the module that resolves a torch device), `Platform.is_npu`, `NpuJpegDecoder` | backend or vendor identity |
-| platform and backend | `ascend` | `PlatformCapabilities.device_type == "ascend"`, platform name `ascend-<arch>`, `xinfer/ops/backends/ascend/`, selection names `ascend:xcompute` and `ascend:torch` | torch device strings |
+| platform and backend | `ascend` | `PlatformCapabilities.device_type == "ascend"`, platform name `ascend-<arch>`, `xinfer/ops/backends/ascend/`, operator selection `ascend:kernels` | torch device strings |
 | toolchain | `cann` | prose and error text about DVPP, ACLNN and FIA; `load_npu_media` imports CANN's Python ACL | selectors of any kind |
 
 Rules:
@@ -131,7 +131,7 @@ Rules:
 2. Whatever identifies *which hardware and backend* serves a request — `device_type`, the platform name, the
    backend package, a selection name — is `ascend`.
 3. The vendor software stack is `cann`, named only in prose and error messages, never as a selector.
-4. `Platform.name` is therefore `ascend-<arch>`, for example `ascend-950dt9582`, matching its `device_type` and
+4. `Platform.name` follows `ascend-<arch>`, matching its `device_type` and
    its backend. The `npu` in `Platform.is_npu` and in `platforms/npu.py` answers the device-layer question
    "is this a torch NPU device", which is why those two keep it.
 5. External names keep their spelling: `npu-smi`, `torch_npu`, `ASCEND_HOME`, and vendor error text are quoted

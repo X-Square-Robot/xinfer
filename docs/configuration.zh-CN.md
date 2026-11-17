@@ -10,7 +10,7 @@
 因此每项设置都是适用于任何负载的固定选择或上限。它在启动时解析一次，并连同其来源一起报告。优先级从高到低：
 
 1. **显式（explicit）**：运维人员设置的命令行参数或函数参数。它会对照平台和模型进行检查，但从不被改写。冲突即报错：模型未声明的批大小、在不支持捕获的平台上启用 CUDA graph（仅限 API），或未知的阶段。
-2. **调优表（tuned table）**：针对（模型、架构、量化）组合的实测值，来自 `xinfer/tuned/<model>/<arch>-<quantization>.json` 或 `--tuned <path>`。每张表记录提交、日期、方法和证据；来源显示为 `tuned:<table>@<commit>`。表可以设置 `lanes`。目前没有随附任何表：只有当实测值与默认值不同时才添加表。
+2. **调优表（tuned table）**：针对（模型、架构、量化）组合的实测值，来自 `xinfer/tuned/<model>/<arch>-<quantization>.json` 或 `--tuned <path>`。每张表记录提交、日期、方法和证据；来源显示为 `tuned:<table>@<commit>`。表可以按阶段设置 `lanes` 和 `max_batch`。只有当实测值与默认值不同时才添加表。
 3. **模型 / 平台规则**：模型声明的内容（批大小）和平台支持的能力（graph 捕获、CPU 配额）；来源为 `model:<rule>` 和 `platform:<rule>`。
 4. **默认（default）**：固定值。
 
@@ -25,7 +25,7 @@
 | `max_queued_requests` | 256 | 已提交、等待准入的请求数 |
 | `lanes.<stage>` | 调优值，否则为 2 | 一个通道是一条带有自己 graph 池的 stream；第二个通道让两个请求可以同时运行该阶段 |
 | `stream_priorities.<stage>` | 最终阶段（Wall-OSS：`action`）：将 −1 限制在支持范围内；范围未知、不支持或其他阶段时为 0 | 该阶段各通道的加速器 stream 优先级，越小越高（`--stream-priorities action=0`、`Policy(stream_priorities={...})`） |
-| `batch_sizes.<stage>` | 模型声明的所有大小 | 允许更大的批大小从不会延迟请求，因为批只由已排队的请求组成；模型只为组批结果能通过其精度门禁的阶段声明大于 1 的批大小 |
+| `batch_sizes.<stage>` | 调优 `max_batch` 以内的已声明批大小，否则为模型的默认批大小或全部已声明批大小 | 仅支持单请求的阶段保持该上限。批只由已排队的请求组成 |
 | `cudagraphs` | 平台支持捕获时开启 | |
 | `frontends` | 2，最多为容器配额 CPU 数的一半 | 每个前端会在引擎进程中增加一个桥接线程 |
 | `frontend_workers` | 4，且 `frontends × frontend_workers` 不超过配额 CPU 数的一半 | 每个前端的处理线程数；不同连接的请求同时处理 |

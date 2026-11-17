@@ -59,7 +59,4 @@ CUDA kernel library for this GPU: docs/kernels.md
 
 ## Ascend
 
-The `ascend` backend binds an external xcompute build through `xinfer/ops/backends/_xcompute.py`, with the
-`XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0` settings. Available implementations are selected automatically;
-unsupported calls use their torch fallback. See the [Ascend guide](ascend950dt.md) for runtime, image processing
-and NPU graphs.
+The [Ascend backend](../xinfer/ops/backends/ascend/) groups registrations by operator family. Its [native build](../xinfer/ops/backends/ascend/src/CMakeLists.txt) selects the compiled variants for `xinfer_kernels_ascend.so`. See the [Ascend guide](ascend950dt.md) for build and usage.

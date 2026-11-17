@@ -14,7 +14,7 @@ resolved once at startup and reported with its source. Precedence, highest
 first:
 
 1. **explicit**: a flag or argument the operator set. It is checked against the platform and the model and never rewritten. A conflict is an error: a batch size the model does not declare, CUDA graphs on a platform without capture (API only), or an unknown stage.
-2. **tuned table**: measured values for (model, architecture, quantization), from `xinfer/tuned/<model>/<arch>-<quantization>.json` or `--tuned <path>`. Each table records the commit, date, method and evidence; the source reads `tuned:<table>@<commit>`. Tables can set `lanes`. No table ships at present: a table is added only when a measured value differs from the default.
+2. **tuned table**: measured values for (model, architecture, quantization), from `xinfer/tuned/<model>/<arch>-<quantization>.json` or `--tuned <path>`. Each table records the commit, date, method and evidence. The source reads `tuned:<table>@<commit>`. Tables can set `lanes` and `max_batch` per stage. A table is added only when a measured value differs from the default.
 3. **model / platform rules**: what the model declares (batch sizes) and what the platform supports (graph capture, CPU quota); sources `model:<rule>` and `platform:<rule>`.
 4. **default**: a fixed value.
 
@@ -29,7 +29,7 @@ Code: `xinfer/config/` (`resolve.py`, `tuned.py`).
 | `max_queued_requests` | 256 | submitted requests waiting for admission |
 | `lanes.<stage>` | tuned value, else 2 | a lane is a stream with its own graph pool; a second lane lets two requests run the stage at once |
 | `stream_priorities.<stage>` | final stage (Wall-OSS: `action`): −1 bounded by the supported range; 0 when unknown or unsupported, and for other stages | accelerator stream priority of the stage's lanes, lower is higher (`--stream-priorities action=0`, `Policy(stream_priorities={...})`) |
-| `batch_sizes.<stage>` | every size the model declares | a larger allowed size never delays a request, because batches form only from queued requests; a model declares sizes above 1 only for a stage whose batched results pass its precision gate |
+| `batch_sizes.<stage>` | declared sizes up to the tuned `max_batch`, otherwise the model's defaults or all declared sizes | stages that support only single requests keep that limit. Batches form only from queued requests |
 | `cudagraphs` | on where the platform supports capture | |
 | `frontends` | 2, at most half the CPUs of the container quota | each frontend adds a bridge thread in the engine process |
 | `frontend_workers` | 4, with `frontends × frontend_workers` at most half the CPUs of the quota | processing threads per frontend; requests of different connections are processed at the same time |

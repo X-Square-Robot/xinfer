@@ -50,7 +50,7 @@ class Platform:
     """A resolved execution platform.
 
     Attributes:
-        name: platform name, e.g. ``"cuda-sm120"``, ``"ascend-ascend950dt9582"`` or ``"cpu"``: the hardware and
+        name: platform name, e.g. ``"cuda-sm120"`` or ``"cpu"``: the hardware and
             backend identity, which docs/design.md §3.1 separates from the torch device.
         device: torch device string, e.g. ``"cuda:0"``, ``"npu:0"`` or ``"cpu"``.
         capabilities: the device's capabilities.

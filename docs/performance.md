@@ -31,30 +31,20 @@ See [Wall-OSS validation](models/wall_oss_validation.md) for the latency and mea
 
 ## Ascend 950DT
 
-Both rows were measured on 2026-11-13 on one exclusively reserved Ascend 950DT (CANN 9.1.1, TorchNPU
-2.10.0.post4), revision `0864476` of this branch, with the delivery `xcompute.so` (SHA-256
-`be3ee3e46e58…`) loaded through `XINFER_XCOMPUTE_LIBRARY` with its matching Python package. Both models ran
-with their default operator selection: every operator either model calls resolves to `ascend:xcompute`, and a
-per-layout dispatch audit of a full request pass confirmed every call ran on an xcompute entry (Wall-X 2B:
-21 of its 21 operators, all call layouts admitted; Wall-OSS: 11 of its 11). No operator ran on a torch
-reference in either benchmark. The [Ascend guide](ascend950dt.md) lists each operator's entry.
+Both models used CPU image processing for the synthetic desktop workload with RTC. The single-request run used device image processing for Wall-OSS and CPU image processing for Wall-X 2B.
 
-| Model | Precision and composition | Single request P50 | Robots per NPU | Server P50 at capacity | Server P95 at capacity | Highest measured rate | Numerical agreement |
-|---|---|---|---|---|---|---|---|
-| Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s | internal precision gate with DVPP images: PASS |
-| Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s | fixed-noise actions within max_abs 0.0472 of the reference composition: PASS |
+| # | Model | Precision, composition | Accelerator | Single request P50 | Robots per device | Server P50 at capacity | Server P95 at capacity | Saturation | Numerical agreement |
+|---|---|---|---|---|---|---|---|---|---|
+| 5 | Wall-OSS | BF16, optimized | Ascend 950DT | 39.2 ms | 4 | 81 ms | 93 ms | 27.6 req/s | bitwise equal to the original Ascend build on 2 requests with fixed prepared inputs and noise |
+| 6 | Wall-X 2B | BF16, optimized | Ascend 950DT | 34.8 ms | 15 | 129 ms | 163 ms | 83.9 req/s | two- and four-request batches within 0.246% relative L2 of single-request actions on fixed inputs, with bitwise agreement on pinned RTC rows |
 
-- **Wall-OSS** used a flow and an RTC request as the single-request set and service warmup, `image_preprocess_device` on the NPU (DVPP), and the synthetic desktop load with RTC at 2 and 3 robots — sixteen rounds, zero errors, zero missing responses, zero underflow. At two robots the per-round server P50 spans 118–121 ms with a median of 120.1 ms and a worst-round P95 of 130.2 ms; three robots measured 161–166 ms, above the 150 ms rule, so the capacity is bounded at two. The single request splits into prepare 2.23 ms, engine 78.42 ms and output 0.15 ms.
-- **Wall-X 2B** used the 216-request latency capture as the single-request set (fixed noise seed 20261112), two requests as service warmup, and the synthetic desktop load with RTC at 2 robots — 八 rounds, 零 errors, 零 missing responses. Its single request splits into prepare 2.80 ms, engine 76.76 ms and output 0.15 ms.
+### Conditions
 
-Both models' rows report one wiring: the xcompute package's own entries, which mix CANN ACLNN Matmul,
-FusedInferAttentionScore V5 and official operators with TileLang and AOT custom kernels inside xcompute. At the
-backend-selection level both models name xcompute by default; TorchNPU's own operators and the CANN bridge
-remain opt-in pins (`--op-backends linear=ascend:torch_npu`).
+Each row was measured on 2026-11-18 on one Ascend 950DT with torch 2.10.0+cpu and torch-npu 2.10.0.post4. Wall-OSS ran eight rounds per tier. Wall-X 2B capacity requires a median round server P50 of at most 150 ms, zero errors and zero missing responses. Row 6 shows the first of two CANN 9.3.0-beta.1 sweeps. Both passed at 15 robots with two rounds per tier.
 
-Both checks are end to end. Wall-OSS passed the internal precision gate with image preprocessing on the NPU
-(DVPP), the same path the benchmark used. Wall-X 2B ran a fixed-noise action check: ten requests with injected
-deterministic initial noise through the default dispatch and through the reference composition of the same
-build, comparing the denormalized action predictions end to end.
+| # | Model options | Single-request input set | Load | Server warmup |
+|---|---|---|---|---|
+| 5 | `examples/ascend/wall_oss.env` | flow and RTC requests as in row 1 | synthetic desktop observations with RTC, measured at 3, 4 and 5 robots | the same two requests |
+| 6 | `examples/ascend/wallx2b.env`, up to four requests per action batch, RTC gripper limit 5.0 | 216 captured requests as in row 2 | synthetic desktop observations with RTC, measured at 8, 12, 14, 15 and 16 robots | two requests from the capture |
 
-See the [Ascend guide](ascend950dt.md) for the operator and graph configuration.
+See the [Ascend guide](ascend950dt.md) for the build and benchmark commands.
