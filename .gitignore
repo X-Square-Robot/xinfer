@@ -33,5 +33,5 @@ Thumbs.db
 /runs/
 
 # Ascend kernel build products (sources only in-tree; BUILD-SPIKE policy)
-xinfer/ops/backends/ascend/kernels/lib/
-xinfer/ops/backends/ascend/kernels/.build/
+xinfer/ops/backends/ascend/lib/
+xinfer/ops/backends/ascend/src/.build/

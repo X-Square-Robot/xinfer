@@ -31,7 +31,7 @@ swaps the R6D adafast objects 1:1 inside the final combined library.
 """
 
 import tilelang.ascend.language as T
-from ops.gemm.silu_and_mul import _store_rne
+from gemm.silu_and_mul import _store_rne
 
 ROWS, HIDDEN, WARP, LANES = 16, 1024, 32, 64
 

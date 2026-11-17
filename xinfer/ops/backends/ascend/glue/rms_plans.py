@@ -7,7 +7,7 @@ norms onto the rms_consistent plans: the ViT patch norm ``[rows, 1280]``
 otherwise), the prefill input norm ``[rows, 2048]`` (the UB plan) and the
 ``[rows in {16, 32, 64}, 1024]`` action rows (the generic h1024 plan over an
 FP32 weight). The unified core library carries the same kernels
-(``kernels/ops/norm/rms_consistent.py``, the ``xinfer_aot_rms_consistent_*``
+(``src/norm/rms_consistent.py``, the ``xinfer_aot_rms_consistent_*``
 launchers); this module mirrors that dispatch call for call so the served
 sites keep the 38.82 bits. An envelope miss returns ``None`` and the caller
 keeps its composition (the reference for the binding's general tail); the

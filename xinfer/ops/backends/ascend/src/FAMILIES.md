@@ -10,7 +10,7 @@ Organisation: by **computation family** (a coordinator directive of 2026-11-16),
 by model; both models' kernels coexist inside the same family directory. Model
 ownership is recorded per kernel below, never in the tree.
 
-## Library map (build.sh targets)
+## Library map (build-libraries.sh targets; the transition family-library form)
 
 | library | env (`_LIB`) | modules | kernels (models) |
 |---|---|---|---|

@@ -6,10 +6,12 @@ library — `xinfer_kernels_ascend.so`, built by `src/CMakeLists.txt` and loaded
 needs no other repository; the external xcompute path (`backends/_xcompute.py`) keeps serving deployments that
 prefer a prebuilt external build until this tree covers them.
 
-**Status: scaffold.** The framework is in place — family directories, the CMake build, the loader, the per-SoC
-platform keys and the GEMM shape envelopes — while the kernel sources themselves are TODO placeholders that
-IN-TREE-R1 moves in from the v22 knife tree (see "R1" below). Nothing here registers an operator until the
-library is built; until then the backend runs its existing routes.
+**Status: R1a.** The kernel sources have moved in — the family directories carry the 44 modules of the
+porting audit (see "R1a" below) — and the CMake build, the loader, the per-SoC platform keys and the GEMM
+shape envelopes are in place; the family-library transition build (`build-libraries.sh`) reproduces the
+delivered library set. The cuda-paradigm wrappers (`takes`/`kernel_name` per family) and the TVM-FFI glue
+faces are R1b; until they land, the backend registers through its transition loader and runs its existing
+routes. Nothing here registers an operator until a library is built.
 
 ## Families
 
@@ -75,7 +77,7 @@ family reproduced the delivered objects byte for byte under this recipe.
 
 ### From DSL source to the one library
 
-The kernels are TileLang AOT: each family module builds TileLang programs, the generator (`tools/`, TODO R1)
+The kernels are TileLang AOT: each family module builds TileLang programs, the generator (`tools/generate.py`, landed R1a)
 lowers them, renames the host launcher symbols and hands the host C to bisheng for the `dav-3510` target,
 producing `.o` files with the device image embedded (`aclrtBinaryLoadFromData` loads them at run time).
 The CMake aggregates those objects with per-family host glue — thin `.cc` files exporting
@@ -86,19 +88,50 @@ registers the operators on exactly those platforms.
 
 Whether the AOT launcher symbols keep their historical `xcompute_aot_` prefix or become `xinfer_aot_` during
 the move is R1's call (the rename is mechanical in the generator's renaming pass); either way they are an
-implementation detail behind the TVM-FFI exports, unlike the ctypes knife libraries of the v22 tree.
+implementation detail behind the TVM-FFI exports, unlike the ctypes knife libraries of the v22 tree. R1a's
+answer: the delivered libraries spell `xinfer_aot_` (the zero-xcompute grep assertion is unconditional); the
+generator's `--symbol-prefix` reproduces either spelling for anchor builds.
 
-## R1: moving the kernels in
+## R1a: the kernels have moved in
 
-- Sources come from the v22 knife tree: the `src/<family>/npu/*.py` TileLang modules and the generator pair
-  (`aot/generate.py`, `aot/abi.py`) per the build-spike contract; `finish_br_c1024` needs family-ization first
-  (it lives outside the v22 `src/` families), and the two walloss remnant kernels ride along.
-- Kernel sources keep their Apache-2.0 headers in the move (they come from the xcompute project, as the CUDA
-  sources did); new host glue written here follows the repository's own files.
-- Each family README's table is the checklist: kernel name, envelope, dose, v22 source path, gate evidence.
-- The SHAPES envelope of the GEMM family is already declared in `../gemm_950dt.py`; the other families get
-  theirs next to their glue as R1 rewrites the wrappers in the CUDA paradigm (`Call` normalization, `takes`,
-  `kernel_name`).
-- Keep the honest boundary: the vendor faces the audit locked (FusedInferAttentionScore residual families,
-  aclnnChunkGatedDeltaRule, the large-shape aclnn Matmul floor, the elementwise soup) are runtime dependencies
-  of this library, not ports.
+The 44 kernel modules of the porting audit live in the family directories (`gemm/smallm_r3.py`,
+`norm/adanorm_r2.py`, …), moved in from the v22 knife tree (IN-TREE-R1a, 2026-11-17): the TileLang DSL
+modules beside their family READMEs, the generator pair in `tools/` (`generate.py` + `abi.py`, the
+build-spike contract), the C-ABI static bridges in `common/` beside `build_info.cc`, and the rosters'
+library map in `FAMILIES.md`. `finish_br_c1024` and `decodeattn_r4` arrived family-ized; the two walloss
+remnant kernels ride along. The modules keep their Apache-2.0 headers (they come from the xcompute
+project, as the CUDA sources did). Module roots resolved by the generator are `<family>.<module>` from
+this directory (e.g. `--module gemm.smallm_r3`).
+
+Each family README's table is the checklist: kernel name, envelope, dose, v22 source path, gate evidence.
+The SHAPES envelope of the GEMM family is declared in `../gemm_950dt.py`; the other families get theirs
+next to their glue as R1b rewrites the wrappers in the CUDA paradigm (`Call` normalization, `takes`,
+`kernel_name`). Keep the honest boundary: the vendor faces the audit locked (FusedInferAttentionScore
+residual families, aclnnChunkGatedDeltaRule, the large-shape aclnn Matmul floor, the elementwise soup)
+are runtime dependencies of this library, not ports.
+
+## The transition build: the 17 family libraries
+
+`build-libraries.sh` (this directory) is the validated byte-anchor recipe the 20.62/38.82 stacks run on:
+one core library plus one knife library per routed family (the map in `FAMILIES.md`), linked against
+the CANN runtime four, loaded through the backend's transition loader with the deployment's
+`XINFER_<FAMILY>_LIB` names preserved verbatim. `build-libraries.sh install` fills `../lib/`, the
+loader's default search path. It is the transition form of `CMakeLists.txt` (which aggregates the same
+objects into the one `xinfer_kernels_ascend.so`); R1b retires it when the TVM-FFI glue faces land.
+
+### Symbol prefix and byte anchors
+
+Every exported launcher uses `xinfer_aot_<kernel>_{call,init,get_last_error}` (plus
+`xinfer_aot_<kernel>_device` as the device symbol and the static bridges' `xinfer_*` C ABI). The v22
+`xcompute_aot_` names are intentionally not kept: the rename makes the zero-xcompute grep assertion
+unconditional and prevents the two branches' libraries from loading interchangeably. `tools/generate.py
+--symbol-prefix xcompute_aot_` reproduces the v22 delivery objects byte for byte (anchor builds).
+
+Each family's delivered `.o`/`.asc`/`.tir` must equal the delivered library set (`SHA256SUMS.objects` of
+the serving build) when built with the vendored, unmodified generator at the same prefix; the
+`build-libraries.sh` recipe (toolchain pin below) is the byte-for-byte contract. Mismatch downgrades to
+the bit-level witness (same inputs through the delivered library and the new library, outputs compared
+bitwise). Symbol renames and the family-directory layout change only host-side names; kernel lowering is
+untouched. The AA-resample real6 objects are assets, not regenerable sources (the auto-scheduler
+deadlock documented in `build-libraries.sh`); they are renamed and relinked, never regenerated.
+

@@ -13,9 +13,9 @@ fail=0
 
 echo "== 1) source assertion: bare-word grep over the ascend domain =="
 # The NV zero-change domains (cuda/, _xcompute.py, tests stand-ins) are outside
-# the scan; kernels/tools/generate.py carries no literal after the S1 sweep.
+# the scan; src/tools/generate.py carries no literal after the S1 sweep.
 if git grep -n -i "xcompute" -- xinfer/ops/backends/ascend xinfer/models xinfer/engine xinfer/platforms \
-        ':(exclude)xinfer/ops/backends/ascend/kernels/ops/**' > /tmp/audit_src.txt; then
+        ':(exclude)xinfer/ops/backends/ascend/src/*/*.py' > /tmp/audit_src.txt; then
     echo "FAIL: xcompute references remain:"; cat /tmp/audit_src.txt; fail=1
 else
     echo "PASS: no xcompute reference in the ascend domain (kernel sources vendored verbatim excluded;"
@@ -24,7 +24,7 @@ fi
 
 echo
 echo "== 2) binary assertion: every built library =="
-for so in xinfer/ops/backends/ascend/kernels/lib/*.so; do
+for so in xinfer/ops/backends/ascend/lib/*.so; do
     [ -e "$so" ] || { echo "PASS(empty): no libraries installed (build.sh install creates them)"; break; }
     count=$(nm -D --defined-only "$so" | grep -c "xcompute" || true)
     if [ "$count" -ne 0 ]; then
