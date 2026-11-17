@@ -28,6 +28,7 @@ from xinfer.ops.registry import register
 # arch -> K (hidden width) -> inclusive ranges of batch, M (rows) and A (action width)
 SHAPES = {
     120: {1024: dict(batch=(1, 4), m=(1, 32), a=(26, 32))},
+    110: {1024: dict(batch=(1, 4), m=(1, 32), a=(26, 32))},
 }
 
 
@@ -73,9 +74,11 @@ def denoise_output_euler(x, h, weight, *, dt, dof_mask=None, padding_velocity=No
     return out
 
 
-# arch -> inclusive ranges of batch, M (rows), A (action width) and N (output width, a multiple of 16)
+# arch -> boxes of inclusive ranges of batch, M (rows), A (action width) and N (output width, a multiple of 16)
 EMBED_SHAPES = {
-    120: dict(batch=(1, 1), m=(1, 80), a=(1, 32), n=(16, 4096)),
+    120: [dict(batch=(1, 1), m=(1, 80), a=(1, 32), n=(16, 4096))],
+    110: [dict(batch=(1, 1), m=(1, 48), a=(1, 32), n=(16, 2048)),
+          dict(batch=(1, 1), m=(49, 80), a=(1, 32), n=(16, 1024))],
 }
 
 
@@ -84,12 +87,12 @@ def denoise_input_embed_takes(x, weight) -> bool:
     if x.dim() != 3 or weight.dim() != 3 or x.dtype != torch.float32 or weight.dtype != torch.float32:
         return False
     device_arch = arch(x.device)
-    ranges = EMBED_SHAPES.get(device_arch) if device_arch in BUILD_ARCHS else None
-    if ranges is None or weight.shape[1] % 16:
+    boxes = EMBED_SHAPES.get(device_arch) if device_arch in BUILD_ARCHS else None
+    if boxes is None or weight.shape[1] % 16:
         return False
     b, m, a = x.shape
-    return all(lo <= v <= hi for v, (lo, hi) in ((b, ranges["batch"]), (m, ranges["m"]), (a, ranges["a"]),
-                                                   (weight.shape[1], ranges["n"])))
+    return any(all(lo <= v <= hi for v, (lo, hi) in ((b, box["batch"]), (m, box["m"]), (a, box["a"]),
+                                                     (weight.shape[1], box["n"]))) for box in boxes)
 
 
 def denoise_input_embed(x, weight, *, head_index=None, extra=None, input_mask=None, addends=(), override=None,

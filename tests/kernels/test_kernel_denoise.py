@@ -17,7 +17,7 @@ def reference(x, h, weight, dt, dof_mask=None, padding_velocity=None, pinned=Non
     return out
 
 
-@sm(120)
+@sm(110, 120)
 @pytest.mark.parametrize("b,m,a", [(1, 16, 26), (2, 32, 32), (4, 1, 26)])
 @pytest.mark.parametrize("h_dtype,w_dtype", [(torch.bfloat16, torch.float32), (torch.bfloat16, torch.bfloat16),
                                              (torch.float32, torch.float32)])
@@ -41,7 +41,7 @@ def test_matches_reference(b, m, a, h_dtype, w_dtype, options, rnd):
     assert torch.equal(x, out)
 
 
-@sm(120)
+@sm(110, 120)
 @pytest.mark.parametrize("extra", [False, True])
 @pytest.mark.parametrize("heads", [1, 2])
 @pytest.mark.parametrize("options", ["plain", "addends", "mask+override"])

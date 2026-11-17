@@ -34,6 +34,10 @@ def reference(op, x, weight, bias, activation, residual=None, row_scale=None, qu
     return ACT[activation](y[:, :n]) * y[:, n:]
 
 
+def row_scale(m, rnd):
+    return (rnd(m, dtype=torch.float32) > 0).float()
+
+
 def arguments(op, cls, m, n, k, rnd):
     """Inputs with the epilogue ``cls`` implements (found by asking ``takes`` on the candidates): x, weight, bias
     and the keyword arguments."""
@@ -43,13 +47,18 @@ def arguments(op, cls, m, n, k, rnd):
         x, weight = gemm.quantize_mxfp8(x), gemm.quantize_mxfp8(weight)
     for bias in (None, rnd(rows)):
         for activation in (("silu",) if op == "gemm_glu" else (None, "gelu", "gelu_tanh")):
-            for residual in ((None,) if op == "gemm_glu" or activation else (None, rnd(m, n))):
+            extras = ({},) if op == "gemm_glu" or activation else \
+                ({}, {"residual": rnd(m, n)}, {"row_scale": row_scale(m, rnd)})
+            for extra in extras:
                 for quantize in (False, True):
-                    kw = dict(activation=activation, **({} if residual is None else {"residual": residual}),
-                              **({"quantize": True} if quantize else {}))
+                    kw = dict(activation=activation, **extra, **({"quantize": True} if quantize else {}))
                     if gemm.kernel_name(op, x, weight, bias, **kw) == cls.__name__:
                         return x, weight, bias, kw
     raise AssertionError(f"{cls.__name__} takes no call at {m}x{n}x{k}")
+
+
+def tolerance(cls, quantized):
+    return MXFP8_TOLERANCE if quantized else getattr(cls, "TOLERANCE", 5e-3)
 
 
 @pytest.mark.parametrize("op,cls,m,n,k", list(tuned_calls()))
@@ -58,19 +67,23 @@ def test_kernel_matches_reference_and_generic(op, cls, m, n, k, rnd):
     entry = getattr(gemm, op)
     out = entry(x, weight, bias, **kw)
     quantized = kw.get("quantize", False)
-    assert close(fp32(out), reference(op, x, weight, bias, **kw), MXFP8_TOLERANCE if quantized else 5e-3)
+    assert close(fp32(out), reference(op, x, weight, bias, **kw), tolerance(cls, quantized))
     # the generic path on the same call: the same value up to rounding (it rounds the GEMM result to BF16 before
     # the epilogue, a fused kernel rounds once)
-    call = gemm._call(op, x, weight, bias, kw["activation"], kw.get("residual"), None, quantized)
+    call = gemm._call(op, x, weight, bias, kw["activation"], kw.get("residual"), kw.get("row_scale"), quantized)
     generic = gemm._out(None, (m, n), call)
     (gemm._generic_glu if op == "gemm_glu" else gemm._generic_gemm)(call, generic)
-    assert close(fp32(out), fp32(generic), MXFP8_TOLERANCE if quantized else 5e-3)
+    assert close(fp32(out), fp32(generic), tolerance(cls, quantized))
     if isinstance(x, tuple):
         return
-    # the transposed-storage form of the same weight gives the same kernel and bits
     stored_kn = weight.t().contiguous().t()
+    if getattr(cls, "LAYOUT", None) == "nk":  # a kernel that takes weights stored [N, K] only
+        assert gemm.kernel_name(op, x, stored_kn, bias, **kw) != cls.__name__
+        return
+    # the transposed-storage form of the same weight gives the same kernel and bits
     assert gemm.kernel_name(op, x, stored_kn, bias, **kw) == cls.__name__
-    assert torch.equal(entry(x, stored_kn, bias, **kw), out)
+    if getattr(cls, "DETERMINISTIC", True):
+        assert torch.equal(entry(x, stored_kn, bias, **kw), out)
 
 
 @pytest.mark.parametrize("op,cls,m,n,k", list(tuned_calls()))
@@ -79,7 +92,8 @@ def test_outside_the_tuned_range_runs_generic(op, cls, m, n, k, rnd):
     x, weight, bias, kw = arguments(op, cls, m, n, k, rnd)
     for rows in {lo - 1 for lo, _ in ranges} | {hi + 1 for _, hi in ranges}:
         if rows >= 1 and not any(lo <= rows <= hi for lo, hi in ranges):
-            other = dict(kw, residual=rnd(rows, n)) if "residual" in kw else kw
+            other = dict(kw, **{name: rnd(rows, n) if name == "residual" else row_scale(rows, rnd)
+                                for name in ("residual", "row_scale") if name in kw})
             shorter = gemm.quantize_mxfp8(rnd(rows, k)) if isinstance(x, tuple) else rnd(rows, k)
             assert gemm.kernel_name(op, shorter, weight, bias, **other) != cls.__name__
 
@@ -132,10 +146,11 @@ def test_out_argument_and_errors(rnd):
         gemm.gemm_glu(x, rnd(7, 16))
 
 
-@sm(120)
+@sm(110, 120)
 def test_repeat_calls_are_bitwise_equal_and_replay_in_a_cuda_graph(rnd):
-    """Every SM120 kernel: the same bits on a second call, and in a captured graph replayed on new inputs. Scratch
-    memory belongs to a stream, so each call runs once on the capture stream before the capture."""
+    """Every kernel of the GPU: the same bits on a second call, and in a captured graph replayed on new inputs (a
+    kernel that adds its split-K partial sums in arrival order: the same values up to rounding). Scratch memory
+    belongs to a stream, so each call runs once on the capture stream before the capture."""
     stream = torch.cuda.Stream()
     for param in tuned_calls():
         op, cls, m, n, k = param.values
@@ -149,8 +164,11 @@ def test_repeat_calls_are_bitwise_equal_and_replay_in_a_cuda_graph(rnd):
                 return (t,)
             return t[0], t[1][layout.scale_offsets(*t[0].shape, t[0].device)]
 
+        def same(a, b):
+            return torch.equal(a, b) if getattr(cls, "DETERMINISTIC", True) else close(a, b, tolerance(cls, False))
+
         first = entry(x, weight, bias, **kw)
-        assert all(torch.equal(a, b) for a, b in zip(parts(entry(x, weight, bias, **kw)), parts(first)))
+        assert all(same(a, b) for a, b in zip(parts(entry(x, weight, bias, **kw)), parts(first)))
         out = tuple(torch.empty_like(t) for t in first) if isinstance(first, tuple) else torch.empty_like(first)
         with torch.cuda.stream(stream):
             entry(x, weight, bias, out=out, **kw)
@@ -163,7 +181,7 @@ def test_repeat_calls_are_bitwise_equal_and_replay_in_a_cuda_graph(rnd):
             old.copy_(new)
         graph.replay()
         torch.cuda.synchronize()
-        assert all(torch.equal(a, b) for a, b in zip(parts(out), parts(expected))), cls.__name__
+        assert all(same(a, b) for a, b in zip(parts(out), parts(expected))), cls.__name__
 
 
 def test_growing_scratch_inside_a_capture_is_an_error(rnd):

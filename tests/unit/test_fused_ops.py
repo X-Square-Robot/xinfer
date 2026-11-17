@@ -141,6 +141,7 @@ WALLX2B = ("layer_norm_cast", "zero_centered_rms_norm", "add_zero_centered_rms_n
            "gated_residual_modulated_rms_norm", "identity_layer_norms_", "qkv_norm_split", "qkv_norm_rope_kvcache",
            "rope_full", "rot_pos", "pos_embed_interp", "segment_attention", "gated_kvcache_attention",
            "gated_delta_net", "flow_input_embed")
+PREFETCH = ("prefetch_weights", "join_prefetch")  # L2 prefetches on integrated GPUs, nothing elsewhere
 
 
 def test_the_cuda_modules_register_their_operators_when_the_kernel_library_loads(monkeypatch):
@@ -169,7 +170,7 @@ def test_the_cuda_modules_register_their_operators_when_the_kernel_library_loads
     try:
         registry = registered(dict(requires=library, platforms=("sm120",), version="sha256:0"))
         names = registry.backend_ops("cuda:kernels")
-        assert set(names) == set(FUSED) | set(WALLX2B) | set(MXFP8)
+        assert set(names) == set(FUSED) | set(WALLX2B) | set(MXFP8) | set(PREFETCH)
         # Filter by implementation: the Ascend backend registers some of the same operators after the CUDA modules.
         assert {i.platforms for name in names for i in registry.implementations(name)
                 if i.name == "cuda:kernels"} == {("sm120",)}

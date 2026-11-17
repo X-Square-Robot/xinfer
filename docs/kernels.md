@@ -8,13 +8,13 @@ The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the kerne
 
 ## GPU support
 
-The kernel library is built for one GPU architecture and registers its operators on that architecture only. This repository has kernels for SM120 (RTX 50 series).
+The kernel library is built for one GPU architecture and registers its operators on that architecture only. This repository has kernels for SM120 (RTX 50 series) and SM110 (Jetson Thor).
 
-A GEMM runs on a kernel written for its architecture when the call is one that kernel was tuned on, and otherwise on cuBLASLt with the epilogue as a separate kernel. Each kernel lists the shapes it takes next to the code that launches it (`xinfer/ops/backends/cuda/gemm_sm120.py`): the ranges of rows over which it was measured not slower than the cuBLASLt path on an RTX 5090. The attention and flow kernels list their shapes the same way (`attn.py`, `flow.py`), and the calls outside them run on the torch reference.
+A GEMM runs on a kernel written for its architecture when the call is one that kernel was tuned on, and otherwise on cuBLASLt with the epilogue as a separate kernel. Each kernel lists the shapes it takes next to the code that launches it (`xinfer/ops/backends/cuda/gemm_sm120.py`, `gemm_sm110.py`): on an RTX 5090 the ranges of rows over which it was measured not slower than the cuBLASLt path; on a Jetson AGX Thor the ranges over which it was measured at least 5% faster at three or more consecutive scan points, the selection of the xcompute build of the [performance table](performance.md), whose outputs the library gives bit for bit on the reference requests. On SM110 the library covers the BF16 compositions of Wall-OSS and Wall-X 2B. The attention and flow kernels list their shapes the same way (`attn.py`, `flow.py`), and the calls outside them run on the torch reference.
 
 ## Build
 
-Building needs the CUDA 13 toolkit, CMake 3.24 or later, the `apache-tvm-ffi` Python package and the CUTLASS headers (a submodule):
+Building needs the CUDA 13 toolkit, CMake 3.24 or later (3.28 for SM110), the `apache-tvm-ffi` Python package and the CUTLASS headers (a submodule):
 
 ```bash
 git submodule update --init third_party/cutlass
@@ -23,7 +23,7 @@ cmake -S xinfer/ops/backends/cuda/src -B build/kernels
 cmake --build build/kernels -j
 ```
 
-This writes `xinfer/ops/backends/cuda/xinfer_kernels.so`. The target architecture is the first GPU of the build machine; `-DXINFER_CUDA_ARCH=120` sets it on a machine without that GPU.
+This writes `xinfer/ops/backends/cuda/xinfer_kernels.so`. The target architecture is the first GPU of the build machine; `-DXINFER_CUDA_ARCH=120` (or `110`) sets it on a machine without that GPU.
 
 ## Run
 

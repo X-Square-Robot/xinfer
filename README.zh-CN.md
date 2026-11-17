@@ -97,7 +97,7 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 | 硬件 | 设备 | 运行时 |
 |---|---|---|
 | NVIDIA GPU · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
-| NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA，Wall-OSS 可选 Xcompute 算子 |
+| NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
 | CPU | `cpu` | 参考实现与测试 |
 

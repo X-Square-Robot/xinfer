@@ -21,7 +21,7 @@ xinfer/ops/
   layout/          storage layouts of the low-precision formats (scale swizzle, weight row orders, rope table)
   backends/        one package per backend (hardware), one module per operator category
     _xcompute.py     imports the xcompute library once (shared by every backend that calls it)
-    cuda/            attn.py, gemm.py, norm.py, flow.py, position.py
+    cuda/            attn.py, gemm.py (with gemm_sm120.py, gemm_sm110.py), norm.py, flow.py, position.py
     ascend/          attn.py, gemm.py, norm.py; graph-safe Torch attention when NPU graphs are enabled
 
 ```
