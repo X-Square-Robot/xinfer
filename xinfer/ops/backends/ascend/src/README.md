@@ -99,8 +99,10 @@ The 44 kernel modules of the porting audit live in the family directories (`gemm
 modules beside their family READMEs, the generator pair in `tools/` (`generate.py` + `abi.py`, the
 build-spike contract), the C-ABI static bridges in `common/` beside `build_info.cc`, and the rosters'
 library map in `FAMILIES.md`. `finish_br_c1024` and `decodeattn_r4` arrived family-ized; the two walloss
-remnant kernels ride along. The modules keep their Apache-2.0 headers (they come from the xcompute
-project, as the CUDA sources did). Module roots resolved by the generator are `<family>.<module>` from
+remnant kernels ride along. License headers: the static bridges vendored from the v22 repo keep their
+provenance notes, while the TileLang modules are this campaign's own sources and carry their working
+docstrings, not per-file ASF headers (the CUDA sources' headers came with the xcompute migration; the
+header question for the campaign-authored modules is an audit item for the owner to adjudicate). Module roots resolved by the generator are `<family>.<module>` from
 this directory (e.g. `--module gemm.smallm_r3`).
 
 Each family README's table is the checklist: kernel name, envelope, dose, v22 source path, gate evidence.

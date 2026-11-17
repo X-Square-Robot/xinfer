@@ -342,7 +342,7 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
                     if _is_slow_fallback(table.selection(name)) and name in FUSED_OPS})
     if names:
         hint = ("Build the CUDA kernel library for this GPU: docs/kernels.md" if kind == "cuda" else
-                "Install the Ascend xcompute build, or set XINFER_XCOMPUTE_LIBRARY to it: docs/ascend950dt.md")
+                "Build the Ascend kernel library for this NPU: docs/ascend950dt.md")
         message = (f"{model}: {len(names)} operators have no fast kernel loaded and fall back to slow torch code "
                    f"({', '.join(names)}). {hint}")
         if strict():
