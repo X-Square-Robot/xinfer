@@ -1,29 +1,13 @@
-"""aa_resample mount: the separable AA-bicubic resize steps of the device image
-chain through the AA-RESAMPLE TileLang AOT kernels.
+"""Separable antialiased bicubic downsampling through the in-tree native library.
 
-Flag ``XINFER_AA_RESAMPLE`` (default on, the PUSH-FINAL composite adjudication -- gate 0.0259 <= 0.05 with full
-e2e dominance; =off restores the vendor): replaces each
-``F.interpolate(bicubic, antialias=True, align_corners=False)`` +
-``add_(0.5).floor_().clamp_(0,255).to(uint8)`` step of ``chain_view`` /
-``device_images._resize`` on the two AA-down deployment shapes with two
-kernel launches (vertical pass u8->fp32 mid, horizontal pass fp32->u8 with
-the quantize law fused). Envelope = 720x1280->128x224 and 480x640->160x224
-only: the two AA-up legs (128x224->224x352, 160x224->224x320) are NOT
-routed -- their custom kernels lose to the aclnn vendor eager (73.5us vs
-29.5us, unit-r6 receipt) and the WIN=224 truncation fix attempts (real9 /
-real10 builds) deadlock the vector core through the TileLang
-auto-scheduler's inserted flag stream; the vendor stays on the up legs and
-this mount declines them (2026-11-16, AA-RESUME).
+``XINFER_AA_RESAMPLE`` is on by default. The supported steps are
+720x1280 -> 128x224 and 480x640 -> 160x224; other sizes use the caller's
+interpolation path. Vertical accumulation uses FP32 and the horizontal
+pass includes the uint8 round-half-up conversion.
 
-The knife shared object path is ``XINFER_AA_RESAMPLE_LIB``. An unset or
-unloadable path, or a shape outside the envelope, returns None so the
-caller keeps the released aclnn chain.
-
-Weights are built host-side in fp64 with the extracted torch formula
-(probe-validated 2026-11-16) and stored as fp32; the horizontal index tables
-are per-tap uint32 windows clamped into range (zero-weight taps make the
-clamped gathers exact). Tables, mid buffers and outputs are cached per shape
-with stable addresses, so the NPUGraph capture of the chain replays cleanly.
+Host coefficients are computed in FP64 and stored in FP32. Horizontal
+uint32 index windows are clamped, with zero coefficients outside the input.
+Tables and intermediate buffers retain stable addresses for graph replay.
 """
 
 from __future__ import annotations
@@ -62,9 +46,7 @@ def _dump_stats():
 atexit.register(_dump_stats)
 
 A = -0.5
-# (HIN, WIN, HOUT, WOUT, TAPS) -- envelope: AA-down shapes only. The knife
-# .so links only these four kernels (real6-validated objects); the up legs
-# stay on the aclnn vendor -- see the module docstring for the receipt.
+# (HIN, WIN, HOUT, WOUT, TAPS): only these downsampling steps use native entries.
 STEPS = {
     (720, 1280, 128, 224): ("aa_v_720_1280_128_224", "aa_h_720_1280_128_224", 25),
     (480, 640, 160, 224): ("aa_v_480_640_160_224", "aa_h_480_640_160_224", 13),
@@ -155,10 +137,14 @@ def _tables_1d(hin, hout, taps):
 
 
 def _shape_pack(device, hin, win, hout, wout, taps):
-    key = (hin, win, hout, wout)
+    device = torch.device(device)
+    if device.index is None:
+        device = torch.device(device.type, torch.npu.current_device())
+    shape = (hin, win, hout, wout)
+    key = (device, torch.npu.current_stream(device).npu_stream, *shape)
     pack = _SHAPES.get(key)
     if pack is None:
-        vname, hname, taps = STEPS[key]
+        vname, hname, taps = STEPS[shape]
         wy, basey = _tables_1d(hin, hout, taps)
         wx, basex = _tables_1d(win, wout, taps)
         woutp = (wout + 63) // 64 * 64

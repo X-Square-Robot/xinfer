@@ -125,6 +125,12 @@ class ResizeChainGraphs:
     def _capture(self, meta, sizes, resize) -> None:
         start = time.perf_counter()
         static_in = torch.zeros(meta["out_size"], dtype=torch.uint8, device=self.device)
+        # Stream-local operator buffers must be created on the stream captured below.
+        self._stream.wait_stream(torch.npu.current_stream(self.device))
+        with torch.inference_mode(), torch.npu.stream(self._stream):
+            warm_output = chain_view(static_in, meta, sizes, resize, self._resize, self._quantize)
+        self._stream.synchronize()
+        del warm_output
         graph = torch.npu.NPUGraph()
         # inference_mode, as LaneCUDAGraphs captures the stage graphs: torch_npu's capture_begin
         # updates a graph-bookkeeping tensor in place, and once the engine's own captures (inside

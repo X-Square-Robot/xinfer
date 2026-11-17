@@ -444,13 +444,7 @@ def denoise_output_euler(x, h, weight, *, dt, bias=None, prenorm="none", norm_we
         out = x
     _require(out is x, "the carried tail updates x in place")
     device = x.device
-    scratch = getattr(denoise_output_euler, "_scratch", None)
-    stream = torch.npu.current_stream(device).npu_stream
-    if scratch is None or scratch.device != device:
-        if torch.npu.is_current_stream_capturing():
-            raise RuntimeError("warm up the flow Euler tail on this stream before graph capture")
-        scratch = torch.empty(512 * 1024, dtype=torch.uint8, device=device)
-        denoise_output_euler._scratch = scratch
+    scratch = _native.scratch("denoise_fp32head", 512 * 1024, device)
     flags = 0
     if bias is not None:
         flags |= 1
