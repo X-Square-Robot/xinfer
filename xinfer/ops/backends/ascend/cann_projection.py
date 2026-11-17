@@ -314,36 +314,12 @@ class CannProjection:
         self._vision_cube_warmed = False
         self._buffers = {}
         self._m768_warmed = False
-        # 2b-m16: the wallx2b action feeds o_t/down_t as fresh transposed
-        # [N, K] views of persistent [K, N] parameters; materializing the
-        # row-major weight per call costs a 4 MB device transpose inside
-        # every captured replay (probe card0: 12.4 -> 5.0 us for the M16
-        # o-projection once the copy is cached). Keyed by the storage
-        # identity of the source view and pinned to the source's lifetime.
-        self._contig_weights = {}
-        # mx8-r3: flag-isolated routes for the wall-oss prefill down
-        # projection family ([M, 11008] x [2048, 11008]).
-        self._mx8_kn = {}
-        self._mx8_split = {}
         self._lock = Lock()
 
     def _stable_contiguous(self, weight):
         if weight.is_contiguous():
             return weight
-        key = (
-            weight.data_ptr(),
-            tuple(weight.shape),
-            tuple(weight.stride()),
-            weight.dtype,
-        )
-        entry = self._contig_weights.get(key)
-        if entry is None:
-            copy = weight.contiguous()
-            # Keep the source view (and its storage) alive so the identity
-            # cannot be recycled by a later allocation.
-            self._contig_weights[key] = (weight, copy)
-            return copy
-        return entry[1]
+        return _native.derived("cann_contiguous", weight, weight.contiguous)
 
     def _mx8_down(self, x, weight):
         """mx8-r3 flag routes for the [M, 11008] x [2048, 11008] down projection.
@@ -358,27 +334,17 @@ class CannProjection:
         """
         x = x.contiguous()
         if _MX8_DOWN_MODE == "prepack":
-            key = (weight.data_ptr(), tuple(weight.shape), weight.dtype)
-            entry = self._mx8_kn.get(key)
-            if entry is None:
-                if torch.npu.is_current_stream_capturing():
-                    raise RuntimeError("warm up the mx8 down prepack route before graph capture")
-                copy = weight.t().contiguous()
-                self._mx8_kn[key] = (weight, copy)
-                entry = self._mx8_kn[key]
-            return torch.mm(x, entry[1])
+            transposed = weight.t()
+            packed = (transposed if transposed.is_contiguous() else
+                      _native.derived("mx8_kn", weight, transposed.contiguous))
+            return torch.mm(x, packed)
         if _MX8_DOWN_MODE == "splitk":
-            key = (weight.data_ptr(), tuple(weight.shape), weight.dtype)
-            entry = self._mx8_split.get(key)
-            if entry is None:
-                if torch.npu.is_current_stream_capturing():
-                    raise RuntimeError("warm up the mx8 down splitk route before graph capture")
-                stacked = weight.t().reshape(_MX8_DOWN_SPLITK, -1, weight.shape[0]).contiguous()
-                self._mx8_split[key] = (weight, stacked)
-                entry = self._mx8_split[key]
+            split = weight.t().reshape(_MX8_DOWN_SPLITK, -1, weight.shape[0])
+            stacked = (split if split.is_contiguous() else
+                       _native.derived(("mx8_split", _MX8_DOWN_SPLITK), weight, split.contiguous))
             rows = x.shape[0]
             view = x.reshape(rows, _MX8_DOWN_SPLITK, -1).permute(1, 0, 2)
-            return torch.bmm(view, entry[1]).sum(0)
+            return torch.bmm(view, stacked).sum(0)
         raise RuntimeError(f"unknown XINFER_MX8_DOWN_MODE {_MX8_DOWN_MODE!r}")
 
     @contextmanager
