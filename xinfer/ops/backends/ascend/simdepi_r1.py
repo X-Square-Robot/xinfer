@@ -1,20 +1,10 @@
-"""simdepi-r1 opt-in route: fused-after SIMD add_rms (buf2/f32direct plans).
+"""Optional add-RMSNorm plans with buffered stores and direct FP32 weights.
 
-SIMD-EPILOGUE R1. Off by default (XINFER_SIMDEPI=off). Families:
-v1280 -- [rows,1280] BF16 vision/merger add rows ride se1_ubv1280_buf2f
-       (the released ubv_h1280 arithmetic with sum/out MTE3 double
-       buffering + FP32-direct weight row; probe-se1: sum+norm bitwise,
-       12.71 -> 10.66 us graph on r2112).
-p2048 -- [1,P,2048] BF16 prefill add rows ride se1_ubv2048_buf2f (the
-       released ubv_h2048 arithmetic with the same buf2 scheduling;
-       probe-se1: sum+norm bitwise, 8.28 -> 7.26 us graph on p768).
-
-All launches resolve the current stream per call so NPUGraph capture
-records the node (the gdn-gamma ctypes rule). The FP32 weight row is
-cached per storage identity (identical f32 values to the in-kernel UNPK
-upcast of the BF16 staging; the rmsfuse-r5 v1280 pattern).
-The library path is XINFER_SIMDEPI_LIB; unset disables the route (the callers treat a missing route as the
-released chain).
+``XINFER_SIMDEPI`` is off by default. ``v1280`` serves [rows,1280] BF16
+vision/merger inputs; ``p2048`` serves [1,P,2048] BF16 prefill inputs.
+The arithmetic is unchanged from the corresponding normalization plans.
+The in-tree launchers use the current stream; FP32 weight representations
+are cached before graph capture.
 """
 import array
 import ctypes

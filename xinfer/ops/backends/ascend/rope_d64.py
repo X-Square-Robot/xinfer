@@ -1,15 +1,12 @@
-"""2B-COVERAGE: rotary_dim-64 partial rope through the AOT launcher (ctypes).
+"""Partial rotary embedding for the first 64 channels of 256-wide heads.
 
-The launcher symbol ``xinfer_aot_rope_half_d64_call`` follows the
-established internal AOT-launcher precedent (no FFI face change): the kernel
-rotates the first 64 channels of every head with individually rounded vector
-multiplies (no FMA contraction) and one RNE BF16 round, and passes channels
-64..255 through an exact bf16->f32->bf16 round trip, bitwise-equal to the
-torch composition of ``fused.rope_full`` at ``rotary_dim == 64`` (the only
-bit-level deviations are signed zeros, +0 vs -0, numerically identical).
-The angle tables are duplicated to 64 columns with a fresh concat per call:
-stateless, so a graph capture always bakes the concat into the graph and
-every replay recomputes it from the current angles.
+The in-tree launcher uses individually rounded vector multiplications
+without FMA contraction, then one RNE BF16 conversion. Remaining channels
+pass through an exact BF16/FP32/BF16 roundtrip. The reference agrees except
+for numerically equivalent signed zeros.
+
+Compact angle tables are expanded anew per call, so graph replay recomputes
+them from the current angles.
 """
 
 import ctypes
@@ -57,7 +54,7 @@ def rope_half_d64(q, k, cos, sin):
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     # the single library's TVM-FFI face serves first (the unified launch boundary);
-    # the ctypes launcher of the family library is the fallback below
+    # the same library's C-ABI launcher is the fallback below
     if not _native.launch_kernel("rope_half_d64",
                                  (q, k, cos2, sin2, q_out, k_out), (tokens,)):
         rc = call(ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),

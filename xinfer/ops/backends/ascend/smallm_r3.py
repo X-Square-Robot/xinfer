@@ -1,10 +1,9 @@
-"""smallm-r3 opt-in routes: M16 action-loop kernels from libsmallm_r3.so.
+"""Optional small-M action projections in the in-tree native library.
 
-Round-3 SMALLM-K. Off by default (XINFER_SMALLM_R3=off). Families:
-oproj, gateup, down, qkv (comma list, or 1/all/on for all four). The library
-path defaults to the campaign artifact and can be overridden with
-XINFER_SMALLM_R3_LIB. All launches resolve the current stream per call so
-NPUGraph capture records the node (gdn-gamma ctypes rule).
+``XINFER_SMALLM_R3`` is off by default. Select ``oproj``, ``gateup``,
+``down`` or ``qkv`` with a comma list, or enable all with ``1/all/on``.
+Launches resolve the current stream per call. Packed weights must be
+prepared before graph capture.
 """
 from xinfer.ops.backends.ascend import _native
 import ctypes

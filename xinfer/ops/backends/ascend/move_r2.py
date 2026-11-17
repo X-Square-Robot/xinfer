@@ -1,31 +1,15 @@
-"""MOVE-R2 mount (kernel launchers for the XINFER_MOVER2 class route).
+"""Gated DeltaNet layout and elementwise adapters for the in-tree native library.
 
-The route lives in ``glue.cann_gated_delta_net.CannGatedDeltaNet.__call__``
-(conv-gemm precedent); this module only loads libmove_r2.so and launches the
-two delivered kernels, counting per-family route stats.
+``XINFER_MOVER2`` is off by default and accepts these families:
+- ``gdrapply``: write TND Q/K packs with one RNE and copy V after the existing
+  convolution, SiLU and normalization statistics.
+- ``gdrgates``: compute beta and gate pre-activations from strided ZBA rows.
+- ``gdrtailmix``: apply the elementwise tail with its three RNE roundings;
+  normalization statistics remain in the existing Torch/CANN chain.
 
-Flag ``XINFER_MOVER2`` (default off), comma list:
-  ``gdrapply``  — post-conv elementwise fuse: the full-width transpose copy
-                  (kills the conv-output width slice), aclnn SiLU + the aclnn
-                  square/sum/rsqrt stats stay, then ONE kernel writes the TND
-                  q/k packs (x * rstd, single RNE) and the v copy. Replaces
-                  Slice + Mul_Cast(n) + 2x mul-by-one + AsStrided(v).
-  ``gdrgates``  — beta/g gate chain in one pass via the production library's
-                  ``gdp_gates_fwd_bf16`` (theta-lib line-equal math), reading
-                  the strided zba rows directly.
-  ``gdrtailmix``— the raw-side elementwise tail in ONE kernel (nbf/wn/gate
-                  muls with the chain's exact three RNE roundings) from the
-                  aclnn rstd and gate tensors. Replaces the 6-op aclnn
-                  elementwise tail (raw cast, mul, cast, w-mul, gate-mul,
-                  cast); the stats (pow/mean/rsqrt) stay on aclnn.
-
-All three keep the chunk kernel's operand contracts (q,k,v,beta,g layouts
-and dtypes unchanged), so the GDN-K3 chunk domain is untouched. The
-gdrapply/gdrtailmix kernels are mul/cast-only on aclnn-identical inputs
-(bitwise-expected); gdrgates differs only in vendor transcendental
-approximations (probe-adjudicated <= 3 fp32 ulp on g, beta bitwise).
-Every route is envelope-guarded with per-family fail-safe fallback.
-Route counters land in $XINFER_MOVER2_STATS[-pidN].json at shutdown.
+Chunk inputs keep their layouts and dtypes. The gate route may differ in
+FP32 transcendental approximations; the layout/tail routes retain the same
+arithmetic. Optional route counts use ``XINFER_MOVER2_STATS``.
 """
 
 from __future__ import annotations

@@ -1,23 +1,11 @@
-"""rmsfuse-r4 opt-in routes: lean RMS plans from librmsfuse_r4.so.
+"""Optional RMS normalization plans in the in-tree native library.
 
-Round-4 OSS-RMSFUSE. Off by default (XINFER_RMSFUSE_R4=off). Families:
-m16 -- the lean M16/H1024 add/plain plans (UB-staged loads, direct FP32
-       weight; arithmetic statements identical to the lib generic_h1024
-       program, probe-r4 bitwise on sum and norm);
-f32in -- the action o-proj/down sites borrow the projection's FP32
-       accumulator and the kernel rounds it to BF16 in-register
-       (bit-identical to the gemm_epilogue finish cast followed by the m16
-       plan; kills the separate Cast node). Engine wiring attaches
-       ``gemm_add_rms_r4`` to the registered add_rms_norm implementation
-       (the copykill-r2 K2 attribute pattern); defers to the smallm-r3
-       routes when their oproj/down families are enabled.
-h2048w -- the prefill [1,P,2048] add rows ride the f32-direct-weight copy
-       of the ubv_h2048 plan (weight staging removed; per-row arithmetic
-       and the lane tree unchanged, probe-r4 bitwise).
-
-All launches resolve the current stream per call so NPUGraph capture records
-the node (the gdn-gamma ctypes rule). XINFER_RMSFUSE_R4_LIB overrides the
-library path.
+``XINFER_RMSFUSE_R4`` is off by default. ``m16`` handles M16/H1024
+normalization, ``h2048w`` handles [1,P,2048] add-normalization with direct
+FP32 weights, and ``f32in`` exposes the FP32-accumulator finish helper.
+That helper rounds the product to BF16 before the M16 normalization and
+defers to an enabled small-M projection route. Launches use the current
+stream; weight conversions must be prepared before graph capture.
 """
 from xinfer.ops.backends.ascend import _native
 import array

@@ -1,21 +1,15 @@
-"""soupunlock mount: precision-band unlocked fused reduction kernels.
+"""Optional fused reductions for prefill normalization and vision LayerNorm.
 
-Flag ``XINFER_SOUPUNLOCK`` (default ``rmsfull`` armed from layer 8 since
-the CAPACITY-R2 adjudication, 2026-11-16; ``XINFER_SOUPUNLOCK=off`` opts
-out, ``on`` / ``rmsfull,visionln`` re-arm both families and
-``XINFER_SOUPUNLOCK_FROM_LAYER`` retunes the layer gate), families:
+``XINFER_SOUPUNLOCK`` defaults to ``rmsfull`` from layer 8. ``off`` disables
+it; ``on`` enables both ``rmsfull`` and ``visionln``. The existing
+``XINFER_SOUPUNLOCK_FROM_LAYER`` selects the first RMS layer.
 
-- ``rmsfull``: the whole add_zero_centered_rms_norm prefill site in ONE
-  AOT launch (s, stats, apply) -- replaces soupform normprep + the aclnn
-  Mean/Adds/Rsqrt stats chain + apply_rstd. The reduction is a deterministic
-  fp32 warp tree; the band witness proves it is no worse than the vendor
-  chain against an fp64 oracle (SOUP-UNLOCK, 2026-11-15 ruling).
-- ``visionln``: the vision LayerNorm sites (hidden 1024, BF16) as one fused
-  two-pass kernel replacing aclnnLayerNormV4.
-
-Envelope misses return None so the caller keeps the released chain. Route
-counters are appended to $XINFER_SOUPUNLOCK_STATS (pid-suffixed per process,
-the serve child included) for the routing receipt.
+``rmsfull`` combines the residual sum, deterministic FP32 tree statistics
+and zero-centered RMS apply. ``visionln`` uses a two-pass LayerNorm for
+1024-wide BF16 inputs. These are tolerance-level reduction implementations;
+the in-tree library retains the original operation order and envelopes.
+Unsupported calls return None. ``XINFER_SOUPUNLOCK_STATS`` records optional
+per-process route counts.
 """
 
 from __future__ import annotations
