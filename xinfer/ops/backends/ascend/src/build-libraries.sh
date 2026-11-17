@@ -215,7 +215,10 @@ if compgen -G "$STATIC_SRC_DIR/*.cc" > /dev/null; then
     NPU_INC="$PYV/lib/python3.11/site-packages/torch_npu/include"
     PY_INC="$PYV/include"
     mkdir -p "$WORK/out/static"
+    # build_info.cc is the single-library form's TVM-FFI self-description (CMakeLists builds it);
+    # the family libraries are ctypes-loaded and do not carry it.
     for cc in "$STATIC_SRC_DIR"/*.cc; do
+        [ "$(basename "$cc")" = "build_info.cc" ] && continue
         g++ -std=c++17 -O2 -fPIC \
             -I"$STATIC_SRC_DIR" -I"$RUNTIME/include" -I"$RUNTIME/aarch64-linux/include" \
             -I"$TORCH_INC" -I"$TORCH_INC/torch/csrc/api/include" -I"$NPU_INC" -I"$PY_INC" \
