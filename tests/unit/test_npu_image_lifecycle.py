@@ -1,6 +1,5 @@
 """DVPP session ownership without an NPU or Python ACL."""
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -13,14 +12,19 @@ from xinfer.platforms import npu as npu_images
 def media(monkeypatch):
     state = SimpleNamespace(device=None, calls=[], init_status=0, exit_status=0)
 
-    @contextmanager
-    def device_context(device):
-        previous = state.device
-        state.device = device
-        try:
-            yield
-        finally:
-            state.device = previous
+    class device_context:
+        """A re-entrant stand-in for ``torch.npu.device``: the decoder caches its context object
+        (WT2b) and re-enters it across calls, which the generator ``@contextmanager`` cannot do."""
+
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            self._previous = state.device
+            state.device = self.device
+
+        def __exit__(self, *exc):
+            state.device = self._previous
 
     def sys_init():
         state.calls.append(("init", state.device))
@@ -30,11 +34,18 @@ def media(monkeypatch):
         state.calls.append(("exit", state.device))
         return state.exit_status
 
-    acl = SimpleNamespace(himpi=SimpleNamespace(sys_init=sys_init, sys_exit=sys_exit))
+    acl = SimpleNamespace(himpi=SimpleNamespace(sys_init=sys_init, sys_exit=sys_exit),
+                          rt=SimpleNamespace())
     monkeypatch.setattr(torch, "npu", SimpleNamespace(device=device_context), raising=False)
+    monkeypatch.setattr(npu_images, "_aclfast", None)  # the native fast path needs the real ACL
     monkeypatch.setattr(npu_images, "load_npu_media", lambda: acl)
     monkeypatch.setattr(npu_images, "_MEDIA_USERS", {})
-    monkeypatch.setattr(npu_images.NpuJpegDecoder, "_decode", lambda self, jpeg: jpeg)
+    # The wave decoder has no per-image ``_decode`` step anymore (the transactions start
+    # together and the frames drain by size): a deviceless test routes every image to the
+    # host fallback -- ``_begin`` answering None -- and stubs that fallback to the passthrough
+    # the old ``_decode`` patch was, so the lease and close semantics below run unchanged.
+    monkeypatch.setattr(npu_images.NpuJpegDecoder, "_begin", lambda self, jpeg: None)
+    monkeypatch.setattr(npu_images.NpuJpegDecoder, "_decode_on_host", lambda self, jpeg: jpeg)
     return state
 
 

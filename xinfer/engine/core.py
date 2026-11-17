@@ -563,6 +563,8 @@ class Engine:
         Returns:
             True if a request was admitted or a batch was dispatched.
         """
+        if self._upload_batcher is not None:
+            self._upload_batcher.poll()  # reclaim the slabs whose release event completed
         progressed = self._admit_requests()
         progressed = self._queue_device_ready() or progressed
         for stage in reversed(self.order):  # downstream first drains the pipeline
@@ -696,10 +698,12 @@ class Engine:
             if stream is None:
                 request.inputs, request.inputs_ready = inputs, None
             else:
-                ready = self._device_module.Event()
+                # timing-enabled when a stats sink is configured, like the queue-handover path's
+                # admission event: ``_request_stats`` reads elapsed times off ``inputs_ready``
+                ready = self._device_module.Event(enable_timing=self.stats_sink is not None)
                 ready.record(stream)
                 if images and self._device_stream is not None:
-                    fence = self._device_module.Event()
+                    fence = self._device_module.Event(enable_timing=self.stats_sink is not None)
                     fence.record(self._device_stream)
                     request.inputs, request.inputs_ready = inputs, (ready, fence)
                 else:
@@ -1306,11 +1310,19 @@ class Engine:
                 times = {stage: (began - request.ready_at, ended - request.ready_at)
                          for stage, (began, ended, _) in request.timing.items()}
             else:
-                since = request.inputs_ready.elapsed_time
+                # the fast-admission pair (upload event, decode fence) is ready when the later of
+                # the two completes, so a stage's wait counts from the later one -- the smaller
+                # elapsed time of the pair
+                marks = request.inputs_ready if type(request.inputs_ready) is tuple else \
+                    (request.inputs_ready,)
+
+                def since(event):
+                    return min(mark.elapsed_time(event) for mark in marks)
+
                 times = {stage: (since(began) / 1000, since(ended) / 1000)
                          for stage, (began, ended, _) in request.timing.items()}
-        except (RuntimeError, ValueError):  # timing may be unavailable even for a timing-enabled event
-            return None
+        except (RuntimeError, ValueError, TypeError, AttributeError):  # timing may be unavailable even
+            return None                                                # for a timing-enabled event; never kill the completer
         stages = {}
         for stage, (began, ended) in times.items():
             ready = max((times[upstream][1] for upstream in self.stages[stage].depends_on), default=0.0)
@@ -1345,16 +1357,14 @@ class Engine:
             request.handle = None
         slab, request.upload_slab = request.upload_slab, None
         if slab is not None and self._upload_batcher is not None:
-            # ADMISSION-GAP AG2: the request's batched upload slab returns to the ring here. On the
-            # success path the completer waited for the final event (every stage read the slab); on
-            # a failure with an ``after`` event still pending, wait for it first so the async
-            # host-to-device copy is never still reading the host slab a later request overwrites.
-            if after is not None:
-                try:
-                    after.synchronize()
-                except Exception:  # noqa: BLE001 - the device errored; retire the slab anyway
-                    logger.exception("could not wait out a failed request's upload slab")
-            self._upload_batcher.release(slab)
+            # ADMISSION-GAP AG2: the request's batched upload slab returns to the ring here, gated
+            # on the same ``after`` event as the slot above while a failed dispatch's enqueued work
+            # may still read it -- never through a host wait: the engine thread must not block on
+            # device work (the failing request's future resolves in this same call, and the failed
+            # dispatch's event can stay pending a long while). The ring reclaims the slab from a
+            # later engine step's poll once the event completed; on the success path the completer
+            # already waited for the final event, so ``after`` is None there.
+            self._upload_batcher.release(slab, after=after)
         request.inputs = None
         request.outputs.clear()
         if locked:

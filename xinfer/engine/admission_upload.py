@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import threading
+from typing import Any
 
 import numpy as np
 import torch
@@ -87,14 +88,42 @@ class UploadBatcher:
         self._slot_count = slots
         self._slab_bytes = slab_bytes
         self._free: list[_RingSlot] = []
+        self._releasing: list[tuple[_RingSlot, Any]] = []  # (slot, event) awaiting the event's completion
         self._lock = threading.Lock()  # engine thread only in practice; guards release() callers
         self._outstanding = 0
 
-    def release(self, slot: _RingSlot) -> None:
-        """Return a ring slot after its request finished (all device readers done)."""
+    def release(self, slot: _RingSlot, after: Any = None) -> None:
+        """Return a ring slot once ``after`` (if given) completes; a later poll reclaims it.
+
+        The event-gated form never blocks the caller: the engine thread must not wait on device
+        work (a failed dispatch's lane event can stay pending a long while, and the request's
+        future must resolve before it). The slot returns to the free list in this call when
+        ``after`` is None or already complete, else when a later :meth:`poll` finds it complete.
+        """
         with self._lock:
-            self._outstanding -= 1
-            self._free.append(slot)
+            if after is None or after.query():
+                self._outstanding -= 1
+                self._free.append(slot)
+            else:
+                self._releasing.append((slot, after))
+
+    def poll(self) -> None:
+        """Reclaim the slots whose release event has completed (the engine thread, each step)."""
+        if not self._releasing:
+            return
+        with self._lock:
+            pending = []
+            for slot, after in self._releasing:
+                try:
+                    done = after.query()
+                except Exception:  # noqa: BLE001 - a device in an error state never completes; retire the slot
+                    done = True
+                if done:
+                    self._outstanding -= 1
+                    self._free.append(slot)
+                else:
+                    pending.append((slot, after))
+            self._releasing = pending
 
     def upload(self, tensors: dict, names: list[str]) -> tuple[dict, _RingSlot] | None:
         """Pack and upload ``tensors[name] for name in names`` (CPU tensors); None to fall back.

@@ -718,6 +718,16 @@ def __dir__():
     return sorted(_EXPORTS)
 
 
+def explicit_export(name):
+    """The curated export ``name`` (the ``_EXPORTS`` registry), or None.
+
+    The namespace's explicit surface: the same registry ``__getattr__`` serves its dynamic
+    lookups from, never a manufactured entry — the paired-loader rule ``_support.canonical``
+    reads through the namespace's ``explicit_export``.
+    """
+    return _EXPORTS.get(name)
+
+
 # The ``CORE`` surface the ported glue modules reference (the former
 # ``CORE`` object): attribute access over the same namespace, plus
 # the absent-entry ValueError convention for the class glues' fail-safes.

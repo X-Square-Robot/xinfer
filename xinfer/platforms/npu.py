@@ -153,18 +153,40 @@ _CHROMA = {
     1000: (2, 1, False), 1001: (2, 1, True),  # YUV/YVU440SP
 }
 
+# The frame quantizer of the JPEG decode path: a callable the operator backends may register
+# (dependency inversion - the platforms package must not import them). ``None`` leaves the
+# released torch chain below, whose semantics the registered knives must match.
+_FRAME_QUANTIZER = None
+
+
+def register_frame_quantizer(function):
+    """Register ``function(x) -> uint8 tensor or None`` as the decoded-frame quantizer.
+
+    The Ascend backend's SOUP2 quant knife registers itself here (one kernel for the
+    add+floor+clamp+cast of the YUV-to-RGB conversion); a ``None`` return falls back to the
+    released torch chain, and so does any raised error. A second registration replaces the
+    first, which the backend tests use to install their own.
+    """
+    global _FRAME_QUANTIZER
+    _FRAME_QUANTIZER = function
+
 
 def _quant_u8(x):
-    """SOUP2 quant knife: one kernel for add+floor+clamp+cast; falls back."""
-    try:
-        from xinfer.ops.backends.ascend import soup2
+    """The frame quantizer an operator backend may inject; falls back to the released chain.
 
-        if soup2.enabled("quant"):
-            out = soup2.quant_u8(x)
+    The dependency direction forbids this package from importing the operator backends
+    (test_layering's rule), so the Ascend backend registers its SOUP2 quant knife - one kernel
+    for add+floor+clamp+cast - through :func:`register_frame_quantizer` when it loads; without
+    a registration (or on any miss) the torch chain below serves, with the same semantics.
+    """
+    quantizer = _FRAME_QUANTIZER
+    if quantizer is not None:
+        try:
+            out = quantizer(x)
             if out is not None:
                 return out
-    except Exception:  # noqa: BLE001 - any miss runs the released chain
-        pass
+        except Exception:  # noqa: BLE001 - any miss runs the released chain
+            pass
     return x.add_(0.5).floor_().clamp_(0, 255).to(torch.uint8)
 
 

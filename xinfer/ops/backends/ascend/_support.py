@@ -41,6 +41,19 @@ class _AscendKernelsNamespace:
     def __getattr__(self, name):
         return getattr(_glue_core, name)
 
+    @staticmethod
+    def explicit_export(name):
+        """The core's curated export ``name``, or None — never a manufactured entry.
+
+        The paired-loader rule ``canonical`` reads: only a namespace's explicitly defined
+        surface establishes the operator contract, never what its ``__getattr__`` might
+        hand out (the core answers its dynamic lookups from the same registry, so this is
+        that explicit surface).
+        """
+        if _glue_core is None:
+            return None
+        return _glue_core.explicit_export(name)
+
     def __repr__(self):  # pragma: no cover - diagnostics only
         return f"<ascend:kernels namespace over {_glue_core!r}>"
 
@@ -62,15 +75,32 @@ if _native.enabled() and _native.core_library() is not None:
         VERSION = f"libxinfer_ascend_core.so sha256:{hashlib.sha256(Path(_path).read_bytes()).hexdigest()[:12]}"
 
 
+def _explicit_export(name):
+    """The namespace's explicitly defined ``name``, or None — never a ``__getattr__`` product.
+
+    The paired-loader rule ``canonical`` keeps through this re-homing: a module-level
+    ``__getattr__`` may expose raw, output-first launcher functions, whose names alone do
+    not establish the XInfer operator contract. A package answers from its own definitions;
+    the in-tree namespace answers through its ``explicit_export`` (the core module's
+    curated registry — the surface its own dynamic lookups serve).
+    """
+    if xc is None:
+        return None
+    reader = getattr(type(xc), "explicit_export", None)
+    if callable(reader):
+        return reader(name)
+    return vars(xc).get(name)
+
+
 def canonical(name, reference):
     """An explicit glue export with the operator's call signature, or None.
 
-    Inspect the glue namespace directly: a module-level __getattr__ may expose
-    raw, output-first launcher functions, whose names alone do not establish
-    the XInfer operator contract. The registry checks our wrappers'
-    signatures, so the wrapped provider also needs this check.
+    Inspect the glue namespace's explicitly defined surface only: a module-level
+    ``__getattr__`` may expose raw, output-first launcher functions, whose names
+    alone do not establish the XInfer operator contract. The registry checks our
+    wrappers' signatures, so the wrapped provider also needs this check.
     """
-    function = getattr(xc, name, None) if xc is not None else None
+    function = _explicit_export(name)
     if not callable(function):
         return None
     expected = inspect.signature(reference)
