@@ -392,20 +392,10 @@ def _qkv_2b_split(packed, q_weight, k_weight, tail):
     return q, k, v, gate
 
 
-# FLOW-TAIL FT-1: the per-layer q/k norm factors ``weight.float()+1``
-# are constants; caching them keeps the Cast+Adds prep kernels out of eager
-# runs and NPU graph capture (the cached tensors hold the weights alive, so
-# the data_ptr key stays unique; values are the identical torch composition).
-_FT_QKV_FACTORS = {}
-
-
 def _ft_qkv_factor_pair(q_weight, k_weight):
-    key = (q_weight.data_ptr(), k_weight.data_ptr())
-    pair = _FT_QKV_FACTORS.get(key)
-    if pair is None:
-        pair = (q_weight.float() + 1, k_weight.float() + 1)
-        _FT_QKV_FACTORS[key] = pair
-    return pair
+    """Keep each norm factor only while its source weight lives."""
+    return (_native.derived("qkv_norm_factor", q_weight, lambda: q_weight.float() + 1),
+            _native.derived("qkv_norm_factor", k_weight, lambda: k_weight.float() + 1))
 
 
 def _gqa_bhsd():

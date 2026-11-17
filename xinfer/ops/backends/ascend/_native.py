@@ -19,6 +19,7 @@ import re
 import types
 import weakref
 from pathlib import Path
+from threading import Lock
 
 import torch
 
@@ -239,21 +240,39 @@ class Carver:
         return self.take(count * torch.empty((), dtype=dtype).element_size()).view(dtype).view(shape)
 
 
-_derived = {}  # (what, data pointer, shape, strides) -> tensor derived from a weight
+_derived = {}  # weight identity and layout -> (weak owner, derived tensor)
+_derived_lock = Lock()
 
 
 def derived(what, weight, make):
-    """``make()``, computed once per weight and dropped when the tensor that owns the weight's memory is freed
-    (a later tensor at the same address never gets another weight's result)."""
-    key = (what, weight.data_ptr(), tuple(weight.shape), tuple(weight.stride()))
-    if key not in _derived:
+    """Cache an independent derived tensor for the lifetime of its source tensor owner.
+
+    Ordinary views share their ``_base`` owner. Inference views without ``_base`` must themselves
+    stay alive across warmup and capture: a storage address does not identify a logical weight.
+    Neither the cache nor its cleanup callback keeps the source weight alive.
+    """
+    owner = weight if weight._base is None else weight._base
+    version = None if owner.is_inference() else owner._version
+    key = (what, weight.device, weight.dtype, id(owner), weight.data_ptr(),
+           tuple(weight.shape), weight.stride(), version)
+    entry = _derived.get(key)
+    if entry is not None and entry[0]() is owner:
+        return entry[1]
+    with _derived_lock:
+        entry = _derived.get(key)
+        if entry is not None and entry[0]() is owner:
+            return entry[1]
         if capturing(weight.device):
             raise RuntimeError(f"the {what} form of a weight is built on its first call, which must not be inside "
-                               "an NPU graph capture")
-        _derived[key] = make()
-        owner = weight if weight._base is None else weight._base
-        weakref.finalize(owner, _derived.pop, key, None)
-    return _derived[key]
+                               "an NPU graph capture; retain its owner through warmup and capture")
+        result = make()
+
+        def discard(reference):
+            if _derived.get(key, (None,))[0] is reference:
+                _derived.pop(key, None)
+
+        _derived[key] = weakref.ref(owner, discard), result
+        return result
 
 
 # ---- the C-ABI composition bridges of the core family library (src/common/) ------------------
