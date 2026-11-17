@@ -100,16 +100,8 @@ function(xinfer_aot_module group module)
     endforeach()
   else()
     add_custom_command(OUTPUT ${_generated}
-      COMMAND /bin/bash -c
-        ". ${XINFER_CANN_RUNTIME}/set_env.sh >/dev/null 2>&1 || true; \
-         export BISHENG_HOME=${XINFER_BISHENG_HOME} ASCEND_HOME_PATH=${XINFER_BISHENG_HOME} \
-                ASCEND_TOOLKIT_HOME=${XINFER_BISHENG_HOME} PATH=${XINFER_BISHENG_HOME}/bin:$PATH \
-                MAX_JOBS=1 TILELANG_CACHE_DIR=${CMAKE_BINARY_DIR}/tl-cache \
-                PYTHONPATH=${PROJECT_SOURCE_DIR}; \
-         cd ${PROJECT_SOURCE_DIR}/tools && \
-         exec ${XINFER_TILELANG_PYTHON} generate.py \
-                --output ${CMAKE_BINARY_DIR}/aot/${module} --module ${module} --kernels ${_kernels}"
-      DEPENDS tools/generate.py tools/abi.py
+      COMMAND /bin/bash ${PROJECT_SOURCE_DIR}/tools/aot-generate.sh ${CMAKE_BINARY_DIR}/aot/${group} ${module} ${_kernels}
+      DEPENDS tools/generate.py tools/abi.py tools/aot-generate.sh
       VERBATIM)
     list(APPEND _AOT_OBJECTS ${_generated})
   endif()
@@ -161,14 +153,8 @@ foreach(_k IN LISTS _AA_KERNELS)
   endif()
   set(_renamed "${CMAKE_BINARY_DIR}/aa_renamed/${_k}.o")
   add_custom_command(OUTPUT "${_renamed}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/aa_renamed"
-    COMMAND /bin/bash -c
-      "nm ${XINFER_AA_REAL6_DIR}/${_k}.o | awk '{print $3}' | grep xcompute_aot_ | sort -u \
-         | while read -r s; do printf '%s %s\n' $s $(echo $s | sed s/xcompute_aot_/xinfer_aot_/); done \
-         > ${CMAKE_BINARY_DIR}/aa_renamed/${_k}.map && \
-       objcopy --redefine-syms=${CMAKE_BINARY_DIR}/aa_renamed/${_k}.map \
-         ${XINFER_AA_REAL6_DIR}/${_k}.o ${_renamed}"
-    DEPENDS "${XINFER_AA_REAL6_DIR}/${_k}.o"
+    COMMAND /bin/bash ${PROJECT_SOURCE_DIR}/tools/aa-rename.sh "${XINFER_AA_REAL6_DIR}/${_k}.o" "${_renamed}"
+    DEPENDS "${XINFER_AA_REAL6_DIR}/${_k}.o" tools/aa-rename.sh
     VERBATIM)
   list(APPEND _AA_OBJECTS "${_renamed}")
 endforeach()
