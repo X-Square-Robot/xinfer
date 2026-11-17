@@ -1,5 +1,5 @@
 # Single-library build of the existing Wall-OSS and Wall-X 2B kernels.
-# Toolchain and frozen AA object requirements: README.md.
+# Toolchain and source requirements: README.md.
 cmake_minimum_required(VERSION 3.24)
 project(xinfer_kernels_ascend LANGUAGES CXX)
 
@@ -52,9 +52,9 @@ find_package(tvm_ffi CONFIG REQUIRED)
 
 set(XINFER_TILELANG_PYTHON "${Python_EXECUTABLE}" CACHE FILEPATH
     "Python of the TileLang fork venv that runs the AOT generator")
-set(XINFER_AOT_OBJECT_DIR "" CACHE PATH
-    "Directory of prebuilt AOT objects to consume instead of generating (e.g. the r5-lib out/ tree; empty = generate)")
 
+set(_TL_INCLUDE "${PROJECT_SOURCE_DIR}/third_party/tilelang/include")
+file(GLOB _TL_HEADERS CONFIGURE_DEPENDS "${_TL_INCLUDE}/tl_templates/ascend/*.h")
 file(GLOB_RECURSE _AOT_PYTHON_SOURCES CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/*.py")
 set(_AOT_OBJECTS "")
 function(xinfer_aot_module group module)
@@ -63,25 +63,15 @@ function(xinfer_aot_module group module)
   foreach(_k IN LISTS _kernels)
     list(APPEND _generated "${CMAKE_BINARY_DIR}/aot/${group}/${_k}.o")
   endforeach()
-  if(XINFER_AOT_OBJECT_DIR)
-    foreach(_k IN LISTS _kernels)
-      if(EXISTS "${XINFER_AOT_OBJECT_DIR}/${group}/${_k}.o")
-        list(APPEND _AOT_OBJECTS "${XINFER_AOT_OBJECT_DIR}/${group}/${_k}.o")
-      else()
-        message(FATAL_ERROR "XINFER_AOT_OBJECT_DIR does not carry ${group}/${_k}.o")
-      endif()
-    endforeach()
-  else()
-    add_custom_command(OUTPUT ${_generated}
-      COMMAND ${CMAKE_COMMAND} -E env
-        "XINFER_CANN_RUNTIME=${XINFER_CANN_RUNTIME}"
-        "XINFER_BISHENG_HOME=${XINFER_BISHENG_HOME}"
-        "XINFER_TILELANG_PYTHON=${XINFER_TILELANG_PYTHON}"
-        /bin/bash ${PROJECT_SOURCE_DIR}/tools/aot-generate.sh ${CMAKE_BINARY_DIR}/aot/${group} ${module} ${_kernels}
-      DEPENDS tools/generate.py tools/abi.py tools/aot-generate.sh ${_AOT_PYTHON_SOURCES}
-      VERBATIM)
-    list(APPEND _AOT_OBJECTS ${_generated})
-  endif()
+  add_custom_command(OUTPUT ${_generated}
+    COMMAND ${CMAKE_COMMAND} -E env
+      "XINFER_CANN_RUNTIME=${XINFER_CANN_RUNTIME}"
+      "XINFER_BISHENG_HOME=${XINFER_BISHENG_HOME}"
+      "XINFER_TILELANG_PYTHON=${XINFER_TILELANG_PYTHON}"
+      /bin/bash ${PROJECT_SOURCE_DIR}/tools/aot-generate.sh ${CMAKE_BINARY_DIR}/aot/${group} ${module} ${_kernels}
+    DEPENDS tools/generate.py tools/abi.py tools/aot-generate.sh ${_AOT_PYTHON_SOURCES} ${_TL_HEADERS}
+    VERBATIM)
+  list(APPEND _AOT_OBJECTS ${_generated})
   set(_AOT_OBJECTS "${_AOT_OBJECTS}" PARENT_SCOPE)
 endfunction()
 
@@ -115,18 +105,27 @@ xinfer_aot_module(mover2 gdn.mover2_kernels gdrapply_bf16 gdrtailmix_bf16)
 xinfer_aot_module(conv_gemm gdn.conv_gemm dconv4_c6144)
 xinfer_aot_module(soup2 elem.soup2_kernels qksq_c6144 rawsq_r128 quant_u8)
 
-set(XINFER_AA_REAL6_DIR "" CACHE PATH
-    "The delivered AA-resample real6 asset objects")
 set(_AA_KERNELS aa_v_720_1280_128_224 aa_h_720_1280_128_224 aa_v_480_640_160_224 aa_h_480_640_160_224)
 set(_AA_OBJECTS "")
 foreach(_k IN LISTS _AA_KERNELS)
-  if(NOT EXISTS "${XINFER_AA_REAL6_DIR}/${_k}.o")
-    message(FATAL_ERROR "AA real6 asset object missing: ${XINFER_AA_REAL6_DIR}/${_k}.o (set XINFER_AA_REAL6_DIR)")
-  endif()
+  set(_source "${PROJECT_SOURCE_DIR}/resample/generated/${_k}.asc")
+  set(_compiled "${CMAKE_BINARY_DIR}/aa_compiled/${_k}.o")
   set(_renamed "${CMAKE_BINARY_DIR}/aa_renamed/${_k}.o")
+  # Compile the original generated program directly, without rescheduling its DSL.
+  # Both the device kernel and host launcher are source in this translation unit.
   add_custom_command(OUTPUT "${_renamed}"
-    COMMAND /bin/bash ${PROJECT_SOURCE_DIR}/tools/aa-rename.sh "${XINFER_AA_REAL6_DIR}/${_k}.o" "${_renamed}"
-    DEPENDS "${XINFER_AA_REAL6_DIR}/${_k}.o" tools/aa-rename.sh
+    BYPRODUCTS "${_compiled}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/aa_compiled"
+    COMMAND ${CMAKE_COMMAND} -E env
+      "BISHENG_HOME=${XINFER_BISHENG_HOME}"
+      "ASCEND_HOME_PATH=${XINFER_BISHENG_HOME}"
+      "ASCEND_TOOLKIT_HOME=${XINFER_BISHENG_HOME}"
+      "${XINFER_BISHENG_HOME}/bin/bisheng" -O2 -fPIC -std=c++20
+      -mllvm -cce-aicore-dcpreload-args=false
+      "--npu-arch=${XINFER_SOC_COMPILE_TARGET_${XINFER_ASCEND_SOC}}"
+      "-I${_TL_INCLUDE}" -Wl,--no-mmap-output-file -c "${_source}" -o "${_compiled}"
+    COMMAND /bin/bash ${PROJECT_SOURCE_DIR}/tools/aa-rename.sh "${_compiled}" "${_renamed}"
+    DEPENDS "${_source}" ${_TL_HEADERS} tools/aa-rename.sh
     VERBATIM)
   list(APPEND _AA_OBJECTS "${_renamed}")
 endforeach()

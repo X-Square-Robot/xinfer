@@ -1,10 +1,8 @@
 #!/bin/bash
-# aa-rename.sh — rename the delivered AA-resample real6 asset object's xcompute_aot_ launcher
-# symbols to xinfer_aot_ (the device-kernel registration is symbol-address based, so the rename is
-# internally consistent; build-libraries.sh carries the full asset story). The real6 objects are
-# assets, never regenerated.
+# Rename the original launcher's symbols after compiling its checked-in source.
+# The device program and launch arguments are unchanged.
 #
-#   aa-rename.sh <asset.o> <renamed.o>
+#   aa-rename.sh <freshly-compiled.o> <renamed.o>
 set -euo pipefail
 
 SRC=$1

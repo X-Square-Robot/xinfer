@@ -28,6 +28,8 @@ from pathlib import Path
 
 from abi import validate_packed_launch_layout
 
+TEMPLATE_INCLUDE = Path(__file__).resolve().parents[1] / "third_party" / "tilelang" / "include"
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -50,7 +52,6 @@ def main():
     # Build dependencies deliberately remain outside the runtime loader.
     import tilelang
     from tilelang.contrib.bisheng import compile_ascend
-    from tilelang.env import TILELANG_TEMPLATE_PATH
     from tilelang.jit.adapter.wrapper import TLAscendSourceWrapper
 
     class AOTSourceWrapper(TLAscendSourceWrapper):
@@ -132,7 +133,7 @@ def main():
             source,
             target_format="o",
             npu_arch=args.arch,
-            options=["-I" + TILELANG_TEMPLATE_PATH, *compile_options],
+            options=["-I" + str(TEMPLATE_INCLUDE), *compile_options],
             path_target=object_path,
             verbose=True,
         )
@@ -172,7 +173,7 @@ def main():
             source,
             target_format="o",
             npu_arch=args.arch,
-            options=["-I" + TILELANG_TEMPLATE_PATH, *compile_options],
+            options=["-I" + str(TEMPLATE_INCLUDE), *compile_options],
             path_target=object_path,
             verbose=True,
         )
