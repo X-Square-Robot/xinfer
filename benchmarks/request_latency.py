@@ -43,6 +43,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--warmup-runs", type=int, default=5)
     parser.add_argument("--op-backends", default=None,
                         help="comma-separated operator=pin items, as for xinfer-serve --op-backends")
+    parser.add_argument("--reference-ops", action="store_true",
+                        help="use reference operators except explicit --op-backends pins, as for xinfer-serve")
     parser.add_argument("--out", type=Path, required=True, help="new JSON result file")
     args = parser.parse_args(argv)
     if args.runs < 1 or args.warmup_runs < 0:
@@ -72,6 +74,8 @@ def main(argv=None) -> int:
     options = json.loads(args.model_options)
     if args.op_backends:
         options["op_backends"] = _parse_pins(args.op_backends)
+    if args.reference_ops:
+        options["reference_ops"] = True
     policy = Policy(args.model, args.checkpoint, device=args.device, **options)
     try:
         policy.warmup(requests)
