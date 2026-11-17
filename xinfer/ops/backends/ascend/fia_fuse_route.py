@@ -27,6 +27,8 @@ from threading import Lock
 
 import torch
 
+from xinfer.ops.backends.ascend import _native
+
 _H, _KVH, _M, _D = 8, 2, 16, 256
 _BUILD_KEYS = (432, 448, 464, 480)
 _CHUNKS = {L: (L + 63) // 64 for L in _BUILD_KEYS}

@@ -63,9 +63,9 @@ def qkv_split_vec(packed, rstd_q, rstd_k, q_factor, k_factor):
                   ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
                   ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(gate.data_ptr()),
                   rows, ctypes.c_void_p(stream_obj.npu_stream))
+        if rc != 0:
+            message = get_error()
+            text = message.decode("utf-8", "replace") if message else "unknown failure"
+            raise RuntimeError(f"qkv_split_vec: {text}")
     _WARMED.add(rows)
-    if rc != 0:
-        message = get_error()
-        text = message.decode("utf-8", "replace") if message else "unknown failure"
-        raise RuntimeError(f"qkv_split_vec: {text}")
     return q, k, v, gate

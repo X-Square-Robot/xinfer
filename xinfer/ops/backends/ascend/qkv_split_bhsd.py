@@ -74,9 +74,9 @@ def qkv_split_bhsd(packed, rstd_q, rstd_k, q_factor, k_factor,
                   ctypes.c_void_p(out_q.data_ptr()), ctypes.c_void_p(out_k.data_ptr()),
                   ctypes.c_void_p(out_v.data_ptr()), ctypes.c_void_p(out_gate.data_ptr()),
                   rows, ctypes.c_void_p(stream_obj.npu_stream))
+        if rc != 0:
+            message = get_error()
+            text = message.decode("utf-8", "replace") if message else "unknown failure"
+            raise RuntimeError(f"qkv_split_bhsd: {text}")
     _WARMED.add(rows)
-    if rc != 0:
-        message = get_error()
-        text = message.decode("utf-8", "replace") if message else "unknown failure"
-        raise RuntimeError(f"qkv_split_bhsd: {text}")
     return out_q, out_k, out_v, out_gate

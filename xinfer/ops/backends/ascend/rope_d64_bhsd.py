@@ -65,9 +65,9 @@ def rope_d64_bhsd(q, k, cos, sin, out_q=None, out_k=None):
                   ctypes.c_void_p(cos.data_ptr()), ctypes.c_void_p(sin.data_ptr()),
                   ctypes.c_void_p(out_q.data_ptr()), ctypes.c_void_p(out_k.data_ptr()),
                   tokens, ctypes.c_void_p(stream_obj.npu_stream))
+        if rc != 0:
+            message = get_error()
+            text = message.decode("utf-8", "replace") if message else "unknown failure"
+            raise RuntimeError(f"rope_d64_bhsd: {text}")
     _WARMED.add(tokens)
-    if rc != 0:
-        message = get_error()
-        text = message.decode("utf-8", "replace") if message else "unknown failure"
-        raise RuntimeError(f"rope_d64_bhsd: {text}")
     return out_q, out_k

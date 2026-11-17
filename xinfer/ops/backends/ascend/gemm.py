@@ -473,3 +473,5 @@ def qkv_norm_rope_kvcache(x, weight, q_weight, k_weight, cos, sin, k_cache, v_ca
 
 
 from xinfer.ops.backends.ascend import gemm_950dt  # noqa: E402, F401 - lists the 950DT kernels
+
+from xinfer.ops.backends.ascend import _native

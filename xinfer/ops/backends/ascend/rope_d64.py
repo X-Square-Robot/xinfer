@@ -65,9 +65,9 @@ def rope_half_d64(q, k, cos, sin):
                   ctypes.c_void_p(cos2.data_ptr()), ctypes.c_void_p(sin2.data_ptr()),
                   ctypes.c_void_p(q_out.data_ptr()), ctypes.c_void_p(k_out.data_ptr()),
                   tokens, ctypes.c_void_p(stream_obj.npu_stream))
+        if rc != 0:
+            message = get_error()
+            text = message.decode("utf-8", "replace") if message else "unknown failure"
+            raise RuntimeError(f"rope_half_d64: {text}")
     _WARMED.add(tokens)
-    if rc != 0:
-        message = get_error()
-        text = message.decode("utf-8", "replace") if message else "unknown failure"
-        raise RuntimeError(f"rope_half_d64: {text}")
     return q_out, k_out

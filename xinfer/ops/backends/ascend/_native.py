@@ -285,6 +285,9 @@ def launch(aot_pair, tensors, scalars, stream=None):
                            f"{message.decode('utf-8', 'replace') if message else 'unknown failure'}")
 
 
+_FFI_FACES: dict = {}  # kernel name -> its typed function, cached on first sight (the hot dose)
+
+
 def launch_kernel(name, tensors, scalars=()):
     """Launch one AOT kernel through the single library's TVM-FFI face; ``False`` when it cannot.
 
@@ -293,14 +296,19 @@ def launch_kernel(name, tensors, scalars=()):
     int64 per scalar - and resolves the current NPU stream itself, so the python envelopes call it
     with exactly the tensors and scalars they hold. ``False`` (the caller keeps its ctypes path)
     when the single library is not loaded or carries no face of ``name``: a family-library
-    deployment or a library built before a kernel then serves unchanged.
+    deployment or a library built before a kernel then serves unchanged. The face lookup is cached
+    per name: the serving stacks launch thousands of kernels per request, and the module attribute
+    walk is measurable next to a ctypes call at that dose.
     """
-    if lib is None:
-        return False
-    try:
-        face = getattr(lib, name)
-    except AttributeError:
-        return False
+    face = _FFI_FACES.get(name)
+    if face is None:
+        if lib is None:
+            return False
+        try:
+            face = getattr(lib, name)
+        except AttributeError:
+            return False
+        _FFI_FACES[name] = face
     face(*tensors, *[int(s) for s in scalars])
     return True
 
