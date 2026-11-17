@@ -99,6 +99,10 @@ exits 0. The server checks `Engine.health()` every 0.5 s; when the engine can
 no longer serve (its engine or completion thread has stopped), it shuts down
 the same way and exits 1, so that its supervisor can restart it.
 
+## Batching and lanes
+
+`--max-batch` limits the batch sizes the model declares; it does not enable unvalidated batch sizes. `--lanes` controls the streams and graph pools per stage. Both can change latency, throughput and memory use. Keep the resolved settings with each benchmark result and measure the target workload before changing a deployment.
+
 ## Load testing
 
 `benchmarks/robot_load.py` runs virtual robots against the service in closed

@@ -59,7 +59,4 @@ CUDA kernel library for this GPU: docs/kernels.md
 
 ## Ascend
 
-The `ascend` backend binds an external xcompute build through `xinfer/ops/backends/_xcompute.py`, with the
-`XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0` settings. Available implementations are selected automatically;
-unsupported calls use their torch fallback. See the [Ascend guide](ascend950dt.md) for runtime, image processing
-and NPU graphs.
+The `ascend` backend builds its AOT entries into `xinfer_kernels_ascend.so` and registers through the same operator table. Wall-OSS also uses in-tree TileLang JIT kernels during warmup. The AOT loader is `ascend/_native.py`; `XINFER_ASCEND_KERNELS_LIBRARY` selects an explicit build and `XINFER_ASCEND_KERNELS=0` disables it. See the [Ascend guide](ascend950dt.md) for the runtime compiler, images, graphs and validation.

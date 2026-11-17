@@ -59,6 +59,4 @@ CUDA kernel library for this GPU: docs/kernels.md
 
 ## 昇腾
 
-`ascend` 后端通过 `xinfer/ops/backends/_xcompute.py` 绑定外部的 xcompute 构建，使用
-`XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0` 设置。可用实现会自动选中；不支持的调用使用 torch 回退。
-运行环境、图像处理和 NPU 图执行见[昇腾指南](ascend950dt.zh-CN.md)。
+`ascend` 后端将 AOT 入口编译为 `xinfer_kernels_ascend.so`，通过同一算子表注册。Wall-OSS 还在预热期间使用仓内 TileLang JIT 算子。AOT 加载器为 `ascend/_native.py`；`XINFER_ASCEND_KERNELS_LIBRARY` 选择显式构建，`XINFER_ASCEND_KERNELS=0` 禁用该库。运行时编译器、图像、图执行和验证见[昇腾指南](ascend950dt.zh-CN.md)。
