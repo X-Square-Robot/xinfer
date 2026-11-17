@@ -229,7 +229,7 @@ def test_legacy_eager_only_entries_do_not_replace_graph_safe_implementations(iso
     )})
     load()
     table = registry.build_table(_platform())
-    for name in ("gemm_epilogue", "gemm_glu_epilogue"):
+    for name in ("linear", "gemm_epilogue", "gemm_glu_epilogue"):
         assert table.selection(name).backend == "reference"
         assert table.selection(name).contract.graph_safe
     assert table.selection("varlen_attention").name == "ascend:torch"
