@@ -61,8 +61,9 @@ __device__ __forceinline__ void mbar_wait(uint64_t* b, uint32_t parity) {
       "r"(parity));
 }
 __device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap* map, uint64_t* bar, int x, int y) {
+  // .shared::cta: on SM120 the .shared::cluster form adds a driver-call fallback that raises the context stack limit.
   asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];" ::"r"(
+      "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];" ::"r"(
           smem_u32(dst)),
       "l"(map), "r"(smem_u32(bar)), "r"(x), "r"(y)
       : "memory");
