@@ -206,7 +206,7 @@ def main(argv=None) -> None:
     from xinfer.frontend.protocol import ADMIT_STATUS, INTERNAL_ERROR, OK, read_requests
     from xinfer.frontend.server import run_frontend
     from xinfer.frontend.shm import ShmReader
-    from xinfer.models.interface import PreparedRequest
+    from xinfer.models.interface import PreparedRequest, bind_image_prefetch
     from xinfer.models.registry import get_model_class
     from xinfer.platforms import resolve_platform
 
@@ -243,10 +243,12 @@ def main(argv=None) -> None:
     if args.dry_run:
         print(resolved.report(), flush=True)
         return
-    engine = Engine(model, platform, resolved.engine_config())
+    engine = Engine(model, platform, resolved.engine_config(), image_resize=table.image_resize,
+                    image_quantize=table.image_quantize)
     warmup = []
     if args.warmup:
         prepare, _, _ = model_cls.build_processors(args.checkpoint, **model_options)
+        bind_image_prefetch(prepare, engine.image_prefetch)
         raw = [request for path in args.warmup for request in read_requests(path)]
         outputs = engine.warmup([prepare(request) for request in raw])
         warmup = [(request, {k: np.asarray(v) for k, v in out.items()}) for request, out in zip(raw, outputs)]

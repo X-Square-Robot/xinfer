@@ -18,7 +18,7 @@ from xinfer import ops
 from xinfer.config import ExplicitSettings, apply_image_preprocess_device, resolve
 from xinfer.engine.core import Engine
 from xinfer.engine.cudagraph import CUDAGraphConfig
-from xinfer.models.interface import PreparedRequest, connect
+from xinfer.models.interface import PreparedRequest, bind_image_prefetch, connect
 from xinfer.models.registry import get_model_class
 from xinfer.platforms import resolve_platform
 
@@ -107,7 +107,9 @@ class Policy:
                                 explicit=ExplicitSettings(cudagraphs=None if cudagraphs is None else bool(cudagraphs),
                                                           stream_priorities=stream_priorities or {}))
         policy = cudagraphs if isinstance(cudagraphs, CUDAGraphConfig) else None
-        self.engine = Engine(self.model, self.platform, self.resolved.engine_config(policy))
+        self.engine = Engine(self.model, self.platform, self.resolved.engine_config(policy),
+                             image_resize=self.op_table.image_resize, image_quantize=self.op_table.image_quantize)
+        bind_image_prefetch(self._prepare, self.engine.image_prefetch)
 
     def prepare(self, observation: Mapping[str, Any]) -> PreparedRequest:
         """Run the model's InputProcessor on one observation (CPU, calling thread).

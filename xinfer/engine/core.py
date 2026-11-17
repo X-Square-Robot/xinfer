@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import logging
+import os
 import queue
 import threading
 import time
@@ -41,6 +42,8 @@ from typing import Any
 import torch
 
 from xinfer.engine import batching
+from xinfer.engine.admission_upload import UploadBatcher, upload_batch_enabled
+from xinfer.engine import image_prefetch
 from xinfer.engine.device_images import DeviceImageDecoder
 from xinfer.engine.executor import Lane, _to_device, allocate_outputs
 from xinfer.engine.cudagraph import CUDAGraphConfig, LaneCUDAGraphs, _ReadTracker, capture_batch_sizes, warmup_requests
@@ -52,6 +55,33 @@ from xinfer.platforms.devices import device_module_for
 from xinfer.platforms.interface import Platform
 
 logger = logging.getLogger(__name__)
+
+# The device-image thread's prefetch wave cap: the tickets already queued are drained as one
+# start batch up to this many views, and a wave's started views accumulate up to this many
+# before it is flushed (a request's boundary flushes it earlier). Three covers a request's
+# camera views; more would only batch unrelated requests' starts.
+MAX_WAVE_VIEWS = 3
+
+# A failed final synchronize must not let Python destruction return uncertain buffers to an
+# allocator. A successful shutdown retry releases this keepalive; otherwise process exit owns it.
+_FAILED_ENGINES = set()
+
+
+class _CompletionFence:
+    """A recorded event, or an explicitly unknown completion that never releases its storage."""
+
+    def __init__(self, engine, event=None):
+        self.engine, self.event = engine, event
+
+    def query(self):
+        if self.event is None:
+            return False
+        try:
+            return self.event.query()
+        except Exception as exc:  # no evidence that queued device work stopped reading
+            self.event = None
+            self.engine._fail_device(exc)
+            return False
 
 
 @dataclass(frozen=True)
@@ -124,7 +154,7 @@ class _Request:
     """
 
     __slots__ = ("id", "robot", "prepared", "future", "handle", "inputs", "inputs_ready", "events", "outputs",
-                 "dispatched", "submitted_at", "admitted_at", "ready_at", "timing")
+                 "dispatched", "submitted_at", "admitted_at", "ready_at", "timing", "upload_slab")
 
     def __init__(self, request_id, robot, prepared, future):
         self.id, self.robot, self.prepared, self.future = request_id, robot, prepared, future
@@ -136,6 +166,7 @@ class _Request:
         self.admitted_at = None
         self.ready_at = None
         self.timing: dict[str, tuple] = {}
+        self.upload_slab = None  # pinned upload source held until this request completes
 
 
 def _timing_event(lane):
@@ -145,6 +176,21 @@ def _timing_event(lane):
         return None
     event.record(lane.stream)
     return event
+
+
+class _CaptureImageGraphs:
+    """Queue item: capture the device-image chain graphs now; the engine thread waits on ``done``.
+
+    Graph capture is device-wide on this stack (ACL fails any other stream's synchronize while one
+    stream captures: ``rtDeviceSynchronizeWithTimeout ... reason=stream is captured``, measured), so
+    the capture has to run in a window where no other thread captures or synchronizes — the end of
+    warmup, with the engine thread blocked on this item.
+    """
+
+    __slots__ = ("done",)
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
 
 
 class Engine:
@@ -167,7 +213,7 @@ class Engine:
     """
 
     def __init__(self, model: VLAModel, platform: Platform, config: EngineConfig | None = None,
-                 *, start: bool = True):
+                 *, start: bool = True, image_resize=None, image_quantize=None):
         """Validate the model's handoffs, derive the batch sizes, create the lanes and start the threads.
 
         Each stage's allowed batch sizes are its ``Capabilities.batch_sizes`` plus 1, up to its ``max_batch``.
@@ -178,6 +224,8 @@ class Engine:
             platform: the platform to run on.
             config: engine settings; ``EngineConfig()`` when None.
             start: start the engine and completion threads now; with False, call ``start()`` later.
+            image_resize: selected device-image resize operator, or None for the default torch recipe.
+            image_quantize: selected decoded-image quantizer, or None for the default torch recipe.
 
         Raises:
             ValueError: a handoff names an unknown stage, or its producer is not a direct or transitive dependency
@@ -188,6 +236,8 @@ class Engine:
         self.platform = platform
         self.config = config = config or EngineConfig()
         self._device_module = device_module_for(platform.device)
+        self._image_resize = image_resize
+        self._image_quantize = image_quantize
         self.stages = model.stage_graph
         self.order = [stage.name for stage in self.stages]
         self.final_stages = [stage for stage in self.order if not self.stages.consumers(stage)]
@@ -238,6 +288,15 @@ class Engine:
                 for lane in self.lanes[stage]:
                     lane.copy_stream = self._device_module.Stream(device=platform.device)
         self._upload = self._device_module.Stream(device=platform.device) if self._device_module else None
+        # These contexts belong to separate producer threads and are never entered recursively.
+        self._upload_ctx = (self._device_module.stream(self._upload) if self._device_module is not None
+                            and self._upload is not None else contextlib.nullcontext())
+        # Batch upload and prefetched admission are enabled on the validated NPU path.
+        self._fast_admission = (platform.is_npu
+                               and os.environ.get("XINFER_ADMISSION_FAST", "1") not in ("0", "false", "False"))
+        self._upload_batcher = (UploadBatcher(platform.device, slots=config.max_running_requests)
+                                if platform.is_npu and upload_batch_enabled() else None)
+        self._prefetch_device = None  # resolved lazily: the device the device-image thread decodes for
 
         self.slots = SlotPool(config.max_running_requests)
         self._queues = {stage: deque() for stage in self.order}
@@ -248,6 +307,8 @@ class Engine:
         self._completions: queue.Queue = queue.Queue()
         self._request_ids = itertools.count()
         self._stopping = False
+        self._device_error = None
+        self._uncertain_keepalive = []
         self.stats = Counter()
         # Called on the completer thread with each completed request's RequestStats (xinfer.observability.stats), or
         # None; xinfer-serve sets it after the warmup to record its metrics.
@@ -259,10 +320,17 @@ class Engine:
         # counted in _device_inflight (engine thread only) and come back through _device_ready.
         self._device_stream = (self._device_module.Stream(device=platform.device)
                                if platform.is_cuda or platform.capabilities.device_images else None)
+        self._device_ctx = (self._device_module.stream(self._device_stream)
+                            if self._device_module is not None and self._device_stream is not None
+                            else contextlib.nullcontext())
         self._decoder = None
         self._device_requests: queue.Queue = queue.Queue()
         self._device_ready: list = []
         self._device_inflight = 0
+        # The entry point binds this handle only to this engine's processor. Frontend processes
+        # have no handle and continue decoding at admission.
+        self.image_prefetch = (image_prefetch.ImagePrefetch(self._device_requests)
+                               if platform.is_npu and self._device_stream is not None else None)
         self._device_thread = threading.Thread(target=self._device_images_loop, name="xinfer-device-images",
                                                daemon=True)
         if start:
@@ -298,7 +366,9 @@ class Engine:
         """
         future: Future = Future()
         with self._lock:
-            if self._stopping:
+            if self._device_error is not None:
+                future.set_exception(self._device_error)
+            elif self._stopping:
                 future.set_exception(AdmitError("stopped"))
             elif robot is not None and self._inflight[robot] >= self.config.per_robot_inflight:
                 future.set_exception(AdmitError("per_robot_limit"))
@@ -367,7 +437,26 @@ class Engine:
                         {stage: counters["graphs"] for stage, counters in stats.items()},
                         sum(counters["capture_ms"] for counters in stats.values()) / 1000,
                         self._device_module.memory_reserved(self.platform.device) / 2 ** 30)
+        self._capture_image_graphs()
         return outputs
+
+    def _capture_image_graphs(self) -> None:
+        """Capture the graphs of the device-image post-decode chain, if the thread is up.
+
+        Runs after the stage graphs are captured and after ``finish_warmup``, and blocks this thread
+        while the device-image thread captures: graph capture is device-wide on this stack (ACL
+        refuses another stream's synchronize during it), so it must not overlap any other thread's
+        capture or synchronize. Buckets seen during the warmup requests are the ones captured; a
+        shape first seen while serving keeps the eager chain.
+        """
+        if self.config.cudagraphs is None or self._device_stream is None:
+            return
+        done = _CaptureImageGraphs()
+        self._device_requests.put(done)
+        if not done.done.wait(timeout=300):
+            error = TimeoutError("device image graph capture did not finish within 300 s")
+            self._fail_device(error)
+            raise error
 
     def cudagraph_stats(self) -> dict:
         """Per-stage CUDA graph counters, summed over the stage's lanes (read without locking: a snapshot).
@@ -398,6 +487,8 @@ class Engine:
 
         Meant for a supervisor polling a started engine; after ``shutdown`` the threads are stopped too.
         """
+        if self._device_error is not None:
+            return f"device completion failed: {self._device_error}"
         for thread in (self._engine_thread, self._completer, self._device_thread):
             if not thread.is_alive():
                 return f"{thread.name} thread stopped"
@@ -416,6 +507,8 @@ class Engine:
         with self._lock:
             self._stopping = True
             self._wake.notify()
+        if self.image_prefetch is not None:
+            self.image_prefetch.close()
         if self._engine_thread.is_alive():
             self._engine_thread.join()
         if self._completer.is_alive():
@@ -424,18 +517,32 @@ class Engine:
         if self._device_thread.is_alive():
             self._device_requests.put(None)
             self._device_thread.join()
+        try:
+            if self._device_module is not None:
+                with self._device_module.device(self.platform.device):
+                    self._device_module.synchronize()
+            if self._decoder is not None:
+                # The image worker deferred teardown after a device failure. It has stopped, and
+                # device synchronization now makes serialized cleanup safe.
+                self._decoder.close()
+                self._decoder = None
+        except Exception:
+            _FAILED_ENGINES.add(self)
+            raise
+        _FAILED_ENGINES.discard(self)
         for lanes in self.lanes.values():
             for lane in lanes:
                 lane.cudagraphs = None
+        self._uncertain_keepalive.clear()
+        self.slots = SlotPool(self.config.max_running_requests)
+        self._upload_batcher = None
         if self.platform.is_cuda:
-            torch.cuda.synchronize()
             import gc
 
             gc.collect()
             torch.cuda.empty_cache()
         elif self.platform.is_npu:
             with self._device_module.device(self.platform.device):
-                self._device_module.synchronize()
                 self._device_module.empty_cache()
 
     # ------------------------------------------------------------- engine loop
@@ -479,11 +586,18 @@ class Engine:
         Returns:
             True if a request was admitted or a batch was dispatched.
         """
+        if self._device_error is not None:
+            self._queue_device_ready()
+            return self._fail_pending_device_requests()
+        if self._upload_batcher is not None:
+            self._upload_batcher.poll()  # reclaim the slabs whose release event completed
         progressed = self._admit_requests()
         progressed = self._queue_device_ready() or progressed
         for stage in reversed(self.order):  # downstream first drains the pipeline
             stage_queue = self._queues[stage]
             while stage_queue:
+                if self._device_error is not None:
+                    return True
                 lane = self._free_lane(stage)
                 if lane is None:
                     break
@@ -492,6 +606,27 @@ class Engine:
                     self._execute_stage_batch(stage, lane, batch)
                     progressed = True
         return progressed
+
+    def _fail_device(self, error):
+        """Stop submissions after device completion became unknown; no locks are acquired here.
+
+        Event queries may call this while the admission or slot lock is held. The engine's
+        existing poll loop observes the failure and resolves queued requests without launching them.
+        """
+        if self._device_error is None:
+            self._device_error = error
+        self._stopping = True
+
+    def _fail_pending_device_requests(self):
+        with self._lock:
+            pending = list(self._waiting)
+            self._waiting.clear()
+        for requests in self._queues.values():
+            pending.extend(requests)
+            requests.clear()
+        for request in {request.id: request for request in pending}.values():
+            self._fail_request(request, self._device_error, after=_CompletionFence(self))
+        return bool(pending)
 
     def _admit_requests(self) -> bool:
         """Admit waiting requests in FIFO order while slots are free (engine thread).
@@ -510,7 +645,7 @@ class Engine:
         admitted = False
         while True:
             with self._lock:
-                if not self._waiting:
+                if self._device_error is not None or not self._waiting:
                     return admitted
                 request = self._waiting[0]
                 if request.future.cancelled():
@@ -521,26 +656,165 @@ class Engine:
                     request.handle = self.slots.allocate()
                 except PoolExhausted:
                     return admitted
+                if self._device_error is not None:
+                    self.slots.release(request.handle)
+                    request.handle = None
+                    return admitted
                 self._waiting.popleft()
             request.admitted_at = time.perf_counter()
             stream = self._upload
-            stream_context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
             admitted = True
             try:
+                if self._admit_prefetched(request, stream):
+                    continue
+            except Exception as exc:  # noqa: BLE001 - only this request fails
+                self._fail_request(request, exc, after=self._upload_fence(stream, request))
+                continue
+            stream_context = self._upload_ctx if stream is not None else contextlib.nullcontext()
+            try:
                 with stream_context, span("admit", request=request.id, robot=request.robot):
-                    request.inputs = {name: _to_device(value, self.platform.device)
-                                      for name, value in request.prepared.tensors.items()}
+                    request.inputs = self._upload_prepared(request)
                     if stream is not None:
                         request.inputs_ready = self._device_module.Event(enable_timing=self.stats_sink is not None)
                         request.inputs_ready.record(stream)
             except Exception as exc:  # noqa: BLE001 - only this request fails
-                self._fail_request(request, exc)
+                self._fail_request(request, exc, after=self._upload_fence(stream, request))
                 continue
             if any(isinstance(value, DeviceImage) for value in request.inputs.values()):
                 self._device_inflight += 1
                 self._device_requests.put(request)
             else:
                 self._queue_for_first_stages(request)
+
+    def _upload_fence(self, stream, request):
+        """An event recorded at the upload stream's tail, or None: fences in-flight copies of a failed admission.
+
+        A failed request's pinned upload slab may still be read by its asynchronous copy.
+        If an event cannot be recorded, retain that source instead of returning it to the ring.
+        """
+        if stream is None or self._device_module is None:
+            return None
+        try:
+            event = self._device_module.Event()
+            event.record(stream)
+            return event
+        except Exception as exc:  # noqa: BLE001 - the device is in an error state; the request still fails
+            logger.exception("could not fence the admission uploads of a failed request")
+            if request.upload_slab is not None:
+                self._upload_batcher.retire(request.upload_slab)
+                request.upload_slab = None
+            self._fail_device(exc)
+            return _CompletionFence(self)
+
+    def _admit_prefetched(self, request: _Request, stream) -> bool:
+        """Assemble a fully prefetched request on the engine thread; False uses the image queue.
+
+        Returns True, with ``request.inputs``/``inputs_ready`` set and the request queued for its first stages,
+        when every ``DeviceImage`` of the request has a completed, error-free prefetch slot decoded for this
+        engine's device (a request without ``DeviceImage`` values takes this path with a single ready event, as
+        before); False, with nothing done, when any view still needs the device-image thread, which then runs
+        today's queue handover unchanged.
+
+        ``slot.view`` is written by the device-image
+        thread only after that view's whole decode was enqueued on the device stream, so reading it here under
+        the GIL means the work is enqueued; the fence event this records at the device stream's *tail* can
+        therefore only complete after it (a concurrent enqueue by the device-image thread makes it later, never
+        earlier). ``inputs_ready`` becomes ``(upload event, fence)`` for such a request; the only consumer that
+        accepts tuples is ``Lane.wait``, and the device-image thread never sees these requests at all.
+        """
+        if not self._fast_admission or self._device_module is None:
+            return False
+        tensors = request.prepared.tensors
+        views = None
+        for name, value in tensors.items():
+            if isinstance(value, DeviceImage):
+                slot = value.prefetch
+                if (slot is None or slot.owner is not self.image_prefetch
+                        or slot.view is None or slot.error is not None):
+                    return False
+                device = slot.device
+                if device is None:
+                    return False
+                if self._prefetch_device is None:
+                    expected = torch.device(self.platform.device)
+                    if expected.index is None:
+                        expected = torch.device(expected.type, self._device_module.current_device())
+                    self._prefetch_device = expected
+                if device != self._prefetch_device:
+                    return False
+                if views is None:
+                    views = {}
+                views[name] = slot.view
+        images = views is not None
+        stream_context = self._upload_ctx if stream is not None else contextlib.nullcontext()
+        with stream_context:
+            inputs = self._upload_prepared(request)
+            if images:
+                for name, view in views.items():
+                    inputs[name] = view
+            if stream is None:
+                request.inputs, request.inputs_ready = inputs, None
+            else:
+                # timing-enabled when a stats sink is configured, like the queue-handover path's
+                # admission event: ``_request_stats`` reads elapsed times off ``inputs_ready``
+                ready = self._device_module.Event(enable_timing=self.stats_sink is not None)
+                ready.record(stream)
+                if images and self._device_stream is not None:
+                    fence = self._device_module.Event(enable_timing=self.stats_sink is not None)
+                    fence.record(self._device_stream)
+                    request.inputs, request.inputs_ready = inputs, (ready, fence)
+                else:
+                    request.inputs, request.inputs_ready = inputs, ready
+        self.stats["admission_fast" if images else "admission_no_images"] += 1
+        self._queue_for_first_stages(request)
+        return True
+
+    def _upload_prepared(self, request: _Request) -> dict:
+        """The request's tensors on the device, plus optional model-derived stage inputs.
+
+        After the plain upload the model's optional
+        ``derive_stage_inputs`` hook may add request-derived tensors (the rope
+        tables) to the inputs dict; the stage graphs then treat them as
+        ordinary static-view-refreshed inputs instead of capturing their
+        per-request rebuild chain.
+        """
+        inputs = self._upload_prepared_base(request)
+        hook = getattr(self.model, "derive_stage_inputs", None)
+        if callable(hook):
+            try:
+                extra = hook(request.prepared.tensors, inputs)
+            except Exception:  # noqa: BLE001 - the mount is optional
+                logger.exception("derive_stage_inputs failed; running without derived inputs")
+                extra = None
+            if extra:
+                inputs.update(extra)
+        return inputs
+
+    def _upload_prepared_base(self, request: _Request) -> dict:
+        """The request's tensors on the device, with batched uploads where supported.
+
+        The batcher packs every CPU tensor of ``prepared.tensors`` into one pinned slab and issues a single
+        stream-ordered host-to-device copy, returning byte-identical device views (bitwise equal to the per-tensor
+        uploads). Non-viewable inputs, an oversized set or an exhausted ring use the per-tensor ``_to_device``
+        loop. An error after enqueue propagates without reusing uncertain host bytes. The request holds its ring
+        slot until it finishes (``_finish_request``), fencing the async copy's reads of the host slab.
+        """
+        tensors = request.prepared.tensors
+        batcher = self._upload_batcher
+        if batcher is not None:
+            names = [name for name, value in tensors.items()
+                     if torch.is_tensor(value) and value.device.type == "cpu"]
+            if names:
+                packed = batcher.upload(tensors, names)
+                if packed is not None:
+                    inputs, slot = packed
+                    request.upload_slab = slot
+                    merged = dict(tensors)
+                    merged.update(inputs)
+                    self.stats["upload_batched"] += 1
+                    return merged
+                self.stats["upload_batch_declined"] += 1
+        return {name: _to_device(value, self.platform.device) for name, value in tensors.items()}
 
     def _queue_for_first_stages(self, request: _Request) -> None:
         """Append ``request`` to the queue of every stage without dependencies (engine thread)."""
@@ -550,8 +824,8 @@ class Engine:
                 self._queues[stage].append(request)
 
     def _device_images_loop(self) -> None:
-        """Device-image thread body: turn each handed-over request's ``DeviceImage`` values into views, in admission
-        order.
+        """Device-image thread body: per-view prefetch tickets, then each handed-over request's ``DeviceImage``
+        values turned into views, in queue (admission) order.
 
         The ``DeviceImageDecoder`` is created on first use. If initialization raises, the request fails and the next
         one tries again. The work runs on the thread's stream after the request's upload, and an event recorded
@@ -562,22 +836,106 @@ class Engine:
         """
         self._bind_device()
         stream = self._device_stream
+        wave = []
+        stash = deque()  # items read ahead of a ticket batch, handled in order
+
+        def flush_wave():
+            if wave:
+                if self._device_error is not None:
+                    self._uncertain_keepalive.extend(wave)
+                    for image in wave:
+                        image.prefetch.error = self._device_error
+                else:
+                    self._prefetch_views(list(wave))
+                wave.clear()
+
         while True:
-            request = self._device_requests.get()
+            request = stash.popleft() if stash else self._device_requests.get()
+            if self._device_error is not None:
+                if isinstance(request, image_prefetch.Ticket):
+                    request.image.prefetch.error = self._device_error
+                    continue
+                if isinstance(request, image_prefetch.Boundary):
+                    continue
+                if isinstance(request, _CaptureImageGraphs):
+                    request.done.set()
+                    continue
+                if request is not None:
+                    with self._wake:
+                        self._device_ready.append((request, request.inputs, _CompletionFence(self), self._device_error))
+                        self._wake.notify()
+                    continue
+            if isinstance(request, image_prefetch.Ticket):
+                # A request's views are handed over back to back and decode as one wave: every
+                # view's DVPP transaction starts before any frame is fetched, so the media engine
+                # decodes them concurrently. The processor's boundary (or the admission item, or
+                # MAX_WAVE_VIEWS for a processor that sends none) closes the wave.
+                #
+                # The tickets already queued (this request's remaining views)
+                # are drained as one batch and their transactions start under one stream context
+                # and one GIL-releasing C call, in ticket order -- the same starts the per-ticket
+                # path issued, without the interpreter slices the prepare window interleaved
+                # between them. A non-ticket item read ahead goes to ``stash`` and is handled
+                # before anything still queued behind it.
+                tickets = [request]
+                while len(tickets) < MAX_WAVE_VIEWS and not stash:
+                    try:
+                        nxt = self._device_requests.get_nowait()
+                    except queue.Empty:
+                        break
+                    if isinstance(nxt, image_prefetch.Ticket):
+                        tickets.append(nxt)
+                    else:
+                        stash.append(nxt)
+                        break
+                try:
+                    if self._decoder is None:
+                        self._decoder = DeviceImageDecoder(self.platform.device, self._image_resize,
+                                                           self.image_prefetch, self._image_quantize)
+                    with self._device_ctx, torch.inference_mode():
+                        self._decoder.start_batch([ticket.image for ticket in tickets])
+                except Exception as exc:  # noqa: BLE001 - these requests fail with it when admitted
+                    for ticket in tickets:
+                        ticket.image.prefetch.error = exc
+                for ticket in tickets:
+                    wave.append(ticket.image)
+                    if len(wave) >= MAX_WAVE_VIEWS:
+                        flush_wave()
+                continue
+            flush_wave()
+            if isinstance(request, _CaptureImageGraphs):
+                # The engine thread is blocked on ``done``: nothing else captures or synchronizes the
+                # device, which is what graph capture needs here (see the class docstring).
+                try:
+                    if self._decoder is not None:
+                        captured = self._decoder.capture_image_graphs()
+                        logger.info("device image chain: %d graphs captured (%s)",
+                                    captured, self._decoder.image_graph_stats)
+                except Exception:  # noqa: BLE001 - the chain keeps running eagerly
+                    logger.exception("could not capture the device image chain graphs")
+                finally:
+                    request.done.set()
+                continue
+            if isinstance(request, image_prefetch.Boundary):
+                continue
             if request is None:
                 if self._decoder is not None:
+                    if self._device_error is not None:
+                        return  # shutdown synchronizes before retrying decoder teardown
                     try:
                         self._decoder.close()
-                    except Exception:  # noqa: BLE001 - shutdown still joins this worker
+                    except Exception as exc:  # retain the decoder for teardown after shutdown synchronizes
                         logger.exception("could not release the device image decoder")
-                    finally:
+                        self._fail_device(exc)
+                    else:
                         self._decoder = None
                 return
             inputs = error = event = None
             try:
                 if self._decoder is None:
-                    self._decoder = DeviceImageDecoder(self.platform.device)
-                context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
+                    self._decoder = DeviceImageDecoder(self.platform.device, self._image_resize,
+                                                       self.image_prefetch, self._image_quantize)
+                context = self._device_ctx  # cached on this thread, never nested
                 with context, torch.inference_mode():
                     if stream is not None and request.inputs_ready is not None:
                         stream.wait_event(request.inputs_ready)
@@ -590,12 +948,58 @@ class Engine:
                     event.record(stream)
                 except Exception as exc:  # noqa: BLE001 - report a device error, keep the worker alive
                     logger.exception("could not record the device images' completion")
-                    event = None
-                    if self.platform.is_npu and error is None:
-                        error = exc
+                    self._fail_device(exc)
+                    event, error = _CompletionFence(self), exc
             with self._lock:
                 self._device_ready.append((request, inputs, event, error))
                 self._wake.notify()
+
+    def _start_view(self, image) -> None:
+        """Start one view's DVPP transaction as soon as its bytes reach the engine.
+
+        The media engine decodes it while the processor finishes the request's remaining host work
+        (the wave's frames are fetched when the wave is flushed), so a view never waits for its
+        request's other views to be handed over.
+        """
+        slot = getattr(image, "prefetch", None)
+        if slot is None or slot.txn is not None or slot.view is not None or slot.error is not None:
+            return
+        try:
+            if self._decoder is None:
+                self._decoder = DeviceImageDecoder(self.platform.device, self._image_resize,
+                                                   self.image_prefetch, self._image_quantize)
+            with self._device_ctx, torch.inference_mode():
+                self._decoder.start(image)
+        except Exception as exc:  # noqa: BLE001 - the request fails with it when admitted
+            slot.error = exc
+
+    def _prefetch_views(self, images) -> None:
+        """Decode and resize a wave of prefetched ``DeviceImage`` views into their slots.
+
+        The same stream, decoder and per-view path as the admission-time decode, one queue item per
+        view, with the wave's JPEGs decoded in one DVPP pass: their channel transactions start
+        before any frame is fetched, so the media engine decodes them concurrently. A decode that
+        raises is recorded in every slot of the wave and fails those requests at admission, as an
+        admission-time decode failure would.
+        """
+        images = [image for image in images if getattr(image, "prefetch", None) is not None]
+        if not images:
+            return
+        try:
+            if self._decoder is None:
+                self._decoder = DeviceImageDecoder(self.platform.device, self._image_resize,
+                                                   self.image_prefetch, self._image_quantize)
+            with self._device_ctx, torch.inference_mode():
+                views = self._decoder.decode_many(images)
+        except Exception as exc:  # noqa: BLE001 - these requests fail with it when admitted
+            device = self._decoder.device if self._decoder is not None else None
+            for image in images:
+                image.prefetch.error = exc
+                image.prefetch.device = device
+            return
+        for image, view in zip(images, views):
+            image.prefetch.device = self._decoder.device
+            image.prefetch.view = view
 
     def _queue_device_ready(self) -> bool:
         """Queue the requests whose views are ready for their first stages; fail those whose decoding raised.
@@ -611,7 +1015,11 @@ class Engine:
             ready, self._device_ready = self._device_ready, []
         for request, inputs, event, error in ready:
             self._device_inflight -= 1
+            if self._device_error is not None:
+                event, error = _CompletionFence(self), self._device_error
             if error is not None:
+                if inputs is not None:
+                    request.inputs = inputs
                 self._fail_request(request, error, after=event)
                 continue
             request.inputs, request.inputs_ready = inputs, event
@@ -624,7 +1032,12 @@ class Engine:
         A lane is free when it has no dispatch event or its event has completed (polled with ``query()``).
         """
         for lane in self.lanes[stage]:
-            if lane.event is None or lane.event.query():
+            try:
+                done = lane.event is None or lane.event.query()
+            except Exception as exc:
+                self._fail_device(exc)
+                return None
+            if done:
                 lane.event = None
                 return lane
         return None
@@ -786,6 +1199,8 @@ class Engine:
         batch_size = len(batch)
         final = stage in self.final_stages
         timed = self.stats_sink is not None
+        inputs = out = stage_batch = None
+        hosts = []
         try:
             with lane.use_stream(), torch.inference_mode(), span(
                     self._span_names[stage], batch_size=batch_size, lane=lane.index,
@@ -814,7 +1229,7 @@ class Engine:
                     ended = _timing_event(lane)
                     ended_at = time.perf_counter()
                 if final:
-                    hosts, event = self._copy_to_host(stage, lane, out, batch_size)
+                    _, event = self._copy_to_host(stage, lane, out, batch_size, hosts=hosts)
                 else:  # copy out of the lane's buffers before its next dispatch
                     for i, request in enumerate(batch):
                         request.outputs[stage] = {name: self._row(stage, name, out[name], i, batch_size).clone()
@@ -827,9 +1242,13 @@ class Engine:
                     if lane.copy_stream is not None:
                         lane.stream.wait_stream(lane.copy_stream)
                     after = lane.event = lane.record()
-                except Exception:  # noqa: BLE001 - the device is in an error state; nothing more runs on it
+                except Exception as completion_error:  # completion is unknown; do not reuse its lane or buffers
                     logger.exception("could not record the failed dispatch's completion")
+                    self._fail_device(completion_error)
+                    after = lane.event = _CompletionFence(self)
             for request in batch:
+                if request.handle is not None and after is not None:
+                    self.slots.tensors(request.handle)["failed_stage"] = (inputs, out, stage_batch, hosts)
                 self._fail_request(request, exc, after=after)
             raise
         lane.event = event
@@ -857,7 +1276,7 @@ class Engine:
         """
         return tensor if batch_size == 1 else tensor.narrow(self._batch_axis(stage, name), i, 1)
 
-    def _copy_to_host(self, stage, lane, out, batch_size):
+    def _copy_to_host(self, stage, lane, out, batch_size, *, hosts=None):
         """Copy a final dispatch's rows to the host.
 
         On CUDA the copies run on the lane's ``copy_stream`` after the lane's work. A pinned buffer records an event
@@ -869,23 +1288,28 @@ class Engine:
             lane: the lane that ran the dispatch.
             out: the dispatch's outputs ``{name: tensor}``.
             batch_size: number of requests in the batch.
+            hosts: caller-owned list that retains buffers even if a copy or event recording fails.
 
         Returns:
             ``(hosts, event)``: one ``{name: CPU tensor}`` per row, valid once ``event`` completes (None on the CPU).
         """
+        hosts = [] if hosts is None else hosts
         if lane.copy_stream is None:
-            return [self._to_host(stage, out, i, batch_size) for i in range(batch_size)], lane.record()
+            for i in range(batch_size):
+                self._to_host(stage, out, i, batch_size, hosts=hosts)
+            return hosts, lane.record()
         ready = lane.record()
         with self._device_module.stream(lane.copy_stream):
             lane.copy_stream.wait_event(ready)
             for value in out.values():  # eager outputs must outlive the copies
                 value.record_stream(lane.copy_stream)
-            hosts = [self._to_host(stage, out, i, batch_size) for i in range(batch_size)]
+            for i in range(batch_size):
+                self._to_host(stage, out, i, batch_size, hosts=hosts)
             event = self._device_module.Event()
             event.record(lane.copy_stream)
         return hosts, event
 
-    def _to_host(self, stage, out, i, batch_size) -> dict:
+    def _to_host(self, stage, out, i, batch_size, *, hosts=None) -> dict:
         """Copy request ``i``'s row of every output to the host.
 
         On CUDA each row is copied asynchronously on the current stream into a new pinned buffer, which holds the
@@ -897,17 +1321,20 @@ class Engine:
             out: the dispatch's outputs ``{name: tensor}``.
             i: row index in the batch.
             batch_size: number of requests in the batch.
+            hosts: optional caller-owned list retaining each row before any asynchronous copy.
 
         Returns:
             ``{name: CPU tensor}``.
         """
         host = {}
+        if hosts is not None:
+            hosts.append(host)
         for name, value in out.items():
             row = self._row(stage, name, value, i, batch_size)
             if self._device_module is not None:
                 host_buffer = torch.empty(row.shape, dtype=row.dtype, pin_memory=True)
-                host_buffer.copy_(row, non_blocking=True)
                 host[name] = host_buffer
+                host_buffer.copy_(row, non_blocking=True)
             else:
                 host[name] = row.clone()
         return host
@@ -950,11 +1377,15 @@ class Engine:
                 return
             event, batch, hosts = item
             try:
+                if self._device_error is not None:
+                    raise self._device_error
                 if event is not None:
                     event.synchronize()
             except Exception as exc:  # noqa: BLE001 - fail this batch, keep completing the others
+                self._fail_device(exc)
+                self._uncertain_keepalive.append(hosts)
                 for request in batch:
-                    self._fail_request(request, exc)
+                    self._fail_request(request, exc, after=_CompletionFence(self))
                 continue
             for request, host in zip(batch, hosts):
                 self._finish_request(request)
@@ -988,11 +1419,19 @@ class Engine:
                 times = {stage: (began - request.ready_at, ended - request.ready_at)
                          for stage, (began, ended, _) in request.timing.items()}
             else:
-                since = request.inputs_ready.elapsed_time
+                # the fast-admission pair (upload event, decode fence) is ready when the later of
+                # the two completes, so a stage's wait counts from the later one -- the smaller
+                # elapsed time of the pair
+                marks = request.inputs_ready if type(request.inputs_ready) is tuple else \
+                    (request.inputs_ready,)
+
+                def since(event):
+                    return min(mark.elapsed_time(event) for mark in marks)
+
                 times = {stage: (since(began) / 1000, since(ended) / 1000)
                          for stage, (began, ended, _) in request.timing.items()}
-        except (RuntimeError, ValueError):  # timing may be unavailable even for a timing-enabled event
-            return None
+        except (RuntimeError, ValueError, TypeError, AttributeError):
+            return None  # timing may be unavailable even for a timing-enabled event; keep completing requests
         stages = {}
         for stage, (began, ended) in times.items():
             ready = max((times[upstream][1] for upstream in self.stages[stage].depends_on), default=0.0)
@@ -1020,11 +1459,22 @@ class Engine:
             locked: True when the caller already holds ``self._lock``.
             after: event of a failed dispatch's enqueued work; the slot keeps the request's tensors until it completes.
         """
+        if after is not None and not isinstance(after, _CompletionFence):
+            after = _CompletionFence(self, after)
         if request.handle is not None:
             if after is not None:
-                self.slots.tensors(request.handle)["failed_dispatch"] = (request.inputs, dict(request.outputs))
+                self.slots.tensors(request.handle)["failed_dispatch"] = (
+                    request.prepared, request.inputs, dict(request.outputs))
             self.slots.release(request.handle, after=after)
             request.handle = None
+        slab, request.upload_slab = request.upload_slab, None
+        if slab is not None and self._upload_batcher is not None:
+            # Successful requests already waited for their final event. A failed dispatch returns
+            # its host slab only after the same completion event as its other request tensors.
+            if isinstance(after, _CompletionFence) and after.event is None:
+                self._upload_batcher.retire(slab)
+            else:
+                self._upload_batcher.release(slab, after=after)
         request.inputs = None
         request.outputs.clear()
         if locked:

@@ -32,7 +32,7 @@ def graph_api_for(device: str | torch.device):
     return module
 
 
-def jpeg_decoder_for(device: str | torch.device):
+def jpeg_decoder_for(device: str | torch.device, *, image_quantize=None):
     """Create the selected platform's JPEG decoder, loading no other platform's codec.
 
     The decoder has a canonical, indexed ``device``, is called with a list of CPU uint8 JPEG tensors,
@@ -52,4 +52,13 @@ def jpeg_decoder_for(device: str | torch.device):
         return CudaJpegDecoder(device)
     from xinfer.platforms.npu import NpuJpegDecoder
 
-    return NpuJpegDecoder(device)
+    return NpuJpegDecoder(device) if image_quantize is None else NpuJpegDecoder(device, quantize=image_quantize)
+
+
+def image_pipeline_for(decoder, resize_image, upload):
+    """A platform's optional decode-wave/graph pipeline, using caller-supplied tensor operations."""
+    if decoder.device.type != "npu":
+        return None
+    from xinfer.platforms.npu_images import NpuImagePipeline
+
+    return NpuImagePipeline(decoder, resize_image, upload)

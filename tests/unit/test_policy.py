@@ -76,7 +76,8 @@ def policy(monkeypatch):
 
     monkeypatch.setattr(policy_module, "get_model_class", lambda name: SimpleNamespace(from_checkpoint=load))
     monkeypatch.setattr(policy_module.ops.registry, "load_plugins", lambda: None)
-    monkeypatch.setattr(policy_module, "Engine", lambda model, platform, config: None)
+    monkeypatch.setattr(policy_module, "Engine", lambda model, platform, config, **kwargs:
+                        SimpleNamespace(image_prefetch=None))
 
     def make(device_images=True, **options):
         monkeypatch.setattr(policy_module, "resolve_platform", lambda device: _platform(device_images))
