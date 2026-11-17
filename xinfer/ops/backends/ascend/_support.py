@@ -66,6 +66,16 @@ try:
 except Exception:  # noqa: BLE001 - the core import never fails in-tree; stay safe for odd installs
     xc = None
 
+# The registration ``priority`` of this backend's operators: one rank above the registry's
+# default (10), the D-14 decision of the dual-source transition. While the external xcompute
+# package (``ascend:xcompute``) and this in-tree backend (``ascend:kernels``) can both carry an
+# operator, the in-tree implementation wins by default - deterministically, by this rank, never
+# by registration order (the equal-priority tie the audit's D-14 flags). A deployment that
+# wants the external build pins it explicitly (``serve --op-backends <op>=ascend:xcompute``),
+# or runs without this backend's libraries, which leaves every ``requires`` None and the
+# external registrations the only Ascend implementations.
+PRIORITY = 11
+
 # The registration ``version`` argument: the core family library's sha256 fingerprint (the same
 # form the CUDA ``NATIVE`` kwargs carry), or None when nothing is loaded.
 VERSION = None

@@ -9,6 +9,7 @@ These entries are **not** the default: they sit below the provider ones by prior
 serves ``linear``, the norm-replace entry ``qkv_norm_split``), so a deployment runs on the provider entries unless
 it opts in with ``--op-backends`` naming this library, e.g. ``--op-backends linear=ascend:torch_npu``.
 ``npu_linear`` takes a 2-D input, so ``linear`` flattens the leading dimensions and restores them.
+Contracts against the torch references: tolerance (the vendor operators' own precision).
 """
 
 import torch

@@ -165,26 +165,32 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mas
     values = v_cache.transpose(1, 2).reshape(_KVH * _L, _D)
     fm = flash_mask.reshape(_L, 2)
     scale_bits = struct.unpack("<q", struct.pack("<f", _D**-0.5) + bytes(4))[0]
-    status = call(
-        ctypes.c_void_p(q_flat.data_ptr()),
-        ctypes.c_void_p(keys.data_ptr()),
-        ctypes.c_void_p(values.data_ptr()),
-        ctypes.c_void_p(fm.data_ptr()),
-        ctypes.c_void_p(prefix_len.data_ptr()),
-        ctypes.c_void_p(pbuf.data_ptr()),
-        ctypes.c_int64(int(new_pos)),
-        ctypes.c_int64(scale_bits),
-        ctypes.c_void_p(stream),
-    )
-    if status:
-        raise RuntimeError("decodeattn-r4 scan: " + (err() or b"?").decode("utf-8", "replace"))
-    status = reduce_call(
-        ctypes.c_void_p(pbuf.data_ptr()),
-        ctypes.c_void_p(out.data_ptr()),
-        ctypes.c_void_p(stream),
-    )
-    if status:
-        raise RuntimeError("decodeattn-r4 reduce: " + (reduce_err() or b"?").decode("utf-8", "replace"))
+    # the single library's TVM-FFI faces serve first (the unified launch boundary); the
+    # ctypes launchers of the family library are the fallback below
+    if not _native.launch_kernel(scan_name, (q_flat, keys, values, fm, prefix_len, pbuf),
+                                 (int(new_pos), scale_bits)):
+        status = call(
+            ctypes.c_void_p(q_flat.data_ptr()),
+            ctypes.c_void_p(keys.data_ptr()),
+            ctypes.c_void_p(values.data_ptr()),
+            ctypes.c_void_p(fm.data_ptr()),
+            ctypes.c_void_p(prefix_len.data_ptr()),
+            ctypes.c_void_p(pbuf.data_ptr()),
+            ctypes.c_int64(int(new_pos)),
+            ctypes.c_int64(scale_bits),
+            ctypes.c_void_p(stream),
+        )
+        if status:
+            raise RuntimeError("decodeattn-r4 scan: " + (err() or b"?").decode("utf-8", "replace"))
+    reduce_name = "decodeattn_r4_reduce_row" if row else "decodeattn_r4_reduce"
+    if not _native.launch_kernel(reduce_name, (pbuf, out)):
+        status = reduce_call(
+            ctypes.c_void_p(pbuf.data_ptr()),
+            ctypes.c_void_p(out.data_ptr()),
+            ctypes.c_void_p(stream),
+        )
+        if status:
+            raise RuntimeError("decodeattn-r4 reduce: " + (reduce_err() or b"?").decode("utf-8", "replace"))
     _SEEN.add(("warm",))
     _debug("HIT", q, k_cache, flash_mask, new_pos, scale)
     if row:

@@ -18,6 +18,8 @@ import threading
 
 import torch
 
+from xinfer.ops.backends.ascend import _native
+
 CHANNELS = 6144
 
 _LOCK = threading.Lock()
@@ -116,6 +118,12 @@ def conv_mixed_tokenmajor(qkv, conv_weight):
         out = qkv.new_empty((1, tokens, CHANNELS))
         call, error = _library()
         stream = torch.npu.current_stream(qkv.device).npu_stream
+        # the single library's TVM-FFI face serves first (the unified launch boundary);
+        # the ctypes launcher of the family library is the fallback below
+        if _native.launch_kernel("dconv4_c6144", (out, qkv, w, pad),
+                                 (tokens, qkv.stride(1))):
+            _STATS["routed"] += 1
+            return out
         status = call(
             ctypes.c_void_p(out.data_ptr()),
             ctypes.c_void_p(qkv.data_ptr()),

@@ -9,13 +9,16 @@ alongside this one: a library built here loads only through ``XINFER_ASCEND_KERN
 directory, and ``XINFER_XCOMPUTE_LIBRARY`` pointed at it still fails the external loader's paired-package
 check, so the two loaders cannot serve each other's library.
 
-Transition (R1a): until the per-kernel TVM-FFI glue faces land (R1b), this module also carries the family
-libraries of the delivered stacks — one core library plus one knife library per routed family
-(``src/FAMILIES.md``, built by ``src/build-libraries.sh``), loaded through ctypes under the deployment's
-``XINFER_<FAMILY>_LIB`` names, with the AOT launcher binding, the first-call warmup rule and the C-ABI
-composition bridges of the core library (the loading surface of the retired ``_provider.py``, same names
-and semantics, re-homed so the backend has one loading module). The master gate is shared:
-``XINFER_ASCEND_KERNELS=0`` disables both forms.
+Transition (R1a -> R1b): the per-kernel TVM-FFI glue faces have landed (R1b — the ``aot_glue.cc`` files of
+``src/``, one typed function per AOT kernel), and this module's ``launch_kernel`` is the unified boundary
+the backend's envelopes call: the single library's face serves a launch when it is loaded, and the family
+libraries of the delivered stacks remain the fallback — one core library plus one knife library per routed
+family (``src/FAMILIES.md``, built by ``src/build-libraries.sh``), loaded through ctypes under the
+deployment's ``XINFER_<FAMILY>_LIB`` names, with the AOT launcher binding, the first-call warmup rule and
+the C-ABI composition bridges of the core library (the loading surface of the retired ``_provider.py``,
+same names and semantics, re-homed so the backend has one loading module). The master gate is shared:
+``XINFER_ASCEND_KERNELS=0`` disables both forms. The faces retire the ctypes bindings module by module as
+each envelope's verification lands; the family form retires when every operator runs through ``lib``.
 
 SoCs: the library reports the SoCs it was built for (``BUILD_SOCS``, e.g. ``("ascend950dt9582",)`` — the
 vendor's device name lowercased to alphanumerics, the string ``platforms/npu.py`` reports as the platform's
@@ -282,6 +285,26 @@ def launch(aot_pair, tensors, scalars, stream=None):
                            f"{message.decode('utf-8', 'replace') if message else 'unknown failure'}")
 
 
+def launch_kernel(name, tensors, scalars=()):
+    """Launch one AOT kernel through the single library's TVM-FFI face; ``False`` when it cannot.
+
+    The unified boundary of the per-kernel glue faces (the ``aot_glue.cc`` files of ``src/``): the
+    face takes the same packed-launch ABI the ctypes bindings drive - one tensor per pointer, one
+    int64 per scalar - and resolves the current NPU stream itself, so the python envelopes call it
+    with exactly the tensors and scalars they hold. ``False`` (the caller keeps its ctypes path)
+    when the single library is not loaded or carries no face of ``name``: a family-library
+    deployment or a library built before a kernel then serves unchanged.
+    """
+    if lib is None:
+        return False
+    try:
+        face = getattr(lib, name)
+    except AttributeError:
+        return False
+    face(*tensors, *[int(s) for s in scalars])
+    return True
+
+
 _soc_of = {}
 
 
@@ -524,6 +547,10 @@ class RawBridge:
                 if name not in bnsd_entries:
                     raise ValueError(f"this core library does not carry the {name} BNSD kernel")
                 bnsd_validate(out, x, w, form[1])
+                # the single library's TVM-FFI face serves first (the unified launch
+                # boundary); the ctypes launcher of the family library is the fallback
+                if launch_kernel(name, (x, w, out)):
+                    return
                 call, kern_error = bnsd_entries[name]
                 import torch
 

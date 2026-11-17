@@ -121,6 +121,8 @@ def _entry(name, pointers, scalars):
 
 
 def _launch(name, tensors, scalars):
+    if _native.launch_kernel(name, tensors, scalars):
+        return
     call, err = _entry(name, len(tensors), len(scalars))
     stream = torch.npu.current_stream(tensors[0].device).npu_stream
     status = call(
@@ -202,5 +204,7 @@ def layernorm_c1024(x, weight, bias, eps):
 
 
 import atexit  # noqa: E402 - final receipt line per process
+
+from xinfer.ops.backends.ascend import _native
 
 atexit.register(lambda: _flush_stats(final=True))

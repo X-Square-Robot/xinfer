@@ -68,6 +68,8 @@ def _entry(name):
 
 
 def _launch(name, tensors):
+    if _native.launch_kernel(name, tensors):
+        return
     call, err = _entry(name)
     stream = torch.npu.current_stream(tensors[0].device).npu_stream
     status = call(

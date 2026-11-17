@@ -321,7 +321,8 @@ def prefix_kvcache_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: to
                              prefix_len: torch.Tensor, new_pos: int, *, flash_mask: torch.Tensor | None = None,
                              scale: float | None = None, all_keep: bool = False,
                              return_bnsd: bool = False) -> torch.Tensor:
-    """Attention of ``M`` new tokens over a cache prefix and their own keys (the CUDA backend's ``attention_kvcache``).
+    """Attention of ``M`` new tokens over a cache prefix and their own keys (the CUDA backend's ``attention_kvcache``;
+    the Ascend backend's cache-attention kernels serve it through the same contract).
 
     Each query can attend to the valid prefix and the new keys. An optional column mask supplies the valid query
     row range for each key.

@@ -39,6 +39,8 @@ import os
 import torch
 import torch.nn.functional as F
 
+from xinfer.ops.backends.ascend import _native
+
 FAMILIES = ("gdrprep",)
 _ENABLED = None
 _LIB = None
@@ -75,6 +77,8 @@ def _lib():
 
 
 def _launch(name, tensors, scalars):
+    if _native.launch_kernel(name, tensors, scalars):
+        return
     call = getattr(_lib(), f"xinfer_aot_{name}_call")
     call.restype = ctypes.c_int32
     call.argtypes = [ctypes.c_void_p] * len(tensors) + [ctypes.c_int64] * len(scalars) + [

@@ -39,6 +39,8 @@ from threading import Lock
 
 import torch
 
+from xinfer.ops.backends.ascend import _native
+
 _FAMILIES = ("normprep", "zbasplit", "glumulcast", "vropepack")
 _LOCK = Lock()
 _LIB = None
@@ -118,6 +120,8 @@ def _entry(name, pointers, scalars):
 
 
 def _launch(name, tensors, scalars):
+    if _native.launch_kernel(name, tensors, scalars):
+        return True
     pair = _entry(name, len(tensors), len(scalars))
     if pair is None:
         return False

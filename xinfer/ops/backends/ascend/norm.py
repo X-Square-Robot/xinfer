@@ -5,11 +5,13 @@ also needs the zero-centered VoT norms, the ViT's layer norm and the AdaRMS fami
 ``gated_residual_modulated_rms_norm``, ``identity_layer_norms_``). Each registration names one OpSpec and delegates
 to the glue entry that implements that semantics; entries reject unsupported layouts with ``ValueError`` (or
 fail the ``check`` predicate) and the reference runs instead.
+Contracts against the torch references: the fused mounts bitwise (the audited
+production gates), the vendor entries tolerance.
 """
 
 import torch
 
-from xinfer.ops.backends.ascend._support import VERSION, canonical, entry, has_functions, partial, xc
+from xinfer.ops.backends.ascend._support import PRIORITY, VERSION, canonical, entry, has_functions, partial, xc
 from xinfer.ops.backends.copykill_r2 import enabled as _copykill_enabled
 from xinfer.ops.reference.norm import (
     add_rms_norm as reference_add_rms_norm,
@@ -39,7 +41,7 @@ def _supported(x, residual, weight, eps):
             and 0 < eps <= torch.finfo(torch.float32).max)
 
 
-@register("add_rms_norm", backend="ascend", requires=norm_library,
+@register("add_rms_norm", backend="ascend", priority=PRIORITY, requires=norm_library,
           version=VERSION)
 @partial(reference_add_rms_norm, check=_supported)
 def add_rms_norm(x, residual, weight, eps):
@@ -148,7 +150,7 @@ def _plain_supported(x, weight, eps):
             and x.dtype in (torch.bfloat16, torch.float16, torch.float32) and weight.shape == (x.shape[-1],))
 
 
-@register("rms_norm", backend="ascend", requires=xc if _rms is not None else None,
+@register("rms_norm", backend="ascend", priority=PRIORITY, requires=xc if _rms is not None else None,
           version=VERSION)
 @partial(reference_rms_norm, check=_plain_supported)
 def rms_norm(x, weight, eps):
@@ -197,7 +199,7 @@ def _layer_norm_supported(x, weight, bias, eps):
             and weight.dtype in _WEIGHT_DTYPES and bias.dtype in _WEIGHT_DTYPES)
 
 
-@register("layer_norm_cast", backend="ascend", requires=xc if callable(_layernorm_inplace) else None,
+@register("layer_norm_cast", backend="ascend", priority=PRIORITY, requires=xc if callable(_layernorm_inplace) else None,
           version=VERSION)
 @partial(reference_layer_norm_cast, check=_layer_norm_supported)
 def layer_norm_cast(x, weight, bias, eps):
@@ -212,7 +214,7 @@ def _zero_centered_supported(x, weight, eps):
     return _npu_same_device(x, weight) and weight.dtype in _WEIGHT_DTYPES
 
 
-@register("zero_centered_rms_norm", backend="ascend", requires=xc if _rms is not None else None,
+@register("zero_centered_rms_norm", backend="ascend", priority=PRIORITY, requires=xc if _rms is not None else None,
           version=VERSION)
 @partial(reference_zero_centered_rms_norm, check=_zero_centered_supported)
 def zero_centered_rms_norm(x, weight, eps):
@@ -225,7 +227,7 @@ def _add_zero_centered_supported(x, residual, weight, eps):
             and weight.dtype in _WEIGHT_DTYPES)
 
 
-@register("add_zero_centered_rms_norm", backend="ascend", requires=xc if _add_rms is not None else None,
+@register("add_zero_centered_rms_norm", backend="ascend", priority=PRIORITY, requires=xc if _add_rms is not None else None,
           version=VERSION)
 @partial(reference_add_zero_centered_rms_norm, check=_add_zero_centered_supported)
 def add_zero_centered_rms_norm(x, residual, weight, eps):
@@ -281,7 +283,7 @@ def _modulated_identity_operands(x, pinned):
     return pair
 
 
-@register("modulated_rms_norm", backend="ascend", requires=xc if _adarms is not None else None,
+@register("modulated_rms_norm", backend="ascend", priority=PRIORITY, requires=xc if _adarms is not None else None,
           version=VERSION)
 @partial(reference_modulated_rms_norm, check=_modulated_supported)
 def modulated_rms_norm(x, modulation, eps, pinned_modulation=None, pinned_rows=None):
@@ -299,7 +301,7 @@ def modulated_rms_norm(x, modulation, eps, pinned_modulation=None, pinned_rows=N
                    pinned_modulation=pinned_modulation, pinned_rows=pinned_rows)
 
 
-@register("gated_residual_modulated_rms_norm", backend="ascend", requires=xc if _adarms is not None else None,
+@register("gated_residual_modulated_rms_norm", backend="ascend", priority=PRIORITY, requires=xc if _adarms is not None else None,
           version=VERSION)
 @partial(reference_gated_residual_modulated_rms_norm,
          check=lambda residual, branch, branch_gate, modulation, eps, pinned_modulation=None, pinned_rows=None:
@@ -314,7 +316,7 @@ def gated_residual_modulated_rms_norm(residual, branch, branch_gate, modulation,
                    residual=residual, branch_gate=branch_gate)
 
 
-@register("identity_layer_norms_", backend="ascend", requires=xc if callable(_double_adarmsnorm) else None,
+@register("identity_layer_norms_", backend="ascend", priority=PRIORITY, requires=xc if callable(_double_adarmsnorm) else None,
           version=VERSION, deterministic=True)
 @partial(reference_identity_layer_norms_,
          check=lambda residual, branch, branch_gate, input_modulation, post_modulation, eps,

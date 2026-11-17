@@ -630,3 +630,79 @@ def test_dynamic_ffi_names_are_not_operator_exports_and_wrong_signatures_fail(is
     package.gemm_epilogue = PackedFunction()
     with pytest.raises(TypeError, match="gemm_epilogue.*Python operator signature"):
         load()
+
+
+def test_the_dual_source_transition_is_decided_by_priority_not_registration_order(isolated_backend):
+    """D-14: while an external xcompute build and the in-tree kernels both carry an operator, the
+    winner is the priority rank the backends register with, never the registration order.
+
+    The in-tree backend registers one rank above the registry default (``_support.PRIORITY``), so
+    an external package's default-rank registration loses deterministically in either load order;
+    a pin (``--op-backends <op>=ascend:xcompute``) reaches it explicitly.
+    """
+    from xinfer.ops.registry import Contract
+
+    registry, package, load = isolated_backend
+    from xinfer.ops.backends.ascend._support import PRIORITY
+
+    def one(name):
+        def run(x, weight, bias=None, *, activation=None, residual=None, residual_gate=None,
+                row_class=None, row_scale=None):
+            return ops.reference.gemm_epilogue(x, weight, bias)
+        run.__name__ = name
+        return run
+
+    def add(library, priority, function):
+        registry.add("gemm_epilogue", function, backend="ascend",
+                     contract=Contract(numerics="tolerance"), platforms=("ascend",),
+                     priority=priority, version=f"{library}.so", library=library)
+
+    # the reloaded modules registered the backend's operators at PRIORITY: one rank above the
+    # registry default, the D-14 decision (the fixture's package spells the library its own way)
+    package.gemm_epilogue = one("canonical_gemm")  # the canonical export the binding probes for
+    load()
+    backend_impls = [i for i in registry._impls["gemm_epilogue"] if i.backend == "ascend"]
+    assert backend_impls and all(i.priority == PRIORITY for i in backend_impls)
+
+    # the dual-source race itself, at the registry layer, in both registration orders: the
+    # external build stays at the registry default, the in-tree one at PRIORITY, and only the
+    # order in which the two registrations arrive varies
+    for sequence in (("xcompute", "kernels"), ("kernels", "xcompute")):
+        registry._impls["gemm_epilogue"] = [i for i in registry._impls["gemm_epilogue"]
+                                            if i.backend == "reference"]
+        for library in sequence:
+            add(library, 10 if library == "xcompute" else PRIORITY, one(f"run_{library}"))
+        assert registry.build_table(_platform()).selection("gemm_epilogue").library == "kernels"
+
+    pinned = registry.build_table(_platform(), backends={"gemm_epilogue": "ascend:xcompute"})
+    assert pinned.selection("gemm_epilogue").library == "xcompute"
+
+
+def test_xcompute_library_pointed_at_the_intree_build_is_refused(monkeypatch, tmp_path):
+    """X-02's misdirection guard: ``XINFER_XCOMPUTE_LIBRARY`` at ``xinfer_kernels_ascend.so``
+    ends in a refusal, not a double registration.
+
+    The external loader's ``is_ascend`` heuristic reads the in-tree build's SoC string
+    (``ascend950dt9582`` - no standalone digit run) as "an Ascend build", so the guard is the
+    paired-package check: an in-tree build has no xcompute Python package whose library-path
+    attribute matches, and the import refuses with ``xc is None``.
+    """
+    so = tmp_path / "xinfer_kernels_ascend.so"
+    so.write_bytes(b"")  # the loader is stubbed below; the path only has to exist
+
+    class Library:
+        def __init__(self, path):
+            self.path = str(path)
+
+        def has_function(self, name):
+            return name in ("build_target_archs",)
+
+        def function(self, name):
+            assert name == "build_target_archs"
+            return lambda: "ascend950dt9582"  # the SoC string the in-tree build reports
+
+    monkeypatch.setenv("XINFER_XCOMPUTE_LIBRARY", str(so))
+    monkeypatch.setattr(_xcompute, "_Library", Library)
+    monkeypatch.setattr(_xcompute, "_package_library", lambda: None)
+    assert _xcompute.is_ascend(Library(so))  # the heuristic misjudges the SoC string...
+    assert _xcompute._import() is None       # ...and the paired-package check refuses the build

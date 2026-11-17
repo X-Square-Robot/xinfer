@@ -605,7 +605,6 @@ class CannAction:
                     raise RuntimeError(
                         "warm up the fused 2B QKV tail on this stream before graph capture"
                     )
-                call, get_error = finish
                 q_bnsd = x.new_empty(
                     (1, num_heads, m, head_dim), dtype=torch.bfloat16
                 )
@@ -614,6 +613,17 @@ class CannAction:
                 )
                 q_factor = self._one_plus(q_weight)
                 k_factor = self._one_plus(k_weight)
+                # the single library's TVM-FFI face serves first (the unified launch
+                # boundary); the ctypes launcher of the family library is the fallback
+                # below
+                if _native.launch_kernel(
+                    "gemm_qkv_2b_norm_gate_cache_bnsdq",
+                    (q_bnsd, gate, k_cache, v_cache, y, q_factor, k_factor, cos, sin),
+                    (m, k_cache.shape[1], int(start)),
+                ):
+                    self._qkv_2b_cache_warmed = True
+                    return q_bnsd, gate
+                call, get_error = finish
                 stream = ctypes.c_void_p(
                     torch.npu.current_stream(x.device).npu_stream
                 )

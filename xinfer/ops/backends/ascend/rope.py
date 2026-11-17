@@ -5,13 +5,15 @@
 ``pos_embed_interp`` are the Qwen3.5 ViT's 2-D rotary angles and its interpolated position table, through the
 library functions of the same names; a host grid list becomes the int32 device tensors those functions take,
 cached per (grids, merge, device) so the first — eager — call of a layout has them before any capture.
+Contracts against the torch references: bitwise for the d64 launchers (their only bit-level
+deviations are signed zeros), tolerance for the composed forms.
 """
 
 import math
 
 import torch
 
-from xinfer.ops.backends.ascend._support import VERSION, has_functions, partial, xc
+from xinfer.ops.backends.ascend._support import PRIORITY, VERSION, has_functions, partial, xc
 from xinfer.ops.reference.rope import pos_embed_interp as reference_pos_embed_interp
 from xinfer.ops.reference.rope import rope_full as reference_rope_full
 from xinfer.ops.reference.rope import rot_pos as reference_rot_pos
@@ -27,7 +29,7 @@ def _gqa_bhsd():
     return "bhsd" in os.environ.get("XINFER_GQA_GLUE", "")
 
 
-@register("rope_full", backend="ascend", requires=xc if callable(_full) else None,
+@register("rope_full", backend="ascend", priority=PRIORITY, requires=xc if callable(_full) else None,
           version=VERSION)
 @partial(reference_rope_full,
          check=lambda q, k, cos, sin, rotary_dim:
@@ -143,7 +145,7 @@ def _grid_tensors(grids, merge_size, device):
     return _grids[key]
 
 
-@register("rot_pos", backend="ascend", numerics="bitwise",
+@register("rot_pos", backend="ascend", priority=PRIORITY, numerics="bitwise",
           requires=xc if _position_functions else None, version=VERSION)
 @partial(reference_rot_pos)
 def rot_pos(inv_freq, grids, merge_size):
@@ -153,7 +155,7 @@ def rot_pos(inv_freq, grids, merge_size):
     return out
 
 
-@register("pos_embed_interp", backend="ascend", requires=xc if _position_functions else None,
+@register("pos_embed_interp", backend="ascend", priority=PRIORITY, requires=xc if _position_functions else None,
           version=VERSION)
 @partial(reference_pos_embed_interp,
          check=lambda weight, grids, merge_size:

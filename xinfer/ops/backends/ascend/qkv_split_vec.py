@@ -52,12 +52,17 @@ def qkv_split_vec(packed, rstd_q, rstd_k, q_factor, k_factor):
     k = torch.empty((b, n, 2, 256), dtype=packed.dtype, device=packed.device)
     v = torch.empty_like(k)
     gate = torch.empty((b, n, 2048), dtype=packed.dtype, device=packed.device)
-    rc = call(ctypes.c_void_p(packed.data_ptr()),
-              ctypes.c_void_p(rstd_q.data_ptr()), ctypes.c_void_p(rstd_k.data_ptr()),
-              ctypes.c_void_p(q_factor.data_ptr()), ctypes.c_void_p(k_factor.data_ptr()),
-              ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
-              ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(gate.data_ptr()),
-              rows, ctypes.c_void_p(stream_obj.npu_stream))
+    # the single library's TVM-FFI face serves first when it carries one (the unified
+    # launch boundary); the ctypes launcher is the fallback below
+    if not _native.launch_kernel("qkv_split_vec_h256",
+                                 (packed, rstd_q, rstd_k, q_factor, k_factor,
+                                  q, k, v, gate), (rows,)):
+        rc = call(ctypes.c_void_p(packed.data_ptr()),
+                  ctypes.c_void_p(rstd_q.data_ptr()), ctypes.c_void_p(rstd_k.data_ptr()),
+                  ctypes.c_void_p(q_factor.data_ptr()), ctypes.c_void_p(k_factor.data_ptr()),
+                  ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
+                  ctypes.c_void_p(v.data_ptr()), ctypes.c_void_p(gate.data_ptr()),
+                  rows, ctypes.c_void_p(stream_obj.npu_stream))
     _WARMED.add(rows)
     if rc != 0:
         message = get_error()

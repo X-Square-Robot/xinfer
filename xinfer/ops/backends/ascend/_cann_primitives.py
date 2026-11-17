@@ -143,6 +143,10 @@ def mm_pair():
             if name not in bnsd_entries:
                 raise ValueError(f"this core library does not carry the {name} BNSD kernel")
             _bnsd_validate(out, x, w, form[1])
+            # the single library's TVM-FFI face serves first (the unified launch
+            # boundary); the ctypes launcher of the family library is the fallback
+            if _native.launch_kernel(name, (x, w, out)):
+                return
             call, kern_error = bnsd_entries[name]
             import torch
 

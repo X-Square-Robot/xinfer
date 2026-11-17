@@ -72,7 +72,13 @@ def _bits(value: float) -> int:
 
 
 def _launch(lib, name, tensors, scalars, stream=None):
-    """One AOT launcher call; raises the library's error text on failure."""
+    """One AOT launcher call; raises the library's error text on failure.
+
+    The single library's TVM-FFI face serves first (the unified launch boundary); the ctypes
+    launcher of the family library below is the fallback a deployment without the faces keeps.
+    """
+    if stream is None and _native.launch_kernel(name, tensors, scalars):
+        return
     if stream is None:
         stream = torch.npu.current_stream(tensors[0].device).npu_stream
     call = getattr(lib, f"xinfer_aot_{name}_call")

@@ -102,8 +102,8 @@ def _request(model, seed=1):
         prompt_len=token_ids.shape[1] - H, action_position_base=torch.tensor([int(positions[0, 0, -H])]),
         image_token_index=torch.arange(5, 9), dof_mask_all=False,
         vision_positions=layout["positions"].to(device), vision_window_index=layout["window_index"].to(device),
-        vision_reverse_index=layout["reverse_index"].to(device), vision_cu_window=layout["cu_window"].to(device),
-        vision_cu_full=layout["cu_full"].to(device),
+        vision_reverse_index=layout["reverse_index"].to(device), vision_cu_window=layout["cu_window"],
+        vision_cu_full=layout["cu_full"],  # int lists, passed as the tiny test passes them
     )
     return PreparedRequest(tensors)
 

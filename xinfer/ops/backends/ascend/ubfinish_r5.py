@@ -80,6 +80,9 @@ def finish(out, acc, bias, rows, cols):
     """out[r,c] = rne(acc_f32[r,c] + bias_f32[c]); all tensors contiguous."""
     if not routes(rows, cols):
         raise ValueError(f"ubfinish-r5: no route for {rows}x{cols}")
+    name = _registry()[cols][0]
+    if _native.launch_kernel(name, (out, acc, bias), (rows,)):
+        return
     call, err, name = _entry(cols)
     stream = torch.npu.current_stream(out.device).npu_stream
     status = call(

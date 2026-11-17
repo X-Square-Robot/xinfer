@@ -35,6 +35,8 @@ import time
 from threading import Lock
 
 import numpy as np
+
+from xinfer.ops.backends.ascend import _native
 import torch
 
 _LOCK = Lock()
@@ -117,6 +119,8 @@ def _entry(name, pointers, scalars):
 
 
 def _launch(name, tensors, scalars=()):
+    if _native.launch_kernel(name, tensors, scalars):
+        return True
     pair = _entry(name, len(tensors), len(scalars))
     if pair is None:
         return False

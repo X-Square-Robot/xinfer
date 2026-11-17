@@ -8,13 +8,15 @@ Stream-K reductions may differ at rounding level across runs.
 
 ``gemm_add_rms_norm`` and ``mlp_add_rms_norm`` call this backend's ``gemm_epilogue``, ``gemm_glu_epilogue`` and
 ``add_rms_norm`` in turn (the default selections of those operators), so their results are those calls'.
+Contracts against the torch references: the delivered kernels bitwise on their audited
+served shapes (the production gates), the generic aclnn routes by their 12/12 bitwise witness.
 """
 
 import os
 
 import torch
 
-from xinfer.ops.backends.ascend._support import VERSION, bridge, canonical, partial, xc
+from xinfer.ops.backends.ascend._support import PRIORITY, VERSION, bridge, canonical, partial, xc
 from xinfer.ops.backends.ascend.norm import add_rms_norm, norm_library
 from xinfer.ops.reference import gemm as reference
 from xinfer.ops.registry import register
@@ -65,7 +67,7 @@ native_cache = canonical_cache or getattr(cann_action, "qkv_rope_kvcache", None)
 native_2b_cache = getattr(cann_action, "qkv_norm_rope_kvcache", None)
 
 
-@register("gemm_epilogue", backend="ascend", requires=xc if callable(native_gemm) else None,
+@register("gemm_epilogue", backend="ascend", priority=PRIORITY, requires=xc if callable(native_gemm) else None,
           version=VERSION)
 @partial(reference.gemm_epilogue)
 def gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, residual_gate=None,
@@ -90,7 +92,7 @@ def _glu_supported(x, weight, *, bias=None, modulation=None, row_class=None, eps
     return canonical_glu is not None or modulation is None or callable(getattr(cann_action, "gemm_glu_epilogue", None))
 
 
-@register("gemm_glu_epilogue", backend="ascend",
+@register("gemm_glu_epilogue", backend="ascend", priority=PRIORITY,
           requires=xc if canonical_glu is not None or callable(cann_glu) else None,
           version=VERSION)
 @partial(reference.gemm_glu_epilogue, check=_glu_supported)
@@ -103,20 +105,20 @@ def gemm_glu_epilogue(x, weight, *, bias=None, modulation=None, row_class=None, 
                                         row_class=row_class, eps=eps)
 
 
-@register("gemm_add_rms_norm", backend="ascend",
+@register("gemm_add_rms_norm", backend="ascend", priority=PRIORITY,
           requires=xc if callable(native_gemm) and norm_library is not None else None, version=VERSION)
 def gemm_add_rms_norm(x, projection, residual, weight, eps, bias=None):
     return add_rms_norm(gemm_epilogue(x, projection, bias).view(residual.shape), residual, weight, eps)
 
 
-@register("mlp_add_rms_norm", backend="ascend",
+@register("mlp_add_rms_norm", backend="ascend", priority=PRIORITY,
           requires=xc if (callable(native_gemm) and norm_library is not None
                           and (canonical_glu is not None or callable(cann_glu))) else None, version=VERSION)
 def mlp_add_rms_norm(x, gate_up, down, residual, weight, eps):
     return gemm_add_rms_norm(gemm_glu_epilogue(x, gate_up), down, residual, weight, eps)
 
 
-@register("qkv_rope_epilogue", backend="ascend", requires=xc if callable(native_qkv) else None,
+@register("qkv_rope_epilogue", backend="ascend", priority=PRIORITY, requires=xc if callable(native_qkv) else None,
           version=VERSION)
 @partial(reference.qkv_rope_epilogue)
 def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
@@ -169,7 +171,7 @@ def _normalize_m16_q(result, args):
     return result
 
 
-@register("qkv_rope_kvcache", backend="ascend",
+@register("qkv_rope_kvcache", backend="ascend", priority=PRIORITY,
           requires=xc if callable(_fused_projection) or callable(native_cache) else None,
           version=VERSION, deterministic=False)
 @partial(reference.qkv_rope_kvcache)
@@ -230,7 +232,7 @@ def _padded_rows(x, weight, bias):
     return _plain_gemm(buffer, weight, bias)[:rows]
 
 
-@register("linear", backend="ascend", requires=xc if callable(_plain_gemm) else None,
+@register("linear", backend="ascend", priority=PRIORITY, requires=xc if callable(_plain_gemm) else None,
           version=VERSION)
 @partial(reference.linear, check=_linear_supported)
 def linear(x, weight, bias=None):
@@ -317,6 +319,17 @@ def _qkv_2b_split(packed, q_weight, k_weight, tail):
     q_out = torch.empty((rows, 4096), dtype=torch.bfloat16, device=packed.device)
     k_cache = torch.empty((2, rows, 256), dtype=torch.bfloat16, device=packed.device)
     v_cache = torch.empty((2, rows, 256), dtype=torch.bfloat16, device=packed.device)
+    # the single library's TVM-FFI face serves first (the unified launch boundary); the
+    # ctypes launcher of the family library is the fallback below
+    if _native.launch_kernel("gemm_qkv_2b_norm_gate_cache_bnsdq",
+                             (q_out, k_cache, v_cache, accumulator, q_factor, k_factor,
+                              ones, zeros), (rows, rows, 0)):
+        _qkv_2b_warmed = True
+        q = q_out[:, :2048].view(rows, 8, 256).unsqueeze(0)
+        k = k_cache.transpose(0, 1).unsqueeze(0).contiguous()
+        v = v_cache.transpose(0, 1).unsqueeze(0).contiguous()
+        gate = q_out[:, 2048:].reshape(1, rows, 2048)
+        return q, k, v, gate
     stream = ctypes.c_void_p(torch.npu.current_stream(packed.device).npu_stream)
     status = call(ctypes.c_void_p(q_out.data_ptr()), ctypes.c_void_p(k_cache.data_ptr()),
                   ctypes.c_void_p(v_cache.data_ptr()), ctypes.c_void_p(accumulator.data_ptr()),
@@ -356,7 +369,7 @@ def _gqa_bhsd():
     return "bhsd" in os.environ.get("XINFER_GQA_GLUE", "")
 
 
-@register("qkv_norm_split", backend="ascend",
+@register("qkv_norm_split", backend="ascend", priority=PRIORITY,
           requires=xc if callable(_split_forward) or callable(_qkv_2b_pair) else None,
           version=VERSION)
 @partial(reference.qkv_norm_split)
@@ -441,7 +454,7 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
 # time is the model-side follow-up that would take the fast kernels.
 
 
-@register("qkv_norm_rope_kvcache", backend="ascend",
+@register("qkv_norm_rope_kvcache", backend="ascend", priority=PRIORITY,
           requires=xc if (callable(_fused_projection) and callable(_qk_norm)) or callable(native_2b_cache)
           else None,
           version=VERSION, deterministic=False)

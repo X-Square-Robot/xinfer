@@ -54,6 +54,12 @@ def _count():
 
 def split_6144_finish(out, accum, rows):
     _count()
+    # the single library's TVM-FFI face serves first (the unified launch boundary); its
+    # bias slot takes a live tensor for the unread pointer (the null-optional convention
+    # the packed-launch callers use), with has_bias=0 as the ctypes path passes
+    if _native.launch_kernel("gemm_glu_fp32_finish_split_6144",
+                             (out, accum, accum), (rows, 0)):
+        return
     call, err = _entry_pair()
     stream = torch.npu.current_stream(accum.device).npu_stream
     status = call(out.data_ptr(), accum.data_ptr(), 0, rows, 0, stream)

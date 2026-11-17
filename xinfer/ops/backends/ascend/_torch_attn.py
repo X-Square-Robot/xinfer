@@ -2,6 +2,7 @@
 
 The FP32 matmul/softmax primitive avoids SDPA's unjoined side stream during NPU graph capture. Layouts, masks
 and cache updates use the reference composition helpers; the CPU/CUDA reference keeps its SDPA primitive.
+Contracts against the torch references: tolerance (the torch attention backends).
 """
 
 import torch

@@ -160,15 +160,22 @@ def _warmup_launches(device):
         scale_bits = struct.unpack("<q", struct.pack("<f", _D**-0.5) + bytes(4))[0]
         scan_call, _ = _entry(f"fia_fuse_scan_l{L}", 6, (ctypes.c_int64, ctypes.c_int64))
         reduce_call, _ = _entry(f"fia_fuse_reduce_l{L}", 3, (ctypes.c_int64,))
+        # the warmup launches must take the same path the production calls will (the
+        # single library's TVM-FFI face when it is loaded - the AOT first-launch loss is
+        # per library and per process, so warming one library does not warm the other)
         for _ in range(2):
-            scan_call(
-                ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
-                ctypes.c_void_p(k.data_ptr()), ctypes.c_void_p(fm.data_ptr()),
-                ctypes.c_void_p(pl.data_ptr()), ctypes.c_void_p(pbuf.data_ptr()),
-                ctypes.c_int64(L - _M), ctypes.c_int64(scale_bits), stream)
-            reduce_call(
-                ctypes.c_void_p(pbuf.data_ptr()), ctypes.c_void_p(out.data_ptr()),
-                ctypes.c_void_p(out.data_ptr()), ctypes.c_int64(_H * _D), stream)
+            if not _native.launch_kernel(f"fia_fuse_scan_l{L}",
+                                         (q, k, k, fm, pl, pbuf), (L - _M, scale_bits)):
+                scan_call(
+                    ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
+                    ctypes.c_void_p(k.data_ptr()), ctypes.c_void_p(fm.data_ptr()),
+                    ctypes.c_void_p(pl.data_ptr()), ctypes.c_void_p(pbuf.data_ptr()),
+                    ctypes.c_int64(L - _M), ctypes.c_int64(scale_bits), stream)
+            if not _native.launch_kernel(f"fia_fuse_reduce_l{L}",
+                                         (pbuf, out, out), (_H * _D,)):
+                reduce_call(
+                    ctypes.c_void_p(pbuf.data_ptr()), ctypes.c_void_p(out.data_ptr()),
+                    ctypes.c_void_p(out.data_ptr()), ctypes.c_int64(_H * _D), stream)
     torch.npu.synchronize()
 
 
@@ -197,28 +204,35 @@ def try_route(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask, scale)
         values = v_cache.transpose(1, 2).view(_KVH * L, _D)
         fm = flash_mask.view(L, 2)
         scale_bits = struct.unpack("<q", struct.pack("<f", _D**-0.5) + bytes(4))[0]
-        status = scan_call(
-            ctypes.c_void_p(q_flat.data_ptr()),
-            ctypes.c_void_p(keys.data_ptr()),
-            ctypes.c_void_p(values.data_ptr()),
-            ctypes.c_void_p(fm.data_ptr()),
-            ctypes.c_void_p(prefix_len.data_ptr()),
-            ctypes.c_void_p(pbuf.data_ptr()),
-            ctypes.c_int64(int(new_pos)),
-            ctypes.c_int64(scale_bits),
-            stream,
-        )
-        if status:
-            raise RuntimeError(f"fia-fuse scan l{L}: " + (scan_err() or b"?").decode("utf-8", "replace"))
-        status = reduce_call(
-            ctypes.c_void_p(pbuf.data_ptr()),
-            ctypes.c_void_p(out.data_ptr()),
-            ctypes.c_void_p(gate.data_ptr()),
-            ctypes.c_int64(gate.stride(1)),
-            stream,
-        )
-        if status:
-            raise RuntimeError(f"fia-fuse reduce l{L}: " + (reduce_err() or b"?").decode("utf-8", "replace"))
+        # the single library's TVM-FFI faces serve first (the unified launch boundary);
+        # the ctypes launchers of the family library are the fallback below
+        if not _native.launch_kernel(f"fia_fuse_scan_l{L}",
+                                     (q_flat, keys, values, fm, prefix_len, pbuf),
+                                     (int(new_pos), scale_bits)):
+            status = scan_call(
+                ctypes.c_void_p(q_flat.data_ptr()),
+                ctypes.c_void_p(keys.data_ptr()),
+                ctypes.c_void_p(values.data_ptr()),
+                ctypes.c_void_p(fm.data_ptr()),
+                ctypes.c_void_p(prefix_len.data_ptr()),
+                ctypes.c_void_p(pbuf.data_ptr()),
+                ctypes.c_int64(int(new_pos)),
+                ctypes.c_int64(scale_bits),
+                stream,
+            )
+            if status:
+                raise RuntimeError(f"fia-fuse scan l{L}: " + (scan_err() or b"?").decode("utf-8", "replace"))
+        if not _native.launch_kernel(f"fia_fuse_reduce_l{L}", (pbuf, out, gate),
+                                     (gate.stride(1),)):
+            status = reduce_call(
+                ctypes.c_void_p(pbuf.data_ptr()),
+                ctypes.c_void_p(out.data_ptr()),
+                ctypes.c_void_p(gate.data_ptr()),
+                ctypes.c_int64(gate.stride(1)),
+                stream,
+            )
+            if status:
+                raise RuntimeError(f"fia-fuse reduce l{L}: " + (reduce_err() or b"?").decode("utf-8", "replace"))
         _SEEN.add(("warm",))
         _STATS["routed"] += 1
         _note(key, "routed")

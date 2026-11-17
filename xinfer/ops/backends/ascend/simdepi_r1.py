@@ -22,6 +22,8 @@ from threading import Lock
 
 import torch
 
+from xinfer.ops.backends.ascend import _native
+
 _ENABLED = None
 _LIB = None
 _ENTRIES = {}
@@ -100,6 +102,8 @@ def _weight32(weight):
 
 
 def _launch(name, tensors, scalars):
+    if _native.launch_kernel(name, tensors, scalars):
+        return
     call, err = _entry(name)
     stream = torch.npu.current_stream(tensors[0].device).npu_stream
     args = [ctypes.c_void_p(t.data_ptr()) for t in tensors]

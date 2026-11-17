@@ -62,7 +62,13 @@ def _launch(name, x2, weight, out, rows, width, x_stride, weight_words, eps):
 
     rh/sh/ih are never dereferenced with add_residual=0 and write_stats=0;
     pass x to keep the packed launcher's non-null handle contract (the v22
-    RMSNormApplyRstd precedent)."""
+    RMSNormApplyRstd precedent). The single library's TVM-FFI face serves the
+    same packed arguments first (the unified launch boundary); the ctypes
+    launcher of the family library is the fallback."""
+    tensors = (x2, x2, x2, weight, out, x2)
+    scalars = (rows, x_stride, x_stride, x_stride, width, 1, weight_words, _bits(eps), 0, 0, 1, 0)
+    if _native.launch_kernel(name, tensors, scalars):
+        return
     call, error = _entry(name)
     stream = torch.npu.current_stream(x2.device).npu_stream
     status = call(ctypes.c_void_p(x2.data_ptr()), ctypes.c_void_p(x2.data_ptr()),

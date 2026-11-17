@@ -13,6 +13,7 @@ provider kernels unless it opts in with ``--op-backends`` naming this library, e
 ``--op-backends gemm_epilogue=ascend:npu_linear``. Measured end to end they were no faster than the provider (370.4 ms
 against 374.4 ms for one Wall-X 2B request, inside run-to-run noise), so the default stays where the documented
 numbers were taken. The ``partial`` checks keep every layout the official operator cannot take on the reference.
+Contracts against the torch references: tolerance (the CANN operator compositions).
 """
 
 import torch

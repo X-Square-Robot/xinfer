@@ -57,10 +57,14 @@ def rope_d64_bhsd(q, k, cos, sin, out_q=None, out_k=None):
         out_q = torch.empty_like(q)
     if out_k is None:
         out_k = torch.empty_like(k)
-    rc = call(ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
-              ctypes.c_void_p(cos.data_ptr()), ctypes.c_void_p(sin.data_ptr()),
-              ctypes.c_void_p(out_q.data_ptr()), ctypes.c_void_p(out_k.data_ptr()),
-              tokens, ctypes.c_void_p(stream_obj.npu_stream))
+    # the single library's TVM-FFI face serves first (the unified launch boundary);
+    # the ctypes launcher of the family library is the fallback below
+    if not _native.launch_kernel("rope_half_d64_bhsd",
+                                 (q, k, cos, sin, out_q, out_k), (tokens,)):
+        rc = call(ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),
+                  ctypes.c_void_p(cos.data_ptr()), ctypes.c_void_p(sin.data_ptr()),
+                  ctypes.c_void_p(out_q.data_ptr()), ctypes.c_void_p(out_k.data_ptr()),
+                  tokens, ctypes.c_void_p(stream_obj.npu_stream))
     _WARMED.add(tokens)
     if rc != 0:
         message = get_error()

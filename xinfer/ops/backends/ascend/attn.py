@@ -2,6 +2,8 @@
 
 Unsupported layouts fall back per cached call key to the graph-safe Ascend Torch composition;
 the platform-independent reference remains SDPA. Legacy eager-only variable-length entries are not registered.
+Contracts against the torch references: tolerance (the decode kernels' fp64-oracle
+band), deterministic under NPU graph replay.
 """
 
 import math
@@ -10,6 +12,7 @@ import torch
 
 from xinfer.ops.backends.ascend import _torch_attn
 from xinfer.ops.backends.ascend._support import (
+    PRIORITY,
     VERSION,
     bridge,
     call_key,
@@ -82,14 +85,14 @@ def _varlen_key(q, k, v, cu_seqlens, *, scale=None):
     return call_key((q, k, v, bounds), {"scale": scale})
 
 
-@register("varlen_attention", backend="ascend", requires=xc if callable(native_varlen) else None,
+@register("varlen_attention", backend="ascend", priority=PRIORITY, requires=xc if callable(native_varlen) else None,
           version=VERSION)
 @partial(_torch_attn.varlen_attention, key=_varlen_key)
 def varlen_attention(q, k, v, cu_seqlens, *, scale=None):
     return native_varlen(q, k, v, cu_seqlens, scale=scale)
 
 
-@register("causal_attention", backend="ascend", requires=xc if callable(native_causal) else None,
+@register("causal_attention", backend="ascend", priority=PRIORITY, requires=xc if callable(native_causal) else None,
           version=VERSION)
 @partial(_torch_attn.causal_attention)
 def causal_attention(q, k, v, *, scale=None, return_bnsd=False):
@@ -101,7 +104,7 @@ def _prefix_supported(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=No
     return callable(native_cache) or _cache_supported(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
 
 
-@register("prefix_kvcache_attention", backend="ascend", requires=xc if callable(native_cache) else raw_cache,
+@register("prefix_kvcache_attention", backend="ascend", priority=PRIORITY, requires=xc if callable(native_cache) else raw_cache,
           version=VERSION)
 @partial(_torch_attn.prefix_kvcache_attention, check=_prefix_supported)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
@@ -195,7 +198,7 @@ def _segment_supported(q, k, v, cu_seqlens, *, scale=None):
                                 max_seqlen=_segment_longest(cu_seqlens), causal=False))
 
 
-@register("segment_attention", backend="ascend", requires=xc if callable(_attention_varlen) else None,
+@register("segment_attention", backend="ascend", priority=PRIORITY, requires=xc if callable(_attention_varlen) else None,
           version=VERSION)
 @partial(_torch_attn.segment_attention, check=_segment_supported)
 def segment_attention(q, k, v, cu_seqlens, *, scale=None):
@@ -240,7 +243,7 @@ def _gqa_causal_bnsd(q, k, v, scale):
     return out.transpose(1, 2)
 
 
-@register("gated_causal_attention", backend="ascend",
+@register("gated_causal_attention", backend="ascend", priority=PRIORITY,
           requires=xc if (callable(_attention_varlen) or _bridge_gated_causal is not None) else None,
           version=VERSION)
 @partial(_torch_attn.gated_causal_attention,
@@ -284,7 +287,7 @@ def gated_causal_attention(q, k, v, gate, *, scale=None):
     return _attention_varlen(q, k, v, seg_len=q.shape[0], causal=True, softmax_scale=scale, out_gate=gate)
 
 
-@register("gated_kvcache_attention", backend="ascend",
+@register("gated_kvcache_attention", backend="ascend", priority=PRIORITY,
           requires=xc if callable(native_cache) or raw_cache is not None else None,
           version=VERSION)
 @partial(_torch_attn.gated_kvcache_attention,
@@ -334,7 +337,7 @@ def _sigmoid_gate(out, gate):
     return (out.to(gate.dtype) * torch.sigmoid(gate)).to(out.dtype)
 
 
-@register("gated_delta_net", backend="ascend", requires=xc if _gated_delta_net is not None else None,
+@register("gated_delta_net", backend="ascend", priority=PRIORITY, requires=xc if _gated_delta_net is not None else None,
           version=VERSION)
 @partial(_torch_attn.gated_delta_net,
          check=lambda qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads,

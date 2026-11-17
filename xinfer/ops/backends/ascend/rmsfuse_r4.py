@@ -85,6 +85,8 @@ def _eps_bits(epsilon):
 
 
 def _launch(name, tensors, scalars):
+    if _native.launch_kernel(name, tensors, scalars):
+        return
     call, err = _entry(name)
     stream = torch.npu.current_stream(tensors[0].device).npu_stream
     args = [ctypes.c_void_p(t.data_ptr()) for t in tensors]
