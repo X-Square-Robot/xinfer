@@ -320,7 +320,7 @@ def test_requests_of_different_lengths_batch_left_padded():
     engine.shutdown()
 
 
-def test_a_failed_completion_fails_its_batch_and_the_completer_goes_on(monkeypatch):
+def test_a_failed_completion_fails_its_batch_and_stops_new_device_work(monkeypatch):
     class FailingEvent:  # final-stage work whose synchronization raises
         def query(self):
             return True
@@ -333,8 +333,8 @@ def test_a_failed_completion_fails_its_batch_and_the_completer_goes_on(monkeypat
     for i in (1, 2):
         with pytest.raises(RuntimeError, match="sync failed"):
             engine.submit(_req(i)).result(timeout=10)
-    assert engine.health() is None  # both threads still run
-    assert engine.slots.in_use() == 0
+    assert "device completion failed: sync failed" == engine.health()
+    assert engine.slots.in_use() == 1  # the failed completion has not proved its buffers reusable
     engine.shutdown()
 
 
@@ -399,8 +399,11 @@ def decoder(monkeypatch):
     state = SimpleNamespace(created=[], calls=[], hold=set(), fail=set(), release=threading.Event())
 
     class Decoder:
-        def __init__(self, device):
+        def __init__(self, device, image_resize=None, prefetch=None, image_quantize=None):
             state.created.append(threading.current_thread().name)
+
+        def close(self):
+            pass
 
         def __call__(self, inputs):
             out = dict(inputs)
@@ -431,7 +434,7 @@ def _image_req(i, n=3):
 def test_two_consecutive_cuda_requests_complete_and_report_stage_statistics(monkeypatch, device_images):
     """Real CUDA events cover both upload and image completion; no image codec or model assets are needed."""
     class Decoder:
-        def __init__(self, device):
+        def __init__(self, device, image_resize=None, prefetch=None, image_quantize=None):
             self.device = device
 
         def __call__(self, inputs):

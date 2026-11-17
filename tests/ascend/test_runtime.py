@@ -1,11 +1,13 @@
 """Ascend platform and engine behavior using only stock TorchNPU operators."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from xinfer.engine import Engine, EngineConfig
 from xinfer.engine.cudagraph import CUDAGraphConfig, CUDAGraphMiss
-from xinfer.config import resolve
+from xinfer.config import ExplicitSettings, resolve
 from xinfer.models.interface import HandoffSpec, OutputSpec, PreparedRequest, Stage, StageGraph, TensorSpec, VLAModel
 from xinfer.ops import reference
 from xinfer.ops.backends.ascend import _torch_attn
@@ -44,6 +46,28 @@ def test_explicit_npu_dispatches_to_the_platform_resolver(monkeypatch):
 
     monkeypatch.setattr(npu, "npu_platform", lambda device: device)
     assert resolve_platform("npu:1") == "npu:1"
+
+
+@pytest.mark.parametrize("graph_api", [None, False, lambda: None], ids=["missing", "noncallable", "callable"])
+def test_npu_graph_capability_comes_from_the_runtime(monkeypatch, graph_api):
+    from xinfer.platforms import npu
+
+    props = SimpleNamespace(name="Ascend Future", cube_core_num=32, total_memory=1024)
+    runtime = SimpleNamespace(is_available=lambda: True, current_device=lambda: 0, device_count=lambda: 1,
+                              get_device_properties=lambda index: props)
+    if graph_api is not None:
+        runtime.NPUGraph = runtime.graph = runtime.graph_pool_handle = graph_api
+    monkeypatch.setattr(npu, "device_module_for", lambda device: runtime)
+    monkeypatch.setattr(npu.torch, "device", lambda device: SimpleNamespace(index=0))
+    monkeypatch.setattr(npu, "npu_stream_priority_range", lambda module, index: None)
+    monkeypatch.setattr(npu, "npu_device_images_available", lambda: False)
+    platform = npu.npu_platform("npu:0")
+    assert platform.capabilities.cudagraphs is callable(graph_api)
+    resolved = resolve(Pipeline(), platform, model_name="test", tuned=None)
+    assert (resolved.engine_config().cudagraphs is not None) is callable(graph_api)
+    eager = resolve(Pipeline(), platform, model_name="test", tuned=None,
+                    explicit=ExplicitSettings(cudagraphs=False))
+    assert eager.engine_config().cudagraphs is None
 
 
 def test_discovery_and_eager_handoffs(npu_runtime):

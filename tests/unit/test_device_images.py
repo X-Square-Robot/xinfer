@@ -6,9 +6,11 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from xinfer.engine import device_images
 from xinfer.models.interface import DeviceImage
+from xinfer.ops.reference.image import image_resize
 from xinfer.platforms import cuda, devices
 
 
@@ -248,3 +250,26 @@ def test_nvimgcodec_decodes_into_its_earlier_images_within_one_level_of_opencv()
             assert torch.equal(view, torch.as_tensor(image, device=device).permute(2, 0, 1))
             assert (view.cpu().int() - expected[i].int()).abs().max() <= 1
     assert decoder._free or decoder._copying  # the decoder kept its images for reuse
+
+
+def test_resize_rounds_each_intermediate_step_and_keeps_unchanged_sizes():
+    view = torch.tensor([[[0, 255], [3, 128]], [[1, 254], [4, 127]], [[2, 253], [5, 126]]], dtype=torch.uint8)
+    first = F.interpolate(view[None].float(), size=(3, 5), mode="bilinear", antialias=False, align_corners=False)
+    first = (first + 0.5).floor().clamp(0, 255).to(torch.uint8)
+    second = F.interpolate(first.float(), size=(2, 3), mode="bicubic", antialias=True, align_corners=False)
+    expected = (second + 0.5).floor().clamp(0, 255).to(torch.uint8)[0].permute(1, 2, 0).contiguous()
+    result = image_resize(view, ((2, 2), (3, 5), (2, 3)),
+                          (("bicubic", True), ("bilinear", False), ("bicubic", True)))
+    assert torch.equal(result, expected) and result.is_contiguous()
+    assert torch.equal(image_resize(view, ((2, 2),), (("bilinear", False),)), view.permute(1, 2, 0))
+
+
+def test_op_table_exposes_the_image_contract_on_cpu():
+    from xinfer.ops import registry
+    from xinfer.platforms.cpu import cpu_platform
+
+    table = registry.build_table(cpu_platform(), reference_only=True)
+    view = torch.arange(12, dtype=torch.uint8).reshape(3, 2, 2)
+    assert table.selection("image_resize").backend == "reference"
+    assert torch.equal(table.image_resize(view, ((1, 1),), (("bilinear", False),)),
+                       image_resize(view, ((1, 1),), (("bilinear", False),)))
