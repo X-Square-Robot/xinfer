@@ -315,6 +315,28 @@ def test_gated_delta_net_is_the_reference_mixer():
     torch.testing.assert_close(mixer.out_proj(out), expected)
 
 
+def test_vision_layouts_are_computed_once_per_grid_list_and_copied():
+    from types import SimpleNamespace
+
+    from xinfer.models.layers.vision import qwen2_5_vit, qwen3_5_vit
+
+    grids = [(1, 14, 22), (1, 14, 20), (1, 14, 20)]
+    for module, config, args in ((qwen3_5_vit, SimpleNamespace(spatial_merge_size=2, grid_side=5), (2, 5)),
+                                 (qwen2_5_vit, SimpleNamespace(spatial_merge_size=2, window_size=112, patch_size=14),
+                                  (2, 4))):
+        fresh = module._layout.__wrapped__(tuple(grids), *args)
+        first = module.vision_layout(grids, config)
+        for value in first.values():  # the caller's copy: changing it leaves the next call's layout as computed
+            if torch.is_tensor(value):
+                value.add_(1)
+            else:
+                value.append(-1)
+        second = module.vision_layout(grids, config)
+        assert second.keys() == fresh.keys()
+        for name, value in fresh.items():
+            assert torch.equal(second[name], value) if torch.is_tensor(value) else second[name] == value
+
+
 def test_vision_tables_follow_the_layout_of_the_reference_tower():
     from types import SimpleNamespace
 
