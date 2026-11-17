@@ -10,6 +10,7 @@ on the image grids; ``vision_layout`` computes them on the host.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -73,6 +74,8 @@ def vision_layout(grids, config: Qwen35VisionConfig) -> dict:
     (a ``grid_side²`` square) is bilinearly interpolated to each ``h × w`` grid with ``linspace`` sample points,
     as Wall-X's ``fast_pos_embed_interpolate`` does: four corner indices and FP32 weights per patch.
 
+    The layout is computed once per grid list (a robot's cameras keep their sizes) and copied on each call.
+
     Args:
         grids: Patch grid ``(t, h, w)`` of each image, in packing order; ``h`` and ``w`` must be multiples of
             ``spatial_merge_size``.
@@ -85,10 +88,15 @@ def vision_layout(grids, config: Qwen35VisionConfig) -> dict:
     Raises:
         ValueError: A grid side is not divisible by the merge size.
     """
-    m, side = config.spatial_merge_size, config.grid_side
+    layout = _layout(tuple((int(t), int(h), int(w)) for t, h, w in grids), config.spatial_merge_size,
+                     config.grid_side)
+    return {name: value.clone() if torch.is_tensor(value) else list(value) for name, value in layout.items()}
+
+
+@functools.lru_cache(maxsize=64)
+def _layout(grids, m, side) -> dict:
     positions, index, weight, cu_seqlens = [], [[] for _ in range(4)], [[] for _ in range(4)], [0]
     for t, h, w in grids:
-        t, h, w = int(t), int(h), int(w)
         if h % m or w % m:
             raise ValueError(f"grid {h}x{w} is not divisible by the merge size {m}")
         rows = np.broadcast_to(np.arange(h)[:, None], (h, w)).reshape(h // m, m, w // m, m)
