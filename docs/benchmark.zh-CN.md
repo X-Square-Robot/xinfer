@@ -8,7 +8,7 @@
 | `benchmarks/robot_load.py` | 虚拟机器人经网络对运行中的服务测得的时延 |
 | `benchmarks/performance.py` | [性能表](performance.zh-CN.md)中的一行：按该表的口径运行上面两项 |
 
-结果不纳入 Git。
+结果不纳入 Git。 `request_latency.py` 和 `performance.py` 支持与 `xinfer-serve` 相同的 `--reference-ops` 及逗号分隔的 `--op-backends operator=pin,...`，显式固定的实现优先。`performance.py` 在单请求和负载服务两侧都应用这些选项。
 
 ## 单请求
 

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1120" height="875" viewBox="0 0 1120 875" role="img" aria-labelledby="figure-title figure-desc">
   <title id="figure-title">XInfer architecture</title>
-  <desc id="figure-desc">Vision produces image embeddings, prefill builds the prompt KV cache, and action denoising predicts a robot action chunk. On the shared engine path, model stages bind operator implementations at model load. X-Square Robot’s Xcompute library provides fused kernels. Other options include CUDA FlashAttention, PyTorch references and plugins. The WebSocket service and Python Policy use the shared stage engine on NVIDIA RTX 5090 and Jetson AGX Thor, Ascend 950DT, and reference CPU. A separate experimental route from the in-process Python Policy uses a native runner and the Rhino Launch SDK on the Huixi Rhino RPU (R1).</desc>
+  <desc id="figure-desc">Vision produces image embeddings, prefill builds the prompt KV cache, and action denoising predicts a robot action chunk. On the shared engine path, model stages bind operator implementations at model load. The CUDA and Ascend kernel libraries are built from this repository. Other options include CUDA FlashAttention, PyTorch references and plugins. The WebSocket service and Python Policy use the shared stage engine on NVIDIA RTX 5090 and Jetson AGX Thor, Ascend 950DT, and reference CPU. A separate experimental route from the in-process Python Policy uses a native runner and the Rhino Launch SDK on the Huixi Rhino RPU (R1).</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
       <path d="M0 0L8 4L0 8Z" fill="#485868"/>
@@ -69,10 +69,10 @@
     <path class="flow" d="M976 328V343"/>
 
     <rect x="40" y="347" width="380" height="96" rx="4" fill="#23555d"/>
-    <text x="58" y="379" style="font-size:27px;font-weight:bold;fill:#fff">Xcompute</text>
+    <text x="58" y="379" style="font-size:27px;font-weight:bold;fill:#fff">Kernel libraries</text>
     <text x="402" y="377" text-anchor="end" style="font-size:15px;fill:#d8eeee">CUDA · Ascend</text>
-    <text x="58" y="405" style="font-size:17px;fill:#fff">X-Square Robot’s kernel library</text>
-    <text x="58" y="428" style="font-size:15px;fill:#d8eeee">QKV projection + RoPE · Residual add + RMSNorm</text>
+    <text x="58" y="405" style="font-size:17px;fill:#fff">CUDA built from this repository</text>
+    <text x="58" y="428" style="font-size:15px;fill:#d8eeee">Ascend kernels build from backend sources</text>
 
     <rect class="box" x="438" y="347" width="206" height="96" rx="4"/>
     <text class="node" x="453" y="385">FlashAttention</text>

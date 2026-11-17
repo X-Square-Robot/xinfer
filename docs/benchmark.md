@@ -8,7 +8,7 @@ English | [简体中文](benchmark.zh-CN.md)
 | `benchmarks/robot_load.py` | latency with virtual robots over the network, against a running service |
 | `benchmarks/performance.py` | one row of the [performance table](performance.md): both of the above in the table's protocol |
 
-Results stay outside Git.
+Results stay outside Git. `request_latency.py` and `performance.py` accept the same `--reference-ops` and comma-separated `--op-backends operator=pin,...` selection as `xinfer-serve`; explicit pins win. `performance.py` applies both options to its latency and load services.
 
 ## Single request
 
