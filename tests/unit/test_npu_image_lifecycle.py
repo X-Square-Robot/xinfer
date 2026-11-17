@@ -1,6 +1,5 @@
 """DVPP session ownership without an NPU or Python ACL."""
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -13,14 +12,19 @@ from xinfer.platforms import npu as npu_images
 def media(monkeypatch):
     state = SimpleNamespace(device=None, calls=[], init_status=0, exit_status=0)
 
-    @contextmanager
-    def device_context(device):
-        previous = state.device
-        state.device = device
-        try:
-            yield
-        finally:
-            state.device = previous
+    class device_context:
+        """A re-entrant stand-in for ``torch.npu.device``: the decoder caches its context object
+        (WT2b) and re-enters it across calls, which the generator ``@contextmanager`` cannot do."""
+
+        def __init__(self, device):
+            self.device = device
+
+        def __enter__(self):
+            self._previous = state.device
+            state.device = self.device
+
+        def __exit__(self, *exc):
+            state.device = self._previous
 
     def sys_init():
         state.calls.append(("init", state.device))
@@ -30,11 +34,18 @@ def media(monkeypatch):
         state.calls.append(("exit", state.device))
         return state.exit_status
 
-    acl = SimpleNamespace(himpi=SimpleNamespace(sys_init=sys_init, sys_exit=sys_exit))
+    acl = SimpleNamespace(himpi=SimpleNamespace(sys_init=sys_init, sys_exit=sys_exit),
+                          rt=SimpleNamespace())
     monkeypatch.setattr(torch, "npu", SimpleNamespace(device=device_context), raising=False)
+    monkeypatch.setattr(npu_images, "_aclfast", None)  # the native fast path needs the real ACL
     monkeypatch.setattr(npu_images, "load_npu_media", lambda: acl)
     monkeypatch.setattr(npu_images, "_MEDIA_USERS", {})
-    monkeypatch.setattr(npu_images.NpuJpegDecoder, "_decode", lambda self, jpeg: jpeg)
+    # The wave decoder has no per-image ``_decode`` step anymore (the transactions start
+    # together and the frames drain by size): a deviceless test routes every image to the
+    # host fallback -- ``_begin`` answering None -- and stubs that fallback to the passthrough
+    # the old ``_decode`` patch was, so the lease and close semantics below run unchanged.
+    monkeypatch.setattr(npu_images.NpuJpegDecoder, "_begin", lambda self, jpeg: None)
+    monkeypatch.setattr(npu_images.NpuJpegDecoder, "_decode_on_host", lambda self, jpeg: jpeg)
     return state
 
 
@@ -89,3 +100,71 @@ def test_failed_dvpp_initialization_or_close_does_not_leave_a_lease(media):
     another([jpeg])
     another.close()
     assert media.calls == [("init", device), ("init", device), ("exit", device), ("init", device), ("exit", device)]
+
+
+def test_failed_buffer_drain_keeps_the_lease_for_a_close_retry(media, monkeypatch):
+    device = torch.device("cpu:0")
+    decoder = npu_images.NpuJpegDecoder(device)
+    decoder([torch.ones(1, dtype=torch.uint8)])
+    drains = []
+
+    def drain():
+        drains.append(True)
+        if len(drains) == 1:
+            raise RuntimeError("copy still pending")
+
+    monkeypatch.setattr(decoder, "_flush_deferred", drain)
+    with pytest.raises(RuntimeError, match="copy still pending"):
+        decoder.close()
+    assert decoder._leased and npu_images._MEDIA_USERS[device] == 1
+    decoder.close()
+    assert len(drains) == 2 and not decoder._leased and not npu_images._MEDIA_USERS
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_partially_freed_buffers_are_never_freed_again_on_close_retry(media, monkeypatch, batched):
+    device = torch.device("cpu:0")
+    decoder = npu_images.NpuJpegDecoder(device)
+    decoder([torch.ones(1, dtype=torch.uint8)])
+    decoder._deferred = [(11, 22)]
+    attempted = []
+
+    def free(pointer):
+        attempted.append(pointer)
+        return 0 if pointer == 11 else 1
+
+    def free_batch(pointers):
+        attempted.extend(pointers)
+        return 1  # one succeeded, without identifying which pointer
+
+    decoder._fast = batched
+    monkeypatch.setattr(decoder.acl.himpi, "dvpp_free", free, raising=False)
+    monkeypatch.setattr(npu_images, "_aclfast", SimpleNamespace(free_batch=free_batch))
+    with pytest.raises(RuntimeError, match="failed") as first:
+        decoder.close()
+    with pytest.raises(RuntimeError, match="failed") as second:
+        decoder.close()
+    assert first.value is second.value
+    assert attempted == [11, 22]
+    assert decoder._leased and npu_images._MEDIA_USERS[device] == 1
+    assert decoder._deferred == [(11, 22)]
+
+
+def test_copy_query_failure_can_retry_before_any_pointer_is_freed(media, monkeypatch):
+    device = torch.device("cpu:0")
+    decoder = npu_images.NpuJpegDecoder(device)
+    decoder([torch.ones(1, dtype=torch.uint8)])
+    decoder._deferred = [(11, 22)]
+    freed = []
+
+    def query():
+        raise RuntimeError("copy query failed")
+
+    decoder._copy_event = SimpleNamespace(query=query)
+    monkeypatch.setattr(decoder.acl.himpi, "dvpp_free", lambda pointer: freed.append(pointer) or 0, raising=False)
+    with pytest.raises(RuntimeError, match="copy query failed"):
+        decoder.close()
+    assert decoder._free_error is None and not freed
+    decoder._copy_event.query = lambda: True
+    decoder.close()
+    assert freed == [11, 22] and not decoder._deferred and not npu_images._MEDIA_USERS

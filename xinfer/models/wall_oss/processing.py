@@ -23,6 +23,8 @@ from xinfer.models.layers.vision.qwen2_5_vit import vision_layout
 from xinfer.models.interface import BucketSpec, PreparedRequest
 from xinfer.models.processing import (
     SegmentTokenizer,
+    _view_pool,
+    _wirefast,
     text_length_range,
     check_image_preprocess_device,
     device_image,
@@ -245,6 +247,30 @@ def load_tokenizer(checkpoint: Path):
 # --------------------------------------------------------------------------
 
 
+def _wire_view_fast(value):
+    """``wire_view`` for the device path with the GIL released for the wire decodes and copies (r11 knife A).
+
+    The base64 decode and the bytes-like copy are single C calls that hold the GIL for
+    their whole execution, so the view pool's parallelism was nominal and the device
+    tickets were not put until ~2 ms into a 3.3 ms prepare (probe-timeline-r10). The
+    built ``_wirefast`` helper decodes canonical base64 and copies buffers under
+    ``Py_BEGIN_ALLOW_THREADS``; anything it declines (non-canonical alphabet, padding
+    shapes, non-simple buffers) falls back to the ``wire_view`` call, so the decoded
+    values are equal by construction. Arrays take ``wire_view`` unchanged.
+    """
+    if isinstance(value, str):
+        if _wirefast is not None:
+            decoded = _wirefast.b64decode(value)
+            if decoded is not None:
+                return decoded
+    elif isinstance(value, (bytearray, memoryview)):
+        if _wirefast is not None:
+            copied = _wirefast.to_bytearray(value)
+            if copied is not None:
+                return copied
+    return wire_view(value)
+
+
 def resize_view(image: np.ndarray, target: int, config: ProcessingConfig) -> np.ndarray:
     """Scale the long side to ``target`` then snap to the patch grid; one cubic resize.
 
@@ -439,6 +465,9 @@ def pad_prompt(tensors: Mapping[str, Any], width: int) -> dict[str, Any]:
                                      positions[:, :, start:]], dim=2)
     out["prompt_len"] = width
     out["prompt_valid"] = torch.tensor([keep], dtype=torch.int32)
+    # Bucket padding can shorten the prompt: only a fully valid bucket width keeps the action stage's
+    # all-keep guarantee (no flash mask needed).
+    out["mask_all_keep"] = bool(tensors.get("mask_all_keep", False) and keep == width)
     return out
 
 
@@ -468,6 +497,7 @@ class WallOSSInputProcessor:
     """
 
     def __init__(self, checkpoint: str | Path, model_config: WallOSSConfig, config: ProcessingConfig | None = None):
+        self._image_prefetch = None
         checkpoint = Path(checkpoint)
         self.config = processing_config(config)
         self.bucket = self.config.bucket_spec()
@@ -495,6 +525,9 @@ class WallOSSInputProcessor:
         for key in _DESKTOP_MASKED_DOF:
             if key in slices:
                 self.dof_mask[:, :, slices[key]] = 0.0
+
+    def bind_image_prefetch(self, prefetch) -> None:
+        self._image_prefetch = prefetch
 
     # Normalization: four separate IEEE operations, no clamp.
     def _normalize_actions(self, x: np.ndarray) -> np.ndarray:
@@ -575,8 +608,9 @@ class WallOSSInputProcessor:
             - ``vision_positions``, ``vision_window_index``, ``vision_reverse_index``, ``vision_cu_window``,
               ``vision_cu_full``: the ``vision_layout`` of the image grids;
             - ``inference_delay`` ``[1]`` int64 (0 for flow requests) and ``num_steps`` (int);
-            - RTC only: ``rtc_actions`` ``[1, T, D]`` float32, the normalized relative previous actions,
-              ``T = min(N - 1, H)``.
+            - RTC only: ``rtc_actions`` ``[1, H, D]`` float32, the normalized relative previous actions
+              (``T = min(N - 1, H)`` rows; rows ``T..H-1`` repeat row ``T-1``, matching the stage's
+              repeat and keeping the tensor shape -- and so the NPU-graph key -- request-invariant).
 
             ``meta`` holds ``arms`` (the state pose, see ``build_agent_pos``), ``image_size`` (``(w, h)`` of
             each resized view), ``rtc``, ``inference_delay`` (int) and ``prompt_len_range``: the shortest and
@@ -597,11 +631,25 @@ class WallOSSInputProcessor:
         targets = [model_config.resolution.get(camera.view, -1) for camera in config.cameras]
         if config.image_preprocess_device == "gpu":
             # JPEG bytes go to the device decoder; other encodings are decoded here and resized on the device.
-            originals = [wire_view(views[camera.wire_key]) for camera in config.cameras]
-            originals = [image if isinstance(image, np.ndarray) or is_jpeg(image) else decode_image(image)
-                         for image in originals]
-            shapes = [resize_size(*source_size(image), target, config) for image, target in zip(originals, targets)]
-            images = [device_image(image, (shape,), DEVICE_RESIZE) for image, shape in zip(originals, shapes)]
+            # Per-view handoff (r10 knife 1/1b + r11 knife A): every wire decode runs in
+            # the view pool through _wire_view_fast, which releases the GIL for the
+            # base64 decode and the frame copy, and each result is waited for in camera
+            # order (each wait also releases the GIL). The tickets therefore reach the
+            # device-image thread in the first ~0.5 ms of prepare instead of at ~2 ms,
+            # and the tokenizer's whole-text cache removes its ~1.75 ms GIL span, so the
+            # device chain overlaps the remaining host prepare instead of running after
+            # it (probe-timeline-r10 -> probe-timeline-r11). Same decodes, same values,
+            # camera order.
+            pool = _view_pool()
+            futures = [pool.submit(_wire_view_fast, views[camera.wire_key]) for camera in config.cameras]
+            images, shapes = [], []
+            for future, target in zip(futures, targets):
+                image = future.result()
+                if not (isinstance(image, np.ndarray) or is_jpeg(image)):
+                    image = decode_image(image)
+                shape = resize_size(*source_size(image), target, config)
+                images.append(device_image(image, (shape,), DEVICE_RESIZE, prefetch=self._image_prefetch))
+                shapes.append(shape)
         else:
             resized = map_views(lambda item: resize_view(decode_view(views[item[0].wire_key]), item[1], config),
                                 list(zip(config.cameras, targets)))
@@ -686,6 +734,15 @@ class WallOSSInputProcessor:
                 fill = np.zeros((1, model_config.action_horizon - t, model_config.action_dim), np.float32)
                 p = np.concatenate([p, fill], 1)
             p = self._normalize_actions(p[:, : model_config.action_horizon])[:, :t]
+            if t < model_config.action_horizon:
+                # Fixed [1, H, D] shape (a stable NPU-graph key; the serving
+                # path replays instead of running the action stage eager).
+                # The stage repeats the last pinned row up to H, so the same
+                # repeat here is value-identical; rows >= delay are never
+                # selected (the admitted delay is <= t), so the padded rows
+                # cannot change any output bit.
+                p = np.concatenate(
+                    [p, np.repeat(p[:, -1:], model_config.action_horizon - t, axis=1)], 1)
             tensors["rtc_actions"] = torch.from_numpy(np.ascontiguousarray(p))
             meta["inference_delay"] = delay
             requested = observation.get("num_flow_steps", observation.get("num_steps"))
@@ -693,6 +750,12 @@ class WallOSSInputProcessor:
                 num_steps = int(requested)
         tensors["inference_delay"] = torch.tensor([meta["inference_delay"]], dtype=torch.int64)
         tensors["num_steps"] = num_steps
+        # The host all-keep guarantee for the action stage: with no RTC delay every cache row is visible, so
+        # the flow path can skip the flash-mask build and the FIA mask read. A host value the stage reads
+        # keys the NPU graph, so requests whose value differs (RTC delay > 0, padded prompts) keep the dense
+        # drop-mask path. Bucket padding can shorten the prompt: only a fully valid bucket width keeps the
+        # guarantee (``pad_prompt`` re-checks).
+        tensors["mask_all_keep"] = bool(meta["inference_delay"] == 0)
         if config.prompt_bucket:
             tensors = pad_prompt(tensors, self.bucket.width(prompt_len))
         return PreparedRequest(tensors=tensors, meta=meta)

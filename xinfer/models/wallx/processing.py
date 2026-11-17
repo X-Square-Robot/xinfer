@@ -21,15 +21,27 @@ def pad_prompt(tensors, width: int) -> dict:
     if width == old_width:
         return dict(tensors)
     tokens, positions, mask = (tensors[k] for k in ("input_ids", "position_ids", "action_mask"))
+    # HOST-GAP K3: the same padded values through numpy instead of six torch CPU dispatches
+    # (new_zeros, new_ones and three cat plus clamp, ~0.45 ms per request). The concatenated
+    # arrays are fresh per request, so nothing is shared; values, dtypes and shapes are
+    # unchanged and the tensors are read-only downstream exactly as the torch results were.
+    ids = tokens.numpy()
+    pos = positions.numpy()
+    msk = mask.numpy()
+    valid = tensors["prompt_valid"].numpy()
+    keep = min(width, old_width)
     padding = max(0, width - old_width)
     return dict(
         tensors,
-        input_ids=torch.cat((tokens[:, :width], tokens.new_zeros((tokens.shape[0], padding))), dim=-1),
-        position_ids=torch.cat((positions[..., :width], positions.new_ones((*positions.shape[:-1], padding))), dim=-1),
+        input_ids=torch.from_numpy(np.concatenate(
+            (ids[:, :width], np.zeros((ids.shape[0], padding), dtype=ids.dtype)), axis=-1)),
+        position_ids=torch.from_numpy(np.concatenate(
+            (pos[..., :width], np.ones((*pos.shape[:-1], padding), dtype=pos.dtype)), axis=-1)),
         prompt_len=width,
-        prompt_valid=tensors["prompt_valid"].clamp(max=width),
-        action_mask=torch.cat((mask[..., :min(width, old_width)], mask.new_zeros((*mask.shape[:-1], padding)),
-                               mask[..., old_width:]), dim=-1),
+        prompt_valid=torch.from_numpy(np.minimum(valid, width)),
+        action_mask=torch.from_numpy(np.concatenate(
+            (msk[..., :keep], np.zeros((*msk.shape[:-1], padding), dtype=msk.dtype),
+             msk[..., old_width:]), axis=-1)),
     )
 
 
@@ -157,30 +169,38 @@ def mrope_position_ids(input_ids: np.ndarray, grids: list[tuple[int, int, int]],
             ``len(grids)``.
     """
     token_ids = input_ids.reshape(-1)
-    out = np.empty((3, token_ids.shape[0]), dtype=np.int64)
-    position = 0
-    i = 0
-    image = 0
     n = token_ids.shape[0]
-    while i < n:
-        if token_ids[i] == image_token_id:
-            _, gh, gw = grids[image]
-            rows, cols = gh // merge_size, gw // merge_size
-            count = rows * cols
-            if not np.all(token_ids[i : i + count] == image_token_id):
-                raise ValueError("image token run does not match its grid")
-            r = np.repeat(np.arange(rows), cols)
-            c = np.tile(np.arange(cols), rows)
-            out[0, i : i + count] = position
-            out[1, i : i + count] = position + r
-            out[2, i : i + count] = position + c
-            position += max(rows, cols)
-            i += count
-            image += 1
-        else:
-            out[:, i] = position
-            position += 1
-            i += 1
-    if image != len(grids):
-        raise ValueError(f"prompt has {image} images, request has {len(grids)}")
+    out = np.empty((3, n), dtype=np.int64)
+    # HOST-GAP K4: the per-token python walk is a per-grid pass plus vectorized positions
+    # (~0.15 ms per request saved). Identical integer arithmetic: a text token advances every
+    # axis by one, an image block carries (position, position + row, position + col) and
+    # advances by max(rows, cols); each grid consumes one uninterrupted run of exactly its
+    # token count, so adjacent blocks (no text between) split exactly as the walk did.
+    is_image = token_ids == image_token_id
+    advance = np.where(is_image, 0, 1).astype(np.int64)
+    starts, r_all, c_all = [], [], []
+    i = 0
+    for t, gh, gw in grids:
+        rows, cols = gh // merge_size, gw // merge_size
+        count = rows * cols
+        start = i + int(np.argmax(is_image[i:])) if is_image[i:].any() else n
+        end = start + count
+        if end > n or not is_image[start:end].all():
+            raise ValueError("image token run does not match its grid")
+        advance[end - 1] += max(rows, cols)
+        starts.append(start)
+        r_all.append(np.repeat(np.arange(rows), cols))
+        c_all.append(np.tile(np.arange(cols), rows))
+        i = end
+    if is_image[i:].any():
+        raise ValueError(f"prompt has {len(grids) + 1} images, request has {len(grids)}")
+    position = np.concatenate(((0,), np.cumsum(advance)[:-1])) if n else np.zeros(0, dtype=np.int64)
+    out[0] = position
+    out[1] = position
+    out[2] = position
+    for start, r, c in zip(starts, r_all, c_all):
+        block = position[start]
+        out[0, start : start + r.size] = block
+        out[1, start : start + r.size] = block + r
+        out[2, start : start + r.size] = block + c
     return out[:, None, :]
