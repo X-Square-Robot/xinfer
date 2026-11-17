@@ -152,8 +152,32 @@ def _plain_supported(x, weight, eps):
           version=VERSION)
 @partial(reference_rms_norm, check=_plain_supported)
 def rms_norm(x, weight, eps):
-    # Wall-OSS's vision, prompt and action input norms; the entry's inference path with the plain (not
-    # zero-centered) weight, as the CUDA backend registers it.
+    # Wall-OSS's vision, prompt and action input norms. R5: the plain-norm mounts of the 38.82 stack's
+    # ``rms_norm_cast`` -- its RMSFUSE-r4 RF1 m16 knife for the [1, 16, 1024] action input norms, then the
+    # v22 rmsnorm FFI's rms_consistent plans (the core library's launchers) for the [rows, 1280] ViT patch
+    # norm and the [rows, 2048] prefill input norm. An envelope miss (or a build without the kernels) keeps
+    # the reference composition below, exactly as a v22 build without those kernels would.
+    try:
+        from xinfer.ops.backends.ascend.glue import rmsfuse_r4
+
+        if (rmsfuse_r4.enabled("m16")
+                and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
+                and x.dtype == torch.bfloat16 and x.is_contiguous()
+                and weight.dtype == torch.float32 and weight.device == x.device
+                and tuple(weight.shape) == (1024,)
+                and 0 < eps <= torch.finfo(torch.float32).max):
+            return rmsfuse_r4.rms_m16(x, weight, eps)
+    except (ImportError, OSError):
+        pass
+    try:
+        from xinfer.ops.backends.ascend.glue import rms_plans
+
+        plan = rms_plans.plain_rms(x, weight, eps)
+        if plan is not None:
+            return plan
+    except (ImportError, OSError):
+        pass
+    # The entry's inference path with the plain (not zero-centered) weight, as the CUDA backend registers it.
     return _rms(x, weight, float(eps), True, False)
 
 
