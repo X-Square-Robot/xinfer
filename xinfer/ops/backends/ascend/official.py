@@ -14,7 +14,7 @@ Contracts against the torch references: tolerance (the vendor operators' own pre
 
 import torch
 
-from xinfer.ops.backends.ascend._support import VERSION, partial
+from xinfer.ops.backends.ascend._support import partial
 from xinfer.ops.reference.gemm import linear as reference_linear
 from xinfer.ops.reference.gemm import qkv_norm_split as reference_qkv_norm_split
 from xinfer.ops.registry import register
@@ -23,6 +23,8 @@ try:  # the official operators live on the TorchNPU extension module, not on tor
     import torch_npu
 except ImportError:  # a CPU-only install still imports this module, it just registers nothing
     torch_npu = None
+
+VERSION = None if torch_npu is None else f"torch_npu {torch_npu.__version__}"
 
 _npu_linear = getattr(torch_npu, "npu_linear", None) if torch_npu is not None else None
 _npu_rms_norm = getattr(torch_npu, "npu_rms_norm", None) if torch_npu is not None else None

@@ -19,7 +19,7 @@ Contracts against the torch references: tolerance (the CANN operator composition
 import torch
 import torch.nn.functional as F
 
-from xinfer.ops.backends.ascend._support import VERSION, partial
+from xinfer.ops.backends.ascend._support import partial
 from xinfer.ops.reference.gemm import ACTIVATIONS
 from xinfer.ops.reference.gemm import gemm_epilogue as reference_gemm_epilogue
 from xinfer.ops.reference.gemm import gemm_glu_epilogue as reference_gemm_glu_epilogue
@@ -35,6 +35,8 @@ try:
     import torch_npu
 except ImportError:  # a CPU-only install imports this module and registers nothing
     torch_npu = None
+
+VERSION = None if torch_npu is None else f"torch_npu {torch_npu.__version__}"
 
 _npu_linear = getattr(torch_npu, "npu_linear", None) if torch_npu is not None else None
 _npu_rms_norm = getattr(torch_npu, "npu_rms_norm", None) if torch_npu is not None else None
