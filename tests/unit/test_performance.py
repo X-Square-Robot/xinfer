@@ -5,8 +5,33 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
 import performance  # noqa: E402
+
+
+@pytest.mark.parametrize("npu", [False, True])
+@pytest.mark.parametrize("built", [False, True])
+def test_environment_records_the_selected_native_library_not_a_legacy_path(monkeypatch, tmp_path, npu, built):
+    import hashlib
+    import importlib
+    import importlib.metadata
+
+    native = importlib.import_module(f"xinfer.ops.backends.{'ascend' if npu else 'cuda'}._native")
+    actual = tmp_path / "native.so"
+    actual.write_bytes(b"selected native library")
+    legacy = tmp_path / "xcompute.so"
+    legacy.write_bytes(b"unrelated retired library")
+    monkeypatch.setattr(native, "LIBRARY_PATH", str(actual) if built else None)
+    monkeypatch.setenv("XINFER_XCOMPUTE_LIBRARY", str(legacy))
+    monkeypatch.setattr(performance, "HERE", tmp_path)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: "test-torch-npu")
+    result = performance.environment(npu)
+    assert result["kernel_library"] == (str(actual) if built else None)
+    assert result["kernel_library_sha256"] == (hashlib.sha256(actual.read_bytes()).hexdigest() if built else None)
+    if not npu:
+        assert set(result) == {"created_utc", "host", "revision", "torch", "kernel_library", "kernel_library_sha256"}
 
 
 def _round(p50, p95=None, errors=0, missing=0, throughput=10.0):
@@ -61,7 +86,8 @@ def test_no_completed_round_reports_a_capacity_bound_and_zero_throughput():
     assert "0.0 req/s" in performance.row(result)
 
 
-def test_npu_device_and_model_options_reach_both_children(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reference_ops", [False, True])
+def test_npu_device_and_model_options_reach_both_children(tmp_path, monkeypatch, reference_ops):
     commands = {}
 
     def run(command, **kwargs):
@@ -98,14 +124,39 @@ def test_npu_device_and_model_options_reach_both_children(tmp_path, monkeypatch)
     assert performance.main(["--name", "NPU", "--model", "m", "--checkpoint", "ckpt", "--device", "npu:2",
                              "--model-options", '{"image_preprocess_device":"cpu","processing":{"noise_seed":7}}',
                              "--latency-requests", "latency.json", "--warmup", "warmup.json", "--robots", "1",
-                             "--out", str(out)]) == 0
+                             "--op-backends", "bound=cpu:test", "--out", str(out)]
+                            + (["--reference-ops"] if reference_ops else [])) == 0
     assert set(commands) == {"latency", "server"}
     for command in commands.values():
         assert command[command.index("--device") + 1] == "npu:2"
         options = json.loads(command[command.index("--model-options") + 1])
         assert options["image_preprocess_device"] == "cpu" and options["processing"]["noise_seed"] == 7
+        assert ("--reference-ops" in command) is reference_ops
+        assert command[command.index("--op-backends") + 1] == "bound=cpu:test"
+    # Both child CLIs resolve the same table, including a pin that wins over reference-only selection.
+    import request_latency
+    from xinfer.entrypoints import serve
+    from xinfer.ops import Contract, OpRegistry, OpSpec
+    from xinfer.platforms.cpu import cpu_platform
+
+    registry = OpRegistry()
+    for name in ("bound", "unbound"):
+        registry.define(OpSpec(name, f"{name}(x)", lambda x: x))
+        registry.add(name, lambda x: x, backend="cpu", platforms=("cpu",),
+                     contract=Contract(numerics="bitwise"), library="test")
+    latency_args = commands["latency"][2:]
+    latency_args[latency_args.index("--out") + 1] = str(tmp_path / "selection-only.json")
+    latency = request_latency.parse_args(latency_args)
+    server = serve.parse_args(commands["server"][3:])
+    tables = [registry.build_table(cpu_platform(), reference_only=args.reference_ops, backends=parse(args.op_backends))
+              for args, parse in ((latency, request_latency._parse_pins), (server, serve._op_backends))]
+    assert tables[0].report() == tables[1].report()
+    assert tables[0].selection("bound").name == "cpu:test"
+    assert tables[0].selection("unbound").name == ("reference" if reference_ops else "cpu:test")
     machine = json.loads((out / "robots-1" / "machine.json").read_text())
-    assert json.loads((out / "row.json").read_text())["capacity_rule"] == {"median_p50_ratio": 1.5}
+    recorded = json.loads((out / "row.json").read_text())
+    assert recorded["capacity_rule"] == {"median_p50_ratio": 1.5}
+    assert ("reference_ops" in recorded["args"]) is reference_ops
     assert machine["before"]["npu_smi"] == "Ascend inventory"
 
 
@@ -133,6 +184,10 @@ def test_cuda_default_leaves_image_selection_to_policy_capabilities(tmp_path, mo
                              "--out", str(tmp_path / "result")]) == 0
     assert set(options) == {"latency", "server"}
     assert all("image_preprocess_device" not in child for child in options.values())
+    recorded = json.loads((tmp_path / "result" / "row.json").read_text())
+    assert set(recorded["args"]) == {"name", "model", "checkpoint", "model_options", "device",
+                                     "latency_requests", "warmup", "load_requests", "robots", "op_backends",
+                                     "port", "out", "npu"}
     # Without nvImageCodec, Policy must retain its supported CPU image path.
     platform = SimpleNamespace(name="cuda-sm120", device="cuda:0",
                                capabilities=SimpleNamespace(device_images=False))

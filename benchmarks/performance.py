@@ -87,21 +87,38 @@ def environment(npu: bool = False) -> dict:
     """Where the row was measured (device name comes from ``request_latency.py``)."""
     import torch
 
-    if npu:  # the external library the Ascend backend binds
-        library = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
-    else:  # the kernel library built from this repository
+    if npu:
+        from xinfer.ops.backends.ascend import _native
+    else:
         from xinfer.ops.backends.cuda import _native
 
-        library = _native.LIBRARY_PATH
+    library = _native.LIBRARY_PATH
     revision = subprocess.run(["git", "-C", str(HERE), "rev-parse", "HEAD"], capture_output=True,
                               text=True).stdout.strip() if (HERE.parent / ".git").exists() else None
     result = {"created_utc": datetime.now(timezone.utc).isoformat(), "host": platform.node(), "revision": revision,
               "torch": torch.__version__, "kernel_library": library,
               "kernel_library_sha256": hashlib.sha256(Path(library).read_bytes()).hexdigest() if library else None}
     if npu:
-        from importlib.metadata import version
+        from importlib.metadata import PackageNotFoundError, version
+        from importlib.util import find_spec
 
         result["torch_npu"] = version("torch-npu")
+        try:
+            tilelang_version = version("tilelang")
+        except PackageNotFoundError:
+            tilelang_version = None
+        try:
+            ascend_jit_available = find_spec("tilelang.ascend.torch_exchange") is not None
+        except ImportError:
+            ascend_jit_available = False
+        # The facade re-exports these exact factories. This identifies the available JIT source,
+        # not which requests selected it or the generated binaries of a warmed process.
+        jit_source = Path(_native.__file__).parent / "src" / "gemm" / "g2112_tilelang.py"
+        result["tilelang"] = dict(version=tilelang_version, ascend_available=ascend_jit_available,
+                                  jit_source=str(jit_source.resolve()),
+                                  jit_source_sha256=hashlib.sha256(jit_source.read_bytes()).hexdigest(),
+                                  bisheng_home=os.environ.get("BISHENG_HOME"),
+                                  cache_dir=os.environ.get("TILELANG_CACHE_DIR"))
     return result
 
 
@@ -127,6 +144,8 @@ def serve_and_load(args, robots: int, out: Path) -> list[dict]:
                "--resolved-config", str(out / "resolved.json"), "--warmup", *args.warmup]
     if args.op_backends:
         command += ["--op-backends", args.op_backends]
+    if args.reference_ops:
+        command += ["--reference-ops"]
     if args.device is not None:
         command += ["--device", args.device]
     log_path = out / "server.log"
@@ -164,8 +183,10 @@ def main(argv=None) -> int:
     parser.add_argument("--load-requests", nargs="+", help="load without RTC from these requests (robot_load.py)")
     parser.add_argument("--robots", type=int, nargs="+", required=True, help="robot counts to measure")
     parser.add_argument("--op-backends", default=None,
-                        help="JSON operator name to backend pin, as for xinfer-serve --op-backends; also "
+                        help="comma-separated operator=pin items, as for xinfer-serve --op-backends; also "
                              "applied to the single-request run so both halves use one wiring")
+    parser.add_argument("--reference-ops", action="store_true",
+                        help="use reference operators except explicit pins in both latency and load runs")
     parser.add_argument("--port", type=int, default=34000)
     parser.add_argument("--out", type=Path, required=True, help="new output directory")
     args = parser.parse_args(argv)
@@ -177,7 +198,8 @@ def main(argv=None) -> int:
         parser.error(f"{args.out} already exists")
     args.out.mkdir(parents=True)
     result = {"name": args.name, "capacity_rule": {"median_p50_ratio": KNEE},
-              "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+              "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+                       if k != "reference_ops" or v},
               "environment": environment(args.npu), "latency": {}, "load": {}}
     target = args.out / "latency.json"
     command = [sys.executable, str(HERE / "request_latency.py"), "--model", args.model, "--checkpoint",
@@ -185,6 +207,8 @@ def main(argv=None) -> int:
                "--out", str(target)]
     if args.op_backends:
         command += ["--op-backends", args.op_backends]
+    if args.reference_ops:
+        command += ["--reference-ops"]
     if args.device is not None:
         command += ["--device", args.device]
     subprocess.run(command, check=True)
