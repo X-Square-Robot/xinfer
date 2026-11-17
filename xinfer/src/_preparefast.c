@@ -80,6 +80,7 @@ static PyObject *pf_state_text(PyObject *self, PyObject *args) {
     if (values == NULL) return NULL;
     int64_t *out = (int64_t *)PyArray_DATA((PyArrayObject *)values);
     npy_intp count = 0;
+    int canonical = 1;
     Py_ssize_t text_len = 0;   /* join length: sum(len(str(v))) + (count-1) spaces */
     Py_ssize_t abs_digits = 0; /* sum(len(str(abs(v)))) for text_length_range */
     Py_BEGIN_ALLOW_THREADS
@@ -87,6 +88,7 @@ static PyObject *pf_state_text(PyObject *self, PyObject *args) {
         if (mp[i] == 0.0) continue;
         /* ((x - min) / delta) * 2 - 1 in float64, exactly numpy's op order */
         double v = ((xp[i] - mn[i]) / dv[i]) * 2.0 - 1.0;
+        if (isnan(v)) { canonical = 0; break; }  /* numpy's NaN bin belongs to the fallback */
         if (clamp) {
             if (v > 1.0) v = 1.0;
             if (v < -1.0) v = -1.0;
@@ -105,20 +107,24 @@ static PyObject *pf_state_text(PyObject *self, PyObject *args) {
         count++;
     }
     Py_END_ALLOW_THREADS
+    if (!canonical) { Py_DECREF(values); Py_RETURN_NONE; }
     if (count > 0) text_len += count - 1;
     {
         PyArray_Dims newshape = {&count, 1};
-        if (PyArray_Resize((PyArrayObject *)values, &newshape, 0, NPY_ANYORDER) < 0) {
+        PyObject *resized = PyArray_Resize((PyArrayObject *)values, &newshape, 0, NPY_ANYORDER);
+        if (resized == NULL) {
             Py_DECREF(values);
             return NULL;
         }
+        Py_DECREF(resized);
+        out = (int64_t *)PyArray_DATA((PyArrayObject *)values);
     }
     PyObject *text;
     if (count == 0) {
         text = PyUnicode_FromString("");
     } else {
         char *buf = (char *)PyMem_RawMalloc((size_t)text_len + 1u);
-        if (buf == NULL) { Py_DECREF(values); return NULL; }
+        if (buf == NULL) { Py_DECREF(values); return PyErr_NoMemory(); }
         Py_ssize_t w = 0;
         Py_BEGIN_ALLOW_THREADS
         for (npy_intp i = 0; i < count; i++) {

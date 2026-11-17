@@ -74,6 +74,8 @@ markers = [
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+# Vendored device kernels and generators retain their original source bytes.
+extend-exclude = ["xinfer/ops/backends/ascend/src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
@@ -81,3 +83,7 @@ select = ["E", "F", "W"]
 [tool.ruff.lint.per-file-ignores]
 # Markdown tables in the module docstrings
 "xinfer/ops/backends/cuda/attn.py" = ["E501"]
+# Preserve the existing CANN launch adapters' descriptor names and callable tables.
+"xinfer/ops/backends/ascend/_cann_primitives.py" = ["E741"]
+"xinfer/ops/backends/ascend/cann_projection.py" = ["E731"]
+"xinfer/ops/backends/ascend/core.py" = ["F841"]

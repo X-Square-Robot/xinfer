@@ -1,25 +1,35 @@
 cmake_minimum_required(VERSION 3.24)
 project(xinfer_host LANGUAGES C CXX)
 
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
 # Optional host helpers. Build against the Python and Torch used by the service.
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module NumPy)
 execute_process(COMMAND "${Python_EXECUTABLE}" -c
-  "import torch; print(torch.utils.cmake_prefix_path)"
-  OUTPUT_VARIABLE _torch_prefix OUTPUT_STRIP_TRAILING_WHITESPACE
+  "import pathlib, torch; print(pathlib.Path(torch.__file__).resolve().parent)"
+  OUTPUT_VARIABLE _torch_root OUTPUT_STRIP_TRAILING_WHITESPACE
   COMMAND_ERROR_IS_FATAL ANY)
-list(APPEND CMAKE_PREFIX_PATH "${_torch_prefix}")
-find_package(Torch REQUIRED)
-find_library(TORCH_PYTHON_LIBRARY torch_python REQUIRED HINTS "${TORCH_INSTALL_PREFIX}/lib")
+execute_process(COMMAND "${Python_EXECUTABLE}" -c
+  "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+  OUTPUT_VARIABLE _torch_abi OUTPUT_STRIP_TRAILING_WHITESPACE
+  COMMAND_ERROR_IS_FATAL ANY)
+# These are host-only C++ extensions. Torch's CMake package also enables CUDA
+# for CUDA wheels, which would require nvcc merely to compile pin_memory calls.
+foreach(name torch torch_cpu c10 torch_python)
+  find_library(_${name}_library ${name} REQUIRED HINTS "${_torch_root}/lib" NO_DEFAULT_PATH)
+  list(APPEND _torch_libraries "${_${name}_library}")
+endforeach()
 find_package(Threads REQUIRED)
 
 foreach(name _wirefast _preparefast _pincpp)
   if(name STREQUAL "_pincpp")
     Python_add_library(${name} MODULE WITH_SOABI ${name}.cpp)
     target_compile_features(${name} PRIVATE cxx_std_17)
-    separate_arguments(_torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
-    target_compile_options(${name} PRIVATE ${_torch_flags})
-    target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name})
-    target_link_libraries(${name} PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY})
+    target_include_directories(${name} PRIVATE "${_torch_root}/include" "${_torch_root}/include/torch/csrc/api/include")
+    target_compile_definitions(${name} PRIVATE TORCH_EXTENSION_NAME=${name} _GLIBCXX_USE_CXX11_ABI=${_torch_abi})
+    target_link_libraries(${name} PRIVATE ${_torch_libraries})
   else()
     Python_add_library(${name} MODULE WITH_SOABI ${name}.c)
   endif()
