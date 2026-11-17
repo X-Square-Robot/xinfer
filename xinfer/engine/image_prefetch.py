@@ -33,15 +33,22 @@ class Ticket:
         self.image = image
 
 
+class Boundary:
+    """Marks the end of one request's views in the engine's device-image queue."""
+
+    __slots__ = ()
+
+
 class Slot:
     """The mutable result box of one prefetched view, held by the frozen ``DeviceImage``."""
 
-    __slots__ = ("view", "error", "device")
+    __slots__ = ("view", "error", "device", "txn")
 
     def __init__(self) -> None:
         self.view = None    # the decoded+resized device tensor once done
         self.error = None   # the exception a failed decode raised
         self.device = None  # the device the view was decoded for
+        self.txn = None     # a DVPP transaction already started for this view (engine-internal)
 
 
 _bound: "queue.Queue | None" = None
@@ -65,6 +72,19 @@ def submit(image) -> None:
         target = _bound
     if target is not None:
         target.put(Ticket(image))
+
+
+def flush() -> None:
+    """End the current request's hand-over of views (a no-op without a bound engine).
+
+    The engine decodes the tickets before this boundary as one wave, so a processor that hands
+    over a request's views one by one lets the engine start that wave before the request is
+    admitted instead of at the wave cap or at admission.
+    """
+    with _lock:
+        target = _bound
+    if target is not None:
+        target.put(Boundary())
 
 
 def bind(target: "queue.Queue") -> "queue.Queue | None":

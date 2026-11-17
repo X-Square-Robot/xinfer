@@ -128,6 +128,10 @@ _CHANNEL_EXISTS = 0xA0058004
 _FORMAT_UNSUPPORTED = 0xA0058008
 _TIMEOUT_MS = 3000
 _MAX_CHANNELS = 16
+# Channel transactions a wave may keep in flight on one channel before the oldest is fetched:
+# ``vdec_send_stream`` returns HI_ERR_VDEC_BUF_FULL (0xa005800f) once the channel's stream buffer
+# cannot hold another pending stream, so a wave also tracks the pending JPEG bytes per channel.
+_MAX_INFLIGHT = 3
 _MEDIA_LOCK = Lock()
 _MEDIA_USERS: dict[torch.device, int] = {}
 
@@ -220,6 +224,8 @@ class NpuJpegDecoder:
         self._async_copy = callable(getattr(self.acl.rt, "memcpy_async", None))
         self._deferred: list[tuple[int, int]] = []
         self._copy_event = None
+        # Transactions started by ``start`` and not fetched yet: channel key -> (count, jpeg bytes).
+        self._pending: dict[tuple[int, int, int], tuple[int, int]] = {}
         # WAVE-TAIL WT2b: this decoder's hot paths enter the device context once
         # per call on one thread; the cached context object skips its rebuild.
         self._device_ctx = None
@@ -255,13 +261,33 @@ class NpuJpegDecoder:
         event.record(torch.npu.current_stream())
         self._copy_event = event
 
-    def __call__(self, jpegs, planes=False):
-        """Decode JPEGs; with ``planes`` each result is ``(buffer, meta)`` instead of the RGB view.
+    def __call__(self, jpegs, prestarted=None, planes=False, emit=None):
+        """Decode a wave of JPEGs; ``prestarted[i]`` is a transaction already begun by ``start``.
 
-        With ``planes`` each result is the flat decoded planes copied onto the caller's stream and
-        the geometry of the views inside them, so a caller can run the RGB + resize chain as one
-        captured graph (:mod:`xinfer.engine.image_graphs`). The bytes are the same either way.
+        Every image's DVPP transaction starts first (the host copy plus ``vdec_send_stream``),
+        then each image's frame is fetched and converted: the media engine decodes the wave on
+        the cached channels concurrently instead of one image after the other, which is what a
+        one-at-a-time decode paid for a request's three views (~3.6 ms summed serially, ~1.2 ms
+        with the transactions started together). Every image still runs the same
+        send/get/release transaction on a channel with the same attributes, so its decoded
+        pixels are unchanged -- only the order in which the channel transactions are issued
+        changes.
+
+        With ``planes`` each result is ``(buffer, meta)`` -- the flat decoded planes copied onto
+        the caller's stream and the geometry of the views inside them -- instead of the RGB view,
+        so a caller can run the RGB + resize chain as one captured graph
+        (:mod:`xinfer.engine.image_graphs`). The bytes are the same either way.
+
+        With ``emit`` the wave's drain runs smallest decoded buffer first and calls
+        ``emit(index, result)`` the moment each view's planes are fetched, so the caller replays
+        that view's post-decode chain while the wave's larger views are still decoding. Views of
+        one channel keep their start order (``vdec_get_frame`` hands a channel's frames out in
+        the order it decoded them), and the drain's stable size sort never reorders equal-size
+        views, so every transaction still fetches exactly its own frame -- only the interleaving
+        of independent channels' fetches changes.
         """
+        jpegs = list(jpegs)
+        prestarted = list(prestarted) if prestarted is not None else [None] * len(jpegs)
         with _MEDIA_LOCK:
             if self._closed:
                 raise RuntimeError("CANN JPEGD decoder is closed")
@@ -274,7 +300,170 @@ class NpuJpegDecoder:
                         _call(self.acl.himpi.sys_init)
                     _MEDIA_USERS[self.device] = users + 1
                     self._leased = True
-                return [self._decode(jpeg.contiguous(), planes) for jpeg in jpegs]
+                results = [None] * len(jpegs)
+                started = []      # [(index, context)] in start order
+                pending = dict(self._pending)  # channel key -> (transactions, jpeg bytes) in flight
+                self._pending.clear()
+                done = False
+                try:
+                    for index, jpeg in enumerate(jpegs):
+                        jpeg = jpeg.contiguous()
+                        prestarted_here = prestarted[index] is not None
+                        context = prestarted[index] if prestarted_here else self._begin(jpeg)
+                        if context is None:
+                            results[index] = self._decode_on_host(jpeg)
+                            continue
+                        started.append((index, context))
+                        if prestarted_here:
+                            # A prestarted transaction is already counted in the ``_pending``
+                            # snapshot this drain took; counting it again would trip the
+                            # per-channel in-flight budget and finish the first view before the
+                            # drain began.
+                            continue
+                        key = self._channel_key(context["width"], context["height"], context["size"])
+                        count, size = pending.get(key, (0, 0))
+                        pending[key] = (count + 1, size + context["size"])
+                        if count + 1 > _MAX_INFLIGHT or size + context["size"] > key[2]:
+                            index, result = self._finish_oldest(started, pending, results, planes)
+                            if emit is not None and result is not None:
+                                emit(index, result)
+                    if emit is not None and len(started) > 1:
+                        # Drain the smallest decoded buffers first so their post-decode chains
+                        # overlap the largest view's remaining decode.
+                        started.sort(key=lambda item: item[1]["out_size"])
+                    while started:
+                        index, result = self._finish_oldest(started, pending, results, planes)
+                        if emit is not None and result is not None:
+                            emit(index, result)
+                    done = True
+                finally:
+                    if not done:
+                        for _, context in started:
+                            self._abandon(context)
+                    if self._async_copy and any(result is not None for result in results):
+                        self._record_copy_event()
+                return results
+
+    def _finish_oldest(self, started, pending, results, planes=False):
+        """Fetch and convert the transaction started longest ago, freeing its channel budget."""
+        index, context = started.pop(0)
+        key = self._channel_key(context["width"], context["height"], context["size"])
+        count, size = pending[key]
+        pending[key] = (count - 1, size - context["size"])
+        results[index] = self._finish(context, planes)
+        return index, results[index]
+
+    def start(self, jpeg):
+        """Begin one JPEG's channel transaction now; a later ``__call__`` fetches its frame.
+
+        The media engine decodes while the caller keeps working, so a view whose bytes are ready
+        early does not wait for the rest of its wave. Returns the transaction, or ``None`` when
+        the image needs the host decoder or its channel already holds as much pending input as
+        its stream buffer takes; the wave that fetches it starts it then, under the same budget.
+        """
+        jpeg = jpeg.contiguous()
+        with _MEDIA_LOCK:
+            if self._closed:
+                raise RuntimeError("CANN JPEGD decoder is closed")
+            with self._on_device():
+                self._flush_deferred()
+                if not self._leased:
+                    users = _MEDIA_USERS.get(self.device, 0)
+                    if users == 0:
+                        _call(self.acl.himpi.sys_init)
+                    _MEDIA_USERS[self.device] = users + 1
+                    self._leased = True
+                probed = self._probe(jpeg)
+                if probed is None:
+                    return None
+                info, stream = probed
+                size = jpeg.numel()
+                key = self._channel_key(info["width"], info["height"], size)
+                count, pending_bytes = self._pending.get(key, (0, 0))
+                if count + 1 > _MAX_INFLIGHT or pending_bytes + size > key[2]:
+                    return None
+                self._pending[key] = (count + 1, pending_bytes + size)
+                return self._launch(jpeg, info, stream)
+
+    def start_batch(self, jpegs):
+        """Begin several JPEGs' channel transactions now; a later ``__call__`` fetches the frames.
+
+        Per image this is ``start`` -- ``None`` when the image needs the host decoder or its
+        channel already holds as much pending input as its stream buffer takes, the same budget
+        bookkeeping, the same error semantics -- but the startable views' [malloc + upload +
+        malloc + send] chains run under one GIL-releasing ``_aclfast.start3`` call, in list order,
+        the order per-ticket ``start`` calls would have issued them. What changes is only that
+        the prepare window's interpreter slices cannot interleave between the chains; the sends
+        reach the media engine exactly as before. A list entry may be an ``Exception`` when that
+        view's chain failed mid-way (the caller fails that view's request with it, as ``start``
+        raising would have).
+        """
+        jpegs = list(jpegs)
+        results = [None] * len(jpegs)
+        if not jpegs:
+            return results
+        with _MEDIA_LOCK:
+            if self._closed:
+                raise RuntimeError("CANN JPEGD decoder is closed")
+            with self._on_device():
+                self._flush_deferred()
+                if not self._leased:
+                    users = _MEDIA_USERS.get(self.device, 0)
+                    if users == 0:
+                        _call(self.acl.himpi.sys_init)
+                    _MEDIA_USERS[self.device] = users + 1
+                    self._leased = True
+                ready = []   # [(position, jpeg, info, stream, channel)]
+                for index, jpeg in enumerate(jpegs):
+                    jpeg = jpeg.contiguous()
+                    probed = self._probe(jpeg)
+                    if probed is None:
+                        continue
+                    info, stream = probed
+                    size = jpeg.numel()
+                    key = self._channel_key(info["width"], info["height"], size)
+                    count, pending_bytes = self._pending.get(key, (0, 0))
+                    if count + 1 > _MAX_INFLIGHT or pending_bytes + size > key[2]:
+                        continue
+                    self._pending[key] = (count + 1, pending_bytes + size)
+                    ready.append((index, jpeg, info, stream,
+                                  self._channel_for(info["width"], info["height"], size)))
+                if not ready:
+                    return results
+                if (self._fast and len(ready) == 3
+                        and getattr(_aclfast, "start3", None) is not None):
+                    started = _aclfast.start3(
+                        self.device.index,
+                        *[(channel, jpeg.data_ptr(), jpeg.numel(), info["img_buf_size"],
+                           info["width"], info["height"], info["width_stride"],
+                           info["height_stride"], _SOURCE_FORMAT)
+                          for _, jpeg, info, _stream, channel in ready],
+                        _TIMEOUT_MS)
+                    if started is not None:
+                        for (index, jpeg, info, _stream, channel), outcome in zip(ready, started):
+                            status, phase, source, output = outcome
+                            if status == 0:
+                                results[index] = dict(channel=channel, source=source, output=output,
+                                                      out_size=info["img_buf_size"],
+                                                      width=info["width"], height=info["height"],
+                                                      size=jpeg.numel())
+                                continue
+                            operation = ("dvpp_malloc input", "memcpy", "dvpp_malloc output",
+                                         "vdec_send_stream")[phase]
+                            if phase == 3:
+                                self._drop_channel(self._channel_key(info["width"], info["height"],
+                                                                     jpeg.numel()))
+                                _aclfast.free_batch([source, output])
+                            # this view's request fails with it, as ``start`` raising would have
+                            results[index] = RuntimeError(
+                                f"CANN JPEGD {operation} failed (0x{status & 0xFFFFFFFF:08x})")
+                        return results
+                for index, jpeg, info, stream, _channel in ready:
+                    try:
+                        results[index] = self._launch(jpeg, info, stream)
+                    except Exception as exc:  # noqa: BLE001 - this view's request fails with it
+                        results[index] = exc
+                return results
 
     def close(self) -> None:
         """Release this decoder's lease, ending the session on the last release."""
@@ -304,148 +493,202 @@ class NpuJpegDecoder:
         warnings.warn("CANN JPEGD does not support this JPEG; decoded on the CPU before NPU resize", stacklevel=2)
         return rgb.permute(2, 0, 1).contiguous().to(self.device)
 
-    def _decode(self, jpeg, planes=False):
+    def _probe(self, jpeg):
+        """The image info of one JPEG plus its stream descriptor; ``None`` needs the host decoder."""
         if jpeg.device.type != "cpu" or jpeg.dtype != torch.uint8 or jpeg.ndim != 1 or not jpeg.numel():
             raise ValueError("CANN JPEGD needs a nonempty one-dimensional CPU uint8 tensor")
-        media, runtime = self.acl.himpi, self.acl.rt
         size = jpeg.numel()
         stream = dict(end_of_frame=1, end_of_stream=0, need_display=1, pts=0, len=size, addr=jpeg.data_ptr())
-        # HOST-TAIL HT1: the probe, the start chain (2x dvpp_malloc + H2D copy +
-        # vdec_send_stream) and the finish chain (get_frame + stream-ordered copy
-        # + vdec_release_frame) each run under one released GIL through the
-        # built _aclfast extension; every miss falls to the binding chain below,
-        # which is unchanged.
+        # HOST-TAIL HT1: the probe runs under a released GIL through the built _aclfast
+        # extension; a miss falls to the binding chain below, which is unchanged.
         if self._fast:
             probed = _aclfast.probe(_JPEG, jpeg.data_ptr(), size)
             if probed is not None:
                 status, width, height, wstride, hstride, buf_size, _fmt = probed
-                info = dict(width=width, height=height, width_stride=wstride,
-                            height_stride=hstride, img_buf_size=buf_size)
                 if status & 0xFFFFFFFF == _FORMAT_UNSUPPORTED:
-                    return self._decode_on_host(jpeg)
+                    return None
                 _check(status, "dvpp_get_image_info")
                 if not (32 <= width <= 16384 and 32 <= height <= 16384):
-                    return self._decode_on_host(jpeg)
-                if self._async_copy:
-                    fast = self._decode_fast(jpeg, info, size, width, height, planes)
-                    if fast is not None:
-                        return fast
-                return self._decode_binding(jpeg, info, stream, size, width, height, media, runtime, planes)
-        info, status = media.dvpp_get_image_info(_JPEG, stream)
+                    return None
+                return dict(width=width, height=height, width_stride=wstride,
+                            height_stride=hstride, img_buf_size=buf_size), stream
+        info, status = self.acl.himpi.dvpp_get_image_info(_JPEG, stream)
         if status & 0xFFFFFFFF == _FORMAT_UNSUPPORTED:
-            return self._decode_on_host(jpeg)
+            return None
         _check(status, "dvpp_get_image_info")
         width, height = info["width"], info["height"]
         if not (32 <= width <= 16384 and 32 <= height <= 16384):
-            return self._decode_on_host(jpeg)
-        return self._decode_binding(jpeg, info, stream, size, width, height, media, runtime, planes)
-
-    def _decode_fast(self, jpeg, info, size, width, height, planes=False):
-        """One JPEG's DVPP transaction through _aclfast (None = the binding chain).
-
-        The start chain frees exactly what the binding chain's excepts free on
-        each phase; the finish chain releases the frame exactly once whenever
-        get_frame succeeded. The source/output buffers join ``_deferred`` and
-        free once the stream-ordered frame copy completed (the next call's
-        flush), matching the binding chain's post-copy frees.
-        """
-        out_size = info["img_buf_size"]
-        channel = self._channel_for(width, height, size)
-        started = _aclfast.start(self.device.index, channel, jpeg.data_ptr(), size,
-                                 out_size, width, height, info["width_stride"],
-                                 info["height_stride"], _SOURCE_FORMAT, _TIMEOUT_MS)
-        if started is None:
             return None
-        status, phase, source, output = started
-        if status != 0:
-            operation = ("dvpp_malloc input", "memcpy", "dvpp_malloc output", "vdec_send_stream")[phase]
-            if phase == 3:
+        return info, stream
+
+    def _begin(self, jpeg):
+        """Start one JPEG's channel transaction; ``None`` means the image needs the host decoder."""
+        probed = self._probe(jpeg)
+        return None if probed is None else self._launch(jpeg, *probed)
+
+    def _launch(self, jpeg, info, stream):
+        """Allocate, upload and send one probed JPEG's stream on its channel.
+
+        The fast start chain (2x dvpp_malloc + the H2D copy + vdec_send_stream) runs under one
+        released GIL through the built _aclfast extension; a miss falls to the binding chain,
+        which is unchanged. Phase failures free exactly what the binding chain's excepts free;
+        a send failure hands both pointers back for the drop+free below.
+        """
+        size = jpeg.numel()
+        width, height = info["width"], info["height"]
+        if self._fast:
+            out_size = info["img_buf_size"]
+            channel = self._channel_for(width, height, size)
+            started = _aclfast.start(self.device.index, channel, jpeg.data_ptr(), size,
+                                     out_size, width, height, info["width_stride"],
+                                     info["height_stride"], _SOURCE_FORMAT, _TIMEOUT_MS)
+            if started is not None:
+                status, phase, source, output = started
+                if status != 0:
+                    operation = ("dvpp_malloc input", "memcpy", "dvpp_malloc output", "vdec_send_stream")[phase]
+                    if phase == 3:
+                        self._drop_channel(self._channel_key(width, height, size))
+                        _aclfast.free_batch([source, output])
+                    raise RuntimeError(f"CANN JPEGD {operation} failed (0x{status & 0xFFFFFFFF:08x})")
+                return dict(channel=channel, source=source, output=output, out_size=out_size,
+                            width=width, height=height, size=size)
+        media, runtime = self.acl.himpi, self.acl.rt
+        source, status = media.dvpp_malloc(self.device.index, size)
+        _check(status, "dvpp_malloc input")
+        try:
+            _call(runtime.memcpy, source, size, jpeg.data_ptr(), size, _HOST_TO_DEVICE)
+            stream["addr"] = source
+            out_size = info["img_buf_size"]
+            output, status = media.dvpp_malloc(self.device.index, out_size)
+            _check(status, "dvpp_malloc output")
+        except Exception:
+            _call(media.dvpp_free, source)
+            raise
+        context = dict(channel=None, source=source, output=output, out_size=out_size,
+                       width=width, height=height, size=size)
+        picture = dict(width=width, height=height, width_stride=info["width_stride"],
+                       height_stride=info["height_stride"], pixel_format=_SOURCE_FORMAT,
+                       vir_addr=output, buffer_size=out_size)
+        try:
+            context["channel"] = self._channel_for(width, height, size)
+            _call(media.vdec_send_stream, context["channel"], stream, picture, _TIMEOUT_MS)
+        except Exception:
+            # a channel that failed mid-transaction is not trusted again: drop it so the next
+            # decode recreates a fresh one, as the per-JPEG lifecycle always did
+            if context["channel"] is not None:
                 self._drop_channel(self._channel_key(width, height, size))
-                _aclfast.free_batch([source, output])
-            raise RuntimeError(f"CANN JPEGD {operation} failed (0x{status & 0xFFFFFFFF:08x})")
-        data = torch.empty(out_size, dtype=torch.uint8, device=self.device)
-        fetched = _aclfast.finish(channel, out_size, data.data_ptr(),
+            _call(media.dvpp_free, source)
+            _call(media.dvpp_free, output)
+            raise
+        return context
+
+    def _finish(self, context, planes=False):
+        """Fetch one started transaction's frame, copy it off DVPP memory and convert it to RGB.
+
+        With ``planes`` the copy stops after the bytes are on the caller's stream and returns
+        ``(buffer, meta)`` for :func:`xinfer.engine.image_graphs.chain_view` instead of the RGB
+        view. The frame copy is stream-ordered when the runtime has ``memcpy_async`` -- the fast
+        path's form -- and the source and output buffers then wait in ``_deferred`` for the
+        copy's recorded event instead of freeing here. Without it the synchronous copy runs and
+        the buffers free here, the released form.
+        """
+        if self._fast and self._async_copy:
+            done = self._finish_fast(context, planes)
+            if done is not None:
+                return done
+        media = self.acl.himpi
+        channel = context["channel"]
+        try:
+            frame, _, _, status = media.vdec_get_frame(channel, _TIMEOUT_MS)
+            _check(status, "vdec_get_frame")
+        except Exception:
+            self._drop_channel(self._channel_key(context["width"], context["height"], context["size"]))
+            _call(media.dvpp_free, context["source"])
+            _call(media.dvpp_free, context["output"])
+            context["channel"] = None
+            raise
+        view = frame["v_frame"]
+        try:
+            if view["frame_flag"] != 0:
+                raise RuntimeError(f"CANN JPEGD rejected an image (frame_flag={view['frame_flag']})")
+            data = self._planes(context["output"], context["out_size"])
+        except Exception:
+            _call(media.vdec_release_frame, channel, frame)
+            _call(media.dvpp_free, context["source"])
+            _call(media.dvpp_free, context["output"])
+            context["channel"] = None
+            raise
+        _call(media.vdec_release_frame, channel, frame)
+        if self._async_copy:
+            self._deferred.append((context["source"], context["output"]))
+        else:
+            _call(media.dvpp_free, context["source"])
+            _call(media.dvpp_free, context["output"])
+        context["channel"] = None
+        return self._frame_view(view, context["output"], context["out_size"],
+                                context["height"], context["width"], data, planes)
+
+    def _finish_fast(self, context, planes):
+        """``_finish`` through _aclfast: get_frame + memcpy_async + release_frame
+        in one GIL-releasing C call (None = fall back to the binding chain).
+
+        The C call releases the frame exactly once whenever get_frame succeeded;
+        the error paths below free exactly what ``_finish``'s excepts free and
+        raise the same messages, with the channel dropped only where the binding
+        path drops it.
+        """
+        key = self._channel_key(context["width"], context["height"], context["size"])
+        data = torch.empty(context["out_size"], dtype=torch.uint8, device=self.device)
+        fetched = _aclfast.finish(context["channel"], context["out_size"], data.data_ptr(),
                                   torch.npu.current_stream().npu_stream, _TIMEOUT_MS)
         if fetched is None:
             return None
         (status, phase, pixel_format, frame_flag, va0, va1, va2,
          ws0, ws1, ws2, hs0, hs1, hs2) = fetched
+        source, output = context["source"], context["output"]
         if phase == 0:
-            self._drop_channel(self._channel_key(width, height, size))
+            self._drop_channel(key)
             _aclfast.free_batch([source, output])
+            context["channel"] = None
             raise RuntimeError(f"CANN JPEGD vdec_get_frame failed (0x{status & 0xFFFFFFFF:08x})")
         if phase == 1:
             _aclfast.free_batch([source, output])
+            context["channel"] = None
             raise RuntimeError(f"CANN JPEGD memcpy_async failed (0x{status & 0xFFFFFFFF:08x})")
         if phase == 2:
             raise RuntimeError(f"CANN JPEGD vdec_release_frame failed (0x{status & 0xFFFFFFFF:08x})")
         if frame_flag != 0:
             _aclfast.free_batch([source, output])
+            context["channel"] = None
             raise RuntimeError(f"CANN JPEGD rejected an image (frame_flag={frame_flag})")
+        self._deferred.append((source, output))
+        context["channel"] = None
         frame = dict(pixel_format=pixel_format, frame_flag=frame_flag,
                      virt_addr=[va0, va1, va2], width_stride=[ws0, ws1, ws2],
                      height_stride=[hs0, hs1, hs2])
-        view = self._frame_view(frame, output, out_size, height, width, data, planes)
-        # each failure phase above freed exactly what the binding chain's excepts
-        # free (phase 2 leaves the channel holding the frame, like the campaign)
-        self._deferred.append((source, output))
-        self._record_copy_event()
-        return view
+        return self._frame_view(frame, output, context["out_size"], context["height"],
+                                context["width"], data, planes)
 
-    def _decode_binding(self, jpeg, info, stream, size, width, height, media, runtime, planes=False):
-        """The released binding transaction; the frame copy is stream-ordered when the runtime has it.
+    def _abandon(self, context) -> None:
+        """Free a transaction that never reached ``_finish`` (a later view of the wave failed)."""
+        if context is None:
+            return
+        media = self.acl.himpi
+        if context["channel"] is not None:
+            self._drop_channel(self._channel_key(context["width"], context["height"], context["size"]))
+            context["channel"] = None
+        _call(media.dvpp_free, context["source"])
+        _call(media.dvpp_free, context["output"])
 
-        The frame's planes leave DVPP memory through ``memcpy_async`` on the caller's stream when
-        ``rt.memcpy_async`` exists -- the fast path's form -- and the source and output buffers
-        then wait in ``_deferred`` for the copy's recorded event instead of freeing here. Without
-        it the synchronous copy runs and the buffers free here, the released form.
-        """
-        out_size = info["img_buf_size"]
-        source, status = media.dvpp_malloc(self.device.index, size)
-        _check(status, "dvpp_malloc input")
-        handed_off = False
-        try:
-            _call(runtime.memcpy, source, size, jpeg.data_ptr(), size, _HOST_TO_DEVICE)
-            stream["addr"] = source
-            output, status = media.dvpp_malloc(self.device.index, out_size)
-            _check(status, "dvpp_malloc output")
-            try:
-                channel = self._channel_for(width, height, size)
-                picture = dict(width=width, height=height, width_stride=info["width_stride"],
-                               height_stride=info["height_stride"], pixel_format=_SOURCE_FORMAT,
-                               vir_addr=output, buffer_size=out_size)
-                try:
-                    _call(media.vdec_send_stream, channel, stream, picture, _TIMEOUT_MS)
-                    frame, _, _, status = media.vdec_get_frame(channel, _TIMEOUT_MS)
-                    _check(status, "vdec_get_frame")
-                except Exception:
-                    # a channel that failed mid-transaction is not trusted again: drop it so the
-                    # next decode recreates a fresh one, as the per-JPEG lifecycle always did
-                    self._drop_channel(self._channel_key(width, height, size))
-                    raise
-                try:
-                    view = frame["v_frame"]
-                    if view["frame_flag"] != 0:
-                        raise RuntimeError(f"CANN JPEGD rejected an image (frame_flag={view['frame_flag']})")
-                    data = torch.empty(out_size, dtype=torch.uint8, device=self.device)
-                    if self._async_copy:
-                        _call(self.acl.rt.memcpy_async, data.data_ptr(), out_size, output, out_size,
-                              _DEVICE_TO_DEVICE, torch.npu.current_stream().npu_stream)
-                    else:
-                        _call(self.acl.rt.memcpy, data.data_ptr(), out_size, output, out_size, _DEVICE_TO_DEVICE)
-                finally:
-                    _call(media.vdec_release_frame, channel, frame)
-                if self._async_copy:
-                    self._deferred.append((source, output))
-                    self._record_copy_event()
-                    handed_off = True
-                return self._frame_view(view, output, out_size, height, width, data, planes)
-            finally:
-                if not handed_off:
-                    _call(media.dvpp_free, output)
-        finally:
-            if not handed_off:
-                _call(media.dvpp_free, source)
+    def _planes(self, output, out_size):
+        """Copy one decoded frame out of DVPP memory into a tensor on the caller's stream."""
+        data = torch.empty(out_size, dtype=torch.uint8, device=self.device)
+        if self._async_copy:
+            _call(self.acl.rt.memcpy_async, data.data_ptr(), out_size, output, out_size,
+                  _DEVICE_TO_DEVICE, torch.npu.current_stream().npu_stream)
+        else:
+            _call(self.acl.rt.memcpy, data.data_ptr(), out_size, output, out_size, _DEVICE_TO_DEVICE)
+        return data
 
     def _open_channel(self, attrs):
         # DVPP channel ids are dense and small (the driver's VDEC channel pool); 256 is the probe ceiling, not a

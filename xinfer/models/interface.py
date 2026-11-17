@@ -345,6 +345,12 @@ class DeviceImage:
 # internals (tests/unit/test_layering.py).
 _prefetch_hook = None
 
+# The engine's end-of-request hand-over hook (the same binding installs ``image_prefetch.flush``
+# here): a no-argument callable marking that a request's ``DeviceImage`` values were all handed
+# over, so the device-image thread starts their decode wave before the request is admitted.
+# ``None`` (no binding) keeps it a no-op -- ``device_images_ready`` falls through.
+_flush_hook = None
+
 
 @dataclass
 class PreparedRequest:

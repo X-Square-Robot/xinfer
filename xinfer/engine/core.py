@@ -56,6 +56,12 @@ from xinfer.platforms.interface import Platform
 
 logger = logging.getLogger(__name__)
 
+# The device-image thread's prefetch wave cap: the tickets already queued are drained as one
+# start batch up to this many views, and a wave's started views accumulate up to this many
+# before it is flushed (a request's boundary flushes it earlier). Three covers a request's
+# camera views; more would only batch unrelated requests' starts.
+MAX_WAVE_VIEWS = 3
+
 
 @dataclass(frozen=True)
 class EngineConfig:
@@ -309,10 +315,13 @@ class Engine:
             image_prefetch.bind(self._device_requests)
             # models never import the engine and the engine may use only the model interface
             # (tests/unit/test_layering.py): the hand-off runs through the interface module's
-            # hook, installed here and cleared at shutdown.
+            # hook, installed here and cleared at shutdown. The flush hook (the end-of-request
+            # boundary) installs the same way, so a processor hands a request's views over as
+            # one wave.
             import xinfer.models.interface
 
             xinfer.models.interface._prefetch_hook = image_prefetch.hand_off
+            xinfer.models.interface._flush_hook = image_prefetch.flush
         self._device_thread = threading.Thread(target=self._device_images_loop, name="xinfer-device-images",
                                                daemon=True)
         if start:
@@ -497,6 +506,8 @@ class Engine:
 
             if xinfer.models.interface._prefetch_hook is image_prefetch.hand_off:
                 xinfer.models.interface._prefetch_hook = None
+            if xinfer.models.interface._flush_hook is image_prefetch.flush:
+                xinfer.models.interface._flush_hook = None
         for lanes in self.lanes.values():
             for lane in lanes:
                 lane.cudagraphs = None
@@ -764,11 +775,53 @@ class Engine:
         """
         self._bind_device()
         stream = self._device_stream
+        wave = []
+        stash = deque()   # WAVE-TAIL WT2a: items read ahead of a ticket batch, handled in order
+
+        def flush_wave():
+            if wave:
+                self._prefetch_views(list(wave))
+                wave.clear()
+
         while True:
-            request = self._device_requests.get()
+            request = stash.popleft() if stash else self._device_requests.get()
             if isinstance(request, image_prefetch.Ticket):
-                self._prefetch_view(request.image)
+                # A request's views are handed over back to back and decode as one wave: every
+                # view's DVPP transaction starts before any frame is fetched, so the media engine
+                # decodes them concurrently. The processor's boundary (or the admission item, or
+                # MAX_WAVE_VIEWS for a processor that sends none) closes the wave.
+                #
+                # WAVE-TAIL WT2a: the tickets already queued (this request's remaining views)
+                # are drained as one batch and their transactions start under one stream context
+                # and one GIL-releasing C call, in ticket order -- the same starts the per-ticket
+                # path issued, without the interpreter slices the prepare window interleaved
+                # between them. A non-ticket item read ahead goes to ``stash`` and is handled
+                # before anything still queued behind it.
+                tickets = [request]
+                while len(tickets) < MAX_WAVE_VIEWS and not stash:
+                    try:
+                        nxt = self._device_requests.get_nowait()
+                    except queue.Empty:
+                        break
+                    if isinstance(nxt, image_prefetch.Ticket):
+                        tickets.append(nxt)
+                    else:
+                        stash.append(nxt)
+                        break
+                try:
+                    if self._decoder is None:
+                        self._decoder = DeviceImageDecoder(self.platform.device)
+                    with self._device_ctx, torch.inference_mode():  # AG3 ctx, WT2a batch
+                        self._decoder.start_batch([ticket.image for ticket in tickets])
+                except Exception as exc:  # noqa: BLE001 - these requests fail with it when admitted
+                    for ticket in tickets:
+                        ticket.image.prefetch.error = exc
+                for ticket in tickets:
+                    wave.append(ticket.image)
+                    if len(wave) >= MAX_WAVE_VIEWS:
+                        flush_wave()
                 continue
+            flush_wave()
             if isinstance(request, _CaptureImageGraphs):
                 # The engine thread is blocked on ``done``: nothing else captures or synchronizes the
                 # device, which is what graph capture needs here (see the class docstring).
@@ -781,6 +834,8 @@ class Engine:
                     logger.exception("could not capture the device image chain graphs")
                 finally:
                     request.done.set()
+                continue
+            if isinstance(request, image_prefetch.Boundary):
                 continue
             if request is None:
                 if self._decoder is not None:
@@ -815,26 +870,50 @@ class Engine:
                 self._device_ready.append((request, inputs, event, error))
                 self._wake.notify()
 
-    def _prefetch_view(self, image) -> None:
-        """Decode and resize one prefetched ``DeviceImage`` into its slot (device-image thread).
+    def _start_view(self, image) -> None:
+        """Start one view's DVPP transaction as soon as its bytes reach the engine.
 
-        The same stream, decoder and per-view path as the admission-time decode, one queue item
-        per view: a ticket always completes before its request's admission item (FIFO). A decode
-        that raises is recorded in the slot and fails the request at admission, as an
-        admission-time decode failure would.
+        The media engine decodes it while the processor finishes the request's remaining host work
+        (the wave's frames are fetched when the wave is flushed), so a view never waits for its
+        request's other views to be handed over.
         """
         slot = getattr(image, "prefetch", None)
-        if slot is None:
+        if slot is None or slot.txn is not None or slot.view is not None or slot.error is not None:
             return
         try:
             if self._decoder is None:
                 self._decoder = DeviceImageDecoder(self.platform.device)
             with self._device_ctx, torch.inference_mode():  # ADMISSION-GAP AG3: cached context
-                view = self._decoder.decode_one(image)
-            slot.device = self._decoder.device
-            slot.view = view
+                self._decoder.start(image)
         except Exception as exc:  # noqa: BLE001 - the request fails with it when admitted
             slot.error = exc
+
+    def _prefetch_views(self, images) -> None:
+        """Decode and resize a wave of prefetched ``DeviceImage`` views into their slots.
+
+        The same stream, decoder and per-view path as the admission-time decode, one queue item per
+        view, with the wave's JPEGs decoded in one DVPP pass: their channel transactions start
+        before any frame is fetched, so the media engine decodes them concurrently. A decode that
+        raises is recorded in every slot of the wave and fails those requests at admission, as an
+        admission-time decode failure would.
+        """
+        images = [image for image in images if getattr(image, "prefetch", None) is not None]
+        if not images:
+            return
+        try:
+            if self._decoder is None:
+                self._decoder = DeviceImageDecoder(self.platform.device)
+            with self._device_ctx, torch.inference_mode():  # ADMISSION-GAP AG3: cached context
+                views = self._decoder.decode_many(images)
+        except Exception as exc:  # noqa: BLE001 - these requests fail with it when admitted
+            device = self._decoder.device if self._decoder is not None else None
+            for image in images:
+                image.prefetch.error = exc
+                image.prefetch.device = device
+            return
+        for image, view in zip(images, views):
+            image.prefetch.device = self._decoder.device
+            image.prefetch.view = view
 
     def _queue_device_ready(self) -> bool:
         """Queue the requests whose views are ready for their first stages; fail those whose decoding raised.

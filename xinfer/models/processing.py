@@ -154,6 +154,21 @@ def view_inputs(inputs) -> list:
     return views
 
 
+def device_images_ready() -> None:
+    """Close the current request's hand-over of views to the engine's device-image thread.
+
+    Call it once, after a request's ``DeviceImage`` values were built with ``device_image``: the
+    engine decodes that request's views as one wave, and this lets it start the wave before the
+    request is admitted. A no-op without a bound engine (frontend processes, CPU paths).
+    """
+    try:
+        hook = _interface._flush_hook
+        if hook is not None:
+            hook()
+    except Exception:  # noqa: BLE001 - prefetch is an optimization; prepare must not fail on it
+        pass
+
+
 class SegmentTokenizer:
     """``tokenizer.encode(text, add_special_tokens=False).ids`` of a ``tokenizers.Tokenizer``, encoding the text
     between added tokens once.

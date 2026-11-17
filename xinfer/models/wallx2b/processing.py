@@ -28,6 +28,7 @@ from xinfer.models.processing import (
     SegmentTokenizer,
     check_image_preprocess_device,
     device_image,
+    device_images_ready,
     is_jpeg,
     map_views,
     source_size,
@@ -616,6 +617,9 @@ class Wallx2bInputProcessor:
                 image, shape = future.result()
                 images.append(image)
                 shapes.append(shape)
+            # Close this request's hand-over: the device-image thread starts the views' decode
+            # wave now, before the request's admission item reaches it.
+            device_images_ready()
         else:
             images = [torch.from_numpy(image) for image in map_views(
                 lambda camera: resize_view(decode_view(wire(camera)), c.resolution.get(camera.view, -1), c), c.cameras)]
