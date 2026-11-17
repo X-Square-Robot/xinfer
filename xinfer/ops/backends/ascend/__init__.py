@@ -1,1 +1,3 @@
-"""Ascend operator implementations, using the shared xcompute loader and registration contracts."""
+"""Operator backends for Ascend platforms: the kernels in ``src/``, loaded by ``_native.py``."""
+
+

@@ -8,11 +8,12 @@ weight as it is and accumulate in FP32, and keep the epilogue in FP32 exactly wh
 Nothing here is a hand-written kernel: every entry is ``torch_npu``'s own operator, and the rest is the elementwise
 arithmetic the reference already did.
 
-These entries are **not** the default. They sit below the xcompute ones by priority, so a deployment runs on the
-xcompute kernels unless it opts in with ``--op-backends`` naming this library, e.g.
-``--op-backends gemm_epilogue=ascend:npu_linear``. Measured end to end they were no faster than xcompute (370.4 ms
+These entries are **not** the default. They sit below the provider ones by priority, so a deployment runs on the
+provider kernels unless it opts in with ``--op-backends`` naming this library, e.g.
+``--op-backends gemm_epilogue=ascend:npu_linear``. Measured end to end they were no faster than the provider (370.4 ms
 against 374.4 ms for one Wall-X 2B request, inside run-to-run noise), so the default stays where the documented
 numbers were taken. The ``partial`` checks keep every layout the official operator cannot take on the reference.
+Contracts against the torch references: tolerance (the CANN operator compositions).
 """
 
 import torch

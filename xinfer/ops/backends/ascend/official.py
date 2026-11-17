@@ -5,10 +5,11 @@
 ``1 + w`` as the weight. Nothing here is a hand-written kernel: the split is views, the arithmetic is the official
 operator, and the only extra step is the elementwise ``1 + w`` on a ``[D]`` vector.
 
-These entries are **not** the default: they sit below the xcompute ones by priority (the unified GEMM entry now
-serves ``linear``, the norm-replace entry ``qkv_norm_split``), so a deployment runs on the xcompute entries unless
+These entries are **not** the default: they sit below the provider ones by priority (the unified GEMM entry now
+serves ``linear``, the norm-replace entry ``qkv_norm_split``), so a deployment runs on the provider entries unless
 it opts in with ``--op-backends`` naming this library, e.g. ``--op-backends linear=ascend:torch_npu``.
 ``npu_linear`` takes a 2-D input, so ``linear`` flattens the leading dimensions and restores them.
+Contracts against the torch references: tolerance (the vendor operators' own precision).
 """
 
 import torch
@@ -26,7 +27,7 @@ except ImportError:  # a CPU-only install still imports this module, it just reg
 _npu_linear = getattr(torch_npu, "npu_linear", None) if torch_npu is not None else None
 _npu_rms_norm = getattr(torch_npu, "npu_rms_norm", None) if torch_npu is not None else None
 
-_PRIORITY = -5  # below the xcompute entries: nothing here is ever selected without an explicit pin
+_PRIORITY = -5  # below the provider entries: nothing here is ever selected without an explicit pin
 
 
 def _linear_supported(x, weight, bias=None) -> bool:
