@@ -1,32 +1,10 @@
-"""GDN-VENDOR mount (kernel launcher for the XINFER_GDNV class route).
+"""Prepare Gated DeltaNet gates with the in-tree native library.
 
-The route lives in ``glue.cann_gated_delta_net.CannGatedDeltaNet.__call__``
-(the move-r2/conv-gemm precedent); this module loads libgdnv.so and computes
-the fused gates prefix, counting per-family route stats.
-
-Flag ``XINFER_GDNV`` (default off), comma list:
-  ``gdrprep`` — the per-layer gates prefix in ONE kernel:
-                beta[t,h] = RNE_bf16(1/(1+exp(-f32(zba[t,2048+h]))))
-                gpre[t,h] = f32(zba[t,2064+h]) + dt[h]
-                then g = premul * F.softplus(gpre) with premul = -exp(A_log)
-                cached at warmup (the same aclnn Exp/Neg on the same [16]
-                input -- bitwise) and dt pre-cast once.
-                Replaces Sigmoid_Slice + Sigmoid + Exp + Neg + Slice + Cast +
-                Add (7 launches); Softplus and the broadcast Mul stay on
-                aclnn with bit-identical inputs.
-
-Bitwise evidence (R/gdn-vendor/results/):
-  probe-tr-bitwise.json  -- sigmoid v0 composition: n_diff=0 over ALL 65536
-                            bf16 patterns; softplus log1p tail NOT bitwise
-                            (hence Softplus stays on aclnn);
-  witness-gdrprep.json   -- the composite (kernel + aclnn Softplus + aclnn
-                            Mul + cached premul) vs the released 9-op chain:
-                            bitwise on the production T family, a 4096-row
-                            bf16-domain sweep, extremes (+-inf/0/denormal) and
-                            NaN (bit equality).
-The g-amp advisory (R/gdn-k3-r2): g feeds the vendor chunk recurrence and
-amplifies ulp differences past the action gate -- this route is landable
-precisely because it is bitwise end to end.
+``XINFER_GDNV=gdrprep`` enables the fused gates prefix; the default is off.
+Beta is ``RNE_bf16(1/(1+exp(-f32(zba[t,2048+h]))))`` and the pre-activation
+is ``f32(zba[t,2064+h]) + dt[h]``. Softplus and multiplication by the cached
+``-exp(A_log)`` remain in the existing Torch/CANN chain, preserving its
+inputs and rounding. The chunk recurrence and its tensor layouts are unchanged.
 """
 
 from __future__ import annotations

@@ -1,14 +1,8 @@
-"""GQA-GLUE knives 1+3: BHSD partial rope consuming the compact angle tables.
+"""Head-major partial rotary embedding with compact angle tables.
 
-Same rotation semantics as the in-service ``rope_half_d64`` (v2.1) with two
-value-preserving changes: q/k are read and written head-major BHSD
-``[H, rows, 256]``, and the compact width-32 ``cos``/``sin`` tables are
-consumed directly -- the kernel duplicates them to the 64 rotation lanes
-in-kernel (the v3 ``vmul``-with-bool-operand compile failure is avoided by
-using the bool vector as the multiply *predicate* against vdup(1.0)), so the
-wrapper's per-call ``cat(cos, cos)``/``cat(sin, sin)`` pair disappears.
-``out_q``/``out_k`` are caller-allocated so the post-rope K can land directly
-in its ``prompt_kv`` slot. Internal AOT launcher only.
+The rotation semantics match ``rope_half_d64``. Q/K use [H,rows,256] and
+the in-tree kernel expands width-32 cosine/sine tables to the 64 rotated
+channels. Caller-allocated outputs allow K to write directly to its cache slot.
 """
 
 import ctypes
@@ -57,7 +51,7 @@ def rope_d64_bhsd(q, k, cos, sin, out_q=None, out_k=None):
     if out_k is None:
         out_k = torch.empty_like(k)
     # the single library's TVM-FFI face serves first (the unified launch boundary);
-    # the ctypes launcher of the family library is the fallback below
+    # the same library's C-ABI launcher is the fallback below
     if not _native.launch_kernel("rope_half_d64_bhsd",
                                  (q, k, cos, sin, out_q, out_k), (tokens,)):
         rc = call(ctypes.c_void_p(q.data_ptr()), ctypes.c_void_p(k.data_ptr()),

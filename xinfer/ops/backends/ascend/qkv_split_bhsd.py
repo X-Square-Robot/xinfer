@@ -1,12 +1,9 @@
-"""GQA-GLUE knife 1: BHSD direct-production qkv split + norm apply.
+"""QKV split and normalization with head-major outputs.
 
-Same math and launcher ABI as the in-service ``qkv_split_vec_h256`` (nine
-pointers + rows + stream) with the q/k/v outputs written head-major BHSD
-``[H, rows, 256]`` (``[1, H, rows, 256]`` tensors): the prefill chain's five
-strided transposes disappear because the FIA BNSD inputs and the
-``prompt_kv`` cache slots consume this layout directly. Outputs are
-caller-allocated (``out_q``/``out_k``/``out_v``/``out_gate``) so the KV-cache
-slots can be handed straight to the kernel. Internal AOT launcher only.
+The in-tree launcher has the same nine-pointer, row-count and stream ABI as
+the token-major split, but writes [H,rows,256] ([1,H,rows,256] views).
+Outputs are caller-allocated so attention and KV-cache slots can consume
+them directly without intermediate transposes.
 """
 
 import ctypes
@@ -63,7 +60,7 @@ def qkv_split_bhsd(packed, rstd_q, rstd_k, q_factor, k_factor,
     if out_gate is None:
         out_gate = torch.empty((b, n, 2048), dtype=packed.dtype, device=packed.device)
     # the single library's TVM-FFI face serves first (the unified launch boundary);
-    # the ctypes launcher of the family library is the fallback below
+    # the same library's C-ABI launcher is the fallback below
     if not _native.launch_kernel("qkv_split_vec_bhsd_h256",
                                  (packed, rstd_q, rstd_k, q_factor, k_factor,
                                   out_q, out_k, out_v, out_gate), (rows,)):

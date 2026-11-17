@@ -1,12 +1,8 @@
-"""conv-gemm knife mount: dconv4_c6144 through the AOT packed-launch ABI.
+"""Depthwise convolution through the in-tree dconv4_c6144 launcher.
 
-XINFER_CONVGEMM=1 (default off) activates the kernel route inside
-``glue.cann_gated_delta_net.CannGatedDeltaNet.__call__``; every
-other code path (route disabled, envelope miss, launcher failure) keeps the
-released F.conv1d chain bit for bit. The library lives in its own .so
-(XINFER_CONVGEMM_LIB) loaded through ctypes with the unified AOT packed-launch
-ABI (pointers, int64 scalars, stream) -- the soupkill precedent, graph-capture
-safe because the launch goes to the live torch stream.
+``XINFER_CONVGEMM=1`` enables this optional route in ``CannGatedDeltaNet``.
+The packed-launch ABI carries pointers, int64 scalars and the current stream.
+Calls outside the supported envelope use the existing convolution path.
 """
 from __future__ import annotations
 
@@ -116,7 +112,7 @@ def conv_mixed_tokenmajor(qkv, conv_weight):
         call, error = _library()
         stream = torch.npu.current_stream(qkv.device).npu_stream
         # the single library's TVM-FFI face serves first (the unified launch boundary);
-        # the ctypes launcher of the family library is the fallback below
+        # the same library's C-ABI launcher is the fallback below
         if _native.launch_kernel("dconv4_c6144", (out, qkv, w, pad),
                                  (tokens, qkv.stride(1))):
             _STATS["routed"] += 1

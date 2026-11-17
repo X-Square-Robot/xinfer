@@ -1,13 +1,9 @@
-"""ubfinish-r5 opt-in route: UB-vectorized bias finish kernels from
-libubfinish_r5.so.
+"""Optional bias finishes from the in-tree native library.
 
-Off by default (XINFER_UBFINISH_R5 unset/0). Ship variant: the rowpass-SIMD
-mold (``ubfinish_r5_s{rpt}_c{cols}`` -- one large multi-row T.copy span per
-core-step, UNPK_B16 bias widen + vadd + vcvt ROUND_R + PK_B32 store). The
-launcher resolves the current stream per call so NPUGraph capture records
-the node (gdn-gamma ctypes rule). Per-column-width compiled entries with
-their row-tile height; unsupported widths or row counts fall back to the
-torch tail upstream (no behavior change).
+``XINFER_UBFINISH_R5=1`` enables per-width row-tiled entries; it is off by
+default. They widen BF16 bias, add in FP32 and store with ROUND_R conversion.
+Launches use the current stream. Unsupported widths or row counts are
+handled by the caller's existing tail.
 """
 from xinfer.ops.backends.ascend import _native
 import ctypes

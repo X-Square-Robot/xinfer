@@ -1,17 +1,10 @@
-"""decodeattn-r4 opt-in route: specialized small-M cache-attention kernel pair.
+"""Optional small-M cache-attention scan/reduce pair in the native library.
 
-Round-4 DECODE-ATTN. Off by default (XINFER_DECODEATTN_R4=off). Replaces the
-per-call ACLNN FIA chain (query transpose copy + FusedInferAttentionScore with
-the flash mask) for the wall-oss decode family
-B1 H16 KV2 M16 D128 L784 new_pos=768 by the libdecodeattn_r4.so scan+reduce
-pair (TileLang AOT, bisheng 9.3.0 / cann 9.1.1 runtime). Numerics: vs fp64
-oracle 0.0023 (same band as the FIA chain), max_abs vs FIA 2.4e-4, ~54%
-bitwise-equal elements across flow/rtc/short-prompt mask families
-(results/probe.json).
-
-Launches resolve the current stream per call so NPUGraph capture records the
-node (gdn-gamma ctypes rule). All mask semantics (prefix device data, the
-new-pos window, flash lts/ute bounds) are enforced inside the kernels.
+``XINFER_DECODEATTN_R4`` is off by default. The supported Wall-OSS call is
+B1/H16/KV2/M16/D128/L784 with new_pos=768. Prefix length, the new-key
+window and flash-mask LTS/UTE bounds retain their existing semantics.
+This route is tolerance-level relative to FIA, not bitwise equivalent.
+Launches resolve the current stream for graph capture.
 """
 from xinfer.ops.backends.ascend import _native
 import ctypes
@@ -108,7 +101,7 @@ def applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):
     ):
         return False
     # The M-major [M, H*D] packing behind the [1, M, H, D] view (the bridge
-    # convention; probe 2026-11-13) and the [KV, L, D]-major cache views.
+    # convention) and the [KV, L, D]-major cache views.
     if not (
         q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
         and q.device.type == "npu"
@@ -162,7 +155,7 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mas
     fm = flash_mask.reshape(_L, 2)
     scale_bits = struct.unpack("<q", struct.pack("<f", _D**-0.5) + bytes(4))[0]
     # the single library's TVM-FFI faces serve first (the unified launch boundary); the
-    # ctypes launchers of the family library are the fallback below
+    # C-ABI launchers from the same library are the fallback below
     if not _native.launch_kernel(scan_name, (q_flat, keys, values, fm, prefix_len, pbuf),
                                  (int(new_pos), scale_bits)):
         status = call(

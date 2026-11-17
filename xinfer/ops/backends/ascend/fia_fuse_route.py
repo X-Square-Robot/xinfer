@@ -1,22 +1,12 @@
-"""FIA-FUSE route: specialized split-K scan+reduce cache-attention pair
-for the wall-x 2B decode family, fusing the FIA call AND the gated pack tail.
+"""Split-K cache attention and gated output packing for Wall-X 2B.
 
-On by default since the FIA-FIX landing (XINFER_FIA_FUSE=off opts out per
-process; an unset XINFER_FIA_FUSE_LIB still keeps the route off).
-Replaces the per-call decode chain
-(_r6b_prefix_kvcache_bnsd FusedInferAttentionScore + gated_attn_bnsd_pack_pow2,
-17.2us measured) by libfia_fuse.so scan + reduce (TileLang AOT, bisheng
-9.3.0 / cann 9.1.1 runtime) which merge the split-K partials, round the
-attention to BF16 (the FIA output rounding) and apply the exact pack_pow2
-gate tail (FP32 sigmoid 1/(1+exp(-x)), two manual-RNE BF16 roundings) while
-storing the packed [B, M, H*D] rows the o_proj GEMM reads.
+``XINFER_FIA_FUSE`` is on by default; ``off`` disables the route. Scan and
+reduce entries come from the in-tree native library. They round attention
+to BF16 and apply the pack_pow2 tail: FP32 ``1/(1+exp(-x))`` followed by
+two RNE BF16 roundings, producing packed [B,M,H*D] rows.
 
-Launches resolve the current stream per call so NPUGraph capture records the
-node. The route stays inside the folded() call's action scope.
-
-Route stats: when XINFER_FIA_FUSE_STATS names a path, every interpreter that
-routes writes <path>-pid<pid>.json at exit (routed / fell_back / errors /
-by_shape) so serve subprocesses give their own receipts.
+Launches use the current stream inside the caller's action scope.
+``XINFER_FIA_FUSE_STATS`` optionally records per-process route counts.
 """
 import atexit
 import ctypes
@@ -201,7 +191,7 @@ def try_route(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask, scale)
         fm = flash_mask.view(L, 2)
         scale_bits = struct.unpack("<q", struct.pack("<f", _D**-0.5) + bytes(4))[0]
         # the single library's TVM-FFI faces serve first (the unified launch boundary);
-        # the ctypes launchers of the family library are the fallback below
+        # the same library's C-ABI launchers are the fallback below
         if not _native.launch_kernel(f"fia_fuse_scan_l{L}",
                                      (q_flat, keys, values, fm, prefix_len, pbuf),
                                      (int(new_pos), scale_bits)):

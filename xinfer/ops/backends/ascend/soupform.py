@@ -1,34 +1,13 @@
-"""soupform mount: single-pass soup kills over the wall-x 2B final stack.
+"""Optional fused projection and normalization finishes in the native library.
 
-Flag ``XINFER_SOUPFORM`` (default off): a comma list of the families
-``normprep`` (add_zero_centered_rms_norm prefill sites: one pass for
-s = rne(residual+x) and sq = f32(s)^2, plus the elementwise apply redstone),
-``zbasplit`` (the DeltaNet qkv_zba row_scale finish split into contiguous
-conv/zba buffers), ``glumulcast`` (the prompt SwiGLU mul+cast single pass over
-the borrowed FP32 accumulator; parked -- the kernel lost its race with the
-aclnn chain at 45.9 vs 38.4 us/site, kept for the record and for the envelope
-audit) and ``vropepack`` (the vision QKV+RoPE finish storing the packed
-[3, rows, heads, dim] layout directly).
+``XINFER_SOUPFORM`` is off by default and accepts ``normprep``, ``zbasplit``,
+``glumulcast`` and ``vropepack``. These respectively prepare the residual
+sum/statistics, write contiguous convolution/ZBA outputs, apply SwiGLU to
+an FP32 accumulator, and write QKV/RoPE in [3,rows,heads,dim] layout.
 
-The knife shared object is delivered with the model stack, not with this
-repository, so its path is configuration: ``XINFER_SOUPFORM_LIB``. An unset or
-unloadable path disables every route instead of raising into the caller.
-
-Every route keeps the released torch chain's FP32 arithmetic and rounds once
-with RNE; envelopes mirror the landed soupkill rules (contiguous operands,
-aligned rows, exact widths) and any miss returns None so the caller keeps the
-released chain. The kernels are the TileLang AOT objects of
-``src/soupform/npu/soupform_kernels.py`` (the ``soupform`` CMake module),
-reached through ctypes exactly like the other internal AOT launchers
-(``xinfer_aot_<name>_call`` / ``_get_last_error``), so the FFI face does not
-move.
-
-Evidence (SOUP-FORM, card 7, final-consolidate stack): witness 0 flips across
-all four families (random + crafted tie/subnormal/overflow inputs); action
-gate vs GBASE 0.0050923228 PASS with the margin 0.0011076772 unchanged;
-e2e 50x3 dual order 27.735 -> 27.000 ms total (engine 25.045 -> 24.300);
-ledger busy -471.7 us and launches 3743 -> 3591. Receipts:
-``npu/knives/2b-soupform/MANIFEST.json``.
+Routes retain their FP32 operation order and RNE output rounding. Unsupported
+layouts or absent entries return None to the caller's existing composition.
+All launchers are resolved through ``_native`` from the in-tree library.
 """
 
 from __future__ import annotations
@@ -93,8 +72,7 @@ def _entry(name, pointers, scalars):
             error = getattr(lib, f"xinfer_aot_{name}_get_last_error")
             error.restype = ctypes.c_char_p
         except (AttributeError, OSError):
-            # A library without this entry (a different knife build, or a stale
-            # XINFER_SOUPFORM_LIB) must not break the model: decline the route.
+            # An absent native entry leaves this call to the existing composition.
             _ENTRIES[key] = None
             return None
         pair = (call, error)
