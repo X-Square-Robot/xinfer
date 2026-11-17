@@ -300,8 +300,8 @@ class NpuJpegDecoder:
                     self._leased = True
                 results = [None] * len(jpegs)
                 started = []      # [(index, context)] in start order
-                pending = dict(self._pending)  # channel key -> (transactions, jpeg bytes) in flight
-                self._pending.clear()
+                # Keep active channel leases visible to the cache until their frames are fetched.
+                pending = self._pending
                 done = False
                 try:
                     for index, jpeg in enumerate(jpegs):
@@ -347,9 +347,19 @@ class NpuJpegDecoder:
         index, context = started.pop(0)
         key = self._channel_key(context["width"], context["height"], context["size"])
         count, size = pending[key]
-        pending[key] = (count - 1, size - context["size"])
+        if count == 1:
+            pending.pop(key)
+        else:
+            pending[key] = (count - 1, size - context["size"])
         results[index] = self._finish(context, planes)
         return index, results[index]
+
+    def _release_pending(self, key, size):
+        count, total = self._pending.get(key, (0, 0))
+        if count <= 1:
+            self._pending.pop(key, None)
+        else:
+            self._pending[key] = (count - 1, total - size)
 
     def start(self, jpeg):
         """Begin one JPEG's channel transaction now; a later ``__call__`` fetches its frame.
@@ -381,7 +391,11 @@ class NpuJpegDecoder:
                 if count + 1 > _MAX_INFLIGHT or pending_bytes + size > key[2]:
                     return None
                 self._pending[key] = (count + 1, pending_bytes + size)
-                return self._launch(jpeg, info, stream)
+                try:
+                    return self._launch(jpeg, info, stream)
+                except Exception:
+                    self._release_pending(key, size)
+                    raise
 
     def start_batch(self, jpegs):
         """Begin several JPEGs' channel transactions now; a later ``__call__`` fetches the frames.
@@ -412,20 +426,27 @@ class NpuJpegDecoder:
                     _MEDIA_USERS[self.device] = users + 1
                     self._leased = True
                 ready = []   # [(position, jpeg, info, stream, channel)]
-                for index, jpeg in enumerate(jpegs):
-                    jpeg = jpeg.contiguous()
-                    probed = self._probe(jpeg)
-                    if probed is None:
-                        continue
-                    info, stream = probed
-                    size = jpeg.numel()
-                    key = self._channel_key(info["width"], info["height"], size)
-                    count, pending_bytes = self._pending.get(key, (0, 0))
-                    if count + 1 > _MAX_INFLIGHT or pending_bytes + size > key[2]:
-                        continue
-                    self._pending[key] = (count + 1, pending_bytes + size)
-                    ready.append((index, jpeg, info, stream,
-                                  self._channel_for(info["width"], info["height"], size)))
+                try:
+                    for index, jpeg in enumerate(jpegs):
+                        jpeg = jpeg.contiguous()
+                        probed = self._probe(jpeg)
+                        if probed is None:
+                            continue
+                        info, stream = probed
+                        size = jpeg.numel()
+                        key = self._channel_key(info["width"], info["height"], size)
+                        count, pending_bytes = self._pending.get(key, (0, 0))
+                        if count + 1 > _MAX_INFLIGHT or pending_bytes + size > key[2]:
+                            continue
+                        channel = self._channel_for(info["width"], info["height"], size)
+                        ready.append((index, jpeg, info, stream, channel))
+                        self._pending[key] = (count + 1, pending_bytes + size)
+                except Exception:
+                    # No stream has been submitted while this list is being prepared.
+                    for _, jpeg, info, _, _ in ready:
+                        self._release_pending(self._channel_key(info["width"], info["height"],
+                                                                jpeg.numel()), jpeg.numel())
+                    raise
                 if not ready:
                     return results
                 if (self._fast and len(ready) == 3
@@ -448,6 +469,8 @@ class NpuJpegDecoder:
                                 continue
                             operation = ("dvpp_malloc input", "memcpy", "dvpp_malloc output",
                                          "vdec_send_stream")[phase]
+                            self._release_pending(self._channel_key(info["width"], info["height"],
+                                                                    jpeg.numel()), jpeg.numel())
                             if phase == 3:
                                 self._drop_channel(self._channel_key(info["width"], info["height"],
                                                                      jpeg.numel()))
@@ -460,6 +483,8 @@ class NpuJpegDecoder:
                     try:
                         results[index] = self._launch(jpeg, info, stream)
                     except Exception as exc:  # noqa: BLE001 - this view's request fails with it
+                        self._release_pending(self._channel_key(info["width"], info["height"],
+                                                                jpeg.numel()), jpeg.numel())
                         results[index] = exc
                 return results
 
@@ -671,6 +696,8 @@ class NpuJpegDecoder:
         """Free a transaction that never reached ``_finish`` (a later view of the wave failed)."""
         if context is None:
             return
+        key = self._channel_key(context["width"], context["height"], context["size"])
+        self._release_pending(key, context["size"])
         media = self.acl.himpi
         if context["channel"] is not None:
             self._drop_channel(self._channel_key(context["width"], context["height"], context["size"]))
@@ -717,8 +744,12 @@ class NpuJpegDecoder:
         channel = self._channels.get(key)
         if channel is not None:
             return channel
-        if len(self._channels) >= _MAX_CHANNELS:
-            self._drop_channel(next(iter(self._channels)))
+        while len(self._channels) >= _MAX_CHANNELS:
+            idle = next((cached for cached in self._channels
+                         if self._pending.get(cached, (0, 0))[0] == 0), None)
+            if idle is None:
+                break  # Active transactions temporarily exceed the idle-cache limit.
+            self._drop_channel(idle)
         attrs = dict(type=_JPEG, mode=_SEND_FRAME, pic_width=width, pic_height=height,
                      stream_buf_size=key[2], frame_buf_size=0, frame_buf_cnt=0)
         channel = self._open_channel(attrs)
