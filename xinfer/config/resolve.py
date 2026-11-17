@@ -255,8 +255,8 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
     - ``lanes.<stage>``: explicit, else the tuned value, else 2.
     - ``stream_priorities.<stage>``: explicit, else -1 bounded by the platform's reported range for a final
       stage (one without consumers), else 0; unknown ranges keep default 0, and nonzero requires platform support.
-    - ``batch_sizes.<stage>`` (allowed batch sizes, 1 always included): with an explicit ``max_batch``, the
-      declared sizes up to it; else every declared size.
+    - ``batch_sizes.<stage>`` (1 always included): declared sizes up to the explicit or tuned ``max_batch``.
+      Without a limit, use the model's defaults or all declared sizes. B1-only stages ignore tuned limits.
     - ``cudagraphs``: explicit, else whether the platform supports graph capture.
     - ``frontends``: explicit, else 2, at most half the CPU quota.
     - ``frontend_workers``: explicit, else 4, with ``frontends × frontend_workers`` at most half the CPU quota.
@@ -279,8 +279,8 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
         A ``ResolvedConfig`` with ``value(name)``, ``settings`` (each with its source) and ``engine_config()``.
 
     Raises:
-        ConfigError: an explicit value is below 1, names an unknown stage, asks for a batch size above the
-            model's largest, or enables CUDA graphs on a platform without capture.
+        ConfigError: an explicit value is below 1, names an unknown stage, or enables CUDA graphs on a platform
+            without capture, or an applied batch limit exceeds the model's largest size.
         ValueError: the bundled tuned table is malformed.
     """
     explicit = explicit or ExplicitSettings()
@@ -340,15 +340,22 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
 
     for stage in stages:
         allowed = sorted(set(capabilities.batch_sizes.get(stage, (1,))) | {1})
-        if stage in explicit.max_batch:
-            limit = _positive(f"max_batch.{stage}", explicit.max_batch[stage])
+        limits, source = explicit.max_batch, "explicit"
+        if stage not in limits and allowed[-1] > 1 and tuned is not None:
+            limits, source = tuned.max_batch, tuned.source
+        if stage in limits:
+            limit = _positive(f"max_batch.{stage}", limits[stage])
             if limit > allowed[-1]:
                 raise ConfigError(f"stage {stage} supports batch sizes {allowed}, not {limit}")
-            out[f"batch_sizes.{stage}"] = Setting([b for b in allowed if b <= limit], "explicit")
+            out[f"batch_sizes.{stage}"] = Setting([b for b in allowed if b <= limit], source)
         elif allowed == [1]:
             out[f"batch_sizes.{stage}"] = Setting([1], "model:declares B1 only")
         else:
-            out[f"batch_sizes.{stage}"] = Setting(allowed, "model:declared sizes")
+            defaults = sorted(set(getattr(capabilities, "default_batch_sizes", {}).get(stage, allowed)) | {1})
+            if not set(defaults).issubset(allowed):
+                raise ConfigError(f"stage {stage} default batch sizes {defaults} exceed supported sizes {allowed}")
+            out[f"batch_sizes.{stage}"] = Setting(defaults, "model:default sizes" if defaults != allowed
+                                                   else "model:declared sizes")
 
     if explicit.cudagraphs is not None:
         if explicit.cudagraphs and not platform.capabilities.cudagraphs:

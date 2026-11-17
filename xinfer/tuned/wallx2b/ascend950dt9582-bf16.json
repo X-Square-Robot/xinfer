@@ -1,0 +1,14 @@
+{
+  "model": "wallx2b",
+  "arch": "ascend950dt9582",
+  "quantization": "bf16",
+  "max_batch": {
+    "action": 2
+  },
+  "measured": {
+    "commit": "675ce9653cf6c0e149a825507ccc2cbe6fa15036",
+    "date": "2026-11-18",
+    "method": "Two rounds per fleet tier with CPU image processing and synthetic RTC",
+    "evidence": "docs/performance.md#ascend-950dt"
+  }
+}

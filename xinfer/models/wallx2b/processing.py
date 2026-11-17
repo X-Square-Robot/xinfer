@@ -11,6 +11,7 @@ The exact-length configuration is tested against that service bit for bit.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,9 +23,12 @@ import torch
 from xinfer.models.layers.vision.qwen3_5_vit import vision_layout
 from xinfer.models.interface import BucketSpec, PreparedRequest
 from xinfer.models.processing import (
+    _view_pool,
+    _wirefast,
     SegmentTokenizer,
     check_image_preprocess_device,
     device_image,
+    device_images_ready,
     is_jpeg,
     map_views,
     source_size,
@@ -41,6 +45,11 @@ from xinfer.models.wallx.processing import (
 )
 from xinfer.models.wallx2b.config import ACTION_TOKEN, ACTION_TOKEN_ID, PROPRI_TOKEN, PROPRI_TOKEN_ID, Wallx2bConfig
 
+try:
+    from xinfer import _preparefast
+except ImportError:  # optional host extension
+    _preparefast = None
+
 IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
@@ -52,6 +61,29 @@ _OPTIONAL_STATE = {"velocity_decomposed": "velocity_decomposed", "height": "lift
 # Action dims the desktop robot never commands.
 _DESKTOP_MASKED_DOF = ("velocity_decomposed", "height", "head_actions")
 _ARMS = (("left", "follow1_pos"), ("right", "follow2_pos"))
+
+
+def _wire_view_fast(value):
+    """``wire_view`` with the GIL released for the wire decodes (the 2B-HOST port of the r11 knife A).
+
+    The base64 decode of a view is a single C call that holds the GIL for its whole
+    execution, so the view pool's parallelism is nominal and the device tickets are not
+    put until late in prepare (probe-timeline-r10, wall_oss lineage). The built
+    ``_wirefast`` helper decodes canonical base64 and copies bytes-like buffers under
+    ``Py_BEGIN_ALLOW_THREADS``; anything it declines falls back to ``wire_view``, so the
+    decoded values are equal by construction. Arrays take ``wire_view`` unchanged.
+    """
+    if isinstance(value, str):
+        if _wirefast is not None:
+            decoded = _wirefast.b64decode(value)
+            if decoded is not None:
+                return decoded
+    elif isinstance(value, (bytearray, memoryview)):
+        if _wirefast is not None:
+            copied = _wirefast.to_bytearray(value)
+            if copied is not None:
+                return copied
+    return wire_view(value)
 
 
 @dataclass(frozen=True)
@@ -362,6 +394,7 @@ class Wallx2bInputProcessor:
     """
 
     def __init__(self, checkpoint: str | Path, model_config: Wallx2bConfig, config: ProcessingConfig | None = None):
+        self._image_prefetch = None
         checkpoint = Path(checkpoint)
         self.config = processing_config(config)
         self.model_config = model_config
@@ -390,6 +423,33 @@ class Wallx2bInputProcessor:
             if key in _DESKTOP_MASKED_DOF:
                 self.dof_mask[:, :, start:start + dim] = 0.0
             start += dim
+        # Batched admission pins its own slab. Probe per-tensor pinning only when
+        # batching is disabled, since some frontend processes have no accelerator.
+        self._pin_prepared = False
+        if os.environ.get("XINFER_UPLOAD_BATCH", "1") in ("0", "false", "False"):
+            try:
+                self._pin_prepared = torch.zeros(1).pin_memory() is not None
+            except (RuntimeError, MemoryError):
+                pass
+        self._pin_cpp = None
+        if self._pin_prepared:
+            try:
+                from xinfer import _pincpp
+            except ImportError:
+                pass
+            else:
+                out = _pincpp.pin_batch({"probe": torch.zeros(1), "host": "x"})
+                if out["probe"].is_pinned() and out["host"] == "x":
+                    self._pin_cpp = _pincpp.pin_batch
+        # PREPARE-C PC2: the state digitize bins and the float64 normalization
+        # statistics are frozen per config; precompute them once instead of per
+        # request (same values numpy recomputed every call).
+        self._state_bins = np.linspace(-1, 1, model_config.state_bins + 1)[:-1]
+        self._state_min64 = model_config.state_norm.min.astype(np.float64)
+        self._state_delta64 = model_config.state_norm.delta.astype(np.float64)
+
+    def bind_image_prefetch(self, prefetch) -> None:
+        self._image_prefetch = prefetch
 
     def _normalize_state(self, x: np.ndarray) -> np.ndarray:
         """``(x - min) / delta · 2 - 1`` in float64, clamped to ``[-1, 1]`` when the checkpoint clamps."""
@@ -500,13 +560,55 @@ class Wallx2bInputProcessor:
 
         if self.config.image_preprocess_device == "gpu":
             # JPEG bytes go to the device decoder; other encodings are decoded here and resized on the device.
-            images = [wire_view(wire(camera)) for camera in c.cameras]
-            images = [image if isinstance(image, np.ndarray) or is_jpeg(image) else decode_image(image)
-                      for image in images]
-            sizes = [resize_sizes(*source_size(image), c.resolution.get(camera.view, -1), c)
-                     for image, camera in zip(images, c.cameras)]
-            images = [device_image(image, size, DEVICE_RESIZE) for image, size in zip(images, sizes)]
-            shapes = [size[-1] for size in sizes]
+            # Per-view handoff (the 2B-HOST port of the walloss r10/r11 prepare knives): every wire
+            # decode runs in the view pool through _wire_view_fast, which releases the GIL for the
+            # base64 decode, and each result is waited for in camera order (each wait also
+            # releases the GIL); device_image then claims a per-view prefetch slot and hands the
+            # view to the engine's device-image thread immediately, so the DVPP chain overlaps
+            # the remaining host prepare (state, prompt, tokenizer, positions) instead of
+            # running after it. Same decodes, same sizes, same values, camera order.
+            pool = _view_pool()
+            # HOST-GAP K6: the whole per-view chain (wire decode, size, device_image, prefetch
+            # ticket) runs inside the pool worker. The ticket used to be claimed after the main
+            # thread waited for the view (ticket0 ~0.6 ms into prepare, timeline probe
+            # 2026-11-15), serializing the DVPP wave behind the main thread GIL bursts; from
+            # the worker the ticket goes out as soon as that view bytes exist, the wave starts
+            # ~0.4 ms earlier and its tail no longer pokes into the engine window. claim and
+            # submit are lock-guarded, every helper in the chain is a pure function, and the
+            # results are still consumed in camera order with the same values.
+            def handoff(camera):
+                value = wire(camera)
+                # PREPARE-C PC4: the wire decode, the JPEG header scan and both
+                # smart_resize calls of this worker chain in one GIL-releasing C
+                # call (b64 already ran GIL-released via _wirefast; this also
+                # removes the python wrapper, is_jpeg, jpeg_size's python marker
+                # walk and resize_sizes' arithmetic from the pool worker, whose
+                # GIL slices serialize the wave's ticket handoffs). device_image
+                # (frombuffer + prefetch ticket) stays python. None = the python
+                # chain below unchanged, byte for byte.
+                if _preparefast is not None:
+                    fast = _preparefast.handoff(value, c.resolution.get(camera.view, -1),
+                                                c.resize_factor, c.resize_min_pixels,
+                                                c.resize_max_pixels, c.patch_size * c.merge_size,
+                                                c.min_pixels, c.max_pixels)
+                    if fast is not None:
+                        data, _src, size = fast
+                        return device_image(data, size, DEVICE_RESIZE, prefetch=self._image_prefetch), size[-1]
+                image = _wire_view_fast(value)
+                if not (isinstance(image, np.ndarray) or is_jpeg(image)):
+                    image = decode_image(image)
+                size = resize_sizes(*source_size(image), c.resolution.get(camera.view, -1), c)
+                return device_image(image, size, DEVICE_RESIZE, prefetch=self._image_prefetch), size[-1]
+
+            futures = [pool.submit(handoff, camera) for camera in c.cameras]
+            images, shapes = [], []
+            for future in futures:
+                image, shape = future.result()
+                images.append(image)
+                shapes.append(shape)
+            # Close this request's hand-over: the device-image thread starts the views' decode
+            # wave now, before the request's admission item reaches it.
+            device_images_ready(self._image_prefetch)
         else:
             images = [torch.from_numpy(image) for image in map_views(
                 lambda camera: resize_view(decode_view(wire(camera)), c.resolution.get(camera.view, -1), c), c.cameras)]
@@ -515,10 +617,24 @@ class Wallx2bInputProcessor:
 
         # State: normalized, then binned into the prompt.
         agent_pos, agent_mask, arms = build_state(state, c)
-        proprio = self._normalize_state(agent_pos)[None]  # [1, 1, state_dim]
-        digits = np.digitize(proprio, np.linspace(-1, 1, c.state_bins + 1)[:-1]) - 1
-        values = digits[0, 0][agent_mask[0] != 0]
-        state_text = " ".join(map(str, values))
+        # PREPARE-C PC2: normalize + digitize + state_text in one GIL-releasing C
+        # call (same float64 arithmetic in numpy's op order, digitize's
+        # searchsorted-'right' semantics, str()'s digits). None = run the python
+        # path below unchanged.
+        state_fast = None
+        if _preparefast is not None:
+            state_fast = _preparefast.state_text(agent_pos, agent_mask, self._state_min64,
+                                                 self._state_delta64, self._state_bins,
+                                                 c.clamp_normalized)
+        if state_fast is not None:
+            state_text, values, n_values, sum_digits = state_fast
+        else:
+            proprio = self._normalize_state(agent_pos)[None]  # [1, 1, state_dim]
+            digits = np.digitize(proprio, self._state_bins) - 1
+            values = digits[0, 0][agent_mask[0] != 0]
+            state_text = " ".join(map(str, values))
+            n_values = len(values)
+            sum_digits = sum(len(str(abs(v))) for v in values)
 
         token_ids = np.asarray(self._tokenize(self._prompt(" ".join(words), state_text, grids)), dtype=np.int64)[None]
         if token_ids.shape[1] > c.max_seq_length:
@@ -533,7 +649,6 @@ class Wallx2bInputProcessor:
         else:
             noise = torch.randn((1, h, d), generator=self._noise)
         p, h = prompt_len, c.action_horizon
-        positions = mrope_position_ids(token_ids, grids, c.image_token_id, c.merge_size)  # [3, 1, P + H]
         delay = 0
         rtc_actions = None
         if rtc is not None:
@@ -541,40 +656,94 @@ class Wallx2bInputProcessor:
             # The reference state of the prefix is the float32 wire pose, unlike the float64 prompt state.
             reference = np.concatenate([arms["left"], arms["right"]]).astype(np.float32)
             rtc_actions = self._normalize_prefix(rtc_prefix(poses, reference, c))
-        # Action rows after the pinned RTC rows (all rows without RTC) skip rtc_rope_gap positions; pinned rows do
-        # not see the other action rows.
-        action_positions = positions[..., p:].copy()
-        action_positions[..., delay:] += c.rtc_rope_gap
-        action_mask = np.ones((1, 1, h, p + h), dtype=bool)
-        action_mask[0, 0, :delay, p + delay:] = False
         layout = vision_layout(grids, c.model.vision)
-        tensors = dict(
-            input_ids=torch.from_numpy(token_ids[:, :p]),
-            position_ids=torch.from_numpy(positions[..., :p].copy()),
-            **{f"image_{i}": image for i, image in enumerate(images)},
-            vision_positions=layout["positions"],
-            vision_pos_index=layout["pos_index"],
-            vision_pos_weight=layout["pos_weight"],
-            vision_cu_seqlens=layout["cu_seqlens"],
-            image_token_index=torch.from_numpy(np.flatnonzero(token_ids[0, :p] == c.image_token_id)),
-            prompt_len=p,
-            prompt_valid=torch.tensor([p]),
-            dof_mask=torch.from_numpy(self.dof_mask.astype(np.float32)),
-            dof_mask_all=bool(self.dof_mask.all()),
-            padding_action=torch.from_numpy(self.padding_action.copy()),
-            noise=noise,
-            action_positions=torch.from_numpy(action_positions),
-            action_mask=torch.from_numpy(action_mask),
-        )
-        if rtc_actions is not None:
-            padded = np.zeros((1, h, c.action_dim), dtype=np.float32)
-            padded[0, :delay] = rtc_actions
-            tensors["rtc_actions"] = torch.from_numpy(padded)
-            tensors["inference_delay"] = torch.tensor([delay], dtype=torch.int64)
+        # PREPARE-C PC1: mrope + action positions/mask + pad_prompt + rtc zero-pad
+        # + image_token_index in one GIL-releasing C call that returns the FINAL
+        # padded arrays (K4's integer walk, K3's padding values, the RTC pattern),
+        # fresh per request exactly as the python path built them. None = the
+        # python path below runs unchanged (and pads after building the dict).
+        tail = None
+        if _preparefast is not None:
+            tail = _preparefast.tail(token_ids, c.image_token_id, c.merge_size, grids, delay,
+                                     c.rtc_rope_gap, self.bucket.width(p), rtc_actions, p, h)
+        if tail is not None:
+            tensors = dict(
+                input_ids=torch.from_numpy(tail["input_ids"]),
+                position_ids=torch.from_numpy(tail["position_ids"]),
+                **{f"image_{i}": image for i, image in enumerate(images)},
+                vision_positions=layout["positions"],
+                vision_pos_index=layout["pos_index"],
+                vision_pos_weight=layout["pos_weight"],
+                vision_cu_seqlens=layout["cu_seqlens"],
+                image_token_index=torch.from_numpy(tail["image_token_index"]),
+                prompt_len=self.bucket.width(p),
+                prompt_valid=torch.from_numpy(tail["prompt_valid"]),
+                dof_mask=torch.from_numpy(self.dof_mask.astype(np.float32)),
+                dof_mask_all=bool(self.dof_mask.all()),
+                padding_action=torch.from_numpy(self.padding_action.copy()),
+                noise=noise,
+                action_positions=torch.from_numpy(tail["action_positions"]),
+                action_mask=torch.from_numpy(tail["action_mask"]),
+            )
+            if "rtc_actions" in tail:
+                tensors["rtc_actions"] = torch.from_numpy(tail["rtc_actions"])
+                tensors["inference_delay"] = torch.tensor([delay], dtype=torch.int64)
+            padded = tensors  # already padded to the bucket width
+        else:
+            positions = mrope_position_ids(token_ids, grids, c.image_token_id, c.merge_size)  # [3, 1, P + H]
+            # Action rows after the pinned RTC rows (all rows without RTC) skip rtc_rope_gap positions; pinned rows do
+            # not see the other action rows.
+            action_positions = positions[..., p:].copy()
+            action_positions[..., delay:] += c.rtc_rope_gap
+            action_mask = np.ones((1, 1, h, p + h), dtype=bool)
+            action_mask[0, 0, :delay, p + delay:] = False
+            tensors = dict(
+                input_ids=torch.from_numpy(token_ids[:, :p]),
+                position_ids=torch.from_numpy(positions[..., :p].copy()),
+                **{f"image_{i}": image for i, image in enumerate(images)},
+                vision_positions=layout["positions"],
+                vision_pos_index=layout["pos_index"],
+                vision_pos_weight=layout["pos_weight"],
+                vision_cu_seqlens=layout["cu_seqlens"],
+                image_token_index=torch.from_numpy(np.flatnonzero(token_ids[0, :p] == c.image_token_id)),
+                prompt_len=p,
+                prompt_valid=torch.tensor([p]),
+                dof_mask=torch.from_numpy(self.dof_mask.astype(np.float32)),
+                dof_mask_all=bool(self.dof_mask.all()),
+                padding_action=torch.from_numpy(self.padding_action.copy()),
+                noise=noise,
+                action_positions=torch.from_numpy(action_positions),
+                action_mask=torch.from_numpy(action_mask),
+            )
+            if rtc_actions is not None:
+                padded = np.zeros((1, h, c.action_dim), dtype=np.float32)
+                padded[0, :delay] = rtc_actions
+                tensors["rtc_actions"] = torch.from_numpy(padded)
+                tensors["inference_delay"] = torch.tensor([delay], dtype=torch.int64)
+            padded = pad_prompt(tensors, self.bucket.width(p))
         # The -1 sentinel shares its sign with the separator token; only digit tokens vary.
-        length_range = text_length_range(p, sum(len(str(abs(v))) for v in values), len(values),
+        length_range = text_length_range(p, sum_digits, n_values,
                                           max_tokens=len(str(c.state_bins - 1)), max_length=self.bucket.max_length)
-        return PreparedRequest(pad_prompt(tensors, self.bucket.width(p)),
+        # HOST-GAP K5: pin the prepared CPU tensors here, inside the DVPP wave window the
+        # prefetch tickets opened (prepare overlaps the device decode), instead of at engine
+        # admission where _to_device pinned them one by one on the engine thread (~0.2 ms of
+        # GIL bursts between the wave end and the vision dispatch; timeline probe 2026-11-15).
+        # pin_memory returns fresh pinned tensors, so the shared cached vision_layout tensors
+        # are copied, never mutated; admission then uploads with non_blocking copies only.
+        # PREPARE-C PC3: _pincpp.pin_batch runs the same ATen pin_memory() per
+        # tensor with the GIL released (the python loop held it ~0.5 ms/request,
+        # probe start.gilphase 2026-11-15); probed at construction, python loop
+        # as the fallback.
+        if self._pin_prepared:
+            if self._pin_cpp is not None:
+                prepared_tensors = self._pin_cpp(padded)
+            else:
+                prepared_tensors = {name: (value.pin_memory() if torch.is_tensor(value)
+                                           and value.device.type == "cpu" and not value.is_pinned() else value)
+                                    for name, value in padded.items()}
+        else:
+            prepared_tensors = padded
+        return PreparedRequest(prepared_tensors,
                                dict(arms=arms, inference_delay=delay, prompt_len_range=length_range))
 
 
@@ -617,6 +786,7 @@ class Wallx2bOutputProcessor:
                                                                                             c.action_dim)
         action = ((normalized[0] + 1) / 2) * c.action_norm.delta + c.action_norm.min
         response = {}
+        arms_f32 = []
         for side, key in _ARMS:
             state = request.meta["arms"][side]
             position = state[None, 0:3] + action[:, self._segments[f"{side}_ee_cartesian_pos_relative"]]
@@ -629,8 +799,12 @@ class Wallx2bOutputProcessor:
             if not np.isfinite(arm).all():
                 raise FloatingPointError(f"non-finite {key}")
             response[key] = arm.tolist()
+            arms_f32.append(arm)
         response["predict_action_norm"] = normalized
-        response["action_pred"] = np.concatenate(
-            [np.asarray(response["follow1_pos"], dtype=np.float32), np.asarray(response["follow2_pos"], np.float32)],
-            axis=-1)
+        # HOST-FINAL HF1a: concatenate the arm arrays themselves instead of the
+        # list round trip. tolist boxes float32 values as exact python floats,
+        # and np.asarray(..., float32) casts them straight back -- a lossless
+        # round trip, so values, dtype and layout are bitwise identical to the
+        # lists it used to rebuild (~12 us per request).
+        response["action_pred"] = np.concatenate(arms_f32, axis=-1)
         return response

@@ -18,6 +18,32 @@ class ThreeStage(VLAModel):
         return Capabilities(num_steps=5, batch_sizes={"vision": (1,), "prefill": (1,), "action": (1, 2, 4)})
 
 
+def test_batch_limits_use_explicit_then_tuned_then_conservative_defaults():
+    class Conservative(ThreeStage):
+        def capabilities(self):
+            return Capabilities(num_steps=5, batch_sizes={"action": (1, 2, 4)},
+                                default_batch_sizes={"action": (1,)})
+
+    model = Conservative()
+    assert resolve(model, _platform(), model_name="m", tuned=None).value("batch_sizes.action") == [1]
+    table = TunedTable("m/sm120-bf16", measured={"commit": "abc1234"}, max_batch={"action": 4, "vision": 4})
+    tuned = resolve(model, _platform(), model_name="m", tuned=table)
+    assert tuned.value("batch_sizes.action") == [1, 2, 4]
+    assert tuned.settings["batch_sizes.action"].source == "tuned:m/sm120-bf16@abc1234"
+    assert tuned.value("batch_sizes.vision") == [1]
+    assert tuned.settings["batch_sizes.vision"].source == "model:declares B1 only"
+    assert tuned.engine_config().max_batch == {"vision": 1, "prefill": 1, "action": 4}
+    explicit = resolve(model, _platform(), model_name="m", tuned=table,
+                       explicit=ExplicitSettings(max_batch={"action": 2}))
+    assert explicit.value("batch_sizes.action") == [1, 2]
+    assert explicit.settings["batch_sizes.action"].source == "explicit"
+    with pytest.raises(ConfigError, match="stage vision supports batch sizes"):
+        resolve(model, _platform(), model_name="m", tuned=table,
+                explicit=ExplicitSettings(max_batch={"vision": 4}))
+    with pytest.raises(ConfigError, match="stage action supports batch sizes"):
+        resolve(model, _platform(), model_name="m", tuned=TunedTable("m/sm120-bf16", max_batch={"action": 8}))
+
+
 def _platform(cudagraphs=True, arch="sm120"):
     capabilities = PlatformCapabilities(device_type="cuda" if cudagraphs else "cpu", arch=arch, cudagraphs=cudagraphs,
                         stream_priorities=cudagraphs, unified_memory=False, multiprocess_service=None, sm_count=170,
@@ -116,13 +142,22 @@ def test_tuned_tables_load_with_provenance(tmp_path):
     (tmp_path / "m").mkdir()
     (tmp_path / "m" / "sm120-mxfp8.json").write_text(json.dumps({
         "model": "m", "arch": "sm120", "quantization": "mxfp8", "lanes": {"vision": 2, "prefill": 2, "action": 2},
+        "max_batch": {"action": 4},
         "measured": {"commit": "abc1234", "date": "2026-11-01", "method": "test", "evidence": "none"}}))
-    assert find_tuned("m", "sm120", "mxfp8", root=tmp_path).lanes == {"vision": 2, "prefill": 2, "action": 2}
+    table = find_tuned("m", "sm120", "mxfp8", root=tmp_path)
+    assert table.lanes == {"vision": 2, "prefill": 2, "action": 2}
+    assert table.max_batch == {"action": 4}
     assert find_tuned("m", "sm110", "mxfp8", root=tmp_path) is None
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"model": "m", "arch": "sm120", "quantization": "bf16", "measured": {"commit": "x"}}))
     with pytest.raises(ValueError, match="measured"):
         load_tuned(bad)
+
+
+@pytest.mark.parametrize("limit", [0, True, 2.5, "4"])
+def test_tuned_batch_limits_require_positive_integers(limit):
+    with pytest.raises(ValueError, match="max_batch must map stage names to positive integers"):
+        TunedTable("m/sm120-bf16", max_batch={"action": limit})
 
 
 def test_stream_priorities_put_the_final_stage_first_and_preserve_explicit_values(tmp_path):
@@ -173,7 +208,8 @@ def test_policy_consumes_stream_priorities_as_runtime_settings(monkeypatch):
 
     monkeypatch.setattr(policy_module, "get_model_class", lambda name: SimpleNamespace(from_checkpoint=load))
     monkeypatch.setattr(policy_module.ops.registry, "load_plugins", lambda: None)
-    monkeypatch.setattr(policy_module, "Engine", lambda model, platform, config: SimpleNamespace(config=config))
+    monkeypatch.setattr(policy_module, "Engine", lambda model, platform, config, **kwargs:
+                        SimpleNamespace(config=config, image_prefetch=None))
     policy = policy_module.Policy("test", "unused", device="cpu", stream_priorities={"action": 0}, scale=3)
     assert received_options == [{"scale": 3}]
     assert policy.engine.config.stream_priorities == {"vision": 0, "prefill": 0, "action": 0}

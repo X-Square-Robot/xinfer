@@ -85,6 +85,21 @@ def test_parse_rtc_follows_the_desktop_protocol(config):
     assert parse_rtc(far, config)[1] == 3
 
 
+@pytest.mark.parametrize("column", [6, 13])
+def test_rtc_gripper_limit_is_five_on_pinned_rows(config, column):
+    from xinfer.models.wallx2b.processing import parse_rtc
+
+    observation = _rtc(H)
+    observation["prev_action_chunk"][1, column] = 5.0
+    assert parse_rtc(observation, config)[1] == 3
+    observation["prev_action_chunk"][1, column] = np.nextafter(np.float32(5.0), np.float32(np.inf))
+    with pytest.raises(ValueError, match="exceed 5.0"):
+        parse_rtc(observation, config)
+    observation["prev_action_chunk"][1, column] = 0
+    observation["prev_action_chunk"][3, column] = 5.3
+    assert parse_rtc(observation, config)[1] == 3
+
+
 def test_rtc_prefix_and_response_compose_back_to_the_pinned_poses(config):
     """Absolute poses → relative actions → normalized → response poses gives the poses back."""
     from xinfer.models.wallx2b.processing import Wallx2bOutputProcessor, rtc_prefix

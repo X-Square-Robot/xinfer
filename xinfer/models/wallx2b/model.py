@@ -39,6 +39,8 @@ from xinfer.ops import active_ops
 
 TIME_EMBED_MAX_PERIOD = 10000.0
 
+_ROPE_TABLE_CACHE_MAX = 128
+
 
 class FlowHead(nn.Module):
     """The action projection, flow-time condition and readout (wall-x ``ActionProcessor``, AdaRMS variant).
@@ -86,6 +88,7 @@ class Wallx2b(WallXQwen35):
     action expert: ``FlowHead``, the action stage with RTC and the processing.
     """
 
+    batch_axes = {"action_positions": 1}
     config_class = Wallx2bConfig
 
     @property
@@ -142,17 +145,61 @@ class Wallx2b(WallXQwen35):
             self.config.max_seq_length - self.config.action_horizon)}
 
     def capabilities(self) -> Capabilities:
-        """One request per dispatch in every stage; ``config.num_steps`` Euler steps."""
+        """One request by default; optimized action batching is selected explicitly."""
         stage_ops = self.stage_ops
         if self.numerics == "optimized":
             stage_ops = dict(OPTIMIZED_STAGE_OPS, vision=self.vision.stage_ops, prefill=self.prefill_stack.stage_ops)
-        return Capabilities(batch_sizes={"vision": (1,), "prefill": (1,), "action": (1,)},
-                            num_steps=self.config.num_steps, stage_ops=stage_ops)
+        batches = (1, 2, 4) if self.numerics == "optimized" else (1,)
+        return Capabilities(batch_sizes={"vision": (1,), "prefill": (1,), "action": batches},
+                            num_steps=self.config.num_steps, stage_ops=stage_ops,
+                            default_batch_sizes={"action": (1,)})
 
     def action_outputs(self, batch):
         """``predict_action_norm`` ``[B, H, D]`` FP32, the actions in normalized units."""
         c = self.config
         return {"predict_action_norm": OutputSpec((batch.batch_size, c.action_horizon, c.action_dim), torch.float32)}
+
+    def derive_stage_inputs(self, cpu_tensors, dev_inputs):
+        """Reuse this model's rotary tables as request inputs refreshed before graph replay."""
+        import os
+
+        if ("tablecache" not in os.environ.get("XINFER_GQA_GLUE", "")
+                or self.numerics != "optimized"):
+            return None
+        out = {}
+        for pos_name, tag in (("position_ids", ""), ("action_positions", "action_")):
+            pos_cpu = cpu_tensors.get(pos_name)
+            pos_dev = dev_inputs.get(pos_name)
+            if not torch.is_tensor(pos_cpu) or not torch.is_tensor(pos_dev) or pos_cpu.dim() != 3:
+                continue
+            if (pos_cpu.device.type != "cpu" or pos_dev.device.type != "npu"
+                    or tuple(pos_dev.shape) != tuple(pos_cpu.shape)):
+                continue
+            pair = self._cached_rope_tables(pos_cpu, pos_dev)
+            out[tag + "rope_cos"], out[tag + "rope_sin"] = pair
+        return out or None
+
+    def _cached_rope_tables(self, positions_cpu, positions):
+        """Keep derived tensors on their model and device; a changed frequency buffer invalidates them."""
+        version = None if self.inv_freq.is_inference() else self.inv_freq._version
+        if (getattr(self, "_rope_cache_frequency", None) is not self.inv_freq
+                or getattr(self, "_rope_cache_version", None) != version):
+            self._rope_table_cache = {}
+            self._rope_cache_frequency = self.inv_freq
+            self._rope_cache_version = version
+        cache = self._rope_table_cache
+        m = self.config.model
+        half = m.rotary_dim // 2
+        key = (positions.device, positions_cpu.dtype, tuple(positions_cpu.shape),
+               positions_cpu.contiguous().numpy().tobytes(), half, tuple(m.mrope_section))
+        pair = cache.get(key)
+        if pair is None:
+            cos, sin = text_rope_tables(self.inv_freq, positions, m.mrope_section)
+            pair = (cos[:, :, 0, :half].contiguous(), sin[:, :, 0, :half].contiguous())
+            if len(cache) >= _ROPE_TABLE_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+            cache[key] = pair
+        return pair
 
     # ----------------------------------------------------------------- stages
     def denoise(self, batch):
@@ -180,8 +227,26 @@ class Wallx2b(WallXQwen35):
         x, c, m = batch.inputs, self.config, self.config.model
         kv = x["prompt_kv"]
         if self.numerics == "optimized":
-            cos, sin = text_rope_tables(self.inv_freq, x["action_positions"], m.mrope_section)
             half = m.rotary_dim // 2
+            # Prepared rotary tables skip rebuilding them inside the action graph.
+            rc = x["action_rope_cos"] if "action_rope_cos" in x else None
+            rs = x["action_rope_sin"] if "action_rope_sin" in x else None
+            if (torch.is_tensor(rc) and torch.is_tensor(rs)
+                    and rc.dtype == rs.dtype == torch.float32
+                    and rc.is_contiguous() and rs.is_contiguous()
+                    and tuple(rs.shape) == tuple(rc.shape)
+                    and tuple(rc.shape) == (kv.shape[2], x["action_positions"].shape[-1], half)
+                    and rc.device == kv.device):
+                if batch.batch_size > 1:
+                    self.action.forward_batch(x, kv, rc, rs, batch.out["predict_action_norm"])
+                else:
+                    self.action(x, kv, rc[0], rs[0], batch.out["predict_action_norm"])
+                return
+            cos, sin = text_rope_tables(self.inv_freq, x["action_positions"], m.mrope_section)
+            if batch.batch_size > 1:
+                self.action.forward_batch(x, kv, cos[:, :, 0, :half].contiguous(),
+                                          sin[:, :, 0, :half].contiguous(), batch.out["predict_action_norm"])
+                return
             self.action(x, kv, cos[0, :, 0, :half].contiguous(), sin[0, :, 0, :half].contiguous(),
                         batch.out["predict_action_norm"])
             return

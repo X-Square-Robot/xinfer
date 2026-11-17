@@ -26,11 +26,19 @@ class TunedTable:
         name: ``"<model>/<arch>-<quantization>"``.
         lanes: measured best lanes per stage name.
         measured: provenance: at least ``commit``, ``date``, ``method`` and ``evidence``.
+        max_batch: measured batch-size limits per stage name.
     """
 
     name: str  # "<model>/<arch>-<quantization>"
     lanes: Mapping[str, int] = field(default_factory=dict)
     measured: Mapping[str, Any] = field(default_factory=dict)
+    max_batch: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_batch, Mapping) or any(
+            type(limit) is not int or limit < 1 for limit in self.max_batch.values()
+        ):
+            raise ValueError("tuned max_batch must map stage names to positive integers")
 
     @property
     def source(self) -> str:
@@ -43,7 +51,7 @@ def load_tuned(path: str | Path) -> TunedTable:
 
     The file must have ``model``, ``arch``, ``quantization`` and ``measured``
     (with ``commit``, ``date``, ``method`` and ``evidence``); it may have
-    ``lanes`` and ``notes``, and nothing else.
+    ``lanes``, ``max_batch`` and ``notes``, and nothing else.
 
     Args:
         path: the JSON file (``--tuned <path>`` or a bundled table).
@@ -60,7 +68,7 @@ def load_tuned(path: str | Path) -> TunedTable:
     missing = [k for k in REQUIRED if k not in data]
     if missing:
         raise ValueError(f"tuned table {path} lacks {missing}")
-    known = set(REQUIRED) | {"lanes", "notes"}
+    known = set(REQUIRED) | {"lanes", "max_batch", "notes"}
     extra = set(data) - known
     if extra:
         raise ValueError(f"tuned table {path} has unknown keys {sorted(extra)}")
@@ -68,7 +76,8 @@ def load_tuned(path: str | Path) -> TunedTable:
         if key not in data["measured"]:
             raise ValueError(f"tuned table {path}: measured.{key} is required")
     return TunedTable(name=f"{data['model']}/{data['arch']}-{data['quantization']}",
-                      lanes={k: int(v) for k, v in data.get("lanes", {}).items()}, measured=data["measured"])
+                      lanes={k: int(v) for k, v in data.get("lanes", {}).items()}, measured=data["measured"],
+                      max_batch=data.get("max_batch", {}))
 
 
 def find_tuned(model: str, arch: str | None, quantization: str | None, root: Path = TUNED_ROOT) -> TunedTable | None:

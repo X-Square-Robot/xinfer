@@ -75,6 +75,53 @@ def test_segment_tokenizer_matches_the_tokenizer():
         assert segments(text) == tokenizer.encode(text, add_special_tokens=False).ids
 
 
+@pytest.mark.parametrize("added", [False, True])
+def test_number_cache_declines_byte_level_bpe_boundaries(added):
+    tokenizers = pytest.importorskip("tokenizers")
+    byte_level = tokenizers.pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.BPE())
+    tokenizer.pre_tokenizer = byte_level
+    text = "State: 12 345 678 901"
+    tokenizer.train_from_iterator([text] * 100, tokenizers.trainers.BpeTrainer(
+        vocab_size=400, initial_alphabet=byte_level.alphabet()))
+    if added:
+        tokenizer.add_tokens(["<|image_pad|>"])
+    segments = SegmentTokenizer(tokenizer)
+    assert segments(text) == tokenizer.encode(text, add_special_tokens=False).ids
+    assert not segments._hl1
+
+
+@pytest.mark.parametrize("marks", [False, True])
+@pytest.mark.parametrize("normalization", [None, "NFC", "NFKC"])
+def test_qwen_number_cache_preserves_tokenizer_boundaries(marks, normalization, monkeypatch):
+    tokenizers = pytest.importorskip("tokenizers")
+    monkeypatch.delenv("XINFER_HL1_NUMCACHE", raising=False)
+    letters = r"[\p{L}\p{M}]+" if marks else r"\p{L}+"
+    punctuation = r"[^\s\p{L}\p{M}\p{N}]+" if marks else r"[^\s\p{L}\p{N}]+"
+    pattern = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?" + letters
+               + r"|\p{N}| ?" + punctuation + r"[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+    tokenizer = tokenizers.Tokenizer(tokenizers.models.BPE())
+    if normalization is not None:
+        tokenizer.normalizer = getattr(tokenizers.normalizers, normalization)()
+    byte_level = tokenizers.pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    tokenizer.pre_tokenizer = tokenizers.pre_tokenizers.Sequence([
+        tokenizers.pre_tokenizers.Split(tokenizers.Regex(pattern), behavior="isolated"), byte_level])
+    texts = [
+        "State: 0 1 42 999", "0 1 42 999", " 0 1 42 999", "State: 01 234 5678 99999\nNext",
+        "State:  0 1 42 999", "State:\t 0 1 42 999", "State:\n  0 1 42 999\n",
+        "State: ０ 1 42 999\n", "状态: 0 1 42 999\n", "e\u0301: 0 1 42 999\n",
+    ]
+    tokenizer.train_from_iterator(texts * 10, tokenizers.trainers.BpeTrainer(
+        vocab_size=400, initial_alphabet=byte_level.alphabet()))
+    tokenizer.add_tokens(["<|image_pad|>"])
+    segments = SegmentTokenizer(tokenizer)
+    assert segments._hl1 == (normalization != "NFKC")
+    for text in texts:
+        assert segments(text) == tokenizer.encode(text, add_special_tokens=False).ids
+    if segments._hl1:
+        assert segments._num_token.cache_info().hits > 0
+
+
 def test_jpeg_size_reads_the_frame_header_without_decoding():
     cv2 = pytest.importorskip("cv2")
     image = np.zeros((37, 53, 3), np.uint8)

@@ -248,8 +248,8 @@ class Capabilities:
     settings; it and the engine call ``VLAModel.capabilities()`` once at startup.
 
     Attributes:
-        batch_sizes: per stage, the batch sizes its method accepts; the stage batches up to the largest by
-            default. Size 1 is always allowed; a stage missing from the mapping is treated as B1 only. A model
+        batch_sizes: per stage, the batch sizes its method accepts; absent a conservative default below,
+            the stage batches up to the largest. Size 1 is always allowed; a missing stage is B1 only. A model
             declares sizes above 1 only for a stage whose batched results pass its precision gate.
         num_steps: denoising steps of the action stage, as declared by the model (the v1 runtime
             does not read it).
@@ -257,6 +257,7 @@ class Capabilities:
         rtc_delay_range: inclusive range of accepted RTC inference delays, when ``rtc`` is True.
         stage_ops: per stage, the operators its method calls. ``Policy`` and ``xinfer-serve`` warn at startup
             when one of them has no backend kernel loaded and runs on a fused operator's torch reference.
+        default_batch_sizes: optional subset used when no explicit ``--max-batch`` is supplied.
     """
 
     batch_sizes: Mapping[str, tuple[int, ...]]
@@ -265,6 +266,8 @@ class Capabilities:
     rtc_delay_range: tuple[int, int] | None = None  # inclusive, when rtc is True
     # Operators each stage calls, for the startup check of slow fallbacks.
     stage_ops: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    # Optional conservative defaults; --max-batch may enable other supported sizes.
+    default_batch_sizes: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -323,11 +326,15 @@ class DeviceImage:
         sizes: ``(h, w)`` after each resize step; the last is the view's size.
         resize: per step, ``(mode, antialias)`` of ``torch.nn.functional.interpolate``. A step whose size differs
             from its input's runs in FP32 and stores uint8, rounding half up; a step of the same size is skipped.
+        prefetch: optional request-owned slot for an in-process decode. The processor's bound engine fills it
+            before admission; another engine cannot consume its codec transaction or stream-local result.
+            None keeps decoding at admission, including in device-free frontend processes.
     """
 
     data: Any
     sizes: tuple[tuple[int, int], ...]
     resize: tuple[tuple[str, bool], ...]
+    prefetch: Any = None
 
 
 @dataclass
@@ -386,6 +393,13 @@ def connect(processor: InputProcessor) -> InputProcessor:
     state, else ``processor``. ``xinfer serve`` calls it for every WebSocket connection, ``Policy`` once."""
     method = getattr(processor, "connect", None)
     return processor if method is None else method()
+
+
+def bind_image_prefetch(processor: InputProcessor, prefetch) -> None:
+    """Bind an optional in-process image queue to the processor that serves that engine."""
+    method = getattr(processor, "bind_image_prefetch", None)
+    if method is not None:
+        method(prefetch)
 
 
 class OutputProcessor(Protocol):
