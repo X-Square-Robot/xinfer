@@ -8,13 +8,13 @@ Wall-OSS 和 Wall-X 2B 的默认组合在 CUDA 上使用融合算子。它们的
 
 ## GPU 支持
 
-kernel 库针对一种 GPU 架构编译，只在这种架构上注册算子。本仓库目前有 SM120（RTX 50 系列）的 kernel。
+kernel 库针对一种 GPU 架构编译，只在这种架构上注册算子。本仓库有 SM120（RTX 50 系列）和 SM110（Jetson Thor）的 kernel。
 
-GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`）：在 RTX 5090 上实测不慢于 cuBLASLt 路径的行数区间。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
+GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`、`gemm_sm110.py`）：在 RTX 5090 上是实测不慢于 cuBLASLt 路径的行数区间；在 Jetson AGX Thor 上是连续三个或更多扫描点都快至少 5% 的行数区间，即测得[性能表](performance.zh-CN.md)数据时所用 xcompute 构建的选路，本库在参考请求上的输出与该构建逐位相同。在 SM110 上本库覆盖 Wall-OSS 和 Wall-X 2B 的 BF16 计算组合。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
 
 ## 编译
 
-编译需要 CUDA 13 工具链、CMake 3.24 或更高版本、`apache-tvm-ffi` Python 包和 CUTLASS 头文件（子模块）：
+编译需要 CUDA 13 工具链、CMake 3.24 或更高版本（SM110 需要 3.28）、`apache-tvm-ffi` Python 包和 CUTLASS 头文件（子模块）：
 
 ```bash
 git submodule update --init third_party/cutlass
@@ -23,7 +23,7 @@ cmake -S xinfer/ops/backends/cuda/src -B build/kernels
 cmake --build build/kernels -j
 ```
 
-产物是 `xinfer/ops/backends/cuda/xinfer_kernels.so`。目标架构取编译机器的第一块 GPU；在没有该 GPU 的机器上用 `-DXINFER_CUDA_ARCH=120` 指定。
+产物是 `xinfer/ops/backends/cuda/xinfer_kernels.so`。目标架构取编译机器的第一块 GPU；在没有该 GPU 的机器上用 `-DXINFER_CUDA_ARCH=120`（或 `110`）指定。
 
 ## 运行
 

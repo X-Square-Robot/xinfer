@@ -59,16 +59,16 @@ the shape, else the operator's torch reference. All BF16, like the reference.
 
 | Step | Operator | Kernel at this model's shapes |
 |---|---|---|
-| ViT and LM residual add + RMSNorm | `add_rms_norm` (`rms_norm` for the first norm) | xcompute `add_rmsnorm` / `rmsnorm` |
-| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` (`qk_order="any"`: Q and K only feed the attention) | `qkv_proj_rope` → cuBLASLt and a RoPE kernel; on SM110 `tcgen05_bf16_sm110` (Q and K in rotary-pair order) |
+| ViT and LM residual add + RMSNorm | `add_rms_norm` (`rms_norm` for the first norm) | `add_rmsnorm` / `rmsnorm` |
+| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` (`qk_order="any"`: Q and K only feed the attention) | `qkv_proj_rope` → cuBLASLt and a RoPE kernel; on SM110 `tcgen05_qkv_rope_bf16_sm110` (Q and K in rotary-pair order) |
 | ViT attention (windows, full blocks) | `varlen_attention` | flash-attention 2 |
 | ViT projection and MLP down (+ bias) + residual add + the next RMSNorm | `gemm_add_rms_norm` | `gemm` → cuBLASLt, `add_rmsnorm`; on integrated GPUs (Jetson Thor) `gemm` with the residual → cuBLASLt (β·C), `rmsnorm` |
 | Merger (+ bias; fc1 + GELU) | `gemm_epilogue` | `gemm` → cuBLASLt |
-| ViT gate/up + bias + SiLU-mul | `gemm_glu_epilogue` (`bias`) | `gemm_glu` → cuBLASLt and the SiLU-mul kernel |
+| ViT gate/up + bias + SiLU-mul | `gemm_glu_epilogue` (`bias`) | `gemm_glu` → cuBLASLt and the SiLU-mul kernel; on SM110 `tcgen05_glu_bf16_sm110` |
 | Expert-0 QKV + bias + M-RoPE, K/V written to the prompt K/V | `qkv_rope_kvcache` | `qkv_proj_rope` (`kv_cache`) → cuBLASLt and a RoPE kernel |
 | Expert-0 causal attention | `causal_attention` | flash-attention 2 |
 | Expert-0 output projection | `gemm_epilogue` | cuBLASLt |
-| Expert-0 MLP (gate/up + SiLU-mul, down) + residual add + the next RMSNorm | `mlp_add_rms_norm` | `gemm_glu` → `tma_streamk_bf16_sm120`, `gemm` → cuBLASLt, `add_rmsnorm`; on SM110 `fused_mlp` → `mcast_bf16_sm110` and `rmsnorm` for M 513–768, other M `gemm_glu` → `mcast_bf16_sm110`, `gemm` with the residual → `mcast_bf16_sm110` and `rmsnorm` |
+| Expert-0 MLP (gate/up + SiLU-mul, down) + residual add + the next RMSNorm | `mlp_add_rms_norm` | `gemm_glu` → `tma_streamk_bf16_sm120`, `gemm` → cuBLASLt, `add_rmsnorm`; on SM110 the fused MLP `mcast_mlp_bf16_sm110` and `rmsnorm` for M 520–768, other M `gemm_glu` → `mcast_glu_bf16_sm110`, `gemm` with the residual → `mcast_residual_bf16_sm110` and `rmsnorm` |
 | Action embedding (`ActionHead`, FP32) | `linear`, `silu` | cuBLAS (FP32) |
 | Expert-1 QKV + bias + M-RoPE + K/V append | `qkv_rope_kvcache` | `qkv_proj_rope` (`kv_cache`) → cuBLASLt and a RoPE kernel |
 | Expert-1 attention over the prompt K/V and the action keys | `prefix_kvcache_attention` | `attention_kvcache` → `splitkv` |

@@ -245,16 +245,26 @@ def action_attention(q, k, v, k_prompt, v_prompt, num_pinned, prompt_lengths=Non
 # ---------------------------------------------------------------------------
 # Kernels of this backend
 # ---------------------------------------------------------------------------
-# arch -> (query heads, KV heads, head dim) -> inclusive ranges of batch, M (query rows) and L (cache rows)
+# arch -> (query heads, KV heads, head dim) -> inclusive ranges of batch, M (query rows) and L (cache rows); a list of
+# such boxes where the measured ranges are not one box
 KVCACHE_SHAPES = {
-    120: {(16, 2, 128): dict(batch=(1, 8), m=(1, 32), l=(64, 1984)),
-          (8, 2, 256): dict(batch=(1, 2), m=(1, 32), l=(64, 1984))},
+    120: {(16, 2, 128): [dict(batch=(1, 8), m=(1, 32), l=(64, 1984))],
+          (8, 2, 256): [dict(batch=(1, 2), m=(1, 32), l=(64, 1984))]},
+    110: {(16, 2, 128): [dict(batch=(1, 1), m=(1, 32), l=(192, 2048))],
+          (8, 2, 256): [dict(batch=(1, 1), m=(1, 32), l=(128, 256)), dict(batch=(1, 1), m=(1, 16), l=(257, 832)),
+                        dict(batch=(1, 1), m=(1, 9), l=(833, 1280)), dict(batch=(1, 1), m=(2, 4), l=(1281, 2048))]},
+}
+# arch -> (query heads, KV heads, head dim) -> (L, keys per chunk up to that L, keys per chunk beyond): shorter caches
+# use smaller chunks so that every SM has work
+KVCACHE_CHUNKS = {
+    120: {(16, 2, 128): (576, 32, 64), (8, 2, 256): (576, 32, 64)},
+    110: {(16, 2, 128): (448, 64, 128), (8, 2, 256): (576, 32, 64)},
 }
 
 
-def _chunk(cache_rows):
-    """Keys per chunk: shorter caches use smaller chunks so that every SM has work."""
-    return 32 if cache_rows <= 576 else 64
+def _chunk(device_arch, heads, cache_rows):
+    limit, short, long = KVCACHE_CHUNKS[device_arch][heads]
+    return short if cache_rows <= limit else long
 
 
 def attention_kvcache_takes(q, k_cache) -> bool:
@@ -263,11 +273,9 @@ def attention_kvcache_takes(q, k_cache) -> bool:
         return False
     device_arch = arch(q.device)
     b, m, heads, d = q.shape
-    ranges = KVCACHE_SHAPES.get(device_arch, {}).get((heads, k_cache.shape[2], d)) if device_arch in BUILD_ARCHS else None
-    if ranges is None:
-        return False
-    return all(lo <= v <= hi for v, (lo, hi) in ((b, ranges["batch"]), (m, ranges["m"]),
-                                                   (k_cache.shape[1], ranges["l"])))
+    boxes = KVCACHE_SHAPES.get(device_arch, {}).get((heads, k_cache.shape[2], d)) if device_arch in BUILD_ARCHS else None
+    return any(all(lo <= v <= hi for v, (lo, hi) in ((b, box["batch"]), (m, box["m"]), (k_cache.shape[1], box["l"])))
+               for box in boxes or ())
 
 
 def attention_kvcache(q, k_cache, v_cache, *, prefix_len, new_pos=None, flash_mask=None, softmax_scale=None,
@@ -297,7 +305,7 @@ def attention_kvcache(q, k_cache, v_cache, *, prefix_len, new_pos=None, flash_ma
         raise ValueError(f"attention_kvcache: new_pos={new_pos} needs 0 <= new_pos and new_pos + M <= L")
     if out is None:
         out = torch.empty(b, m, heads * d, dtype=torch.bfloat16, device=q.device)
-    chunk = _chunk(cache_rows)
+    chunk = _chunk(arch(q.device), (heads, kv_heads, d), cache_rows)
     need = int(lib.attention_kvcache_splitkv_workspace_size(b, m, heads, kv_heads, d, cache_rows, chunk))
     lib.attention_kvcache_splitkv(
         out, None, k_cache, v_cache, scratch("attention_kvcache", need, q.device), q, prefix_len, None, None,
@@ -437,6 +445,7 @@ HEAD_DIM = 128
 # arch -> (key heads, value heads) -> inclusive range of the sequence length
 DELTA_RULE_SHAPES = {
     120: {(16, 16): (1, 1024)},
+    110: {(16, 16): (1, 1024)},
 }
 
 

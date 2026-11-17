@@ -78,7 +78,7 @@ def arch(device) -> int:
 
 # GEMM kernels of an architecture: operation -> classes with ``arch``, ``takes(call)`` and ``run(call, out)``, asked
 # in order (gemm.py; the classes are in gemm_sm<arch>.py).
-KERNELS = {"gemm": [], "gemm_glu": [], "qkv_proj_rope": []}
+KERNELS = {"gemm": [], "gemm_glu": [], "qkv_proj_rope": [], "fused_mlp": []}
 
 
 def kernel(op, arch):

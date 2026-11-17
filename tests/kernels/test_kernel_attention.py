@@ -32,6 +32,28 @@ def reference(q, k_cache, v_cache, prefix_len, new_pos, flash_mask):
 @pytest.mark.parametrize("heads,d", [(16, 128), (8, 256)])
 @pytest.mark.parametrize("masked", [False, True])
 def test_matches_reference(b, m, rows, prefix, heads, d, masked, rnd):
+    check(b, m, rows, prefix, heads, d, masked, rnd)
+
+
+@sm(110)
+@pytest.mark.parametrize("m,rows,prefix,heads,d", [
+    (16, 784, 768, 16, 128), (1, 192, 170, 16, 128), (32, 448, 400, 16, 128), (8, 2048, 2000, 16, 128),
+    (32, 256, 200, 8, 256), (16, 480, 464, 8, 256), (9, 1280, 1200, 8, 256), (4, 2048, 2000, 8, 256)])
+@pytest.mark.parametrize("masked", [False, True])
+def test_matches_reference_sm110(m, rows, prefix, heads, d, masked, rnd):
+    check(1, m, rows, prefix, heads, d, masked, rnd)
+
+
+@sm(110)
+def test_sm110_takes_the_measured_boxes(rnd):
+    """8 query / 2 KV heads of 256: fewer query rows the longer the cache; one request at a time."""
+    assert attn.attention_kvcache_takes(rnd(1, 16, 8, 256), rnd(1, 832, 2, 256))
+    assert not attn.attention_kvcache_takes(rnd(1, 17, 8, 256), rnd(1, 832, 2, 256))
+    assert not attn.attention_kvcache_takes(rnd(1, 1, 8, 256), rnd(1, 2048, 2, 256))
+    assert not attn.attention_kvcache_takes(rnd(2, 16, 16, 128), rnd(2, 784, 2, 128))
+
+
+def check(b, m, rows, prefix, heads, d, masked, rnd):
     q, k_cache, v_cache = rnd(b, m, heads, d), rnd(b, rows, 2, d), rnd(b, rows, 2, d)
     prefix_len = torch.full((b,), prefix, dtype=torch.int32, device=DEVICE)
     new_pos = rows - m

@@ -37,16 +37,16 @@
 
 | 步骤 | 算子 | 本模型形状下的 kernel |
 |---|---|---|
-| ViT 和语言模型的残差加法 + RMSNorm | `add_rms_norm`（第一个归一化用 `rms_norm`） | xcompute `add_rmsnorm` / `rmsnorm` |
-| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue`（`qk_order="any"`：Q 和 K 只给注意力用） | `qkv_proj_rope` → cuBLASLt 加一个 RoPE kernel；SM110 上 `tcgen05_bf16_sm110`（Q、K 为旋转对顺序） |
+| ViT 和语言模型的残差加法 + RMSNorm | `add_rms_norm`（第一个归一化用 `rms_norm`） | `add_rmsnorm` / `rmsnorm` |
+| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue`（`qk_order="any"`：Q 和 K 只给注意力用） | `qkv_proj_rope` → cuBLASLt 加一个 RoPE kernel；SM110 上 `tcgen05_qkv_rope_bf16_sm110`（Q、K 为旋转对顺序） |
 | ViT 注意力（窗口、全注意力块） | `varlen_attention` | flash-attention 2 |
 | ViT 投影和 MLP down（+ bias）+ 残差加法 + 下一层 RMSNorm | `gemm_add_rms_norm` | `gemm` → cuBLASLt、`add_rmsnorm`；集成显卡（Jetson Thor）上 `gemm` 带残差 → cuBLASLt（β·C）加 `rmsnorm` |
 | merger（+ bias；fc1 + GELU） | `gemm_epilogue` | `gemm` → cuBLASLt |
-| ViT gate/up + bias + SiLU-mul | `gemm_glu_epilogue`（`bias`） | `gemm_glu` → cuBLASLt 加 SiLU-mul kernel |
+| ViT gate/up + bias + SiLU-mul | `gemm_glu_epilogue`（`bias`） | `gemm_glu` → cuBLASLt 加 SiLU-mul kernel；SM110 上 `tcgen05_glu_bf16_sm110` |
 | expert 0 的 QKV + bias + M-RoPE，K/V 写入 prompt K/V | `qkv_rope_kvcache` | `qkv_proj_rope`（`kv_cache`）→ cuBLASLt 加一个 RoPE kernel |
 | expert 0 的因果注意力 | `causal_attention` | flash-attention 2 |
 | expert 0 的输出投影 | `gemm_epilogue` | cuBLASLt |
-| expert 0 的 MLP（gate/up + SiLU-mul、down）+ 残差加法 + 下一层 RMSNorm | `mlp_add_rms_norm` | `gemm_glu` → `tma_streamk_bf16_sm120`、`gemm` → cuBLASLt、`add_rmsnorm`；SM110 上 M 513–768 时 `fused_mlp` → `mcast_bf16_sm110` 加 `rmsnorm`，其他 M 时 `gemm_glu` → `mcast_bf16_sm110`、带残差的 `gemm` → `mcast_bf16_sm110` 加 `rmsnorm` |
+| expert 0 的 MLP（gate/up + SiLU-mul、down）+ 残差加法 + 下一层 RMSNorm | `mlp_add_rms_norm` | `gemm_glu` → `tma_streamk_bf16_sm120`、`gemm` → cuBLASLt、`add_rmsnorm`；SM110 上 M 520–768 时融合 MLP `mcast_mlp_bf16_sm110` 加 `rmsnorm`，其他 M 时 `gemm_glu` → `mcast_glu_bf16_sm110`、带残差的 `gemm` → `mcast_residual_bf16_sm110` 加 `rmsnorm` |
 | 动作嵌入（`ActionHead`，FP32） | `linear`、`silu` | cuBLAS（FP32） |
 | expert 1 的 QKV + bias + M-RoPE + 追加 K/V | `qkv_rope_kvcache` | `qkv_proj_rope`（`kv_cache`）→ cuBLASLt 加一个 RoPE kernel |
 | expert 1 对 prompt K/V 和动作 key 的注意力 | `prefix_kvcache_attention` | `attention_kvcache` → `splitkv` |

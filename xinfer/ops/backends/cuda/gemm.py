@@ -6,8 +6,9 @@
 | ``gemm_glu_epilogue`` | ``gemm_glu`` |
 | ``qkv_rope_epilogue``, ``qkv_rope_kvcache`` | ``qkv_proj_rope`` |
 | ``qkv_norm_rope_kvcache`` | ``qkv_proj_rope`` (``qk_norm``) |
-| ``gemm_add_rms_norm`` | ``gemm``, then ``add_rms_norm`` |
-| ``mlp_add_rms_norm`` | ``gemm_glu``, ``gemm``, then ``add_rms_norm`` |
+| ``gemm_add_rms_norm`` | ``gemm``, then ``add_rms_norm`` (integrated GPUs: ``gemm`` with the residual, ``rmsnorm``) |
+| ``mlp_add_rms_norm`` | the fused MLP where a kernel takes the call, else ``gemm_glu`` and ``gemm_add_rms_norm`` |
+| ``prefetch_weights``, ``join_prefetch`` | L2 prefetches on a side stream (integrated GPUs only) |
 | ``mxfp8_quantize`` | ``quantize_mxfp8`` |
 | ``mxfp8_gemm_epilogue``, ``mxfp8_gemm_glu_quantize``, ``mxfp8_qkv_rope_epilogue`` | the three with MXFP8 operands |
 
@@ -25,14 +26,21 @@ transposed view of a contiguous ``[K, N]`` tensor), or both are MXFP8 pairs ``(v
 
 Every function runs through the generic path: one cuBLASLt GEMM, then the epilogue as a separate elementwise kernel
 (BF16 operands on any CUDA GPU, MXFP8 operands where cuBLASLt has block-scaled FP8 GEMMs: SM120). An architecture
-module (``gemm_sm120``) adds kernels that fuse the epilogue into the GEMM; each kernel states the calls it takes
-(``takes``), and a function runs the first kernel of its architecture that takes the call, the generic path
-otherwise. A kernel that needs the weight in another memory order builds that copy on the weight's first call and
+module (``gemm_sm120``, ``gemm_sm110``) adds kernels that fuse the epilogue into the GEMM; each kernel states the
+calls it takes (``takes``), and a function runs the first kernel of its architecture that takes the call, the generic
+path otherwise. A kernel that needs the weight in another memory order builds that copy on the weight's first call and
 keeps it while the weight lives.
 
 An operator call with an option the functions do not take runs on the torch reference. Some kernels differ at
 rounding level across runs (``deterministic=False``). ``qkv_rope_epilogue`` builds the packed RoPE table once per
 ``cos`` / ``sin`` pair, which the layers of a forward share.
+
+On integrated GPUs (Jetson Thor: DRAM shared with the CPU, a small L2) ``gemm_add_rms_norm`` adds the residual in the
+GEMM (the sum rounded once, from the FP32 product) and normalizes the sum, where the two-tensor ``add_rms_norm``
+would run at DRAM bandwidth, and ``prefetch_weights`` prefetches weights into L2 from a side stream (an RTX 5090
+would lose time on it). Elsewhere ``gemm_add_rms_norm`` runs ``gemm_epilogue`` and ``add_rms_norm``, with their bits,
+and ``prefetch_weights`` does nothing. ``mlp_add_rms_norm`` runs the fused MLP where a kernel takes the call (its
+result is added into ``residual`` in place, which it returns).
 """
 
 from __future__ import annotations
@@ -44,7 +52,7 @@ from typing import NamedTuple, Optional
 import torch
 
 from xinfer.ops.backends.cuda._native import KERNELS, NATIVE, Carver, arch, derived, empty_mxfp8, lib, scratch
-from xinfer.ops.backends.cuda.norm import add_rms_norm
+from xinfer.ops.backends.cuda.norm import add_rms_norm, rmsnorm
 from xinfer.ops.layout import mxfp8 as layout
 from xinfer.ops.reference import gemm as reference
 from xinfer.ops.registry import register
@@ -74,6 +82,7 @@ class Call:
     weight_scale: Optional[torch.Tensor] = None
     quantize: bool = False  # the result is an MXFP8 pair
     rope: Optional[tuple] = None  # qkv_proj_rope: (heads, KV heads, head dim, rotary dim, packed table or None)
+    qk_order: str = "standard"  # qkv_proj_rope: "any" lets a kernel write Q and K in rotary-pair order
 
     @property
     def device(self):
@@ -275,7 +284,7 @@ class QkNorm(NamedTuple):
 
 
 def _qkv_call(x, weight, bias=None, *, num_heads, head_dim, num_kv_heads=None, cos=None, sin=None,
-              rope_table=None, rotary_dim=None, qk_norm=None, kv_cache=None, out=None):
+              rope_table=None, rotary_dim=None, qk_norm=None, kv_cache=None, qk_order="standard", out=None):
     """The checked call of qkv_proj_rope and its (extra rows, table flag)."""
     num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
     rotary_dim = head_dim if rotary_dim is None else rotary_dim
@@ -290,11 +299,12 @@ def _qkv_call(x, weight, bias=None, *, num_heads, head_dim, num_kv_heads=None, c
     if table and (rope_table.dtype != torch.float32 or tuple(rope_table.shape) != (rotary_dim // 4, c.m, 4)):
         raise ValueError("qkv_proj_rope: rope_table must be layout.mxfp8.rope_table of these M rows")
     c.rope = (num_heads, num_kv_heads, head_dim, rotary_dim, rope_table)
+    c.qk_order = qk_order
     return c, extra
 
 
 def qkv_proj_rope(x, weight, bias=None, *, num_heads, head_dim, num_kv_heads=None, cos=None, sin=None,
-                  rope_table=None, rotary_dim=None, qk_norm=None, kv_cache=None, out=None):
+                  rope_table=None, rotary_dim=None, qk_norm=None, kv_cache=None, qk_order="standard", out=None):
     """The attention input projection with rotate-half RoPE on the Q and K heads.
 
     x ``[M, K]`` and ``weight`` are BF16 or MXFP8 pairs. ``weight`` ``[(H + 2 H_kv) * D + E, K]`` holds the Q, K
@@ -307,9 +317,12 @@ def qkv_proj_rope(x, weight, bias=None, *, num_heads, head_dim, num_kv_heads=Non
     K (after RoPE) and V go to rows ``start .. start + M`` of the BF16 caches instead, row-major
     ``[rows, H_kv * D]`` or head-major ``[H_kv, rows, D]`` (a strided view with a unit last stride), and the
     result is ``[M, H * D + E]`` (Q | extra).
+
+    ``qk_order="any"``: where a kernel that writes them so takes the call, the channels of every Q and K head come
+    in rotary-pair order (``j`` and ``j + rotary_dim / 2`` adjacent), which leaves attention over them unchanged.
     """
     c, extra = _qkv_call(x, weight, bias, num_heads=num_heads, head_dim=head_dim, num_kv_heads=num_kv_heads,
-                         cos=cos, sin=sin, rope_table=rope_table, rotary_dim=rotary_dim)
+                         cos=cos, sin=sin, rope_table=rope_table, rotary_dim=rotary_dim, qk_order=qk_order)
     num_heads, num_kv_heads, head_dim, rotary_dim, _ = c.rope
     table = rope_table is not None
     out = _out(out, (c.m, num_heads * head_dim + extra if kv_cache is not None else c.n), c)
@@ -380,14 +393,64 @@ def gemm_glu_epilogue(x, weight, *, bias=None, modulation=None, row_class=None, 
     return gemm_glu(x.contiguous(), weight, bias, activation="silu")
 
 
+_integrated = {}  # device index -> whether the GPU shares its memory with the CPU
+
+
+def _integrated_gpu(device) -> bool:
+    if device.index not in _integrated:
+        _integrated[device.index] = bool(torch.cuda.get_device_properties(device).is_integrated)
+    return _integrated[device.index]
+
+
 @register("gemm_add_rms_norm", backend="cuda", deterministic=False, **NATIVE)
 def gemm_add_rms_norm(x, projection, residual, weight, eps, bias=None):
+    if _integrated_gpu(x.device) and residual.is_contiguous():
+        x = x.contiguous()
+        out = gemm(x, projection, bias, residual=residual.view(x.shape[0], -1)).view(residual.shape)
+        return out, rmsnorm(out, weight, eps)
     return add_rms_norm(gemm_epilogue(x, projection, bias).view(residual.shape), residual, weight, eps)
 
 
 @register("mlp_add_rms_norm", backend="cuda", deterministic=False, **NATIVE)
 def mlp_add_rms_norm(x, gate_up, down, residual, weight, eps):
+    x = x.contiguous()
+    c = _call("gemm_glu", x, gate_up, None, "silu")
+    cls = _kernel_for("fused_mlp", c)
+    if cls is not None and tuple(down.shape) == (c.k, c.n) and residual.is_contiguous():
+        cls.run(c, down, residual.view(c.m, -1))  # adds into the residual in place
+        return residual, rmsnorm(residual, weight, eps)
     return gemm_add_rms_norm(gemm_glu_epilogue(x, gate_up), down, residual, weight, eps)
+
+
+PREFETCH_GRID = 2  # CTAs issuing the L2 prefetches: a few keep DRAM busy without taking SMs from the compute stream
+_prefetch_streams = {}  # (device, caller's stream) -> side stream
+_prefetching = set()  # keys whose side stream has work the caller's stream has not waited for
+
+
+@register("prefetch_weights", backend="cuda", **NATIVE)
+def prefetch_weights(weights):
+    """On integrated GPUs, L2 prefetches of ``weights`` on a side stream forked from the caller's stream (one per
+    caller's stream, so lanes capturing graphs on different streams do not share it); the caller's stream waits
+    for them at ``join_prefetch``. On other GPUs nothing."""
+    stream = torch.cuda.current_stream()
+    if not _integrated_gpu(stream.device):
+        return
+    key = (stream.device, stream.cuda_stream)
+    side = _prefetch_streams.setdefault(key, torch.cuda.Stream(device=stream.device))
+    side.wait_stream(stream)
+    with torch.cuda.stream(side):
+        for weight in weights:
+            lib.l2_prefetch(weight, 0, weight.numel() * weight.element_size(), PREFETCH_GRID, 256)
+    _prefetching.add(key)
+
+
+@register("join_prefetch", backend="cuda", **NATIVE)
+def join_prefetch():
+    stream = torch.cuda.current_stream()
+    key = (stream.device, stream.cuda_stream)
+    if key in _prefetching:
+        stream.wait_stream(_prefetch_streams[key])
+        _prefetching.discard(key)
 
 
 _rope_tables = {}  # (cos, sin) -> their packed RoPE table
@@ -407,7 +470,7 @@ def _rope_table(cos, sin):
 @register("qkv_rope_epilogue", backend="cuda", deterministic=False, **NATIVE)
 def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
     return qkv_proj_rope(x.contiguous(), weight, bias, rope_table=_rope_table(cos, sin), num_heads=num_heads,
-                            head_dim=head_dim)
+                            head_dim=head_dim, qk_order=qk_order)
 
 
 @register("qkv_norm_rope_kvcache", backend="cuda", deterministic=False, **NATIVE)
@@ -450,4 +513,4 @@ def mxfp8_qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim):
                             head_dim=head_dim)
 
 
-from xinfer.ops.backends.cuda import gemm_sm120  # noqa: E402, F401 - lists the SM120 kernels
+from xinfer.ops.backends.cuda import gemm_sm110, gemm_sm120  # noqa: E402, F401 - list the kernels of each architecture
