@@ -35,7 +35,7 @@ BUILTIN_MODULES = ("xinfer.ops.backends.cuda.attn", "xinfer.ops.backends.cuda.ge
                    "xinfer.ops.backends.ascend.attn", "xinfer.ops.backends.ascend.norm",
                    "xinfer.ops.backends.ascend.rope", "xinfer.ops.backends.ascend.flow",
                    "xinfer.ops.backends.ascend.official",
-                   "xinfer.ops.backends.ascend.cann")
+                   "xinfer.ops.backends.ascend.cann", "xinfer.ops.backends.ascend.image")
 STRICT_ENV = "XINFER_OPS_STRICT"
 
 
@@ -182,7 +182,15 @@ class OpTable:
         Returns:
             The wrapped ``OpTable``.
         """
-        selections = {name: replace(i, function=wrap(i)) for name, i in self._selections.items()}
+        selections = {}
+        for name, implementation in self._selections.items():
+            function = wrap(implementation)
+            binder = getattr(implementation.function, "bind", None)
+            if binder is not None:
+                def bind(*, layer_index, _i=implementation, _binder=binder):
+                    return wrap(replace(_i, function=_binder(layer_index=layer_index)))
+                function.bind = bind
+            selections[name] = replace(implementation, function=function)
         return OpTable(self.platform_name, selections)
 
     def __getattr__(self, name: str) -> Callable:
@@ -199,6 +207,17 @@ class OpTable:
     def selection(self, name: str) -> Implementation:
         """The ``Implementation`` selected for operator ``name`` (KeyError if it is not in the table)."""
         return self._selections[name]
+
+    def bind(self, name: str, *, layer_index: int) -> Callable:
+        """Bind an operator's existing implementation to a layer at model construction.
+
+        A backend may expose ``function.bind(layer_index=...)`` to resolve a layer-specific
+        numerical path once. The callable still has the operator's original signature and
+        contract. Without a binder, including references, the selected function is unchanged.
+        """
+        function = self.selection(name).function
+        binder = getattr(function, "bind", None)
+        return function if binder is None else binder(layer_index=layer_index)
 
     def report(self) -> list[dict]:
         """One row per operator, for the startup selection table.

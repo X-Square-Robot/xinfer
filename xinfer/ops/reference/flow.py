@@ -14,6 +14,7 @@ def flow_velocity_euler(x: torch.Tensor, h: torch.Tensor, weight: torch.Tensor, 
                         dof_mask: torch.Tensor | None = None, padding_velocity: torch.Tensor | None = None,
                         pinned: torch.Tensor | None = None, pinned_values: torch.Tensor | None = None) -> torch.Tensor:
     """One Euler step of action rows from their normed stream output (the CUDA backend's ``denoise_output_euler``,
+    and the Ascend backend's kernel of the same name,
     velocity ``flow``).
 
     ``p = h · weightᵀ`` in FP32; the velocity is ``padding_velocity · (1 − dof_mask) + p · dof_mask`` (``p``
@@ -50,7 +51,7 @@ def flow_input_embed(x: torch.Tensor, weight: torch.Tensor, head_index: torch.Te
                      extra: torch.Tensor | None = None, input_mask: torch.Tensor | None = None,
                      addends: tuple[torch.Tensor, ...] = (), override: torch.Tensor | None = None,
                      override_mask: torch.Tensor | None = None) -> torch.Tensor:
-    """Token inputs of flow rows (the CUDA backend's ``denoise_input_embed``).
+    """Token inputs of flow rows (the CUDA backend's ``denoise_input_embed``, and the Ascend backend's).
 
     ``p = [x | extra] · weight[head]ᵀ`` in FP32 (zero where ``input_mask`` is 0), then the addends in order, or
     ``override`` where ``override_mask`` is set; one rounding to BF16.

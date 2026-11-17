@@ -74,7 +74,11 @@ def cuda_ops(tmp_path, monkeypatch):
     import sys
 
     reg = _registry()
-    monkeypatch.setattr(importlib.import_module("xinfer.ops.registry"), "registry", reg)
+    registry_module = importlib.import_module("xinfer.ops.registry")
+    monkeypatch.setattr(registry_module, "registry", reg)
+    # This fixture defines only double/triple; real backend operators belong to
+    # the production registry, regardless of which tests imported them first.
+    monkeypatch.setattr(registry_module, "BUILTIN_MODULES", ())
     (tmp_path / "cuda_ops.py").write_text(BACKEND)
     monkeypatch.syspath_prepend(str(tmp_path))
     yield reg
