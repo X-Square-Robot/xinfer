@@ -25,7 +25,7 @@ no SoC) registers nothing here.
 The external loader and this one must never serve each other's library. ``XINFER_XCOMPUTE_LIBRARY`` does not
 name this library: the external loader's ``is_ascend`` heuristic reads a soc string as "an Ascend build", and
 what refuses the library there is the paired-package check (an in-tree build has no xcompute Python package
-whose ``KERNEL_LIB_PATH`` matches), so the misdirection ends in a refusal, not a double registration — the
+whose library-path attribute matches), so the misdirection ends in a refusal, not a double registration — the
 acceptance test that points ``XINFER_XCOMPUTE_LIBRARY`` at ``xinfer_kernels_ascend.so`` and expects ``xc is
 None`` must keep passing. During the transition an operator may exist twice (``ascend:xcompute`` and
 ``ascend:kernels``); which one wins is decided explicitly — priority or pin — when IN-TREE-R1 moves the first
