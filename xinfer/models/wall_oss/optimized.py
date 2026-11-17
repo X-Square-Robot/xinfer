@@ -303,10 +303,15 @@ class OptimizedAction(nn.Module):
                     # strided-query descriptor, error 561103, so the kernel writes the layout the attention
                     # consumes). The strided [1, M, H, D] view turns contiguous inside the attention
                     # transpose; the reference and CUDA backends return packed [M, H*D].
-                    q_arg = q.transpose(0, 1)[None] if q.ndim == 3 else q.view(1, horizon, heads, d)
+                    bnsd = q.ndim == 3
+                    q_arg = q.transpose(0, 1)[None] if bnsd else q.view(1, horizon, heads, d)
+                    # The attention output follows the same economy as the prefill site above: the BNSD
+                    # [H, M, D] form only when the NPU's fused QKV armed it (its o-projection reads the
+                    # transpose folded into the Cube A-load), the packed [1, M, H*D] form otherwise — the
+                    # o-projection's gemm contract ([M, K] rows) that every backend takes directly.
                     o = ops.prefix_kvcache_attention(q_arg, keys.transpose(1, 2),
                                                      values.transpose(1, 2), start, p, flash_mask=flash_mask,
-                                                     all_keep=all_keep, return_bnsd=True)
+                                                     all_keep=all_keep, return_bnsd=bnsd)
                     # The BNSD [H, M, D] output feeds the o-projection directly: the pinned CANN route reads
                     # it with the transpose folded into the Cube A-load; every other backend permutes.
                     # The fused gemm+add_rms entries (RMSFUSE RF3 gemm_add_rms_r4, then COPYKILL K2's
