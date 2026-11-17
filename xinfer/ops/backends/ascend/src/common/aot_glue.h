@@ -45,7 +45,7 @@ template <typename Call, typename Error, typename... Args>
 inline void Launch(const char* what, Call call, Error error_fn, const TensorView& first,
                    Args... args) {
   void* stream = Stream(first);
-  int32_t status = call(details::ToC(args)..., stream);
+  int32_t status = call(details::ToC(first), details::ToC(args)..., stream);
   if (status != 0) {
     const char* message = error_fn();
     throw std::runtime_error(std::string(what) + ": " +

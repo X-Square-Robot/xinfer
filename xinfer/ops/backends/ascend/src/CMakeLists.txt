@@ -171,6 +171,19 @@ if(NOT XINFER_TORCH_ROOT)
   get_filename_component(_venv "${_venv}" DIRECTORY)
   set(XINFER_TORCH_ROOT "${_venv}/lib/python3.11/site-packages")
 endif()
+
+# The TorchNPU libraries the static bridges and the glue faces resolve their stream calls through.
+# The delivered family libraries carry the same DT_NEEDED (the R2 adjudication's exemption: the
+# core's TensorView half); a python process loads its extensions RTLD_LOCAL, so the in-tree library
+# cannot borrow torch_npu's symbols from the global namespace and names its own copy.
+set(XINFER_TORCH_LIBS "" CACHE PATH "The torch/torch_npu library root pair (torch/lib, torch_npu/lib)")
+if(NOT XINFER_TORCH_LIBS)
+  set(XINFER_TORCH_LIBS "${XINFER_TORCH_ROOT}")
+endif()
+foreach(_lib torch_npu torch_cpu c10)
+  find_library(XINFER_${_lib} NAMES lib${_lib}.so REQUIRED
+               HINTS "${XINFER_TORCH_LIBS}/torch_npu/lib" "${XINFER_TORCH_LIBS}/torch/lib")
+endforeach()
 set(KERNEL_SOURCES
   common/build_info.cc
   common/cann_fia_v5.cc
@@ -231,11 +244,22 @@ if(_SOC_COMPILABLE)
   set(_ARCH_OBJECTS "$<TARGET_OBJECTS:xinfer_kernels_ascend_arch>")
 endif()
 
+# The SoC list's compilable sources reach the shared library through the arch OBJECT library
+# above; the shared target takes the rest (the AOT and asset objects) directly, so no source
+# compiles twice and no TVM-FFI export is defined twice.
+set(_SOC_LINK_INPUTS "")
+foreach(_s IN LISTS KERNEL_${_SOC_UC}_SOURCES)
+  if(NOT _s MATCHES "\\.(cc|cpp|cxx|c)$")
+    list(APPEND _SOC_LINK_INPUTS ${_s})
+  endif()
+endforeach()
+
 add_library(xinfer_kernels_ascend SHARED
-  ${KERNEL_SOURCES} ${KERNEL_${_SOC_UC}_SOURCES} ${_ARCH_OBJECTS})
+  ${KERNEL_SOURCES} ${_SOC_LINK_INPUTS} ${_ARCH_OBJECTS})
 kernels_target_setup(xinfer_kernels_ascend)
 target_link_libraries(xinfer_kernels_ascend PRIVATE
-  tvm_ffi::shared ${XINFER_ascendcl} ${XINFER_opapi} ${XINFER_runtime} ${XINFER_nnopbase})
+  tvm_ffi::shared ${XINFER_ascendcl} ${XINFER_opapi} ${XINFER_runtime} ${XINFER_nnopbase}
+  ${XINFER_torch_npu} ${XINFER_torch_cpu} ${XINFER_c10})
 set_target_properties(xinfer_kernels_ascend PROPERTIES
   PREFIX ""
   SUFFIX ".so"
