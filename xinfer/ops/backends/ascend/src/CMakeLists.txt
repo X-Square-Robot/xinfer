@@ -77,8 +77,7 @@ find_package(tvm_ffi CONFIG REQUIRED)
 set(XINFER_TILELANG_PYTHON "/root/tl-fork-store/venv-tl-src/bin/python" CACHE FILEPATH
     "Python of the TileLang fork venv that runs the AOT generator")
 set(XINFER_AOT_OBJECT_DIR "" CACHE PATH
-    "Directory of prebuilt AOT objects to consume instead of generating (e.g. the r5-lib out/ tree: "
-    "the serving build's objects are the validated object source; empty = generate from the TileLang sources)")
+    "Directory of prebuilt AOT objects to consume instead of generating (e.g. the r5-lib out/ tree; empty = generate)")
 
 # xinfer_aot_module(<group> <module> <kernel>...): declare the custom command for one family module and
 # append its objects to _AOT_OBJECTS. <group> is the family-library target of the transition build (the
