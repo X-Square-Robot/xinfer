@@ -323,11 +323,15 @@ class DeviceImage:
         sizes: ``(h, w)`` after each resize step; the last is the view's size.
         resize: per step, ``(mode, antialias)`` of ``torch.nn.functional.interpolate``. A step whose size differs
             from its input's runs in FP32 and stores uint8, rounding half up; a step of the same size is skipped.
+        prefetch: optional request-owned slot for an in-process decode. The processor's bound engine fills it
+            before admission; another engine cannot consume its codec transaction or stream-local result.
+            None keeps decoding at admission, including in device-free frontend processes.
     """
 
     data: Any
     sizes: tuple[tuple[int, int], ...]
     resize: tuple[tuple[str, bool], ...]
+    prefetch: Any = None
 
 
 @dataclass
@@ -386,6 +390,13 @@ def connect(processor: InputProcessor) -> InputProcessor:
     state, else ``processor``. ``xinfer serve`` calls it for every WebSocket connection, ``Policy`` once."""
     method = getattr(processor, "connect", None)
     return processor if method is None else method()
+
+
+def bind_image_prefetch(processor: InputProcessor, prefetch) -> None:
+    """Bind an optional in-process image queue to the processor that serves that engine."""
+    method = getattr(processor, "bind_image_prefetch", None)
+    if method is not None:
+        method(prefetch)
 
 
 class OutputProcessor(Protocol):
