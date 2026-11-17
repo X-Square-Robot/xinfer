@@ -62,7 +62,8 @@ include = ["xinfer*"]
 
 [tool.setuptools.package-data]
 xinfer = ["tuned/*/*.json", "ops/backends/cuda/xinfer_kernels.so", "ops/backends/ascend/xinfer_kernels_ascend.so",
-          "_wirefast*.so", "_preparefast*.so", "_pincpp*.so", "_aclfast*.so"]
+          "_wirefast*.so", "_preparefast*.so", "_pincpp*.so", "_aclfast*.so",
+          "ops/backends/ascend/src/third_party/tilelang/LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
