@@ -8,11 +8,11 @@ from numbers import Integral, Real
 from threading import Lock
 
 import torch
-from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.core import CORE
-from xinfer.ops.backends.ascend.glue._cann_action_scope import action_scope, memo_action_metadata
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
+from xinfer.ops.backends.ascend._cann_action_scope import action_scope, memo_action_metadata
 try:  # decodeattn-r4: opt-in decode-family kernel pair (XINFER_DECODEATTN_R4)
-    from xinfer.ops.backends.ascend.glue import decodeattn_r4 as _decodeattn_r4
+    from xinfer.ops.backends.ascend import decodeattn_r4 as _decodeattn_r4
 except Exception:  # pragma: no cover - the route stays off without the lib
     _decodeattn_r4 = None
 try:  # copykill-r2 integration flags (XINFER_COPYKILL_R2, default off)
@@ -82,7 +82,7 @@ class CannAttention:
             # their raw C-ABI launchers through ctypes. Builds without either
             # entry leave the pairs unbound and the capability probes below
             # degrade to the canonical attention entries as before.
-            from xinfer.ops.backends.ascend.glue import _cann_primitives
+            from xinfer.ops.backends.ascend import _cann_primitives
 
             bnsd = _cann_primitives.bnsd_pair()
             tnd = _cann_primitives.tnd_pair()

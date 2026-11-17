@@ -26,8 +26,8 @@ _LIB = None
 _ENTRIES = {}
 _LOCK = Lock()
 
-import xinfer.ops.backends.ascend._provider as _provider
-_DEFAULT_LIB = _provider._default_library_path("libdecodeattn_r4.so")
+from xinfer.ops.backends.ascend import _native
+_DEFAULT_LIB = _native._default_library_path("libdecodeattn_r4.so")
 _H, _KVH, _M, _D, _L = 16, 2, 16, 128, 784
 _P_SHAPE = (28, 65, 128)
 

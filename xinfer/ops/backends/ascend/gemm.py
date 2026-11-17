@@ -246,7 +246,7 @@ _no_action_rows = {}  # (batch, device) -> zero action-row starts/ends [B] and o
 
 
 try:
-    from xinfer.ops.backends.ascend.glue.cann_action import _qkv_2b_cache_finish_pair as _qkv_2b_pair
+    from xinfer.ops.backends.ascend.cann_action import _qkv_2b_cache_finish_pair as _qkv_2b_pair
 except Exception:  # builds without the package's CANN bridge module
     _qkv_2b_pair = None
 
@@ -381,11 +381,11 @@ def qkv_norm_split(packed, q_weight, k_weight, num_heads, num_kv_heads, head_dim
     # per call at 464 rows), and this kernel is bitwise to the composition on identical statistics.
     # The module is absent without the delivered package and the guard falls through below.
     try:
-        from xinfer.ops.backends.ascend.glue.qkv_split_vec import qkv_split_vec as _qkv_vec
+        from xinfer.ops.backends.ascend.qkv_split_vec import qkv_split_vec as _qkv_vec
     except (ImportError, OSError):
         _qkv_vec = None
     try:
-        from xinfer.ops.backends.ascend.glue.qkv_split_bhsd import qkv_split_bhsd as _qkv_bhsd
+        from xinfer.ops.backends.ascend.qkv_split_bhsd import qkv_split_bhsd as _qkv_bhsd
     except (ImportError, OSError):
         _qkv_bhsd = None
     if (_qkv_vec is not None

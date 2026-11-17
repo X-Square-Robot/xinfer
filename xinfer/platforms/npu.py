@@ -157,7 +157,7 @@ _CHROMA = {
 def _quant_u8(x):
     """SOUP2 quant knife: one kernel for add+floor+clamp+cast; falls back."""
     try:
-        from xinfer.ops.backends.ascend.glue import soup2
+        from xinfer.ops.backends.ascend import soup2
 
         if soup2.enabled("quant"):
             out = soup2.quant_u8(x)

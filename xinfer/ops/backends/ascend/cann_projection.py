@@ -9,19 +9,19 @@ from threading import Lock
 
 import torch
 import torch.nn.functional as F
-from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.core import CORE
-from xinfer.ops.backends.ascend.glue.rmsnorm import add_rmsnorm as _add_rmsnorm
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
+from xinfer.ops.backends.ascend.rmsnorm import add_rmsnorm as _add_rmsnorm
 try:  # r6a-m16epi A1 (XINFER_SMALLM_R3=gateup, default off)
-    from xinfer.ops.backends.ascend.glue import smallm_r3
+    from xinfer.ops.backends.ascend import smallm_r3
 except Exception:  # pragma: no cover - optional mount
     smallm_r3 = None
 try:  # glu-epilogue K-B (XINFER_GLUEPI=prefillglu, default off)
-    from xinfer.ops.backends.ascend.glue import glu_epi
+    from xinfer.ops.backends.ascend import glu_epi
 except Exception:  # pragma: no cover - optional mount
     glu_epi = None
 try:  # finish-bf16 (XINFER_FINISHBF16, default off)
-    from xinfer.ops.backends.ascend.glue import finishbf16
+    from xinfer.ops.backends.ascend import finishbf16
 except Exception:  # pragma: no cover - optional mount
     finishbf16 = None
 try:  # copykill-r2 integration flags (XINFER_COPYKILL_R2, default off)
@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - optional mount
     def _copykill_enabled(_family):
         return False
 try:  # INT-WOSS g2112-r3 flag-isolated routes (XINFER_G2112_*, default off)
-    from xinfer.ops.backends.ascend.glue.g2112_tilelang import (
+    from xinfer.ops.backends.ascend.g2112_tilelang import (
         G2112_FLAGS, glu_route, mm_fp32_route, down_route, accumulator_route, samu_route,
     )
 except Exception:  # pragma: no cover - optional mount
@@ -82,7 +82,7 @@ def _gap_ubf_routes(m, n):
     global _GAP_UBF_READY
     if _GAP_UBF_READY is None:
         try:
-            from xinfer.ops.backends.ascend.glue import ubfinish_r5
+            from xinfer.ops.backends.ascend import ubfinish_r5
 
             _GAP_UBF_READY = ubfinish_r5.routes if ubfinish_r5.enabled() else (lambda rows, cols: False)
         except Exception:  # noqa: BLE001 - any miss keeps the released chain
@@ -152,7 +152,7 @@ _SOUP2_FINPLAIN_SHAPES = {(2048, 2048), (2048, 5120), (1024, 1536), (1024, 4096)
 
 def _soup2_family_ok(family):
     try:
-        from xinfer.ops.backends.ascend.glue import soup2
+        from xinfer.ops.backends.ascend import soup2
 
         return soup2.enabled(family)
     except Exception:  # noqa: BLE001 - any miss keeps the released chain
@@ -184,7 +184,7 @@ def _finish(y, bias, activation, residual, residual_gate, row_class, row_scale):
         and y.dim() == 2
         and y.shape[1] == 1024
     ):
-        from xinfer.ops.backends.ascend.glue import soupkill
+        from xinfer.ops.backends.ascend import soupkill
 
         fused = soupkill.finish_bias_res(
             y, bias, residual, y.new_empty(tuple(y.shape), dtype=torch.bfloat16)
@@ -202,7 +202,7 @@ def _finish(y, bias, activation, residual, residual_gate, row_class, row_scale):
         and y.is_contiguous() and y.device.type == "npu"
         and _soup2_family_ok("fc1gelu")
     ):
-        from xinfer.ops.backends.ascend.glue import soup2
+        from xinfer.ops.backends.ascend import soup2
 
         fused = soup2.fc1gelu(y, bias.float(), y.new_empty(tuple(y.shape), dtype=torch.bfloat16))
         if fused is not None:
@@ -244,9 +244,9 @@ def _aot_ctypes_entry(name):
     import ctypes
 
     try:
-        from xinfer.ops.backends.ascend import _provider
+        from xinfer.ops.backends.ascend import _native
 
-        lib = _provider.core_library()
+        lib = _native.core_library()
         call = getattr(lib, f"xinfer_aot_{name}_call", None)
         error = getattr(lib, f"xinfer_aot_{name}_get_last_error", None)
     except (OSError, AttributeError, ImportError):
@@ -285,7 +285,7 @@ class CannProjection:
             # its raw C-ABI launcher through ctypes. Older builds without
             # either entry raise AttributeError and the CANN arms degrade
             # as before.
-            from xinfer.ops.backends.ascend.glue import _cann_primitives
+            from xinfer.ops.backends.ascend import _cann_primitives
 
             pair = _cann_primitives.mm_pair()
             if pair is None:
@@ -449,9 +449,9 @@ class CannProjection:
         the unified core carries the same kernel (rms_consistent_generic_h1024_f32in,
         the leaf battery's bitwise-verified entry), so the probe resolves it there.
         """
-        lib = _provider.core_library()
+        lib = _native.core_library()
         return (lib is not None
-                and _provider.has_symbol(lib, "xinfer_aot_rms_consistent_generic_h1024_f32in_call"))
+                and _native.has_symbol(lib, "xinfer_aot_rms_consistent_generic_h1024_f32in_call"))
 
     def _bnsd_m768(self, x, weight):
         """The r8 prefill M768 BNSD route: BF16 out, zero workspace, no shared buffers.
@@ -571,7 +571,7 @@ class CannProjection:
                 return smallm_r3.down(x, self._stable_contiguous(weight))
             if tuple(x.shape) == (16, 2048) and tuple(weight.shape) == (1024, 2048):
                 return torch.matmul(x, self._stable_contiguous(weight).t())
-            from xinfer.ops.backends.ascend.glue import soup2
+            from xinfer.ops.backends.ascend import soup2
 
             return soup2.finplain(x, self._stable_contiguous(weight).t())
         if (
@@ -743,7 +743,7 @@ class CannProjection:
             and bias.is_contiguous()
             and _gap_ubf_routes(m, n)
         ):
-            from xinfer.ops.backends.ascend.glue import ubfinish_r5 as _ub5
+            from xinfer.ops.backends.ascend import ubfinish_r5 as _ub5
 
             with self._project(x, weight, shape) as output:
                 out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
@@ -858,7 +858,7 @@ class CannProjection:
             # for the record and for the envelope audit.
             if bias is None:
                 try:
-                    from xinfer.ops.backends.ascend.glue import soupform
+                    from xinfer.ops.backends.ascend import soupform
 
                     if soupform.enabled("glumulcast"):
                         gate = F.silu(y[:, :n])

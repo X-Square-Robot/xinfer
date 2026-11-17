@@ -10,10 +10,10 @@ from threading import Lock
 
 import torch
 import torch.nn.functional as F
-from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.core import CORE
-from xinfer.ops.backends.ascend.glue._cann_action_scope import memo_action_metadata
-from xinfer.ops.backends.ascend.glue import smallm_r3
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
+from xinfer.ops.backends.ascend._cann_action_scope import memo_action_metadata
+from xinfer.ops.backends.ascend import smallm_r3
 
 
 _QKV_2B_CACHE_FINISH = None
@@ -25,10 +25,10 @@ def _qkv_2b_cache_finish_pair():
     if _QKV_2B_CACHE_FINISH is None:
         import ctypes
 
-        from xinfer.ops.backends.ascend import _provider
+        from xinfer.ops.backends.ascend import _native
 
         try:
-            library = _provider.core_library()
+            library = _native.core_library()
             call = getattr(library, "xinfer_aot_gemm_qkv_2b_norm_gate_cache_bnsdq_call")
             get_error = getattr(
                 library, "xinfer_aot_gemm_qkv_2b_norm_gate_cache_bnsdq_get_last_error"
@@ -61,7 +61,7 @@ def _check_tensor(tensor, name, device, shape, dtypes):
 
 
 def _finish_fp32_glu(projected):
-    from xinfer.ops.backends.ascend import _provider
+    from xinfer.ops.backends.ascend import _native
 
     output = torch.empty((projected.shape[0], 2560), dtype=torch.bfloat16, device=projected.device)
     CORE.gemm_epilogue_glu(output, projected, 0, 2560)
@@ -471,7 +471,7 @@ class CannAction:
                 for tensor in (bias, cos, sin, k_cache, v_cache)
             )
         ):
-            from xinfer.ops.backends.ascend.glue.adarmsnorm import Adarmsnorm
+            from xinfer.ops.backends.ascend.adarmsnorm import Adarmsnorm
 
             activation, _ = Adarmsnorm()(
                 x, modulation, float(eps), True, row_class=row_class

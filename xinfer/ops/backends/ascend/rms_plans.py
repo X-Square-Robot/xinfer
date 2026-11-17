@@ -22,7 +22,7 @@ import struct
 
 import torch
 
-from xinfer.ops.backends.ascend import _provider
+from xinfer.ops.backends.ascend import _native
 
 _MAX_I32 = 2**31 - 1
 _FLOAT32_MAX = torch.finfo(torch.float32).max
@@ -40,7 +40,7 @@ def _entry(name):
     """The ``xinfer_aot_<name>_call`` / ``..._get_last_error`` pair, or None."""
     pair = _ENTRIES.get(name)
     if pair is None:
-        lib = _provider.core_library()
+        lib = _native.core_library()
         if lib is None:
             return None
         try:

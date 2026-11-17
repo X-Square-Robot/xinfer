@@ -20,8 +20,8 @@ import os
 import torch
 
 _FAMILIES = ("finish", "vrope", "glu", "gelu")
-import xinfer.ops.backends.ascend._provider as _provider
-_DEFAULT_LIB = _provider._default_library_path("libsoupkill.so")
+from xinfer.ops.backends.ascend import _native
+_DEFAULT_LIB = _native._default_library_path("libsoupkill.so")
 _LOCK = None
 _LIB = None
 _ENTRIES: dict = {}
@@ -77,7 +77,7 @@ def _xc_library():
     if _XC_LIB is None:
         with _XC_LOCK:
             if _XC_LIB is None:
-                _XC_LIB = _provider.core_library()
+                _XC_LIB = _native.core_library()
                 if _XC_LIB is None:
                     raise OSError("soupkill glu: the unified core library is not loaded")
     return _XC_LIB

@@ -1,1 +1,1 @@
-"""Ascend operator implementations over the unified in-tree kernel provider."""
+"""Operator backends for Ascend platforms: the kernels in ``src/``, loaded by ``_native.py``."""

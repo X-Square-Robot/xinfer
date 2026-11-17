@@ -44,11 +44,11 @@ def rope_full(q, k, cos, sin, rotary_dim):
     # the angle tables are duplicated to 64 columns with a fresh concat per call, so a graph capture
     # always bakes the duplication into the graph. Every miss keeps the paths below.
     try:
-        from xinfer.ops.backends.ascend.glue.rope_d64 import rope_half_d64 as _rope_d64
+        from xinfer.ops.backends.ascend.rope_d64 import rope_half_d64 as _rope_d64
     except (ImportError, OSError):
         _rope_d64 = None
     try:
-        from xinfer.ops.backends.ascend.glue.rope_d64_bhsd import rope_d64_bhsd as _rope_bhsd
+        from xinfer.ops.backends.ascend.rope_d64_bhsd import rope_d64_bhsd as _rope_bhsd
     except (ImportError, OSError):
         _rope_bhsd = None
     # GQA-GLUE knives 1+3 (XINFER_GQA_GLUE=bhsd): head-major BHSD

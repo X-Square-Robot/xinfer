@@ -11,7 +11,7 @@ implemented here over the provider:
 
 * the CANN bridge trio used by ``glue.cann_attention`` / ``glue.cann_projection``
   / ``glue.cann_gated_delta_net`` — FIA probe pairs, the ACLNN Mm pair, the
-  vendor GDN chunk pair (``_provider.BRIDGE`` over the static bridge objects);
+  vendor GDN chunk pair (``_native.BRIDGE`` over the static bridge objects);
 * the wall_oss QKV cache finishes (``gemm_qkv_cache_bias_rope_m16/prefill``)
   and the vision QKV rope finish (``gemm_qkv_vision_rope_finish``), as python
   envelopes over the core library's AOT launchers (the v22 .cc envelopes,
@@ -40,7 +40,7 @@ reference composition serves it.
 
 The class glues call ``CORE.<entry>(...)`` with torch tensors; the
 implementations below validate the serving envelopes and launch through
-``_provider``. Envelope misses raise ``ValueError`` so the ``partial()``
+``_native``. Envelope misses raise ``ValueError`` so the ``partial()``
 machinery caches "unsupported" and falls back — never a silent numerics
 switch.
 """
@@ -53,7 +53,7 @@ import struct
 
 import torch
 
-from xinfer.ops.backends.ascend import _provider
+from xinfer.ops.backends.ascend import _native
 
 
 class MissingBackendError(AttributeError):
@@ -97,7 +97,7 @@ def _require(cond, message):
 # ---------------------------------------------------------------------------
 # CANN bridge trio (static bridge objects in the core library)
 # ---------------------------------------------------------------------------
-_BRIDGE = _provider.BRIDGE
+_BRIDGE = _native.BRIDGE
 
 
 def _gdr_pair():
@@ -184,7 +184,7 @@ def gemm_qkv_cache_bias_rope_m16(out, key, value, accumulator, bias, cosine, sin
     head-major K/V caches ``[2, cap, 128]``, an FP32 ``[16, 2560]``
     accumulator, a BF16 ``[2560]`` bias and FP32 ``[16, 64]`` tables.
     """
-    lib = _provider.core_library()
+    lib = _native.core_library()
     _require(lib is not None, "gemm_qkv_cache: no core library")
     # The .cc's Prepare contract (gemm_qkv_cache.cc): a packed 2-D [16, 2048] Q
     # or the r3 BNSD form -- 3-D [16, 16, 128], the head-major [H, M, D] order
@@ -214,7 +214,7 @@ def gemm_qkv_cache_bias_rope_m16(out, key, value, accumulator, bias, cosine, sin
 
 def gemm_qkv_cache_bias_rope_prefill(out, key, value, accumulator, bias, cosine, sine, start):
     """The prefill fused finish over the FP32 ``[rows, 2560]`` accumulator."""
-    lib = _provider.core_library()
+    lib = _native.core_library()
     _require(lib is not None, "gemm_qkv_cache: no core library")
     rows = accumulator.shape[0]
     _require(rows % 4 == 0 and rows > 0, "prefill QKV epilogue requires rows % 4 == 0")
@@ -259,7 +259,7 @@ def action_qkv_gemm_norm_rope(output, input, weight, bias, q_weight, k_weight,
     at the NV subset); the BF16-input NV form is not carried by the unified
     core, so it raises here exactly like a build without the bridge would.
     """
-    lib = _provider.core_library()
+    lib = _native.core_library()
     _require(lib is not None, "gemm_qkv_cache: no core library")
     _require(isinstance(input, torch.Tensor) and input.dtype == torch.float32,
              "action_qkv_gemm_norm_rope: the unified core carries the FP32 M16 cache-append form only")
@@ -273,7 +273,7 @@ def gemm_qkv_vision_rope_finish(out, accumulator, bias, cosine, sine):
     One UB pass over the borrowed FP32 ``[2112, 3840]`` accumulator (the r5
     probe measured the torch rope chain ~113 us against ~10.6 us here).
     """
-    lib = _provider.core_library()
+    lib = _native.core_library()
     _require(lib is not None, "gemm_qkv_vision_rope_finish: no core library")
     rows = accumulator.shape[0]
     _require(accumulator.ndim == 2 and accumulator.dtype == torch.float32
@@ -303,7 +303,7 @@ def gemm_epilogue_glu(out, projected, has_bias_flag, half_width):
     the 2048/3456 sites are served by the smallm gateup / g2112 routes). Any
     other width raises and the caller keeps its released chain.
     """
-    lib = _provider.core_library()
+    lib = _native.core_library()
     _require(lib is not None, "gemm_epilogue_glu: no core library")
     _require(half_width == 11008 and projected.dtype == torch.float32
              and projected.is_contiguous() and projected.shape[1] == 2 * half_width,
@@ -320,7 +320,7 @@ def gemm_epilogue_glu(out, projected, has_bias_flag, half_width):
 # AdaRMS action compositions (adanorm-r2 kernels; the .cc action envelopes)
 # ---------------------------------------------------------------------------
 def _action_entries():
-    lib = _provider.knife_library("adanorm_r2", env="XINFER_ADANORM_R2_LIB",
+    lib = _native.knife_library("adanorm_r2", env="XINFER_ADANORM_R2_LIB",
                                   default="libadanorm_r2.so")
     return lib
 
@@ -406,7 +406,7 @@ def denoise_input_embed(x, weight, *, head_index=None, extra=None, input_mask=No
     FP32 ``[heads, N, A]`` (``[heads, N, 2A]`` with extra) weight, optional
     int32 head_index and uint8 input_mask, up to three FP32 addends.
     """
-    lib = _provider.core_library()
+    lib = _native.core_library()
     _require(lib is not None, "denoise: no core library")
     _require(x.dim() == 3 and weight.dim() == 3,
              "denoise_input_embed: x must be [B, M, A] and weight [heads, N, A]")
@@ -462,7 +462,7 @@ def denoise_output_euler(x, h, weight, *, dt, bias=None, prenorm="none", norm_we
     rows and FP32-or-scalar dt. Other shapes raise ValueError (the binding's
     partial cache falls back to the reference composition).
     """
-    lib = _provider.core_library()
+    lib = _native.core_library()
     _require(lib is not None, "denoise: no core library")
     _require(x.dim() == 3 and h.dim() == 3 and weight.dim() == 2,
              "the fp32-head Euler tail needs [B,M,A] x, [B,M,1024] h, [A,1024] weight")
@@ -627,7 +627,7 @@ def _carried_attention_varlen(q, k, v, cu_seqlens=None, max_seqlen=None, causal=
         raise ValueError("the unified ascend library carries no causal/gated varlen entry")
     if cu_seqlens is None:
         raise ValueError("the varlen entry requires cu_seqlens")
-    import xinfer.ops.backends.ascend.glue.cann_attention as _cann_attention
+    import xinfer.ops.backends.ascend.cann_attention as _cann_attention
 
     bridge = getattr(_carried_attention_varlen, "_bridge", None)
     if bridge is None:
@@ -705,7 +705,7 @@ def __getattr__(name):
     if name in _CLASS_ENTRIES:
         import importlib
         module = importlib.import_module(
-            "xinfer.ops.backends.ascend.glue."
+            "xinfer.ops.backends.ascend."
             + ("cann_gated_delta_net" if name == "CannGatedDeltaNet" else "adarmsnorm"))
         return getattr(module, name)
     entry = _EXPORTS.get(name)

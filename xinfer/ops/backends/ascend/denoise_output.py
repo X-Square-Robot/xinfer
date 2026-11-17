@@ -23,8 +23,8 @@ from typing import Optional, Union
 
 import torch
 
-from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.core import CORE
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
 
 
 _PRENORM = {"none": 0, "rmsnorm": 1, "adarms": 2}

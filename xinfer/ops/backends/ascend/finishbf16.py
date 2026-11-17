@@ -26,8 +26,8 @@ from threading import Lock
 import torch
 
 _FAMILIES = ("gateup", "zba", "vrope", "finres", "gelu")
-import xinfer.ops.backends.ascend._provider as _provider
-_DEFAULT_LIB = _provider._default_library_path("libfinishbf16.so")
+from xinfer.ops.backends.ascend import _native
+_DEFAULT_LIB = _native._default_library_path("libfinishbf16.so")
 _LOCK = Lock()
 _LIB = None
 _ENTRIES: dict = {}

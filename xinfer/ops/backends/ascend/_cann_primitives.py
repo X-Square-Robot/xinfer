@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import ctypes
 
-from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.core import CORE
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
 
 _library = None
 
@@ -26,7 +26,7 @@ def _load():
     """
     global _library
     if _library is None:
-        _library = _provider.core_library()
+        _library = _native.core_library()
     return _library
 
 

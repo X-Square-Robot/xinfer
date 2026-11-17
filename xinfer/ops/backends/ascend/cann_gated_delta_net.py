@@ -40,8 +40,8 @@ from threading import Lock
 
 import torch
 import torch.nn.functional as F
-from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.core import CORE
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
 
 
 _FINISH2 = None
@@ -57,9 +57,9 @@ def _finish2_entry():
     global _FINISH2
     if _FINISH2 is None:
         try:
-            from xinfer.ops.backends.ascend import _provider
+            from xinfer.ops.backends.ascend import _native
 
-            library = _provider.core_library()
+            library = _native.core_library()
             call = library.xinfer_aot_gdr_cann_finish2_call
             call.restype = ctypes.c_int
             call.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int64] * 6 + [ctypes.c_void_p]
@@ -74,7 +74,7 @@ def _finish2_entry():
 def _gdnv_enabled(family: str) -> bool:
     """GDNV route gate (XINFER_GDNV, default off; see glue.gdn_vendor)."""
     try:
-        from xinfer.ops.backends.ascend.glue import gdn_vendor
+        from xinfer.ops.backends.ascend import gdn_vendor
 
         return gdn_vendor.enabled(family)
     except Exception:  # noqa: BLE001 - any miss keeps the released chain
@@ -84,7 +84,7 @@ def _gdnv_enabled(family: str) -> bool:
 def _mover2_enabled(family: str) -> bool:
     """MOVE-R2 route gate (XINFER_MOVER2, default off; see glue.move_r2)."""
     try:
-        from xinfer.ops.backends.ascend.glue import move_r2
+        from xinfer.ops.backends.ascend import move_r2
 
         return move_r2.enabled(family)
     except Exception:  # noqa: BLE001 - any miss keeps the released chain
@@ -94,7 +94,7 @@ def _mover2_enabled(family: str) -> bool:
 def _soup2_enabled(family):
     """SOUP2 route gate (XINFER_SOUP2, default off; see glue.soup2)."""
     try:
-        from xinfer.ops.backends.ascend.glue import soup2
+        from xinfer.ops.backends.ascend import soup2
 
         return soup2.enabled(family)
     except Exception:  # noqa: BLE001 - any miss keeps the released chain
@@ -103,7 +103,7 @@ def _soup2_enabled(family):
 
 def _soup2_qksq(x_t, tokens, two_hk, dk):
     try:
-        from xinfer.ops.backends.ascend.glue import soup2
+        from xinfer.ops.backends.ascend import soup2
 
         return soup2.qksq(x_t, tokens, two_hk, dk)
     except Exception:  # noqa: BLE001
@@ -112,7 +112,7 @@ def _soup2_qksq(x_t, tokens, two_hk, dk):
 
 def _soup2_rawsq(out, tokens, hv, dv):
     try:
-        from xinfer.ops.backends.ascend.glue import soup2
+        from xinfer.ops.backends.ascend import soup2
 
         return soup2.rawsq(out, tokens, hv, dv)
     except Exception:  # noqa: BLE001
@@ -247,7 +247,7 @@ class CannGatedDeltaNet:
         x_t = None
         if os.environ.get("XINFER_CONVGEMM", "0") == "1":
             try:
-                from xinfer.ops.backends.ascend.glue.conv_gemm import conv_mixed_tokenmajor
+                from xinfer.ops.backends.ascend.conv_gemm import conv_mixed_tokenmajor
 
                 x_t = conv_mixed_tokenmajor(qkv, conv_weight)
             except (ImportError, OSError):
@@ -267,7 +267,7 @@ class CannGatedDeltaNet:
         )
         if mover2_apply:
             try:
-                from xinfer.ops.backends.ascend.glue.move_r2 import gdrapply as _gdrapply
+                from xinfer.ops.backends.ascend.move_r2 import gdrapply as _gdrapply
 
                 if x_t is None:
                     mixed_full = F.conv1d(
@@ -344,7 +344,7 @@ class CannGatedDeltaNet:
             and _gdnv_enabled("gdrprep")
         ):
             try:
-                from xinfer.ops.backends.ascend.glue import gdn_vendor as _gdnv_mod
+                from xinfer.ops.backends.ascend import gdn_vendor as _gdnv_mod
 
                 gdnv = _gdnv_mod.gdrprep(zba, A_log, dt_bias, tokens, hv, dv, qkv.dtype)
             except (ImportError, OSError, RuntimeError):
@@ -414,7 +414,7 @@ class CannGatedDeltaNet:
                 and _mover2_enabled("gdrtailmix")
             ):
                 try:
-                    from xinfer.ops.backends.ascend.glue.move_r2 import gdrtailmix as _gdrtailmix
+                    from xinfer.ops.backends.ascend.move_r2 import gdrtailmix as _gdrtailmix
 
                     gate = z.view(tokens, hv, dv).float()
                     F.silu(gate, inplace=True)

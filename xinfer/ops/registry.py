@@ -286,9 +286,9 @@ class OpRegistry:
         path = os.environ.get("XINFER_ASCEND_CORE_LIB")
         if not path:
             return {}
-        from xinfer.ops.backends.ascend import _provider
+        from xinfer.ops.backends.ascend import _native
 
-        if _provider.core_library() is None:
+        if _native.core_library() is None:
             return {}
         registered = sorted(name for name, impls in self._impls.items()
                             if any(implementation.backend == "ascend" for implementation in impls))

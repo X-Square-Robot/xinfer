@@ -50,7 +50,7 @@ def add_rms_norm(x, residual, weight, eps):
     # library; the module is absent without that delivery and these guards fall through to the entries
     # below, so the composition is unchanged.
     try:
-        from xinfer.ops.backends.ascend.glue import simdepi_r1
+        from xinfer.ops.backends.ascend import simdepi_r1
         if (simdepi_r1.enabled("v1280")
                 and x.dim() == 2 and x.shape[-1] == 1280
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -76,7 +76,7 @@ def add_rms_norm(x, residual, weight, eps):
     # delivered package's AOT kernels; the module is absent without that delivery and these guards
     # fall through to the entries below, so the composition is unchanged.
     try:
-        from xinfer.ops.backends.ascend.glue import rmsfuse_r4
+        from xinfer.ops.backends.ascend import rmsfuse_r4
         if (rmsfuse_r4.enabled("m16")
                 and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -109,7 +109,7 @@ def add_rms_norm(x, residual, weight, eps):
 # artifacts plus the CANN projection bridge; without them the attributes stay absent and the
 # action loop keeps the operator composition above.
 try:
-    from xinfer.ops.backends.ascend.glue import rmsfuse_r4
+    from xinfer.ops.backends.ascend import rmsfuse_r4
     if rmsfuse_r4.enabled("f32in"):
         from xinfer.ops.backends.ascend import gemm as _gemm_backend
         _projection = getattr(_gemm_backend, "cann_projection", None)
@@ -158,7 +158,7 @@ def rms_norm(x, weight, eps):
     # norm and the [rows, 2048] prefill input norm. An envelope miss (or a build without the kernels) keeps
     # the reference composition below, exactly as a v22 build without those kernels would.
     try:
-        from xinfer.ops.backends.ascend.glue import rmsfuse_r4
+        from xinfer.ops.backends.ascend import rmsfuse_r4
 
         if (rmsfuse_r4.enabled("m16")
                 and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
@@ -170,7 +170,7 @@ def rms_norm(x, weight, eps):
     except (ImportError, OSError):
         pass
     try:
-        from xinfer.ops.backends.ascend.glue import rms_plans
+        from xinfer.ops.backends.ascend import rms_plans
 
         plan = rms_plans.plain_rms(x, weight, eps)
         if plan is not None:
@@ -237,7 +237,7 @@ def add_zero_centered_rms_norm(x, residual, weight, eps):
     # every miss -- flag off, absent knife library, an envelope mismatch or a
     # fused-path error -- falls back to the entry chain below.
     try:
-        from xinfer.ops.backends.ascend.glue import soupform
+        from xinfer.ops.backends.ascend import soupform
 
         if soupform.enabled("normprep"):
             fused = soupform.normprep_norm(x, residual, weight, eps)

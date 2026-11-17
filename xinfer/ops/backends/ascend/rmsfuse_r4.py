@@ -32,8 +32,8 @@ _ENTRIES = {}
 _LOCK = Lock()
 _W32 = {}
 
-import xinfer.ops.backends.ascend._provider as _provider
-_DEFAULT_LIB = _provider._default_library_path("librmsfuse_r4.so")
+from xinfer.ops.backends.ascend import _native
+_DEFAULT_LIB = _native._default_library_path("librmsfuse_r4.so")
 _FAMILIES = ("m16", "f32in", "h2048w")
 
 
@@ -193,7 +193,7 @@ def gemm_add_rms_r4(x, weight, residual, norm_weight, epsilon, projection):
     caller falls back to the released chain). Defers to the smallm-r3
     oproj/down kernels when those families are enabled."""
     try:
-        from xinfer.ops.backends.ascend.glue import smallm_r3
+        from xinfer.ops.backends.ascend import smallm_r3
         if smallm_r3.enabled("oproj") and x.ndim == 3 and tuple(x.shape) == (16, 16, 128):
             return None
         if smallm_r3.enabled("down") and x.ndim >= 2 and tuple(weight.shape) == (1024, 2048) \

@@ -27,8 +27,8 @@ row still equals the generic pair with the modulation it selected.
 
 import torch
 
-from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.core import CORE
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
 
 
 

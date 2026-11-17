@@ -17,7 +17,7 @@ import os
 
 import torch
 
-from xinfer.ops.backends.ascend import _provider
+from xinfer.ops.backends.ascend import _native
 
 _CALL = None
 _ERROR = None
@@ -27,7 +27,7 @@ _WARMED = set()
 def _library():
     global _CALL, _ERROR
     if _CALL is None:
-        lib = _provider.core_library()
+        lib = _native.core_library()
         if lib is None:
             raise OSError("rope_d64: the unified core library is not loaded")
         call = getattr(lib, "xinfer_aot_rope_half_d64_call")

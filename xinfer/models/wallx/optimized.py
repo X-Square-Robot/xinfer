@@ -57,7 +57,7 @@ def _SOUPUNLOCK_LN(x, weight, bias, eps):
     kernel (fp32 vector-tree stats + Newton rsqrt, band-witnessed); any
     envelope miss returns None so the caller keeps the released chain."""
     try:
-        from xinfer.ops.backends.ascend.glue import soupunlock
+        from xinfer.ops.backends.ascend import soupunlock
 
         if soupunlock.enabled("visionln"):
             return soupunlock.layernorm_c1024(x, weight, bias, eps)
@@ -72,7 +72,7 @@ def _SOUPUNLOCK_RMSFULL(x, residual, weight, eps, layer_idx):
     vs the fp64 oracle). Armed only for layer_idx >= the configured floor;
     any miss returns None so the caller keeps the released chain."""
     try:
-        from xinfer.ops.backends.ascend.glue import soupunlock
+        from xinfer.ops.backends.ascend import soupunlock
 
         if soupunlock.enabled("rmsfull") and layer_idx >= soupunlock.from_layer():
             return soupunlock.rmsnorm_full(x, residual, weight, eps)
@@ -148,13 +148,13 @@ def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
         normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d
     )
     try:
-        from xinfer.ops.backends.ascend.glue import soupkill
+        from xinfer.ops.backends.ascend import soupkill
     except Exception:  # noqa: BLE001 - the mount is optional
         return released()
     if not soupkill.enabled("vrope") or normed.dim() != 2 or cos2 is None or cos2.shape[-1] != d:
         return released()
     if not _SOUPKILL_PROJECTION:
-        from xinfer.ops.backends.ascend.glue.cann_projection import CannProjection
+        from xinfer.ops.backends.ascend.cann_projection import CannProjection
 
         _SOUPKILL_PROJECTION.append(CannProjection())
     projection = _SOUPKILL_PROJECTION[0]
@@ -171,7 +171,7 @@ def _qkv_rope_soupkill(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
 
 def _SOUPFORM_ENABLED(family):
     try:
-        from xinfer.ops.backends.ascend.glue import soupform
+        from xinfer.ops.backends.ascend import soupform
 
         return soupform.enabled(family)
     except Exception:  # noqa: BLE001 - the mount is optional
@@ -187,7 +187,7 @@ def _zba_soupform(flat, weight, keep, conv, p):
     """
     if flat.dim() == 2:
         try:
-            from xinfer.ops.backends.ascend.glue import finishbf16
+            from xinfer.ops.backends.ascend import finishbf16
 
             if finishbf16.enabled("zba"):
                 out = finishbf16.zbasplit_bf16(flat, weight, keep, conv)
@@ -198,12 +198,12 @@ def _zba_soupform(flat, weight, keep, conv, p):
     if not _SOUPFORM_ENABLED("zbasplit") or flat.dim() != 2:
         return None
     if not _SOUPKILL_PROJECTION:
-        from xinfer.ops.backends.ascend.glue.cann_projection import CannProjection
+        from xinfer.ops.backends.ascend.cann_projection import CannProjection
 
         _SOUPKILL_PROJECTION.append(CannProjection())
     proj = _SOUPKILL_PROJECTION[0]
     try:
-        from xinfer.ops.backends.ascend.glue import soupform
+        from xinfer.ops.backends.ascend import soupform
 
         with proj.accumulator(flat, weight) as acc:
             return soupform.zbasplit(acc, keep, conv)
@@ -221,7 +221,7 @@ def _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
     """
     if normed.dim() == 2 and cos2 is not None and cos2.shape[-1] == d:
         try:
-            from xinfer.ops.backends.ascend.glue import finishbf16
+            from xinfer.ops.backends.ascend import finishbf16
 
             if finishbf16.enabled("vrope"):
                 packed = finishbf16.vrope_bf16(normed, block.qkv_weight, block.qkv_bias,
@@ -232,12 +232,12 @@ def _qkv_rope_packed(ops, normed, block, cos, sin, cos2, sin2, n, heads, d):
             pass
     if _SOUPFORM_ENABLED("vropepack") and normed.dim() == 2 and cos2 is not None and cos2.shape[-1] == d:
         if not _SOUPKILL_PROJECTION:
-            from xinfer.ops.backends.ascend.glue.cann_projection import CannProjection
+            from xinfer.ops.backends.ascend.cann_projection import CannProjection
 
             _SOUPKILL_PROJECTION.append(CannProjection())
         proj = _SOUPKILL_PROJECTION[0]
         try:
-            from xinfer.ops.backends.ascend.glue import soupform
+            from xinfer.ops.backends.ascend import soupform
 
             with proj.accumulator(normed, block.qkv_weight) as acc:
                 packed = soupform.vision_qkv_rope_packed(acc, block.qkv_bias, cos2, sin2, heads, d)
@@ -299,7 +299,7 @@ class OptimizedVision(_FormatStage):
         # Two cat kernels per request, not per block; None keeps the released op.
         cos2 = sin2 = None
         try:
-            from xinfer.ops.backends.ascend.glue import soupkill
+            from xinfer.ops.backends.ascend import soupkill
 
             if soupkill.enabled("vrope") and cos.dim() == 2:
                 cos2 = torch.cat((cos, cos), dim=-1).contiguous()

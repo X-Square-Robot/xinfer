@@ -1,19 +1,18 @@
 """Ascend entry discovery and cached partial-support adapters.
 
-The unified branch's own provider (``_provider``) loads the kernel libraries;
-these helpers discover usable exports and optional bridges, and share
-layout-based fallback across GEMM, attention and normalization. The registry
-selects a backend at model build time; unsupported call layouts remain the
-backend's concern.
+The backend's native loader (``_native``, the retired provider surface re-homed) loads the kernel
+libraries; these helpers discover usable exports and optional bridges, and share layout-based
+fallback across GEMM, attention and normalization. The registry selects a backend at model build
+time; unsupported call layouts remain the backend's concern.
 
-The semantics are the former paired-loader helpers, re-pointed at the
-in-repo glue namespace: ``canonical()`` still inspects a package namespace and
-compares signatures, ``bridge()`` still imports a glue module and checks it
-comes from this tree, ``partial()`` still caches per-layout support. The
-provider namespace object (``xc``, below) exposes the class-style operator
-entries from ``glue.core`` so the binding modules' shape is unchanged.
+The semantics are the former paired-loader helpers, re-pointed at the in-repo operator namespace:
+``canonical()`` still inspects a package namespace and compares signatures, ``bridge()`` still
+imports a backend module and checks it comes from this tree, ``partial()`` still caches per-layout
+support. The kernel namespace object (``xc``, below) exposes the class-style operator entries from
+the backend's ``core`` module so the binding modules' shape is unchanged.
 """
 
+import hashlib
 import inspect
 from functools import wraps
 from importlib import import_module
@@ -21,39 +20,46 @@ from pathlib import Path
 
 import torch
 
-from xinfer.ops.backends.ascend import _provider
+from xinfer.ops.backends.ascend import _native
 
-# The glue namespace object: a module-like surface over glue/core.py's
-# class-style entries. It is None when the provider is disabled or the core
-# library is absent (no library, no registrations), which keeps every
-# `requires=` None and the backend on the reference compositions.
+# The kernel namespace object: a module-like surface over the backend's core.py class-style
+# entries. It is None when the loader is disabled or the core library is absent (no library, no
+# registrations), which keeps every `requires=` None and the backend on the reference compositions.
 #
-# The namespace answers to the registry's library name ``xinfer_ascend``:
-# ``register(..., requires=xc)`` spells the selection report's library (and
-# the ``--op-backends <op>=ascend:xinfer_ascend`` pin, ARCH-DESIGN §4.3) from
-# ``requires.__name__``. The retired paired loader's module spelled it
-# ``xcompute``; forwarding attribute access to the glue core keeps the
-# absent-entry AttributeError semantics (getattr(xc, name, None) → None) the
-# class glues' fail-safes depend on.
-class _XinferAscendNamespace:
-    __name__ = "xinfer_ascend"
+# The namespace answers to the registry's library name ``kernels``: ``register(..., requires=xc)``
+# spells the selection report's library (and the ``--op-backends <op>=ascend:kernels`` pin) from
+# ``requires.__name__`` — the naming symmetry the CUDA backend reaches with ``cuda:kernels``
+# (``cuda/_native.py``'s NATIVE kwargs). The retired paired loader's module spelled it
+# ``xcompute``, the unified branch's provider ``xinfer_ascend``; forwarding attribute access to
+# the backend core keeps the absent-entry AttributeError semantics (getattr(xc, name, None) →
+# None) the class glues' fail-safes depend on. The transition's dual-source winner
+# (``ascend:xcompute`` vs ``ascend:kernels``) is decided by priority or pin, never by
+# registration order (``_native.py``'s regulation).
+class _AscendKernelsNamespace:
+    __name__ = "kernels"
 
     def __getattr__(self, name):
         return getattr(_glue_core, name)
 
     def __repr__(self):  # pragma: no cover - diagnostics only
-        return f"<xinfer_ascend namespace over {_glue_core!r}>"
+        return f"<ascend:kernels namespace over {_glue_core!r}>"
 
 
 try:
-    from xinfer.ops.backends.ascend.glue import core as _glue_core
+    from xinfer.ops.backends.ascend import core as _glue_core
 
-    xc = (_XinferAscendNamespace()
-          if _provider.enabled() and _provider.core_library() is not None else None)
-except Exception:  # noqa: BLE001 - the glue import never fails in-tree; stay safe for odd installs
+    xc = (_AscendKernelsNamespace()
+          if _native.enabled() and _native.core_library() is not None else None)
+except Exception:  # noqa: BLE001 - the core import never fails in-tree; stay safe for odd installs
     xc = None
 
-VERSION = "unified-1" if xc is not None else None
+# The registration ``version`` argument: the core family library's sha256 fingerprint (the same
+# form the CUDA ``NATIVE`` kwargs carry), or None when nothing is loaded.
+VERSION = None
+if _native.enabled() and _native.core_library() is not None:
+    _path = _native._LIBRARY_PATHS.get("xinfer_ascend_core")
+    if _path:
+        VERSION = f"libxinfer_ascend_core.so sha256:{hashlib.sha256(Path(_path).read_bytes()).hexdigest()[:12]}"
 
 
 def canonical(name, reference):
@@ -90,15 +96,15 @@ def has_functions(*names):
 
 
 def entry(*names):
-    """The glue namespace when every Python entry is available, otherwise None for ``requires``."""
+    """The kernel namespace when every Python entry is available, otherwise None for ``requires``."""
     return xc if xc is not None and all(callable(getattr(xc, name, None)) for name in names) else None
 
 
 def bridge(name):
-    """A glue module by name; missing modules still raise, absent families return None."""
+    """A backend kernel module by name; missing modules still raise, absent families return None."""
     if xc is None:
         return None
-    module_name = f"xinfer.ops.backends.ascend.glue.{name}"
+    module_name = f"xinfer.ops.backends.ascend.{name}"
     try:
         module = import_module(module_name)
     except ModuleNotFoundError as exc:
@@ -108,7 +114,7 @@ def bridge(name):
         raise
     path = getattr(module, "__file__", None)
     if not path or not Path(path).resolve().is_relative_to(Path(__file__).resolve().parent):
-        raise RuntimeError(f"{module_name} must come from the in-tree glue package")
+        raise RuntimeError(f"{module_name} must come from the in-tree ascend backend package")
     return module
 
 

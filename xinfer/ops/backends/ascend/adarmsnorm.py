@@ -1,8 +1,8 @@
-from xinfer.ops.backends.ascend import _provider
-from xinfer.ops.backends.ascend.glue.core import CORE
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
 import torch
 
-from xinfer.ops.backends.ascend.glue.rmsnorm import _force_kernel_layout
+from xinfer.ops.backends.ascend.rmsnorm import _force_kernel_layout
 
 
 def _get_gate_shape(input, modulation):
@@ -206,7 +206,7 @@ class Adarmsnorm:
         if residual is not None or branch_gate is not None:
             if residual is None or branch_gate is None:
                 raise ValueError("residual and branch_gate must be given together")
-            from xinfer.ops.backends.ascend.glue.gated_residual_adarmsnorm import (
+            from xinfer.ops.backends.ascend.gated_residual_adarmsnorm import (
                 gated_residual_adarmsnorm,
             )
 

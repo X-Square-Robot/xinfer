@@ -18,8 +18,8 @@ _ENTRIES = {}
 _LOCK = Lock()
 _PACKED = {}
 
-import xinfer.ops.backends.ascend._provider as _provider
-_DEFAULT_LIB = _provider._default_library_path("libsmallm_r3.so")
+from xinfer.ops.backends.ascend import _native
+_DEFAULT_LIB = _native._default_library_path("libsmallm_r3.so")
 _FAMILIES = ("oproj", "gateup", "down", "qkv")
 
 

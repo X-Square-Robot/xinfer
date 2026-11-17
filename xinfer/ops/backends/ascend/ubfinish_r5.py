@@ -21,9 +21,9 @@ _ENTRIES = {}
 _REGISTRY = None
 _LOCK = Lock()
 
-import xinfer.ops.backends.ascend._provider as _provider
-_DEFAULT_LIB = _provider._default_library_path("libubfinish_r5.so")
-_DEFAULT_REGISTRY = _provider._default_library_path("ubfinish-r5-registry.json")
+from xinfer.ops.backends.ascend import _native
+_DEFAULT_LIB = _native._default_library_path("libubfinish_r5.so")
+_DEFAULT_REGISTRY = _native._default_library_path("ubfinish-r5-registry.json")
 
 
 def enabled():

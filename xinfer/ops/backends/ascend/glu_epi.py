@@ -33,9 +33,9 @@ def enabled(family):
 def _entry_pair():
     global _ENTRY
     if _ENTRY is None:
-        from xinfer.ops.backends.ascend import _provider
+        from xinfer.ops.backends.ascend import _native
 
-        lib = _provider.core_library()
+        lib = _native.core_library()
         call = getattr(lib, "xinfer_aot_gemm_glu_fp32_finish_split_6144_call")
         call.restype = ctypes.c_int32
         call.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]

@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from xinfer.platforms.npu import _CHROMA, _DEVICE_TO_DEVICE, _call, _rgb
 
 try:  # aa-resample (XINFER_AA_RESAMPLE, default off)
-    from xinfer.ops.backends.ascend.glue import aa_resample
+    from xinfer.ops.backends.ascend import aa_resample
 except Exception:  # pragma: no cover - optional mount
     aa_resample = None
 
@@ -37,7 +37,7 @@ except Exception:  # pragma: no cover - optional mount
 def _quant_u8(x):
     """SOUP2 quant knife: one kernel for add+floor+clamp+cast; falls back."""
     try:
-        from xinfer.ops.backends.ascend.glue import soup2
+        from xinfer.ops.backends.ascend import soup2
 
         if soup2.enabled("quant"):
             out = soup2.quant_u8(x)
