@@ -6,10 +6,11 @@
 其他设备继续使用 GPU Wall-X 2B 实现及其 checkpoint 格式。RPU 配置没有
 CPU、BF16 或 MXFP8 执行回退。
 
-此配置通过 Rhino Launch SDK 使用 Rhino RPU (R1)。SDK 和兼容的 RPU
-xcompute 构建需要单独安装。
+此配置通过 Rhino Launch SDK 使用 Rhino RPU (R1)。SDK 单独安装，原生算子后端从
+`xinfer/ops/backends/rpu/src` 构建。框架接入与原生算子分别评审；实际执行前必须
+安装匹配的算子源码。
 
-执行属于实验特性，同时需要显式的候选准入和单独选定的 AOT xcompute 库。
+执行属于实验特性，同时需要显式的候选准入和匹配的 AOT `xinfer_rpu.so` 库及外部算子资产。
 主机侧模型计划、处理与生命周期契约已经实现；用于生产前仍需完成板级数值、
 ABI 和时延验收。
 
@@ -36,7 +37,7 @@ stream/event 或通用 CUDA `Engine`。执行使用进程内 `Policy` 接口。
 ## 无板卡的 checkpoint 检查
 
 安装模型处理依赖，例如在通过 `python -m pip install -e ".[models]"`
-准备的环境中。预检查不加载张量或导入 xcompute，即可检查 checkpoint 元数据、
+准备的环境中。预检查不加载张量或原生算子库，即可检查 checkpoint 元数据、
 配置和资产哈希：
 
 ```python
@@ -56,10 +57,16 @@ print(manifest)
 
 ## 显式候选准入
 
-在创建实际执行上下文前，显式选择 SDK 准备的 AOT 库。选定的库必须与已经
-导入的 xcompute Python 包匹配，并提供 RPU ABI。先取得部署环境的板卡租约，
-并检查设备占用情况。将 `XCOMPUTE_LIBRARY_PATH` 指向所选库
-（需要时用 `XCOMPUTE_SKIP_AUTO_BUILD=1` 关闭自动构建）。
+创建实际执行上下文前，先针对 Rhino Launch SDK 构建 AOT 算子库。仅含主机
+resolver 的库不能执行请求。在启动进程前选择运行时库及单独的算子资产：
+
+```bash
+export XINFER_RPU_LIBRARY=/path/to/xinfer_rpu.so
+export XINFER_RPU_ASSETS=/path/to/rpu-assets
+```
+
+provider 检查 ABI、catalog 指纹及资产 manifest 哈希。先取得部署环境的板卡租约，
+并检查设备占用情况。导入 Python 模块不会触发库或设备算子的编译。
 
 执行可通过 `Policy` 获得。其上下文管理器会在推理抛出异常时仍关闭
 引擎和输入处理器：
@@ -75,7 +82,7 @@ with Policy("wallx2b", checkpoint, device="rpu:0", quantization="fp16",
 执行不会隐式启用候选能力。如果后端没有实现选定的 family、selector、
 集体窗口或融合队列，则准入失败，而不会静默替换为另一种执行计划。
 
-模型计划通过 xcompute family 入口准备，例如 `gemm`、`rmsnorm`、
+模型计划通过本仓算子 provider 的 family 入口准备，例如 `gemm`、`rmsnorm`、
 `qkv_proj`、`gemm_glu` 和 `attention`。family selector 原样传递给原生
 resolver；主机不选择物理 kernel 地址，也不为 catalog 名称维护别名表。
 
@@ -162,9 +169,9 @@ reset 和关闭之后仍然有效。
 ## 验证与限制
 
 `test_rpu_runtime.py` 的主机生命周期契约使用原生 fake，不需要板卡或
-`xcompute.so`，覆盖资源所有权、显式等待、请求准入、取消、失败、reset 和释放。
+原生算子库，覆盖资源所有权、显式等待、请求准入、取消、失败、reset 和释放。
 其他模型测试覆盖处理、checkpoint 清单、权重变换和 CPU 数值参考；部分计划测试
-需要 xcompute 的 host-only `rpu_tp_resolve` 库导出，缺少该导出时会跳过。
+需要本仓的 host-only `rpu_tp_resolve` 库导出，缺少该导出时会跳过。
 
 ```bash
 python -m pytest -q -m "not gpu and not assets" \

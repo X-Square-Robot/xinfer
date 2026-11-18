@@ -24,6 +24,6 @@ def rpu_platform(device: str):
             device_type="rpu", arch="rpu-tp8", cudagraphs=False,
             stream_priorities=False, unified_memory=False,
             multiprocess_service=False, sm_count=None, total_memory_bytes=None,
-            execution_model="explicit-completion", op_selection="external",
+            execution_model="explicit-completion", op_selection="model-bound",
         ),
     )

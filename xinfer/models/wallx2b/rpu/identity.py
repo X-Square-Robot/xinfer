@@ -1,7 +1,7 @@
-"""Prepared Wall-X 2B FP16 TP8 action identity-mixer layer over public xcompute TP operations.
+"""Prepared Wall-X 2B FP16 TP8 action identity-mixer layer over public native TP operations.
 
 This is one real B1/H16 component, not a full policy executor. All intermediate
-activations remain resident. Native xcompute retains its 48-collective limit,
+activations remain resident. The native provider retains its 48-collective limit,
 serial segment completion checks, and numerical guards. Shared scratch may be
 reused by multiple prepared layers only in a serial execution order.
 """
@@ -49,7 +49,7 @@ def _buffer(value, context, shape, distribution, name, *, weight=False):
 class IdentityLayerWeights:
     """Model-prepared natural TP8 weights; down already contains source /4.
 
-    ``prepare`` performs only xcompute packing/upload. The caller must use
+    ``prepare`` performs only native packing/upload. The caller must use
     ``WeightPreparer`` for source splitting and profile scaling; applying /4 here
     would silently double-scale already prepared checkpoint weights.
     """
@@ -78,7 +78,7 @@ class IdentityLayerWeights:
 class IdentityModulation:
     """One layer/step's once-packed CPU Ada rows and independent gate owners.
 
-    xcompute has no public tensor view into modulation row2. Therefore the
+    the native provider has no public tensor view into modulation row2. Therefore the
     same packed FP16 gate bytes are uploaded into a separate vector once at
     preparation, without any activation readback or invented alias/proof.
     The caller supplies gamma=1+scale, shift and gate/S (MLP gate also x4).

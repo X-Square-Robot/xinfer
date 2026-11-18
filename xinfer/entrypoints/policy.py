@@ -86,10 +86,10 @@ class Policy:
             ValueError: unsupported device type.
         """
         self.platform = resolve_platform(device)
-        if self.platform.capabilities.op_selection == "external":
+        if self.platform.capabilities.op_selection == "model-bound":
             if reference_ops or op_backends:
                 raise ValueError(f"platform {self.platform.name} selects operators through its own binding "
-                                 "(op_selection='external'); Torch operator overrides are unsupported")
+                                 "(op_selection='model-bound'); Torch operator overrides are unsupported")
             from xinfer.ops.registry import OpTable
 
             self.op_table = OpTable(self.platform.name, {})

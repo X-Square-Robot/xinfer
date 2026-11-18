@@ -43,8 +43,9 @@ class PlatformCapabilities:
             ``"explicit-completion"`` selects a vendor SDK execution module (RPU's prepared-batch
             completion-wait model, no CUDA graph, no torch stream).
         op_selection: ``"table"`` selects operators through :class:`xinfer.ops.OpTable` at build
-            time; ``"external"`` records that the model carries its own kernel bindings (xcompute
-            RPU prepared TP entries) and that no ``OpTable`` is constructed on this platform.
+            time; ``"model-bound"`` records that the model binds prepared operations through its native
+            provider instead of the registered tensor-call interface. The shared model construction
+            context receives an empty table; this mode is independent of the source repository.
     """
 
     device_type: str  # "cuda", "ascend", "cpu" or "rpu"
@@ -58,7 +59,7 @@ class PlatformCapabilities:
     device_images: bool = False
     stream_priority_range: tuple[int, int] | None = None
     execution_model: Literal["cuda-lanes", "explicit-completion"] = "cuda-lanes"
-    op_selection: Literal["table", "external"] = "table"
+    op_selection: Literal["table", "model-bound"] = "table"
     # Whether the runtime can register frontend shared memory for zero-copy DMA and whether kineto/
     # torch.device profiler annotations apply. True for CUDA today; other vendors answer via their
     # own platform factory when their runtime exposes equivalent primitives. The profiler and the

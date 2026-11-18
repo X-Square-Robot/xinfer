@@ -1,6 +1,6 @@
 """Prepared Wall-X 2B FP16 TP8 vision tower with three resident, phase-reused slots.
 
-The model owns tensor placement and explicit reductions. xcompute owns all
+The model owns tensor placement and explicit reductions. the native provider owns all
 packing, device kernels, prepared DMA and completion. No Torch device tensor
 or RhinoForge executor appears in this path.
 """

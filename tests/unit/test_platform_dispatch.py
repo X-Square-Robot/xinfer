@@ -55,7 +55,7 @@ def test_engine_factory_rpu_land_on_rpu_engine():
     # already matched, and the next failure is the model's missing RPU hook (not a wrong-engine
     # dispatch fallback).
     with pytest.raises(TypeError, match="RPU models must provide create_rpu_request"):
-        create_engine(_platform("rpu:0", execution_model="explicit-completion", op_selection="external"), model,
+        create_engine(_platform("rpu:0", execution_model="explicit-completion", op_selection="model-bound"), model,
                       config=None)
 
     # Negative: the wrong engine class for a given cap is refused by that engine's own guard,

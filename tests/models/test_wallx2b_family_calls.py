@@ -1,6 +1,6 @@
-"""Model plans prepare TP8 operations through xcompute family entry points.
+"""Model plans prepare TP8 operations through in-tree RPU family entry points.
 
-Catalog entry names remain accepted by xcompute for compatibility, so a call
+Catalog entry names remain accepted by the native provider for compatibility, so a call
 site left on an old name still plans correctly and other tests cannot see it.
 This test keeps the model code on the family API (gemm, rmsnorm, attention, ...).
 """
@@ -34,9 +34,9 @@ def _prepared_names(path):
 
 def test_model_plans_use_family_entry_points():
     try:
-        from xcompute import rpu_tp
-    except Exception as error:  # noqa: BLE001 - any import failure means no resolver
-        pytest.skip(f"xcompute family table unavailable (set XCOMPUTE_LIBRARY_PATH/PYTHONPATH): {error}")
+        from xinfer.ops.backends.rpu import rpu_tp
+    except ImportError as error:
+        pytest.skip(f"in-tree RPU family table unavailable: {error}")
     families = set(rpu_tp.FAMILIES)
     offenders = [
         f"{path.relative_to(ROOT)}:{line}: {name}"
@@ -44,5 +44,5 @@ def test_model_plans_use_family_entry_points():
         for name, line in _prepared_names(path)
         if name not in families and name not in ALLOWED
     ]
-    assert not offenders, "use the xcompute family entry point instead of:\n" + "\n".join(offenders)
+    assert not offenders, "use the RPU family entry point instead of:\n" + "\n".join(offenders)
     assert any(_prepared_names(path) for path in MODEL_FILES), "no prepare calls found"

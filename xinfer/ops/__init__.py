@@ -337,7 +337,7 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
 
     if device_module_for(device) is None:
         # CPU, non-torch vendor addresses or platforms whose model carries its own kernel
-        # binding (op_selection='external') have no "slow torch fallback" to warn about;
+        # binding (op_selection='model-bound') have no "slow torch fallback" to warn about;
         # the caller already gates the call on op_selection=='table'.
         return []
     import torch

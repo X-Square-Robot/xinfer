@@ -12,12 +12,12 @@ from xinfer.platforms.cpu import cpu_platform
 
 
 @pytest.mark.parametrize(("selection", "effective", "options", "expected"), [
-    ("external", "bf16", {}, "bf16"),
-    ("external", "fp16", {}, "fp16"),
+    ("model-bound", "bf16", {}, "bf16"),
+    ("model-bound", "fp16", {}, "fp16"),
     ("table", "fp16", {}, "fp16"),
-    ("external", "bf16", {"quantization": "auto"}, "bf16"),
+    ("model-bound", "bf16", {"quantization": "auto"}, "bf16"),
     ("table", None, {"quantization": "mxfp8"}, "mxfp8"),
-    ("external", None, {}, "bf16"),
+    ("model-bound", None, {}, "bf16"),
 ])
 def test_policy_reports_effective_precision_without_choosing_a_model_default(
         monkeypatch, selection, effective, options, expected):
@@ -85,7 +85,7 @@ def test_policy_routes_rpu_profile_defaults_to_the_rpu_engine(monkeypatch):
         return None
 
     monkeypatch.setattr(policy_module, "get_model_class", lambda name: SimpleNamespace(from_checkpoint=load))
-    monkeypatch.setattr(importlib.import_module("xinfer.engine.rpu.engine"), "RpuExecutionContext",
+    monkeypatch.setattr(policy_module._engine_factory, "_rpu_context",
                         lambda **kwargs: context)
     monkeypatch.setattr(importlib.import_module("xinfer.config.rpu"), "find_tuned", tuned)
 

@@ -30,6 +30,26 @@ def resolve_config(model, platform: Platform, **kwargs):
     raise ValueError(f"unknown execution_model {platform.capabilities.execution_model!r} on {platform.name}")
 
 
+def _rpu_context(**options):
+    """Assemble the in-tree operator provider and the platform resource owner."""
+    try:
+        from xinfer.ops.backends import rpu
+    except ImportError as error:
+        raise RuntimeError("the in-tree RPU operator backend is unavailable; install the matching ops sources "
+                           "and build xinfer_rpu.so") from error
+    from xinfer.platforms.rpu import RpuExecutionContext
+
+    backend = rpu.load_backend()
+    if not backend.provenance["runtime_available"]:
+        raise RuntimeError("the RPU library is host-only; build the runtime against Rhino Launch SDK for execution")
+    context = RpuExecutionContext(backend_factory=backend.backend_factory, **options)
+    context.provenance.update(backend.provenance)
+    assets = getattr(context.native, "asset_provenance", None)
+    if assets is not None:
+        context.provenance["assets"] = dict(assets)
+    return context
+
+
 def create_engine(platform: Platform, model, config=None):
     """Construct the engine ``platform.capabilities.execution_model`` selects.
 
@@ -49,7 +69,7 @@ def create_engine(platform: Platform, model, config=None):
     if platform.capabilities.execution_model == "explicit-completion":
         from xinfer.engine.rpu import RpuEngine
 
-        return RpuEngine(model, platform, config)
+        return RpuEngine(model, platform, config, context_factory=_rpu_context)
     if platform.capabilities.execution_model == "cuda-lanes":
         from xinfer.engine.core import Engine
 

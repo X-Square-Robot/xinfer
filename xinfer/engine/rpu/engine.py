@@ -1,4 +1,4 @@
-"""Single-request stage scheduling for the public xcompute TP8 runtime.
+"""Single-request stage scheduling for the prepared RPU TP8 runtime.
 
 CUDA lanes cannot implement this backend: TP8 has one device submission in
 flight and device accesses require explicit completion. Models prepare a
@@ -52,7 +52,7 @@ class RpuEngine:
     ABI provides no safe device cancellation. Shutdown drains that request.
     """
 
-    def __init__(self, model, platform, config=None, *, context=None):
+    def __init__(self, model, platform, config=None, *, context=None, context_factory=None):
         if platform.capabilities.execution_model != "explicit-completion":
             raise ValueError("RpuEngine requires execution_model='explicit-completion', got "
                              f"{platform.capabilities.execution_model!r} on {platform.name}")
@@ -72,7 +72,9 @@ class RpuEngine:
             raise ValueError("RPU supports one lane and batch size 1 per stage")
         if not callable(getattr(model, "create_rpu_request", None)):
             raise TypeError("RPU models must provide create_rpu_request(prepared, context)")
-        self.context = context or RpuExecutionContext(
+        if context is not None and context_factory is not None:
+            raise ValueError("pass either context or context_factory, not both")
+        self.context = context if context is not None else (context_factory or RpuExecutionContext)(
             allow_candidate=bool(getattr(model, "rpu_allow_candidate", False)),
             retained_segments=getattr(model, "rpu_retained_segments", 128),
             file_descriptor_budget=getattr(model, "rpu_file_descriptor_budget", None))

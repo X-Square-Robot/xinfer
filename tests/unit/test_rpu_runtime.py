@@ -352,14 +352,14 @@ def test_rpu_platform_does_not_use_torch_device(monkeypatch):
         resolve_platform("rpu:1")
 
 
-def test_native_context_requires_explicit_library_before_importing_xcompute(monkeypatch):
+def test_native_context_requires_injection_without_importing_device_runtimes():
     import sys
 
-    monkeypatch.delenv("XCOMPUTE_LIBRARY_PATH", raising=False)
-    before = sys.modules.get("xcompute")
-    with pytest.raises(RuntimeError, match="explicit XCOMPUTE_LIBRARY_PATH"):
+    names = ("xcompute", "tvm_ffi", "xinfer.ops.backends.rpu")
+    before = {name: sys.modules.get(name) for name in names}
+    with pytest.raises(RuntimeError, match="injected native backend"):
         RpuExecutionContext()
-    assert sys.modules.get("xcompute") is before
+    assert {name: sys.modules.get(name) for name in names} == before
 
 
 def test_rpu_resolution_limits_admission_before_building_a_device_context():

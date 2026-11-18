@@ -36,14 +36,14 @@ def disjoint(a, b):
 def catalog_call(op, tensors, integers=None, selectors=None, *, with_names=False):
     """Normalize a family call (gemm, rmsnorm, ...) to its catalog entry.
 
-    Uses xcompute's host-side resolver, so these planning fakes keep asserting
+    Uses the operator backend's host-side resolver, so these planning fakes keep asserting
     the catalog names and argument names the device receives. A catalog call
     is returned unchanged. Returns (entry, tensors by catalog name, integers),
     plus the caller-name -> catalog-name map when with_names is set.
     """
     integers = dict(integers or {})
     selectors = dict(selectors or {})
-    resolver = xcompute_resolver()
+    resolver = native_resolver()
     if not selectors and op not in resolver.FAMILIES:
         result = (op, dict(tensors), integers)
         names = {name: name for name in tensors}
@@ -53,27 +53,17 @@ def catalog_call(op, tensors, integers=None, selectors=None, *, with_names=False
     return (*result, names) if with_names else result
 
 
-def xcompute_resolver():
-    """xcompute.rpu_tp from the build named by XCOMPUTE_LIBRARY_PATH.
-
-    The model plans prepare family entry points, so their planning oracle
-    needs the real resolver; without it the planning test is skipped with
-    the reason (a missing dependency, not a passing check).
-    """
+def native_resolver():
+    """Load the in-tree host resolver; missing native dependencies are explicit skips."""
     import pytest
 
     try:
-        from xcompute import rpu_tp
-    except Exception as error:  # noqa: BLE001 - any import failure means no resolver
-        pytest.skip("RPU planning tests need xcompute's library-exported TP8 family resolver: "
-                    "set XCOMPUTE_LIBRARY_PATH to xcompute.so and PYTHONPATH to its python/ "
-                    f"directory ({type(error).__name__}: {error})")
-    if not hasattr(rpu_tp, "resolve"):
-        pytest.skip(f"xcompute at {rpu_tp.__file__} predates TP8 family entry points")
-    try:
-        rpu_tp.xcompute_lib.get_function("rpu_tp_resolve")
-    except (AttributeError, KeyError):
-        pytest.skip(f"xcompute module {rpu_tp.__file__} selected a library without rpu_tp_resolve")
+        from xinfer.ops.backends import rpu
+        from xinfer.ops.backends.rpu import rpu_tp
+        rpu.load_backend()
+    except (ImportError, FileNotFoundError) as error:
+        pytest.skip("RPU planning tests need the in-tree host family resolver; build xinfer_rpu.so and set "
+                    f"XINFER_RPU_LIBRARY ({type(error).__name__}: {error})")
     return rpu_tp
 
 

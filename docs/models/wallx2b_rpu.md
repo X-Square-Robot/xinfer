@@ -8,10 +8,12 @@ and its checkpoint format. The RPU profile has no CPU, BF16 or MXFP8 execution
 fallback.
 
 This profile targets Rhino RPU (R1) through Rhino Launch SDK. Install the SDK
-and a compatible RPU xcompute build separately.
+separately and build the native operator backend from
+`xinfer/ops/backends/rpu/src`. Framework integration and native operators are
+reviewed separately; the matching operator sources must be installed for execution.
 
 Execution is experimental and requires both explicit candidate admission and
-a separately selected AOT xcompute library. Host-side model plans, processing
+a matching AOT `xinfer_rpu.so` library and external kernel assets. Host-side model plans, processing
 and lifecycle contracts are implemented; board-level numerical, ABI and
 latency acceptance remains required before production use.
 
@@ -44,7 +46,7 @@ required by load profiling.
 Install the model-processing dependencies, for example in an environment
 provisioned with `python -m pip install -e ".[models]"`. Preflight checks
 checkpoint metadata, configuration and asset hashes without loading tensors or
-importing xcompute:
+loading the native operator library:
 
 ```python
 from xinfer.models.wallx2b.rpu.config import preflight_checkpoint
@@ -65,11 +67,18 @@ interface.
 
 ## Explicit candidate admission
 
-Select an SDK-prepared AOT library explicitly before creating a real execution
-context. The selected library must match the already imported xcompute Python
-package and must provide the RPU ABI. Acquire the deployment's board lease and
-check device occupancy first. Set `XCOMPUTE_LIBRARY_PATH` to the chosen library
-(and disable auto-build with `XCOMPUTE_SKIP_AUTO_BUILD=1` when appropriate).
+Build the AOT operator library against Rhino Launch SDK before creating a real
+execution context. A host-only resolver library cannot execute requests. Select
+the runtime library and the separate kernel assets before starting the process:
+
+```bash
+export XINFER_RPU_LIBRARY=/path/to/xinfer_rpu.so
+export XINFER_RPU_ASSETS=/path/to/rpu-assets
+```
+
+The provider checks the ABI, catalog fingerprint and asset manifest hashes.
+Acquire the deployment's board lease and check device occupancy first. Importing
+Python modules never compiles the library or device kernels.
 
 Execution is available through `Policy`. Its context manager closes the engine
 and the input processor even when inference raises:
@@ -86,7 +95,7 @@ Execution never enables candidate capabilities implicitly. A backend that does
 not implement a selected family, selector, collective window or fused queue
 fails admission instead of silently substituting a different execution plan.
 
-Model plans prepare through xcompute family entry points such as `gemm`,
+Model plans prepare through the in-tree operator provider's family entry points such as `gemm`,
 `rmsnorm`, `qkv_proj`, `gemm_glu` and `attention`. Family selectors pass to the
 native resolver unchanged; the host does not choose physical kernel addresses
 or maintain an alias table for catalog names.
@@ -189,10 +198,10 @@ later requests, resets and close.
 ## Validation and limitations
 
 The `test_rpu_runtime.py` host lifecycle contracts use native fakes and run
-without a board or `xcompute.so`. They cover ownership, explicit waits, request
+without a board or native operator library. They cover ownership, explicit waits, request
 admission, cancellation, failure, reset and release. Other model tests cover
 processing, checkpoint manifests, weight transforms and CPU numerical
-references; some planner tests require xcompute's host-only `rpu_tp_resolve`
+references; some planner tests require the in-tree host-only `rpu_tp_resolve`
 library export and are skipped when that export is unavailable.
 
 ```bash

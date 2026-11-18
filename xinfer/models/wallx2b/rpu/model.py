@@ -1,7 +1,7 @@
 """Wall-X 2B FP16 TP8 model with resident Vision, cache-only Text and NFE8 Action.
 
 Model placement and scratch liveness live here and in the stage lowerings.
-All device allocation, DMA, packing, submission and completion use xcompute's
+All device allocation, DMA, packing, submission and completion use the native provider's
 public TP8 interface. There is no CPU or RhinoForge execution fallback.
 """
 

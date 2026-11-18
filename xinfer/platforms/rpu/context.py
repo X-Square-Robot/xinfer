@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
-import os
 import threading
 import weakref
 from collections import Counter
-from pathlib import Path
 
 import numpy as np
 
@@ -54,34 +51,8 @@ class RpuExecutionContext:
             if file_descriptor_budget is not None:
                 self.require_file_descriptor_budget(file_descriptor_budget)
             if backend_factory is None:
-                selected = os.environ.get("XCOMPUTE_LIBRARY_PATH")
-                if not selected:
-                    raise RuntimeError("RPU execution requires explicit XCOMPUTE_LIBRARY_PATH; "
-                                       "build/select the AOT library before starting xinfer")
-                selected = Path(selected).resolve(strict=True)
-                import xcompute
-                from xcompute.rpu import RpuTpContext
-
-                loaded = Path(xcompute.KERNEL_LIB_PATH).resolve(strict=True)
-                if loaded != selected:
-                    raise RuntimeError(f"xcompute already loaded {loaded}, expected {selected}")
-                if "rpu" not in xcompute.compiled_backends():
-                    raise RuntimeError(f"selected xcompute library does not contain RPU: {loaded}")
-                for symbol in ("rpu_tp_context_create", "rpu_tp_empty", "rpu_tp_weight", "rpu_tp_reset",
-                               "rpu_tp_upload", "rpu_tp_download", "rpu_tp_prepare", "rpu_tp_batch",
-                               "rpu_tp_execute", "rpu_tp_wait", "rpu_tp_view",
-                               "rpu_tp_context_create_with_pool", "rpu_tp_batch_stats",
-                               "rpu_tp_context_stats", "rpu_tp_pool_stats", "rpu_tp_rebind",
-                               "rpu_tp_invalidate", "rpu_release"):
-                    if xcompute.xcompute_lib.get_function(symbol) is None:
-                        raise RuntimeError(f"selected xcompute library is missing {symbol}")
-                digest = hashlib.sha256()
-                with loaded.open("rb") as stream:
-                    for block in iter(lambda: stream.read(1024 * 1024), b""):
-                        digest.update(block)
-                self.provenance.update(library=str(loaded), library_sha256=digest.hexdigest(),
-                                       compiled_backends=list(xcompute.compiled_backends()))
-                backend_factory = RpuTpContext
+                raise RuntimeError("RPU execution requires an injected native backend; "
+                                   "use the entry-point engine factory or pass backend_factory")
             options = dict(allow_candidate=allow_candidate)
             if retained_segments != 128:
                 options["retained_segments"] = retained_segments
@@ -199,7 +170,7 @@ class RpuExecutionContext:
         """Prepare a family entry point (gemm, rmsnorm, ...) or a catalog entry.
 
         Selectors (parallel=, activation=, mode=, function=, operation=) pass
-        through to xcompute's family resolution unchanged.
+        through to the native operator provider's family resolution unchanged.
         """
         with self._lock:
             self._check_idle()

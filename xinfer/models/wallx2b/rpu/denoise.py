@@ -1,4 +1,4 @@
-"""Resident Wall-X 2B FP16 TP8 action lowering over xcompute's public TP8 interface.
+"""Resident Wall-X 2B FP16 TP8 action lowering over the native provider's public TP8 interface.
 
 The sparse decoder has eighteen identity token mixers and six attention
 mixers; every layer retains its MLP. The fused down/reduce/gate/Ada boundary
@@ -124,10 +124,10 @@ def pack_action_request(tensors: Mapping) -> tuple[np.ndarray, np.ndarray, np.nd
 
 @dataclass(frozen=True)
 class DenoiseWeights:
-    """Borrowed xcompute owners from the one-time model weight loader.
+    """Borrowed native owners from the one-time model weight loader.
 
     QK gamma is an immutable row-major DDR table, copied into shared scratch
-    at each attention layer. All GEMM packing is owned by xcompute; down
+    at each attention layer. All GEMM packing is owned by the native provider; down
     weights already contain source/4 and conditioning already restores gate*4.
     """
 

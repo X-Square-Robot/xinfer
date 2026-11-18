@@ -43,7 +43,7 @@ def test_rpu_platform_resolution_does_not_load_device_runtimes(tmp_path):
     script = f"import sys\nsys.path.insert(0, {package_root!r})\n" + textwrap.dedent("""
         import importlib.abc
 
-        forbidden = {"torch", "torch_npu", "xcompute", "rpu_backend", "rhino_launch", "acl", "pyacl"}
+        forbidden = {"torch", "torch_npu", "tvm_ffi", "xcompute", "rpu_backend", "rhino_launch", "acl", "pyacl"}
         attempts = []
 
         class DeviceRuntimeGuard(importlib.abc.MetaPathFinder):
@@ -63,7 +63,7 @@ def test_rpu_platform_resolution_does_not_load_device_runtimes(tmp_path):
             assert platform == rpu_platform(device)
             assert platform.device == "rpu:0"
             assert platform.capabilities.execution_model == "explicit-completion"
-            assert platform.capabilities.op_selection == "external"
+            assert platform.capabilities.op_selection == "model-bound"
 
         assert not attempts, attempts
         loaded = sorted(name for name in sys.modules if name.partition(".")[0] in forbidden)
