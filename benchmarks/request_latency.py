@@ -70,7 +70,7 @@ def main(argv=None) -> int:
 
     requests = [request for path in args.requests_file for request in read_requests(path)]
     options = json.loads(args.model_options)
-    if args.op_backends is not None:
+    if args.op_backends:
         options["op_backends"] = _parse_pins(args.op_backends)
     policy = Policy(args.model, args.checkpoint, device=args.device, **options)
     try:

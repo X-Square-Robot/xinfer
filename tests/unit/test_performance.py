@@ -14,13 +14,14 @@ def _round(p50, p95=None, errors=0, missing=0, throughput=10.0):
             "server_infer_ms": {"p50": p50, "p95": p95 or p50 + 10}}
 
 
-def test_a_count_passes_when_the_median_round_is_below_the_limit_and_no_round_has_errors():
-    assert performance.passes([_round(100), _round(149.9), _round(170)])  # median 149.9
-    assert not performance.passes([_round(100), _round(150.0), _round(170)])
-    assert performance.passes([_round(100), _round(140), _round(150), _round(170)])  # median 145
-    assert not performance.passes([_round(100), _round(100, errors=1), _round(100)])
-    assert not performance.passes([_round(100), _round(100, missing=1), _round(100)])
-    assert not performance.passes([])
+def test_a_count_is_past_the_knee_when_its_median_round_rises_over_half_or_a_round_has_errors():
+    previous = [_round(80), _round(90), _round(100)]  # median 90
+    assert not performance.past_knee([_round(100), _round(135), _round(200)], previous)  # median 135: +50 %
+    assert performance.past_knee([_round(100), _round(135.1), _round(200)], previous)
+    assert not performance.past_knee([_round(300)] * 3, None)  # the first count is the reference
+    assert performance.past_knee([_round(90), _round(90, errors=1), _round(90)], previous)
+    assert performance.past_knee([_round(90), _round(90, missing=1), _round(90)], None)
+    assert performance.past_knee([], previous)
 
 
 def test_round_statistics_give_the_median_and_the_worst_round():
@@ -28,25 +29,36 @@ def test_round_statistics_give_the_median_and_the_worst_round():
     assert stats == {"p50_median": 105.0, "p95_median": 114.0, "p50_worst": 140, "p95_worst": 150}
 
 
-def test_the_capacity_is_the_largest_count_with_every_smaller_count_passing():
-    ok, bad = [_round(100)] * 3, [_round(160)] * 3
-    assert performance.capacity({3: ok, 4: ok, 5: bad}) == (4, True)
-    assert performance.capacity({3: ok, 4: bad, 5: ok}) == (3, True)
-    assert performance.capacity({3: ok, 4: ok}) == (4, False)  # no failing count measured: a lower bound
-    assert performance.capacity({3: bad}) == (None, True)
+def test_the_capacity_is_the_largest_count_before_the_first_one_past_the_knee():
+    def at(p50):
+        return [_round(p50)] * 3
+    assert performance.capacity({3: at(82), 4: at(115), 5: at(184)}) == (4, True)  # +41 %, then +60 %
+    assert performance.capacity({3: at(93), 4: at(92), 5: at(156), 6: at(160)}) == (4, True)
+    assert performance.capacity({3: at(80), 4: at(90)}) == (4, False)  # no count past the knee: a lower bound
+    assert performance.capacity({3: [_round(80, errors=1)] * 3}) == (None, True)
 
 
-def test_the_row_reports_the_capacity_point_and_the_saturation_throughput():
-    result = {"name": "M · BF16 · GPU", "latency": {"total_ms": {"p50": 44.21}},
+def test_the_row_reports_the_single_request_parts_the_capacity_point_and_the_saturation_throughput():
+    result = {"name": "M · BF16 · GPU",
+              "latency": {"total_ms": {"p50": 44.21}, "prepare_ms": {"p50": 2.94}, "engine_ms": {"p50": 41.07},
+                          "output_ms": {"p50": 0.18}},
               "load": {"3": [_round(97, 103, throughput=16.7)] * 3,
                        "4": [_round(90, 112, throughput=22.2), _round(140, 150, throughput=22.2),
                              _round(105, 114, throughput=22.2)],
                        "5": [_round(160, throughput=26.4)] * 3},
               "capacity": (4, True)}
-    assert performance.row(result) == "| M · BF16 · GPU | 44.2 ms | 4 | 105 ms | 114 ms | 26.4 req/s |"
+    assert performance.row(result) == "| M · BF16 · GPU | 44.2 ms (3.1 + 41.1) | 4 | 105 ms | 114 ms | 26.4 req/s |"
     result["capacity"] = (5, False)
     result["load"]["5"] = [_round(120, throughput=26.4)] * 3
     assert "| ≥ 5 |" in performance.row(result)
+
+
+def test_no_completed_round_reports_a_capacity_bound_and_zero_throughput():
+    result = {"name": "M", "latency": {"total_ms": {"p50": 20}, "prepare_ms": {"p50": 1},
+                                       "engine_ms": {"p50": 18}, "output_ms": {"p50": 1}},
+              "load": {"2": [], "10": []}, "capacity": (None, True)}
+    assert "| < 2 |" in performance.row(result)
+    assert "0.0 req/s" in performance.row(result)
 
 
 def test_npu_device_and_model_options_reach_both_children(tmp_path, monkeypatch):
@@ -59,7 +71,7 @@ def test_npu_device_and_model_options_reach_both_children(tmp_path, monkeypatch)
         if "request_latency.py" in command[1]:
             commands["latency"] = command
             out.write_text(json.dumps({"device": "Ascend", "total_ms": {"p50": 25},
-                                       "prepare_ms": {}, "engine_ms": {}, "output_ms": {},
+                                       "prepare_ms": {"p50": 2}, "engine_ms": {"p50": 22}, "output_ms": {"p50": 1},
                                        "captures_after_warmup": {}}))
         else:
             out.mkdir()
@@ -93,6 +105,7 @@ def test_npu_device_and_model_options_reach_both_children(tmp_path, monkeypatch)
         options = json.loads(command[command.index("--model-options") + 1])
         assert options["image_preprocess_device"] == "cpu" and options["processing"]["noise_seed"] == 7
     machine = json.loads((out / "robots-1" / "machine.json").read_text())
+    assert json.loads((out / "row.json").read_text())["capacity_rule"] == {"median_p50_ratio": 1.5}
     assert machine["before"]["npu_smi"] == "Ascend inventory"
 
 
@@ -105,7 +118,7 @@ def test_cuda_default_leaves_image_selection_to_policy_capabilities(tmp_path, mo
         options["latency"] = json.loads(command[command.index("--model-options") + 1])
         output = Path(command[command.index("--out") + 1])
         output.write_text(json.dumps({"device": "CUDA", "total_ms": {"p50": 25},
-                                      "prepare_ms": {}, "engine_ms": {}, "output_ms": {},
+                                      "prepare_ms": {"p50": 2}, "engine_ms": {"p50": 22}, "output_ms": {"p50": 1},
                                       "captures_after_warmup": {}}))
 
     def serve(args, robots, out):
@@ -120,7 +133,7 @@ def test_cuda_default_leaves_image_selection_to_policy_capabilities(tmp_path, mo
                              "--out", str(tmp_path / "result")]) == 0
     assert set(options) == {"latency", "server"}
     assert all("image_preprocess_device" not in child for child in options.values())
-    # Without torchvision, Policy must retain its supported CPU image path.
+    # Without nvImageCodec, Policy must retain its supported CPU image path.
     platform = SimpleNamespace(name="cuda-sm120", device="cuda:0",
                                capabilities=SimpleNamespace(device_images=False))
     for child in options.values():

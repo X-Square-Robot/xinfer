@@ -7,10 +7,8 @@ Navigation: [usage](wall_oss.md) · [validation](wall_oss_validation.md)
 ## Source of semantics
 
 The reference is the eager `Qwen2_5_VLMoEForAction` flow path of Wall-X
-`02c5351d` (+ the embodied-serving standalone patch `1e24f619`) and, for
-request processing, the embodied-serving Wall-X 4B service (es `9633ffd`).
-HarriX's bitwise port of that service (`qwen2_5`, `mxfp8-sm120`) was the
-second source. Files: `xinfer/models/wall_oss/` (`config.py`, `model.py`,
+`02c5351d` (with the production service's standalone patch) and, for request
+processing, the production Wall-X 4B service. Files: `xinfer/models/wall_oss/` (`config.py`, `model.py`,
 `processing.py`, `geometry.py`) and the shared layers in `xinfer/models/layers/`.
 
 ## Stage split
@@ -61,18 +59,21 @@ the shape, else the operator's torch reference. All BF16, like the reference.
 
 | Step | Operator | Kernel at this model's shapes |
 |---|---|---|
-| ViT and LM residual add + RMSNorm | `add_rms_norm` (`rms_norm` for the first norm) | xcompute `add_rmsnorm` / `rmsnorm` |
-| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` | `qkv_proj_rope` → cuBLASLt and a RoPE kernel |
+| ViT and LM residual add + RMSNorm | `add_rms_norm` (`rms_norm` for the first norm) | `add_rmsnorm` / `rmsnorm` |
+| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` (`qk_order="any"`: Q and K only feed the attention) | `qkv_proj_rope` → cuBLASLt and a RoPE kernel; on SM110 `tcgen05_qkv_rope_bf16_sm110` (Q and K in rotary-pair order) |
 | ViT attention (windows, full blocks) | `varlen_attention` | flash-attention 2 |
-| ViT projection, MLP down, merger (+ bias; merger fc1 + GELU) | `gemm_epilogue` | `gemm` → cuBLASLt |
-| ViT gate/up + bias + SiLU-mul | `gemm_glu_epilogue` (`bias`) | `gemm_glu` → cuBLASLt and the SiLU-mul kernel |
+| ViT projection and MLP down (+ bias) + residual add + the next RMSNorm | `gemm_add_rms_norm` | `gemm` → cuBLASLt, `add_rmsnorm`; on integrated GPUs (Jetson Thor) `gemm` with the residual → cuBLASLt (β·C), `rmsnorm` |
+| Merger (+ bias; fc1 + GELU) | `gemm_epilogue` | `gemm` → cuBLASLt |
+| ViT gate/up + bias + SiLU-mul | `gemm_glu_epilogue` (`bias`) | `gemm_glu` → cuBLASLt and the SiLU-mul kernel; on SM110 `tcgen05_glu_bf16_sm110` |
 | Expert-0 QKV + bias + M-RoPE, K/V written to the prompt K/V | `qkv_rope_kvcache` | `qkv_proj_rope` (`kv_cache`) → cuBLASLt and a RoPE kernel |
 | Expert-0 causal attention | `causal_attention` | flash-attention 2 |
-| Expert-0 output and down projections; gate/up + SiLU-mul | `gemm_epilogue`; `gemm_glu_epilogue` | cuBLASLt; `tma_streamk_bf16_sm120` |
+| Expert-0 output projection | `gemm_epilogue` | cuBLASLt |
+| Expert-0 MLP (gate/up + SiLU-mul, down) + residual add + the next RMSNorm | `mlp_add_rms_norm` | `gemm_glu` → `tma_streamk_bf16_sm120`, `gemm` → cuBLASLt, `add_rmsnorm`; on SM110 the fused MLP `mcast_mlp_bf16_sm110` and `rmsnorm` for M 520–768, other M `gemm_glu` → `mcast_glu_bf16_sm110`, `gemm` with the residual → `mcast_residual_bf16_sm110` and `rmsnorm` |
 | Action embedding (`ActionHead`, FP32) | `linear`, `silu` | cuBLAS (FP32) |
 | Expert-1 QKV + bias + M-RoPE + K/V append | `qkv_rope_kvcache` | `qkv_proj_rope` (`kv_cache`) → cuBLASLt and a RoPE kernel |
 | Expert-1 attention over the prompt K/V and the action keys | `prefix_kvcache_attention` | `attention_kvcache` → `splitkv` |
 | Expert-1 output and down projections (`[K, N]` weights); gate/up + SiLU-mul | `gemm_epilogue`; `gemm_glu_epilogue` | `gemm` → `smallm_bf16_sm120`; cuBLASLt and the SiLU-mul kernel |
+| Expert-1 weights read ahead: each layer's output, gate/up and down projections and the next layer's QKV, during its QKV and attention | `prefetch_weights`, `join_prefetch` (after the steps) | `l2_prefetch` on a side stream, on integrated GPUs (Jetson Thor); nothing on discrete ones, where it costs time |
 | Readout, velocity of the uncommanded dimensions, Euler step, pinned rows | `flow_velocity_euler` | `denoise_output_euler` → `fused_tail` |
 
 At this model's BF16 shapes xcompute lists no kernel faster than cuBLAS for the ViT and expert-0 GEMMs except the
@@ -89,6 +90,9 @@ Arithmetic that differs from the reference composition:
   and each other) are passed as per-column row ranges (FlashMask `LTS`/`UTE`). The velocity stays FP32.
 - **Prompt buckets**: the padding is masked in the action attention, so the actions of a padded prompt equal those
   of the exact prompt within rounding, not bit for bit.
+- **Jetson Thor**: on integrated GPUs the ViT projections add the residual to the FP32 product and round once, and
+  the fused expert-0 MLP does not fix its reduction order, so two runs can differ at rounding level. On discrete GPUs
+  `gemm_add_rms_norm` and `mlp_add_rms_norm` give the bits of the operators they join.
 
 ## Action-stage batching
 
@@ -169,8 +173,8 @@ masks and layouts). With flash-attn installed the default backend uses:
 ## RTC semantics (decision)
 
 For RTC requests the pinned action tokens (`k < delay`) do not attend to the
-denoising tokens at **every** step. This is what the embodied-serving and
-HarriX services run. The Wall-X eager code skips that cut at step 0 only
+denoising tokens at **every** step. This is what the production services
+run. The Wall-X eager code skips that cut at step 0 only
 (its step-0 joint mask is symmetric among action tokens), so for RTC requests
 the eager code and the served model differ in semantics, not just precision.
 XInfer follows the served model; the eager reference used for validation is
@@ -202,14 +206,14 @@ it sends each JPEG view's bytes (other encodings are decoded on the CPU) or raw
 frame as a `DeviceImage` with the size the CPU path would resize it to, read
 from the JPEG header, and the recipe `DEVICE_RESIZE`, so the prompt, grids and
 vision layout are unchanged. Before the first stage the engine decodes the
-request's JPEGs in one torchvision `decode_jpeg` call and resizes each view
+request's JPEGs in one call of the platform's JPEG decoder (nvImageCodec) and resizes each view
 with an FP32 bicubic interpolation (a = −0.75, no antialiasing, as
 INTER_CUBIC), rounded half up to uint8 ([engine](../engine.md#device-images)).
 The vision stage reads the views as with CPU preprocessing and they have the
 CPU path's shapes, so the vision graph and its key are the same. The resize of
-a raw frame is within one level of OpenCV's; decoded JPEGs differ from
-libjpeg-turbo's around sharp chroma edges, so the actions differ from the CPU
-path's and the option is off by default.
+a raw frame is within one level of OpenCV's and a decoded JPEG within one
+level of libjpeg-turbo's; the views are still not bitwise equal, so the
+actions differ from the CPU path's and the option is off by default.
 
 Deployment choices of the reference (fixed instruction, camera wire keys,
 embodiment text, admitted RTC delays, client step override) are explicit

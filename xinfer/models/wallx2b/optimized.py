@@ -1,11 +1,11 @@
-"""Wall-X 2B on xcompute (``numerics="optimized"``, the default).
+"""Wall-X 2B on the CUDA backend's kernels (``numerics="optimized"``, the default).
 
 The ViT and the prompt stream are the shared ``xinfer/models/wallx/optimized.py``. The action stage runs the steps
 of the reference composition (``numerics="reference"``, the wall-x model under autocast) on operators of
-``xinfer/ops/reference/`` (each an xcompute call) chosen for its 16 rows and width 1024, where the GEMMs with
+``xinfer/ops/reference/`` (each a kernel call) chosen for its 16 rows and width 1024, where the GEMMs with
 fused norms and residuals have no fast kernel: the adaptive norms are separate calls that also add the gated residual
 (the two norms of a linear layer, around its identity mixer, in one call), and the GEMMs are plain (the output
-projections and the MLP down projection read ``[K, N]`` weights, which select xcompute's small-M kernel).
+projections and the MLP down projection read ``[K, N]`` weights, which select the small-M kernel).
 Differences to the reference:
 
 - conditioning: the flow condition and every adaptive norm's modulation are computed in FP32 once at load, for the

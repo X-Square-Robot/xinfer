@@ -35,8 +35,8 @@ class PlatformCapabilities:
         multiprocess_service: whether MPS is available; ``None`` when not determined.
         sm_count: compute units (CUDA SMs or Ascend cube cores); ``None`` on CPU.
         total_memory_bytes: device memory; ``None`` on CPU.
-        device_images: camera views can be decoded and resized on the device;
-            gates ``image_preprocess_device="gpu"``.
+        device_images: camera views can be decoded and resized on the device (it has a JPEG decoder: on CUDA,
+            NVIDIA's nvImageCodec); gates ``image_preprocess_device="gpu"``.
         stream_priority_range: inclusive numeric (minimum, maximum) supported by the active runtime,
             or None when the range is unknown. Lower values have higher scheduling priority.
         execution_model: ``"cuda-lanes"`` selects the thread/lane/GPU-graph engine;

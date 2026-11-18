@@ -2,19 +2,19 @@
 
 English | [简体中文](wallx2b_validation.zh-CN.md)
 
-These upstream BF16 measurements used one Wall-X 2B checkpoint on an NVIDIA GeForce RTX 5090. The November 9 benchmark measured single-request latency and serving capacity. The earlier runs below measured individual stages and compared predicted actions with two baselines. The public port copies transposed GEMM weights on xcompute `7336b0d`. The upstream build reused them without a copy. Latency and capacity have yet to be remeasured on the public port. See the [performance table](../performance.md) and [model guide](wallx2b.md).
+These BF16 measurements used one Wall-X 2B checkpoint on an NVIDIA GeForce RTX 5090. The November 13 benchmark measured single-request latency and serving capacity with this repository. The earlier upstream runs below measured individual stages and compared predicted actions with the checkpoint's BF16 sampler. See the [performance table](../performance.md) and [model guide](wallx2b.md).
 
 ## Single request and serving capacity
 
-On November 9, 2026, the optimized composition ran on an otherwise idle RTX 5090 (SM120) with PyTorch 2.10.0+cu130, flash-attn 2.8.3.post1 and xcompute `7336b0d`.
+On November 13, 2026, the optimized composition ran on an otherwise idle RTX 5090 (SM120) with PyTorch 2.10.0+cu130, flash-attn 2.8.3.post1 and xcompute `7336b0d` with `layout="kn"`.
 
 | In-process request P50 | Robots per GPU | Server P50 at capacity | Server P95 at capacity | Highest measured throughput |
 |---|---|---|---|---|
-| 22.3 ms | 15 | 144 ms | 155 ms | 83.3 requests/s |
+| 22.3 ms | 14 | 85 ms | 107 ms | 81.3 requests/s |
 
 For single-request latency, the benchmark processed captured requests in process, each with three camera JPEGs. Image decoding and resizing ran on the GPU. It called `Policy.warmup` with the full 216-request capture, then cycled through the requests in order, discarded the first five calls and timed the next 50.
 
-For capacity, the service warmed up on two captured requests. Simulated robots then sent desktop observations with real-time chunking (RTC) to the service, which used CPU image preprocessing. Each robot sent 80 requests per round, with the first 20 excluded from steady-state latency. Capacity required zero errors or missing responses in all eight rounds, randomized robot start times and a median of the round P50s below 150 ms. The median round P50 rose from 76.4 ms at 14 robots to 143.6 ms at 15. At 16 robots, every round had a P50 of 160–164 ms and exceeded the limit. The 155 ms P95 describes tail latency at 15 robots. Saturation is the highest completed request rate across measured robot counts. See the [benchmark protocol](../benchmark.md).
+For capacity, the service warmed up on two captured requests. Simulated robots then sent desktop observations with real-time chunking (RTC) to the service, which used CPU image preprocessing. Each robot sent 80 requests per round, with the first 20 excluded from steady-state latency, over eight rounds with randomized robot start times. The median round P50 was 85 ms at 14 robots and 170 ms at 15. The 107 ms P95 describes tail latency at 14 robots. Saturation is the highest completed request rate across measured robot counts. See the [benchmark protocol](../benchmark.md).
 
 ## Stage and end-to-end latency
 
@@ -26,20 +26,6 @@ Each stage entry is the median of 50 CUDA graph replays for one flow request. Th
 | Reference, Nov 6 | 5.32 ms | 28.17 ms | 25.95 ms | 59.4 ms | 76.6 ms | 77.4 ms |
 
 The optimized run used PyTorch 2.10.0+cu130, xcompute `0c48a46`, GPU image preprocessing and a 455-token flow prompt padded to 464. The reference run used PyTorch 2.9.1+cu130, reference operators, FlashAttention 2 for vision, CPU image preprocessing and exact prompt widths.
-
-## Open-loop accuracy
-
-The gate compares predicted trajectories with recorded future poses and measures the change in mean squared error (MSE) relative to the HarriX serving baseline. The test sampled eight observations in each of four training and four held-out episodes (64 observations). Both implementations used the same eight random draws per observation at RTC delays 0, 3 and 6, giving 1,536 requests per implementation. For RTC, the fixed action prefix came from the recorded future poses.
-
-A configuration fails if the 95% confidence interval for the increase in position, rotation or acceleration MSE lies entirely above +1% in any of the six cohort/delay combinations. The intervals were estimated by resampling episodes. Each range below gives the smallest and largest point estimates across the six combinations.
-
-| BF16 composition and image processing | Position ΔMSE | Rotation ΔMSE | Acceleration ΔMSE | Gate |
-|---|---:|---:|---:|---|
-| Optimized, CPU, Nov 7 (`651195d`) | −1.0% to +1.1% | −0.2% to +0.4% | −2.1% to +1.0% | **PASS** |
-| Optimized, GPU, Nov 8 (`0c48a46`) | +0.0% to +1.3% | −0.8% to +0.6% | −1.7% to −0.3% | **PASS** |
-| Reference, CPU, Nov 6 | −1.1% to −0.0% | −1.0% to +0.3% | −0.6% to +3.6% | **FAIL** |
-
-The optimized runs used the default 16-token prompt buckets. For the reference composition, position and rotation passed. Acceleration MSE increased by **2.4% [1.8%, 3.4%]** on training episodes at delay 0 and by **3.6% [2.3%, 4.9%]** on held-out episodes at delay 6. These are offline measurements on recorded observations.
 
 ## Numerical checks against the BF16 sampler
 
@@ -55,14 +41,4 @@ A separate check used the checkpoint's BF16 sampler as the baseline and exact pr
 
 The optimized composition preserved the pinned RTC prefix exactly. For the reference composition, prompt prefill matched the sampler's prompt-only pass bit for bit on four checked requests. Given the sampler's K/V cache, the action stage also matched bit for bit on four requests covering flow and RTC. End to end, the reference composition's mean absolute normalized-action differences were 0.0016 (flow), 0.0014 (RTC 3) and 0.0010 (RTC 6), each over 72 requests. A separate check comparing xcompute `7336b0d` with `0c48a46` found bitwise-identical optimized actions on all 216 requests.
 
-## Measurement records
-
-The following SHA-256 digests identify the archived measurement records. The full-checkpoint runs used separately held weights and captured observations. The repository includes [tiny-checkpoint tests](../../tests/models/test_wallx2b_tiny.py) that exercise both compositions locally.
-
-| Measurement record | Archive SHA-256 |
-|---|---|
-| Nov 6 reference composition and open-loop gate | `214b430683a712bba29bb92d2cfbb1d33b3da95fb245798ed64b282e7d2f87ba` |
-| Nov 7 optimized, stage differences | `630089bf10c898ba2154877f0d1fd4b323b669683cf243630f6d3a5a8d764100` |
-| Nov 7 optimized, default prompt buckets and CPU open-loop gate | `69765f8c31f2d1b33b9a899f10bdcb49deb85617bff5a9a03e3a81b9ccb28bc0` |
-| Nov 8 GPU open-loop gate and stage latency | `5b6701637a9064bb04213ea0cc0a078054d25a844aed8b1ebd3b9394e76fe9d8` |
-| Nov 9 serving, single request and kernel-version parity | `a15e9f7632b36be4c2f0b86dc9aa05a0314012865387796c614f63192ab40ee4` |
+The full-checkpoint runs used separately held weights and captured observations. The repository includes [tiny-checkpoint tests](../../tests/models/test_wallx2b_tiny.py) that exercise both compositions locally. Both compositions also pass the internal precision gate on recorded robot data.

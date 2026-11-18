@@ -3,11 +3,12 @@
 The engine runs ``DeviceImageDecoder`` on its device-image thread before a request's first stage, outside the CUDA
 or NPU graphs (docs/engine.md). The views it produces have the shapes of the CPU path's views, so the graphs and
 their keys are the same in both modes; the variable-length JPEG bytes never reach a graph. The pixels are not
-bitwise equal to the CPU path's: nvJPEG (and CANN JPEGD) decode differently from libjpeg-turbo, mostly around
-sharp chroma edges, and the resize computes in FP32 instead of OpenCV's or Pillow's fixed point.
+bitwise equal to the CPU path's: the resize computes in FP32 instead of OpenCV's or Pillow's fixed point, and the
+decoded JPEGs differ slightly from libjpeg-turbo's (nvImageCodec's by at most one level; CANN JPEGD's mostly around
+sharp chroma edges).
 
-Per-vendor codec ownership lives in ``xinfer/platforms/<device>.py``: this engine module never constructs a
-vendor codec, stream or device object directly.
+Per-vendor codec ownership lives in the concrete modules under ``xinfer/platforms/``: this engine module never
+constructs a vendor codec, stream or device object directly.
 """
 
 from __future__ import annotations

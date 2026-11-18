@@ -1,15 +1,8 @@
-"""The CUDA device's platform: discovery and nvJPEG decoding.
-
-The CUDA-side ownership of NVJPEG used to sit in ``xinfer/engine/device_images.py``; it is kept
-here so every hardware family lives in exactly one place (``ops/backends/<family>/`` does the same
-for operators). The engine no longer constructs a CUDA stream, decoder or device object directly;
-it asks :func:`xinfer.platforms.devices.jpeg_decoder_for` for one, which dispatches by device kind.
-"""
+"""The CUDA device's platform: discovery and JPEG decoding (NVIDIA's nvImageCodec)."""
 
 from __future__ import annotations
 
 import functools
-import importlib.util
 
 from xinfer.platforms.interface import Platform, PlatformCapabilities
 
@@ -29,7 +22,7 @@ def cuda_platform(device: str) -> Platform:
 
     The architecture is ``sm<major><minor>``; graph capture and stream
     priorities follow the runtime range, unified memory follows ``is_integrated``, MPS
-    availability is left undetermined, and device images need torchvision (nvJPEG).
+    availability is left undetermined, and device images need nvImageCodec (``CudaJpegDecoder``).
 
     Args:
         device: ``"cuda"`` (current device) or ``"cuda:N"``.
@@ -59,62 +52,82 @@ def cuda_platform(device: str) -> Platform:
         multiprocess_service=None,
         sm_count=props.multi_processor_count,
         total_memory_bytes=props.total_memory,
-        device_images=_decodes_jpeg(index),
+        device_images=_nvimgcodec_decoder(index) is not None,
         cuda_interop=True,
     )
     return Platform(name=f"cuda-{arch}", device=f"cuda:{index}", capabilities=capabilities)
 
 
 @functools.lru_cache(maxsize=None)
-def _decodes_jpeg(index: int) -> bool:
-    """Whether torchvision decodes JPEG on CUDA device ``index``: its build must have nvJPEG (Jetson's has not).
+def _nvimgcodec_decoder(index: int):
+    """NVIDIA's nvImageCodec decoder for CUDA device ``index`` and its sRGB decode parameters, one per device; None
+    where nvImageCodec is not installed or has no decoder for the device (the capability ``device_images``).
 
-    A build that ships torchvision without nvJPEG (Jetson, some distro builds) reports the
-    capability as False instead of letting the first request fail in ``CudaJpegDecoder``.
+    One CPU thread: by default nvImageCodec starts one per visible core, and they spin while they wait; in a container
+    with a CPU quota that slows the frontends and the engine under load. Nothing is decoded here: a decode at platform
+    resolution left every later CUDA graph replay of the process slower (on an RTX 5090, up to 1 ms per Wall-OSS
+    request).
     """
-    if importlib.util.find_spec("torchvision") is None:
-        return False
-    import torch
-    from torchvision.io import decode_jpeg, encode_jpeg
-
     try:
-        decode_jpeg(encode_jpeg(torch.zeros(3, 8, 8, dtype=torch.uint8)), device=f"cuda:{index}")
-    except RuntimeError:
-        return False
-    return True
+        from nvidia import nvimgcodec
+
+        return (nvimgcodec.Decoder(device_id=index, max_num_cpu_threads=1),
+                nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.SRGB))
+    except (ImportError, OSError, RuntimeError):  # not installed, or no decoder for this device
+        return None
 
 
 class CudaJpegDecoder:
-    """Batch JPEG decode with nvJPEG, ordered before work on the caller's current stream.
+    """Batch JPEG decode with NVIDIA's nvImageCodec (``nvidia-nvimgcodec-cu13``), ordered before work on the caller's
+    current stream. It decodes on the GPU's JPEG engine where there is one (NVJPG: RTX 5090, Jetson Thor).
 
-    torchvision shares one decoder per device and rebuilds it when the device object changes, so every
-    call uses the same canonical ``torch.device`` supplied by ``jpeg_decoder_for``.
+    The decoded images are nvImageCodec's memory. The decoder copies them into tensors on its own stream, keeps them
+    until an event after that copy has completed, and then decodes into them again instead of allocating new ones; the
+    caller never waits. Called from one thread only (the engine's device-image thread).
     """
 
     def __init__(self, device):
         import torch
 
-        try:
-            from torchvision.io import ImageReadMode, decode_jpeg
-        except ImportError as exc:
-            raise ImportError('DeviceImage inputs (image_preprocess_device "gpu") need torchvision '
-                              '(pip install xinfer[gpu-image])') from exc
+        decoder = _nvimgcodec_decoder(device.index)
+        if decoder is None:
+            raise RuntimeError(f'DeviceImage inputs (image_preprocess_device "gpu") need NVIDIA\'s nvImageCodec for '
+                               f"{device} (pip install xinfer[gpu-image])")
         self.device = device
-        self._decode = lambda jpegs: decode_jpeg(jpegs, mode=ImageReadMode.RGB, device=self.device)
-        # nvJPEG writes on an internal stream that does not wait for the caller. Allocate its outputs on
-        # this separate stream so they cannot reuse storage the caller's queued work is still reading.
+        self._decoder, self._params = decoder
         self._stream = torch.cuda.Stream(self.device)
+        self._copying = []  # (event after the copy, images) of earlier calls
+        self._free = []  # images whose copy has completed
 
     def __call__(self, jpegs):
         import torch
 
+        copying = []
+        for event, images in self._copying:
+            if event.query():
+                self._free += images
+            else:
+                copying.append((event, images))
+        self._copying = copying
+        reuse = {}
+        if len(self._free) >= len(jpegs):
+            reuse["images"], self._free = self._free[:len(jpegs)], self._free[len(jpegs):]
         current = torch.cuda.current_stream(self.device)
         with torch.cuda.stream(self._stream):
-            views = self._decode(jpegs)
+            images = self._decoder.decode([jpeg.numpy() for jpeg in jpegs], params=self._params,
+                                          cuda_stream=self._stream.cuda_stream, **reuse)
+            if any(image is None for image in images):
+                raise RuntimeError("nvImageCodec could not decode a JPEG view")
+            views = [torch.as_tensor(image, device=self.device).permute(2, 0, 1).clone(
+                memory_format=torch.contiguous_format) for image in images]
+            copied = torch.cuda.Event()
+            copied.record(self._stream)
+        self._copying.append((copied, images))
         current.wait_stream(self._stream)
         for view in views:
             view.record_stream(current)
         return views
 
     def close(self) -> None:
-        """No per-instance codec release: torchvision owns the shared nvJPEG decoder."""
+        """Drop the kept images; the nvImageCodec decoder itself is shared per device."""
+        self._copying, self._free = [], []

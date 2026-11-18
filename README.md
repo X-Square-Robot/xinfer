@@ -9,16 +9,29 @@
 </p>
 
 <p align="center">
+  <a href="#features-at-a-glance">Features</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#models-and-hardware">Models</a> ·
   <a href="docs/benchmark.md">Benchmarks</a> ·
   <a href="#documentation">Documentation</a> ·
+  <a href="https://arxiv.org/abs/2611.14969">Paper</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 **XInfer is an inference and serving framework for vision-language-action
 (VLA) models.** Our goal is fast, stable, and accurate model inference serving
 for robots, from onboard inference to shared fleet serving.
+
+The design and its evaluation are described in our paper, [Scaling VLA Serving Under Robotic Execution Constraints](https://arxiv.org/abs/2611.14969).
+
+## Features at a glance
+
+- **Real-time chunking (RTC).** Predict the next action chunk from a new observation while the robot executes the current one.
+- **Ultra-low single-robot latency.** Wall-X 2B in BF16 measured 22.3 ms P50 per request on an RTX 5090.
+- **Multi-robot serving on one accelerator.** Robots share model weights, and vision encoding can overlap with action generation across requests.
+- **Low-precision quantization.** Apply MXFP8 or NVFP4 to selected groups of linear layers.
+- **Hardware backends.** NVIDIA RTX 5090, Jetson Thor, Ascend 950DT, and Huixi Rhino RPU (R1) support in development.
+- **High-performance kernels.** Use Xcompute fused kernels and FlashAttention, or plug in another kernel library.
 
 ## Why XInfer
 
@@ -42,8 +55,8 @@ Use Python 3.10+ and a PyTorch build matched to your accelerator. These examples
 python -m pip install -e ".[models,serve]"
 ```
 
-The default Wall-OSS BF16 path uses **xcompute**. Install a build for your CUDA GPU and
-check the selected backends in the [kernel guide](docs/kernels.md). If the build is unavailable,
+The default Wall-OSS BF16 path uses the CUDA kernels in this repository. Build them for your GPU and
+check the selected backends in the [kernel guide](docs/kernels.md). Without the built library,
 XInfer uses the slower PyTorch reference implementations.
 
 The examples use BF16 and require the [supported Wall-OSS checkpoint layout](docs/models/wall_oss.md#requirements), including its tokenizer and normalization files.
@@ -94,36 +107,54 @@ and action representations are documented in each model guide.
 
 | Model | Model ID | Precision | Real-time chunking | Guide |
 |---|---|---|---|---|
-| Wall-OSS · internal checkpoints | `wall_oss` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wall_oss.md) |
-| Wall-X 2B | `wallx2b` | BF16 (xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
+| Wall-OSS · internal checkpoints | `wall_oss` | BF16 (Xcompute; reference operators) | Supported | [Setup and inputs](docs/models/wall_oss.md) |
+| Wall-X 2B | `wallx2b` | BF16; optional MXFP8 or NVFP4 for vision and prefill (action stays BF16) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
 
 Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for both models on an RTX 5090 and on an Ascend 950DT; the [Ascend guide](docs/ascend950dt.md#wall-x-2b-operator-list) lists which operators each model runs there.
 
 | Hardware | Device | Runtime |
 |---|---|---|
 | NVIDIA GPUs · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
+| NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
 | Rhino RPU (R1) | `rpu` | Rhino Launch SDK AOT · [Profile](docs/models/wallx2b_rpu.md) |
 | CPU | `cpu` | Reference implementations and tests |
 
 Each accelerator runs its own Engine and weights.
 
-Optimized CUDA execution uses an **xcompute** build and the optional FlashAttention
+Optimized CUDA execution uses the kernel library built from this repository and the optional FlashAttention
 backend; see [kernels](docs/kernels.md).
-Ascend binds a prebuilt Ascend **xcompute** build the same way, with NPU graphs and
+Ascend binds a prebuilt Ascend **xcompute** build, with NPU graphs and
 DVPP device images; see the [Ascend guide](docs/ascend950dt.md).
+
+## Performance
+
+Single-request latency and capacity of each serving configuration, measured with `benchmarks/performance.py`
+([conditions](docs/performance.md)):
+
+| # | Model | Precision, composition | Accelerator | Single request P50 | Robots per accelerator | Server P50 at capacity | Server P95 at capacity | Peak throughput |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Wall-OSS | BF16, optimized | RTX 5090 | 49.0 ms | 4 | 128 ms | 142 ms | 25.6 req/s |
+| 2 | Wall-X 2B | BF16, optimized | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
+| 3 | Wall-OSS | BF16, optimized | Jetson AGX Thor | 95.4 ms | 2 | 123 ms | 141 ms | 11.5 req/s |
+| 4 | Wall-X 2B | NVFP4 vision and prefill, optimized | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
+| 5 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 6 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.webp" alt="Robot clients connect through a Frontend for input and output processing to the XInfer Engine, which runs Vision, Prefill, and Action. Platform adapters branch to NVIDIA GPUs and Ascend 950DT NPUs, identified by their brand logos, plus CPU reference execution. A dashed More chips box represents additional hardware backends." width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. X-Square Robot’s Xcompute library provides fused kernels alongside optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. Huixi R1 uses a separate experimental native path from Python Policy." width="100%">
 </p>
 
 The Frontend handles input and output processing. Models define stage
 computation and tensor handoffs; the Engine manages admission, queues,
-batching, and resource lifetimes. Platform adapters provide device execution,
-while operator backends supply optimized kernels. The Python API and network
-service share the same Engine and configuration rules. See the
+batching, and resource lifetimes. At model load, the operator registry binds an implementation for each operator on the target device.
+X-Square Robot’s **Xcompute** library provides fused kernels such as QKV projection with RoPE and residual
+addition with RMSNorm. The same registry supports optional CUDA FlashAttention, PyTorch references and
+third-party kernels. Platform adapters handle device execution. On CUDA, Ascend and CPU, the Python API and network
+service share the same Engine. The dashed Huixi R1 path shows the proposed in-process
+Wall-X 2B backend using the Rhino Launch SDK. See the
 [Engine guide](docs/engine.md) for the execution model and
 [configuration](docs/configuration.md) for defaults and overrides.
 
@@ -153,6 +184,22 @@ For commands and measurement definitions, see the [benchmark guide](docs/benchma
 | Profile operators | [Profiling](docs/profiling.md) |
 | Monitor a service with Prometheus and Grafana | [Metrics](docs/metrics.md) |
 | Extend the framework | [Model interface](xinfer/models/interface.py) · [Architecture and design](docs/design.md) |
+
+## Citation
+
+If you use XInfer in your research, please cite our paper:
+
+```bibtex
+@misc{zhang2026scalingvlaservingrobotic,
+      title={Scaling VLA Serving Under Robotic Execution Constraints},
+      author={Yue Zhang and Zicong Ye and Lufang Chen and Dance Yang and Mingyang Li and Zhenwei Duan and Michael Zhao and Ziye Deng and Starrick Liu and Ruizhi Chengze and YongHua Chen and SongAo Han and Yu Sun and Ran Yu and Xiaofan Li and Ruyi Gan and Hao Wang},
+      year={2026},
+      eprint={2611.14969},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2611.14969},
+}
+```
 
 ## Contributing
 

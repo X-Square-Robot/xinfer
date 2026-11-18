@@ -41,11 +41,17 @@ logger = logging.getLogger(__name__)
 # The operators whose references compose torch code in place of a backend kernel (the fused families of
 # xinfer/ops/reference/); ``warn_slow_fallbacks`` reports these when they run on the reference.
 FUSED_OPS = frozenset({"gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache",
-                       "prefix_kvcache_attention", "add_rms_norm", "flow_velocity_euler"})
+                       "prefix_kvcache_attention", "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm",
+                       "flow_velocity_euler", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
+                       "mxfp8_qkv_rope_epilogue"})
 
 for _spec in (
     OpSpec("linear", "linear(x, weight, bias=None) -> Tensor", reference.linear),
     OpSpec("rms_norm", "rms_norm(x, weight, eps) -> Tensor", reference.rms_norm),
+    OpSpec("prefetch_weights", "prefetch_weights(weights) -> None  # hint: tensors read soon, no effect on results",
+           reference.prefetch_weights),
+    OpSpec("join_prefetch", "join_prefetch() -> None  # the stream waits for prefetch_weights' work",
+           reference.join_prefetch),
     OpSpec("silu_and_mul", "silu_and_mul(gate, up) -> Tensor", reference.silu_and_mul),
     OpSpec("silu", "silu(x) -> Tensor", reference.silu),
     OpSpec("gelu", "gelu(x) -> Tensor  # exact erf", reference.gelu),
@@ -150,6 +156,24 @@ for _spec in (
         "mxfp8_gemm_residual(a_q, a_scales, w_q, w_scales, residual_bf16[M, N], bias=None) -> bf16[M, N]",
         mxfp8.gemm_residual,
     ),
+    # Forms of the CUDA backend's GEMM family (xinfer/ops/reference/mxfp8.py): MXFP8 pairs (q, scales), weights in the
+    # checkpoint's row order, quantized outputs with one scale per 128 columns.
+    OpSpec("mxfp8_layer_norm_quantize", "mxfp8_layer_norm_quantize(x[..., K], weight, bias, eps) -> (q[M, K], scales)"
+           "  # the BF16 LayerNorm, quantized", mxfp8.layer_norm_quantize),
+    OpSpec("mxfp8_zero_centered_rms_norm_quantize",
+           "mxfp8_zero_centered_rms_norm_quantize(x[..., K], w, eps) -> (q[M, K], scales)  # the BF16 norm, quantized",
+           mxfp8.zero_centered_rms_norm_quantize),
+    OpSpec("mxfp8_add_zero_centered_rms_norm_quantize",
+           "mxfp8_add_zero_centered_rms_norm_quantize(x, residual, w, eps) -> (residual + x, (q, scales))"
+           "  # norm of the FP32 sum", mxfp8.add_zero_centered_rms_norm_quantize),
+    OpSpec("mxfp8_gemm_epilogue",
+           "mxfp8_gemm_epilogue(x(q, s), weight(q[N, K], s), bias=None, *, activation=None, residual=None,"
+           " row_mask=None, out_quant=False) -> bf16[M, N] | (q, s)", mxfp8.gemm_epilogue),
+    OpSpec("mxfp8_gemm_glu_quantize", "mxfp8_gemm_glu_quantize(x(q, s), weight(q[2N, K], s)) -> (q[M, N], s)"
+           "  # silu(gate)·up in FP32, quantized", mxfp8.gemm_glu_quantize),
+    OpSpec("mxfp8_qkv_rope_epilogue",
+           "mxfp8_qkv_rope_epilogue(x(q, s), weight(q[3HD, K], s), bias, cos[M, R/2], sin, num_heads, head_dim)"
+           " -> bf16[M, 3HD]", mxfp8.qkv_rope_epilogue),
     # Fused vision, language and action operators for Wall-X 2B.
     OpSpec("layer_norm_cast", "layer_norm_cast(x, weight, bias, eps) -> x.dtype  # FP32 inside",
            norm.layer_norm_cast),
@@ -174,7 +198,7 @@ for _spec in (
            gemm.qkv_norm_split),
     OpSpec("segment_attention",
            "segment_attention(q[T, H, D], k, v, cu_seqlens, *, scale=None) -> [T, H, D]"
-           "  # varlen_attention's function on xcompute's attention_varlen",
+           "  # varlen_attention's function on the CUDA backend's attention_varlen",
            attn.segment_attention),
     OpSpec("gated_causal_attention",
            "gated_causal_attention(q[T, H, D], k[T, KV, D], v, gate[T, HD], *, scale=None) -> attention·sigmoid(gate)",
@@ -214,8 +238,9 @@ for _spec in (
            " -> silu(x̂·W_gateᵀ)·(x̂·W_upᵀ)  # x̂ = AdaRMS(x), FP32",
            gemm.gemm_glu_epilogue),
     OpSpec("qkv_rope_epilogue",
-           "qkv_rope_epilogue(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads, head_dim)"
-           " -> [Q | K | V]  # RoPE on the FP32 accumulator", gemm.qkv_rope_epilogue),
+           "qkv_rope_epilogue(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads, head_dim, *,"
+           " qk_order='standard') -> [Q | K | V]  # RoPE on the FP32 accumulator; 'any': Q/K channels may come in"
+           " pair order", gemm.qkv_rope_epilogue),
     OpSpec("prefix_kvcache_attention",
            "prefix_kvcache_attention(q[B, M, H, D], k_cache[B, L, KV, D], v_cache, prefix_len[B], new_pos, *,"
            " flash_mask=None, scale=None) -> [B, M, HD]  # keys [0, prefix) ∪ [new_pos, new_pos + M)",
@@ -225,6 +250,13 @@ for _spec in (
            " start, H, KV, D) -> [M, HD]  # K/V written in place", gemm.qkv_rope_kvcache),
     OpSpec("add_rms_norm", "add_rms_norm(x, residual, weight[K], eps) -> (residual + x, rms_norm(sum))",
            norm.add_rms_norm),
+    OpSpec("gemm_add_rms_norm",
+           "gemm_add_rms_norm(x[M, K], projection[N, K], residual[..., M, N], weight[N], eps, bias=None)"
+           " -> (residual + x·projectionᵀ + bias, rms_norm(sum))", gemm.gemm_add_rms_norm),
+    OpSpec("mlp_add_rms_norm",
+           "mlp_add_rms_norm(x[M, K], gate_up[2I, K], down[N, I], residual[..., M, N], weight[N], eps)"
+           " -> (residual + down(silu(gate)·up), rms_norm(sum))  # the sum may be written into residual",
+           gemm.mlp_add_rms_norm),
     OpSpec("flow_velocity_euler",
            "flow_velocity_euler(x[B, M, A] fp32, h[B, M, K] (normed), weight[A, K], dt, dof_mask=None,"
            " padding_velocity=None, pinned=None, pinned_values=None) -> fp32[B, M, A]  # flow velocity",
@@ -250,6 +282,24 @@ for _spec in (
         "nvfp4_silu_mul_quantize(gate_up_bf16[M, 2K]) -> (e2m1x2[M, K/2], scales)",
         nvfp4.silu_mul_quantize,
     ),
+    # Forms of the CUDA backend's GEMM family (xinfer/ops/reference/nvfp4.py): NVFP4 pairs (q, scales), weights
+    # (q[N, K/2], scales, global_scale); the GEMM rounds to BF16 before the epilogue, and a quantized output is the
+    # final BF16 tensor quantized.
+    OpSpec("nvfp4_layer_norm_quantize",
+           "nvfp4_layer_norm_quantize(x[..., K], weight, bias, eps) -> (q[M, K/2], s)  # the BF16 LayerNorm, quantized",
+           nvfp4.layer_norm_quantize),
+    OpSpec("nvfp4_add_zero_centered_rms_norm_quantize",
+           "nvfp4_add_zero_centered_rms_norm_quantize(x, residual, w, eps) -> (residual + x, (q, s))"
+           "  # add_zero_centered_rms_norm, its BF16 norm quantized", nvfp4.add_zero_centered_rms_norm_quantize),
+    OpSpec("nvfp4_gemm_epilogue",
+           "nvfp4_gemm_epilogue(x(q, s), weight(q[N, K/2], s, g), bias=None, *, activation=None, residual=None,"
+           " out_quant=False) -> bf16[M, N] | (q, s)", nvfp4.gemm_epilogue),
+    OpSpec("nvfp4_gemm_glu_quantize",
+           "nvfp4_gemm_glu_quantize(x(q, s), weight(q[2N, K/2], s, g)) -> (q[M, N/2], s)  # bf16(silu(gate)·up)",
+           nvfp4.gemm_glu_quantize),
+    OpSpec("nvfp4_qkv_rope_epilogue",
+           "nvfp4_qkv_rope_epilogue(x(q, s), weight(q[3HD, K/2], s, g), bias, cos[M, R/2], sin, num_heads, head_dim)"
+           " -> bf16[M, 3HD]", nvfp4.qkv_rope_epilogue),
 ):
     registry.define(_spec)
 del _spec
@@ -297,8 +347,7 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
     names = sorted({name for names in stage_ops.values() for name in names
                     if _is_slow_fallback(table.selection(name)) and name in FUSED_OPS})
     if names:
-        hint = ("Install xcompute built for this GPU, or set XINFER_XCOMPUTE_LIBRARY to such a build: "
-                "docs/kernels.md" if kind == "cuda" else
+        hint = ("Build the CUDA kernel library for this GPU: docs/kernels.md" if kind == "cuda" else
                 "Install the Ascend xcompute build, or set XINFER_XCOMPUTE_LIBRARY to it: docs/ascend950dt.md")
         message = (f"{model}: {len(names)} operators have no fast kernel loaded and fall back to slow torch code "
                    f"({', '.join(names)}). {hint}")

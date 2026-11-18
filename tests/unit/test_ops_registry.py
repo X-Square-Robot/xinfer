@@ -224,7 +224,7 @@ def test_slow_fallbacks_warn_on_cuda_only(caplog):
         assert ops.warn_slow_fallbacks("tiny", table, stage_ops, "rpu:0") == []
         assert not caplog.records
         assert ops.warn_slow_fallbacks("tiny", table, stage_ops, "cuda") == ["gemm_epilogue", "qkv_rope_kvcache"]
-    assert "tiny: 2 operators have no fast kernel loaded" in caplog.text and "XINFER_XCOMPUTE_LIBRARY" in caplog.text
+    assert "tiny: 2 operators have no fast kernel loaded" in caplog.text and "docs/kernels.md" in caplog.text
 
 
 def test_slow_fallbacks_fail_in_strict_mode(monkeypatch):

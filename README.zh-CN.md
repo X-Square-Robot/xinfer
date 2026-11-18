@@ -9,14 +9,27 @@
 </p>
 
 <p align="center">
+  <a href="#特性一览">特性</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#模型与硬件">模型</a> ·
   <a href="docs/benchmark.zh-CN.md">基准测试</a> ·
   <a href="#文档">文档</a> ·
+  <a href="https://arxiv.org/abs/2611.14969">论文</a> ·
   <a href="CONTRIBUTING.md">参与贡献</a>
 </p>
 
 **XInfer 是面向视觉-语言-动作（VLA）模型的推理与服务框架。** 我们的目标是为机器人提供快速、稳定、准确的模型推理服务，覆盖从机载推理到机队共享服务的各种场景。
+
+XInfer 的设计与评测见我们的论文 [Scaling VLA Serving Under Robotic Execution Constraints](https://arxiv.org/abs/2611.14969)。
+
+## 特性一览
+
+- **实时分块（RTC）**　机器人执行当前动作段时，即可根据新观测预测下一段。
+- **单机器人极低时延**　Wall-X 2B BF16 在 RTX 5090 上的单请求 P50 为 22.3 ms。
+- **单卡服务多机器人**　多台机器人共享模型权重，不同请求的视觉编码与动作生成可重叠执行。
+- **低精度量化**　支持按层组对线性层使用 MXFP8 或 NVFP4。
+- **多硬件后端**　NVIDIA RTX 5090、Jetson Thor、昇腾 950DT、Huixi Rhino RPU（R1，适配中）。
+- **高性能算子库**　使用 Xcompute 融合算子，支持 FlashAttention，也可接入其他算子库。
 
 ## 为什么选择 XInfer
 
@@ -33,7 +46,7 @@
 python -m pip install -e ".[models,serve]"
 ```
 
-Wall-OSS 默认的 BF16 优化路径使用 **xcompute**。在支持的 GPU 上安装与其架构匹配的构建后，按 [kernel 指南](docs/kernels.zh-CN.md)检查各算子的后端。缺少兼容构建时使用较慢的 PyTorch 实现。
+Wall-OSS 默认的 BF16 优化路径使用本仓库中的 CUDA kernel。针对所用 GPU 编译后，按 [kernel 指南](docs/kernels.zh-CN.md)检查各算子的后端。没有编译这个库时使用较慢的 PyTorch 实现。
 
 以下示例使用 BF16，需要[受支持的 Wall-OSS checkpoint 布局](docs/models/wall_oss.zh-CN.md#环境要求)，包括 tokenizer 和归一化文件。公开的 Wall-OSS-0.5 和 WALL-OSS-FLOW 权重布局不同，目前无法直接加载。
 
@@ -76,29 +89,43 @@ finally:
 
 | 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
 |---|---|---|---|---|
-| Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
-| Wall-X 2B | `wallx2b` | BF16（xcompute；参考算子） | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
+| Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（Xcompute；参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
+| Wall-X 2B | `wallx2b` | BF16；视觉和预填充可选 MXFP8 或 NVFP4，动作阶段保留 BF16 | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
 Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。两款模型在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)；昇腾 950DT 上的数据在同一张表内，各模型在该平台承接的算子见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
 | 硬件 | 设备 | 运行时 |
 |---|---|---|
 | NVIDIA GPU · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
+| NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
 | Rhino RPU (R1) | `rpu` | Rhino Launch SDK AOT · [配置](docs/models/wallx2b_rpu.zh-CN.md) |
 | CPU | `cpu` | 参考实现与测试 |
 
 每个加速器运行各自的引擎（Engine）和权重。
 
-优化的 CUDA 执行路径使用 **xcompute** 构建和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 以同样的方式绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
+优化的 CUDA 执行路径使用由本仓库编译的 kernel 库和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
+
+## 性能
+
+各服务配置的单请求时延和容量，用 `benchmarks/performance.py` 测得（[测量条件](docs/performance.zh-CN.md)）：
+
+| # | 模型 | 精度、组合 | 加速器 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 峰值吞吐 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Wall-OSS | BF16，优化组合 | RTX 5090 | 49.0 ms | 4 | 128 ms | 142 ms | 25.6 req/s |
+| 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
+| 3 | Wall-OSS | BF16，优化组合 | Jetson AGX Thor | 95.4 ms | 2 | 123 ms | 141 ms | 11.5 req/s |
+| 4 | Wall-X 2B | 视觉和预填充 NVFP4，优化组合 | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
+| 5 | Wall-OSS | BF16，优化组合 | 昇腾 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
+| 6 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## 工作原理
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.webp" alt="机器人客户端经负责输入处理和输出处理的前端（Frontend）连接到 XInfer 引擎（Engine），引擎运行 Vision、Prefill 和 Action。平台适配器分别连到以品牌标志标识的 NVIDIA GPU 和 Ascend 950DT NPU，以及 CPU 参考执行。虚线的 More chips 框表示更多硬件后端。" width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="模型阶段调用加载时选定的算子实现。X-Square Robot 自研的 Xcompute 提供融合算子，也可选择 CUDA FlashAttention、PyTorch 参考算子或第三方插件。引擎支持 RTX 5090、Jetson AGX Thor、昇腾 950DT 和 CPU。Huixi R1 走独立的实验路径。" width="100%">
 </p>
 
-前端（Frontend）负责输入处理和输出处理。模型定义各阶段的计算和张量交接；引擎管理准入、队列、组批和资源生命周期。平台适配器提供设备执行，算子后端提供优化的 kernel。Python API 与网络服务共用同一个引擎和同一套配置规则。执行模型见[引擎指南](docs/engine.zh-CN.md)，默认值与覆盖方式见[配置](docs/configuration.zh-CN.md)。
+前端（Frontend）负责输入处理和输出处理。模型定义各阶段的计算和张量交接；引擎管理准入、队列、组批和资源生命周期。加载模型时，算子注册表为目标设备上的每个算子选择实现。X-Square Robot 自研的 **Xcompute** 提供 QKV 投影与 RoPE、残差加法与 RMSNorm 等融合算子。同一注册表也支持 CUDA 上可选的 FlashAttention、PyTorch 参考算子和第三方算子库。平台适配器负责设备执行。在 CUDA、昇腾和 CPU 上，Python API 与网络服务共用同一引擎。虚线表示正在适配的 Huixi R1 路径，Wall-X 2B 通过进程内 Python 接口调用 Rhino Launch SDK。执行模型见[引擎指南](docs/engine.zh-CN.md)，默认值与覆盖方式见[配置](docs/configuration.zh-CN.md)。
 
 ## 基准测试
 
@@ -125,6 +152,22 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 | 分析算子性能 | [性能剖析](docs/profiling.zh-CN.md) |
 | 用 Prometheus 和 Grafana 监控服务 | [指标](docs/metrics.zh-CN.md) |
 | 扩展框架 | [模型接口](xinfer/models/interface.py) · [架构与设计](docs/design.zh-CN.md) |
+
+## 引用
+
+如果你在研究中使用了 XInfer，请引用我们的论文：
+
+```bibtex
+@misc{zhang2026scalingvlaservingrobotic,
+      title={Scaling VLA Serving Under Robotic Execution Constraints},
+      author={Yue Zhang and Zicong Ye and Lufang Chen and Dance Yang and Mingyang Li and Zhenwei Duan and Michael Zhao and Ziye Deng and Starrick Liu and Ruizhi Chengze and YongHua Chen and SongAo Han and Yu Sun and Ran Yu and Xiaofan Li and Ruyi Gan and Hao Wang},
+      year={2026},
+      eprint={2611.14969},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2611.14969},
+}
+```
 
 ## 参与贡献
 

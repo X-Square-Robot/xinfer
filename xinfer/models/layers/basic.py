@@ -12,6 +12,7 @@ from torch import nn
 
 from xinfer.ops import active_ops
 from xinfer.models.layers.quantization import GatedLayout, QKVLayout, active_quant, make_method
+from xinfer.models.layers.quantization.nvfp4 import global_scale
 
 
 def _meta_param(*shape: int) -> nn.Parameter:
@@ -25,6 +26,39 @@ class ParamGroup(nn.Module):
         super().__init__()
         for name, shape in shapes.items():
             setattr(self, name, _meta_param(*shape))
+
+    def split_rows(self, name: str, **parts: int) -> None:
+        """Replace the loaded ``[N, K]`` weight ``name`` by its consecutive row blocks ``parts`` (name → rows)."""
+        weight, start = getattr(self, name), 0
+        delattr(self, name)
+        for part, rows in parts.items():
+            self.register_buffer(part, weight[start:start + rows].contiguous(), persistent=False)
+            start += rows
+        if start != weight.shape[0]:
+            raise ValueError(f"split_rows: {name} has {weight.shape[0]} rows, the parts {start}")
+
+    def quantize(self, quant: str, ops, *names: str) -> None:
+        """Replace the loaded BF16 ``[N, K]`` weights ``names`` by their ``quant`` form (``quantized``): MXFP8
+        ``(q, scales)`` (1x128 scales along K), or NVFP4 ``(q, scales, global_scale)``, the global scale
+        ``amax / (448 · 6)`` with MSE block scales (``"nvfp4_mse"``), else 1."""
+        for name in names:
+            weight = getattr(self, name)
+            delattr(self, name)
+            if quant == "mxfp8":
+                q, scales = ops.mxfp8_quantize(weight)
+            else:
+                mse = quant == "nvfp4_mse"
+                scale = global_scale(weight) if mse else 1.0
+                q, scales = ops.nvfp4_quantize(weight.contiguous(), global_scale=scale, mse=mse)
+                setattr(self, f"{name}_global_scale", scale)
+            self.register_buffer(f"{name}_q", q, persistent=False)
+            self.register_buffer(f"{name}_scales", scales, persistent=False)
+
+    def quantized(self, name: str) -> tuple:
+        """The weight ``quantize`` made of ``name``: ``(q, scales)``, with ``global_scale`` appended in NVFP4."""
+        weight = getattr(self, f"{name}_q"), getattr(self, f"{name}_scales")
+        scale = getattr(self, f"{name}_global_scale", None)
+        return weight if scale is None else (*weight, scale)
 
 
 class Linear(nn.Module):

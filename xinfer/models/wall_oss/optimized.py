@@ -1,11 +1,13 @@
-"""Wall-OSS on xcompute (``numerics="optimized"``, the default), BF16.
+"""Wall-OSS on the CUDA backend's kernels (``numerics="optimized"``, the default), BF16.
 
 Each stage runs the steps of the reference composition (``numerics="reference"``, the Wall-X eager model) on
-operators of ``xinfer/ops/reference/`` (each an xcompute call where xcompute lists a kernel, else its torch
+operators of ``xinfer/ops/reference/`` (each a kernel call where the CUDA backend lists a kernel, else its torch
 reference). GEMM weights are ``[N, K]``; the action stage's output and down projections are stored ``[K, N]``,
-which selects xcompute's small-M kernel. Differences to the reference:
+which selects the small-M kernel. Differences to the reference:
 
 - every residual add and the RMSNorm after it are one call (``add_rms_norm``), the sum rounded to BF16 as before;
+  in the ViT the projection before it joins them (``gemm_add_rms_norm``), which on integrated GPUs adds the residual
+  to the FP32 product (one rounding);
 - the QKV projections add their bias and rotate q and k on the FP32 accumulator (one rounding); in the prefill and
   action stages the same call writes K and V to the head-major cache;
 - the gated MLPs apply SiLU-mul to the FP32 accumulator (one rounding); the merger's GELU is the fc1 epilogue;
@@ -28,12 +30,12 @@ DTYPE = torch.bfloat16
 FLOW_TIME_SCALE = 0.999
 
 OPTIMIZED_STAGE_OPS = {
-    "vision": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "rms_norm", "add_rms_norm",
+    "vision": ("gemm_epilogue", "gemm_glu_epilogue", "gemm_add_rms_norm", "qkv_rope_epilogue", "rms_norm",
                "varlen_attention"),
-    "prefill": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "rms_norm", "add_rms_norm",
+    "prefill": ("gemm_epilogue", "qkv_rope_kvcache", "mlp_add_rms_norm", "rms_norm", "add_rms_norm",
                 "causal_attention"),
     "action": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "prefix_kvcache_attention",
-               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear"),
+               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "prefetch_weights", "join_prefetch"),
 }
 
 
@@ -94,18 +96,16 @@ class OptimizedVision(nn.Module):
         angles = angles.reshape(n // unit, unit, -1)[window_index].reshape(n, -1)
         cos, sin = angles.cos(), angles.sin()
         normed = ops.rms_norm(x, self.blocks[0].norm1, eps)
-        branch = None
         for i, block in enumerate(self.blocks):
-            if branch is not None:
-                x, normed = ops.add_rms_norm(branch, x, block.norm1, eps)
             cu_seqlens = layout["cu_full"] if i in c.fullatt_block_indexes else layout["cu_window"]
-            qkv = ops.qkv_rope_epilogue(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d)
+            qkv = ops.qkv_rope_epilogue(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d,
+                                        qk_order="any")  # Q and K only feed the attention
             q, k, v = qkv.view(n, 3, heads, d).unbind(1)
             o = ops.varlen_attention(q, k, v, cu_seqlens).reshape(n, -1)
-            x, normed = ops.add_rms_norm(ops.gemm_epilogue(o, block.proj_weight, block.proj_bias), x, block.norm2, eps)
+            x, normed = ops.gemm_add_rms_norm(o, block.proj_weight, x, block.norm2, eps, bias=block.proj_bias)
             hidden = ops.gemm_glu_epilogue(normed, block.gate_up_weight, bias=block.gate_up_bias)
-            branch = ops.gemm_epilogue(hidden, block.down_weight, block.down_bias)
-        _, normed = ops.add_rms_norm(branch, x, self.merger.norm, eps)
+            following = self.blocks[i + 1].norm1 if i + 1 < len(self.blocks) else self.merger.norm
+            x, normed = ops.gemm_add_rms_norm(hidden, block.down_weight, x, following, eps, bias=block.down_bias)
         merged = ops.gemm_epilogue(normed.reshape(-1, self.merger.fc1_weight.shape[1]), self.merger.fc1_weight,
                                    self.merger.fc1_bias, activation="gelu")
         return ops.gemm_epilogue(merged, self.merger.fc2_weight, self.merger.fc2_bias)[layout["reverse_index"]]
@@ -162,9 +162,8 @@ class OptimizedPrefill(nn.Module):
             o = ops.causal_attention(q.view(1, p, heads, d), keys.transpose(0, 1)[None], values.transpose(0, 1)[None])
             h, normed = ops.add_rms_norm(ops.gemm_epilogue(o.reshape(p, -1), layer.o).view(1, p, -1), h,
                                          layer.post_norm, eps)
-            hidden = ops.gemm_glu_epilogue(normed.view(p, -1), layer.gate_up)
-            h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down).view(1, p, -1), h,
-                                         self.layers[i + 1].input_norm, eps)
+            h, normed = ops.mlp_add_rms_norm(normed.view(p, -1), layer.gate_up, layer.down, h,
+                                             self.layers[i + 1].input_norm, eps)
 
 
 class OptimizedAction(nn.Module):
@@ -246,6 +245,9 @@ class OptimizedAction(nn.Module):
             h = self.action_head.embed(x, tau, dof).to(DTYPE)
             normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
             for i, layer in enumerate(self.layers):
+                # this layer's later weights and the next layer's QKV, read while the QKV and attention run
+                following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
+                ops.prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
                 keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
                 q = ops.qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin, keys[0], values[0], p, heads,
                                          kv_heads, d)
@@ -257,6 +259,7 @@ class OptimizedAction(nn.Module):
                 h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down_t.t())[None], h, following, eps)
             x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
                                         pinned_rows, prefix)
+        ops.join_prefetch()
         out.copy_(x)
 
 

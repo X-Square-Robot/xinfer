@@ -114,7 +114,7 @@ def parse_args(argv=None):
     p.add_argument("--reference-ops", action="store_true")
     p.add_argument("--op-backends", default=None,
                    help="pin implementations per operator by backend, library or both, e.g. "
-                        "varlen_attention=flash_attn or rms_norm=cuda:xcompute; pins win over --reference-ops")
+                        "varlen_attention=flash_attn or rms_norm=cuda:kernels; pins win over --reference-ops")
     p.add_argument("--warmup", nargs="*", default=(),
                    help="request files run before serving (JSON or msgpack, each one request or a list)")
     return p.parse_args(argv)

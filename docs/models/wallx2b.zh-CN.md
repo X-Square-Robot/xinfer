@@ -6,6 +6,8 @@
 
 RTX 5090 上的延迟、单卡服务容量和开环精度见[验证结果](wallx2b_validation.zh-CN.md)。
 
+在 CUDA 上使用低精度推理时，在下方的服务命令中加入 `--model-options '{"quantization":"mxfp8"}'`（或 `"nvfp4"`），或者向 `Policy` 传入 `quantization="mxfp8"`（或 `"nvfp4"`）。引擎读取同一份 checkpoint，在加载时量化视觉块和提示词投影层。动作阶段继续使用 BF16 计算组合。各阶段的选项、算子要求和验证方式见[模型设计](wallx2b_design.zh-CN.md)（[MXFP8](wallx2b_design.zh-CN.md#mxfp8)、[NVFP4](wallx2b_design.zh-CN.md#nvfp4)）。
+
 ## Checkpoint 要求
 
 请自行准备兼容的 checkpoint 目录。仓库提供推理代码。下列文件应来自同一次训练导出：
@@ -27,7 +29,7 @@ xinfer-serve --model wallx2b --checkpoint /path/to/wallx2b-checkpoint \
   --device cuda --warmup flow.msgpack rtc.msgpack --port 33985
 ```
 
-默认的优化 BF16 组合可使用 xcompute。安装与 GPU 匹配的构建并查看实际选择的算子后端，见 [kernel 指南](../kernels.zh-CN.md)。如需使用参考组合并让视觉阶段使用 FlashAttention 2，安装兼容的 FlashAttention 2 构建，并在服务命令中追加 `--model-options '{"numerics":"reference"}' --reference-ops --op-backends varlen_attention=flash_attn`。
+默认的优化 BF16 组合在 CUDA kernel 库已编译时使用它。编译方法和实际选择的算子后端见 [kernel 指南](../kernels.zh-CN.md)。如需使用参考组合并让视觉阶段使用 FlashAttention 2，安装兼容的 FlashAttention 2 构建，并在服务命令中追加 `--model-options '{"numerics":"reference"}' --reference-ops --op-backends varlen_attention=flash_attn`。
 
 同一条 flow 观测也可以直接在进程内运行。示例选择 CPU 图像预处理，与服务默认设置一致。
 

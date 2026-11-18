@@ -5,11 +5,15 @@ projection and AdaRMS calls in eager execution and graph capture. Builds
 without these bridges use the references. Other layouts/options also run the reference, with support cached
 per call layout; legacy eager-only raw entries are not registered.
 Stream-K reductions may differ at rounding level across runs.
+
+``gemm_add_rms_norm`` and ``mlp_add_rms_norm`` call this backend's ``gemm_epilogue``, ``gemm_glu_epilogue`` and
+``add_rms_norm`` in turn (the default selections of those operators), so their results are those calls'.
 """
 
 import torch
 
 from xinfer.ops.backends.ascend._support import VERSION, bridge, canonical, partial, xc
+from xinfer.ops.backends.ascend.norm import add_rms_norm, norm_library
 from xinfer.ops.reference import gemm as reference
 from xinfer.ops.registry import register
 
@@ -69,11 +73,24 @@ def gemm_glu_epilogue(x, weight, *, bias=None, modulation=None, row_class=None, 
                                         row_class=row_class, eps=eps)
 
 
+@register("gemm_add_rms_norm", backend="ascend",
+          requires=xc if callable(native_gemm) and norm_library is not None else None, version=VERSION)
+def gemm_add_rms_norm(x, projection, residual, weight, eps, bias=None):
+    return add_rms_norm(gemm_epilogue(x, projection, bias).view(residual.shape), residual, weight, eps)
+
+
+@register("mlp_add_rms_norm", backend="ascend",
+          requires=xc if (callable(native_gemm) and norm_library is not None
+                          and (canonical_glu is not None or callable(cann_glu))) else None, version=VERSION)
+def mlp_add_rms_norm(x, gate_up, down, residual, weight, eps):
+    return gemm_add_rms_norm(gemm_glu_epilogue(x, gate_up), down, residual, weight, eps)
+
+
 @register("qkv_rope_epilogue", backend="ascend", requires=xc if callable(native_qkv) else None,
           version=VERSION)
 @partial(reference.qkv_rope_epilogue)
-def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim):
-    return native_qkv(x, weight, bias, cos, sin, num_heads, head_dim)
+def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
+    return native_qkv(x, weight, bias, cos, sin, num_heads, head_dim)  # the standard order serves "any" too
 
 
 _fused_projection = getattr(xc, "qkv_proj_rope", None) if xc is not None else None
@@ -81,9 +98,9 @@ _qk_norm = getattr(xc, "QkNorm", None) if xc is not None else None
 
 
 # ``qkv_rope_kvcache`` takes the unified projection entry first: the same ``qkv_proj_rope`` call with its
-# ``kv_cache`` epilogue that the reference-composed quick100 gate validated end to end. The CANN action bridge
-# also serves the operator, but its composition fails that gate for Wall-OSS (+1100 % GT-MSE against the frozen
-# reference; every other operator family passes), so it stays the fallback for builds without the entry.
+# ``kv_cache`` epilogue that the end-to-end precision gate validated. The CANN action bridge also serves the
+# operator, but its composition fails that gate for Wall-OSS (every other operator family passes), so it stays the
+# fallback for builds without the entry.
 @register("qkv_rope_kvcache", backend="ascend",
           requires=xc if callable(_fused_projection) or callable(native_cache) else None,
           version=VERSION, deterministic=False)

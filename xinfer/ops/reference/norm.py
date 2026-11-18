@@ -107,7 +107,7 @@ def _adarms(x: torch.Tensor, modulation: torch.Tensor, row_class: torch.Tensor, 
 
 def add_rms_norm(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
                  eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """``s = residual + x`` (one BF16 rounding), then ``rms_norm(s)`` (xcompute ``add_rmsnorm``).
+    """``s = residual + x`` (one BF16 rounding), then ``rms_norm(s)`` (the CUDA backend's ``add_rmsnorm``).
 
     Args:
         x: ``[..., K]`` BF16 branch output.
@@ -182,7 +182,7 @@ def _row_modulation(x: torch.Tensor, modulation: torch.Tensor, pinned_modulation
 def modulated_rms_norm(x: torch.Tensor, modulation: torch.Tensor, eps: float,
                        pinned_modulation: torch.Tensor | None = None,
                        pinned_rows: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """Adaptive RMSNorm with a packed ``[scale | shift | gate]`` modulation (xcompute ``adarmsnorm``).
+    """Adaptive RMSNorm with a packed ``[scale | shift | gate]`` modulation (the CUDA backend's ``adarmsnorm``).
 
     ``normed = bf16(x · rsqrt(mean(x²) + eps) · (1 + scale) + shift)`` in FP32 (``reference.ada_rms_norm``). With
     ``pinned_rows`` the first ``pinned_rows[b]`` rows of batch row ``b`` take ``pinned_modulation`` (RTC pinned rows)
@@ -206,7 +206,7 @@ def gated_residual_modulated_rms_norm(residual: torch.Tensor, branch: torch.Tens
                                       pinned_modulation: torch.Tensor | None = None,
                                       pinned_rows: torch.Tensor | None = None
                                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``s = residual + bf16(branch · branch_gate)``, then ``modulated_rms_norm(s)`` (xcompute
+    """``s = residual + bf16(branch · branch_gate)``, then ``modulated_rms_norm(s)`` (the CUDA backend's
     ``gated_residual_adarmsnorm``).
 
     Args:
@@ -230,7 +230,7 @@ def identity_layer_norms_(residual: torch.Tensor, branch: torch.Tensor, branch_g
                           pinned_input_modulation: torch.Tensor | None = None,
                           pinned_post_modulation: torch.Tensor | None = None,
                           pinned_rows: torch.Tensor | None = None) -> torch.Tensor:
-    """The norms of a layer whose mixer is the identity, in place (xcompute ``double_adarmsnorm``).
+    """The norms of a layer whose mixer is the identity, in place (the CUDA backend's ``double_adarmsnorm``).
 
     Two ``gated_residual_modulated_rms_norm`` transitions: the previous branch into the residual and the input norm,
     then the identity mixer's gated output into the residual and the post norm. ``residual`` becomes the new

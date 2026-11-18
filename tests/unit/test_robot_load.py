@@ -160,10 +160,12 @@ def test_a_wallx_response_without_poses_is_an_error(tmp_path):
     assert _summary(tmp_path / "out")["rounds"][0]["errors"] == 2 and "absolute poses" in rows
 
 
-def test_wallx_observations_have_seeded_random_poses():
+def test_wallx_observations_have_seeded_random_poses_and_views_generated_once():
     pytest.importorskip("cv2")
     first, again = virtual_robot.Observations("robot-0"), virtual_robot.Observations("robot-0")
     assert first.make(None, 5)["state"] == again.make(None, 5)["state"]  # reproducible per robot
+    views = [first.make(None, 5)["views"] for _ in range(2)]
+    assert all(views[0][name] is views[1][name] for name in views[0])  # no per-request generation
     poses = [pose for _ in range(3) for pose in first.make(None, 5)["state"].values()]
     assert len({tuple(pose) for pose in poses}) == 6
     for pose in poses:

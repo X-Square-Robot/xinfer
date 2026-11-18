@@ -105,8 +105,8 @@ At admission the request's tensors are uploaded as usual and its
 `DeviceImage` values stay in host memory. A request with device images then
 goes to the **device-image thread** instead of the queues of its first
 stages. In admission order, the thread makes its own CUDA stream wait for the
-request's upload, decodes all the request's JPEGs in one batched torchvision
-`decode_jpeg` call, uploads its frames, resizes the views in FP32 (rounded
+request's upload, decodes all the request's JPEGs in one batched call of the
+platform's JPEG decoder, uploads its frames, resizes the views in FP32 (rounded
 half up to uint8) and records an event, which becomes the request's
 `inputs_ready` event. The engine thread then queues the request for its first
 stages, and their lanes wait for that event on the GPU: the engine thread
@@ -118,26 +118,36 @@ fails (its tensors held until the thread's event); `shutdown` drains the
 thread and stops it. Warmup requests take the same path.
 
 The decoder (`xinfer.engine.device_images`) is created on the thread for the
-first request with device images. Without a CUDA device or without
-torchvision, every request with device images fails with that reason; under
-`xinfer serve --warmup` the warmup requests are prepared by the same
-processors, so the server then fails at startup.
+first request with device images, by `xinfer.platforms.devices.jpeg_decoder_for`:
+on CUDA, NVIDIA's nvImageCodec (`xinfer.platforms.cuda.CudaJpegDecoder`).
+Without a CUDA device or without nvImageCodec, every request with device
+images fails with that reason; under `xinfer serve --warmup` the warmup
+requests are prepared by the same processors, so the server then fails at
+startup.
 
-One thread is enough and needed: torchvision keeps one nvJPEG decoder per
-process, and its decode call blocks the calling thread. For baseline JPEGs
-it uses nvJPEG's hardware backend, which runs on the GPU's JPEG engine (NVJPG,
-which the RTX 5090 has): the entropy decoding and the IDCT run there, the CPU
-only parses the headers and submits the batch, and the only CUDA kernel is an
-RGBA-to-RGB conversion of about 2 µs per image. Progressive JPEGs take nvJPEG's
-hybrid path instead, with Huffman decoding on the CPU and the IDCT in CUDA
-kernels. The call blocks for about 0.7 ms for three robot camera views on an
-RTX 5090 (torchvision 0.24.1) because it waits: torchvision serializes calls
-with a process-wide lock and synchronizes its decoder stream before and after
-the batch, and nvJPEG's hardware path synchronizes on an event; the thread's
-CPU time is spent spinning in these waits. The call releases the GIL, so it
-takes nothing from the engine thread. The JPEG bytes stay in host memory
-because nvJPEG reads the bitstream from there (torchvision does not accept
-CUDA tensors as input).
+nvImageCodec decodes the batch on the decoder's own stream with nvJPEG's
+hardware decoder, which runs on the GPU's JPEG engine (NVJPG, which the RTX
+5090 and Jetson Thor have): the entropy decoding and the IDCT run there, and a
+CUDA kernel upsamples the chroma as libjpeg-turbo does and converts to RGB, so
+the decoded views are within one level of the CPU path's. The decoded images
+are nvImageCodec's memory. The decoder copies them into tensors on its stream
+and makes the thread's stream wait for that copy; it keeps the images until an
+event after the copy has completed and then decodes into them again, so a call
+neither allocates new images nor waits for the GPU. On an RTX 5090
+(nvImageCodec 0.10) a call takes 0.4–0.7 ms of the thread for a request's
+camera views. The decoder has one CPU thread: nvImageCodec's default, one per
+visible core, spins while it waits and slowed the frontends and the engine
+under load in a container with a CPU quota. One device-image thread is enough,
+and the decoder is called from it only. The JPEG bytes stay in host memory,
+where nvImageCodec reads the bitstream.
+
+Whether a CUDA device has device images is checked by creating the decoder,
+without decoding. A decode at that point, at platform resolution, left every
+later CUDA graph replay of the process slower: on an RTX 5090 the gaps between
+their kernels grew from under 0.5 µs to 0.5–1 µs, about 0.6 ms per Wall-X 2B
+request and up to 1 ms per Wall-OSS request, with or without JPEGs. Without it,
+single requests take as long as with torchvision's decoder, which XInfer used
+before.
 
 ## Warmup
 

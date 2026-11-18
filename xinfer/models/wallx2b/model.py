@@ -16,8 +16,8 @@ RTC (``rtc_delay`` > 0) pins the first ``delay`` rows to the request's normalize
 clean data with the flow-time-1 condition, do not see the other action rows, keep zero velocity and are restored
 after the last step. Only the other rows' positions skip ``rtc_rope_gap``; without RTC every action row does.
 
-The ``numerics`` model option selects the composition. ``"optimized"`` (the default) runs the steps on xcompute's
-operators, with the flow conditioning in FP32 (``optimized.py``). ``"reference"`` follows the
+The ``numerics`` model option selects the composition. ``"optimized"`` (the default) runs the steps on the CUDA
+backend's operators, with the flow conditioning in FP32 (``optimized.py``). ``"reference"`` follows the
 Wall-X model under BF16 autocast: BF16 weights and activations, FP32 prompt-stream RMSNorm weights, the action
 projection and time condition in FP32, the readout as a BF16 GEMM.
 """
@@ -156,7 +156,9 @@ class Wallx2b(WallXQwen35):
 
     def capabilities(self) -> Capabilities:
         """One request per dispatch in every stage; ``config.num_steps`` Euler steps."""
-        stage_ops = OPTIMIZED_STAGE_OPS if self.numerics == "optimized" else self.stage_ops
+        stage_ops = self.stage_ops
+        if self.numerics == "optimized":
+            stage_ops = dict(OPTIMIZED_STAGE_OPS, vision=self.vision.stage_ops, prefill=self.prefill_stack.stage_ops)
         return Capabilities(batch_sizes={"vision": (1,), "prefill": (1,), "action": (1,)},
                             num_steps=self.config.num_steps, stage_ops=stage_ops)
 

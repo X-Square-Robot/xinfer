@@ -39,8 +39,8 @@ stream 优先级是对就绪加速器工作的调度提示，不会绕过事件�
 下述 MXFP8 数据是早期 Wall-OSS 配置的历史测量；当前 [Wall-OSS 组合](models/wall_oss.zh-CN.md)支持 BF16。
 
 为什么取这些值：
-- **通道数 2。** 在 Wall-OSS MXFP8（RTX 5090）上，两个 action 通道的容量为 7 台，一个通道为 5 台（action 阶段组批）；不组批时 2/2/2 优于 1/1/1（饱和时 31.2 对 27.2 req/s）；三个及以上通道未测量。证据：`xinfer-action-batching-20261101.tar.gz` 和 `xinfer-flash-attn-20261101.tar.gz`（哈希见 docs/models/wall_oss_validation.md）。
-- **两个前端。** 对 x2robot dummy 客户端的请求（一路 720×1280 原始视图和两路 640×480 JPEG 视图；三路原始视图时为 1.7 ms），Wall-X 输入处理每个请求耗时 7.1 ms，因此 8 台机器人以 5.6 Hz 发送时，一个前端约有三分之一的时间处于忙碌（`xinfer-wallx-input-processing-v3-20261105.tar.gz`，sha256 `04df60bd…`）。下面的对比是在输入处理每个请求耗时 22.2 ms 时测得的，当时 8 台机器人下一个进程约 100 % 的时间处于忙碌。低负载时更多前端没有帮助：4 台机器人时（2026-11-01，action 阶段组批之前；各跑一次），服务端 P50 / P99 在 1 个前端时为 94.8 / 123.8 ms，2 个时为 95.9 / 133.0 ms，4 个时为 119.9 / 144.0 ms。启用 action 组批后，4 台机器人在 1 个和 2 个前端下端到端时延相同（汇总 P50 分别为 85–87 和 86–88 ms）；1 个前端时请求排队等待输入处理（P50 28 ms 对 21 ms），2 个前端时则改为在引擎中等待（`xinfer-config-defaults-20261103.tar.gz`，sha256 `6f85d5eb…`）。
+- **通道数 2。** 在 Wall-OSS MXFP8（RTX 5090）上，两个 action 通道的容量为 7 台，一个通道为 5 台（action 阶段组批）；不组批时 2/2/2 优于 1/1/1（饱和时 31.2 对 27.2 req/s）；三个及以上通道未测量。
+- **两个前端。** 对 x2robot dummy 客户端的请求（一路 720×1280 原始视图和两路 640×480 JPEG 视图；三路原始视图时为 1.7 ms），Wall-X 输入处理每个请求耗时 7.1 ms，因此 8 台机器人以 5.6 Hz 发送时，一个前端约有三分之一的时间处于忙碌。下面的对比是在输入处理每个请求耗时 22.2 ms 时测得的，当时 8 台机器人下一个进程约 100 % 的时间处于忙碌。低负载时更多前端没有帮助：4 台机器人时（2026-11-01，action 阶段组批之前；各跑一次），服务端 P50 / P99 在 1 个前端时为 94.8 / 123.8 ms，2 个时为 95.9 / 133.0 ms，4 个时为 119.9 / 144.0 ms。启用 action 组批后，4 台机器人在 1 个和 2 个前端下端到端时延相同（汇总 P50 分别为 85–87 和 86–88 ms）；1 个前端时请求排队等待输入处理（P50 28 ms 对 21 ms），2 个前端时则改为在引擎中等待。
 - **每个前端 4 个处理线程。** 图像解码和 resize 会释放 GIL，因此一个进程可以同时准备多个请求。
 - **最终阶段优先。** 优先级相同时，最终阶段的就绪工作要排在后续请求的 vision 和 prefill kernel 之后。在 RTX 5090 上（仓库压测口径，同一代码树上的成对实例），action 优先级 −1 对比 0：
   - Wall-OSS MXFP8，8 台机器人：服务端汇总 P50 为 120.9 / 123.4 对 137.1 / 142.4 ms，P99 为 167.5 / 162.3 对 182.2 / 203.4 ms；
@@ -50,7 +50,7 @@ stream 优先级是对就绪加速器工作的调度提示，不会绕过事件�
   - Wall-OSS BF16，5 台机器人（过载）：中位数低 42 ms、吞吐高 15 %，但 P99 高 24–37 ms；
   - Wall-OSS MXFP8，10 台机器人（过载）：中位数低 13 ms、P95 更低、吞吐高 10 %，但 150 ms 以内的请求更少（2–11 % 对 28–32 %）。
 
-  `--stream-priorities action=0` 可恢复相同优先级。证据：`xinfer-stream-priorities-20261104.tar.gz`（sha256 `b642823fb11b337e6dd5f49ec35108c1e7fafb529c6f96a283704a7de5ff2ec7`）。
+  `--stream-priorities action=0` 可恢复相同优先级。
 
 ## Prompt 形状桶
 
@@ -70,25 +70,25 @@ Wall-OSS 在 action 注意力中对填充位置使用掩码。改变 prompt 宽�
 `image_preprocess_device` 是每个内置模型都有的选项，在所有入口中都放在模型选项的顶层，因此同一份选项可同时用于各个入口（`benchmarks/performance.py` 把同一份选项传给两者）：
 
 - `xinfer serve`（以及 `xinfer-profile`）：`--model-options '{"image_preprocess_device": "gpu"}'`；默认值为 `"cpu"`。
-- `Policy(..., image_preprocess_device=...)`：默认值 `None` 取平台的默认：能在设备上解码和 resize 视图时（有 torchvision 的 CUDA 设备，即平台能力 `device_images`）为 `"gpu"`，否则为 `"cpu"`。
+- `Policy(..., image_preprocess_device=...)`：默认值 `None` 取平台的默认：能在设备上解码和 resize 视图时（平台能力 `device_images`：在 CUDA 上即 NVIDIA 的 nvImageCodec 有该设备的解码器）为 `"gpu"`，否则为 `"cpu"`。
 
 它不是 `processing` 的字段：写在 `processing` 中会抛出 `ConfigError`；在不具备设备图像能力的平台上指定 `"gpu"` 也会抛出。入口解析该选项（`xinfer.config.apply_image_preprocess_device`）并交给模型的处理器。
 
 | 取值 | 视图在哪里解码和 resize | 数值 |
 |---|---|---|
 | `"cpu"`（`xinfer serve` 的默认值） | 在前端：OpenCV 解码，加上模型的 OpenCV / Pillow resize，一个请求的各路视图并行处理 | 与参考服务逐位一致 |
-| `"gpu"`（`Policy` 在 CUDA 上的默认值） | 在设备上，由引擎完成。前端把每路 JPEG 视图的字节（其他编码在 CPU 上解码）或原始帧作为 `DeviceImage` 发送，附带从 JPEG 文件头读出的目标尺寸和模型的 resize 方案；在第一个阶段之前，引擎用一次 torchvision `decode_jpeg` 调用（nvJPEG）解码该请求的全部 JPEG，并以 FP32 resize 各视图（[引擎](engine.zh-CN.md#设备图像)） | 不逐位一致：解码出的 JPEG 在锐利的色度边缘附近与 libjpeg-turbo 的结果不同（在机器人相机视图上平均相差 0.1–0.2 级，少数像素最多相差几十级），FP32 resize 也与 Pillow 的不同（torch 的 bicubic 用 a = −0.75，Pillow 用 −0.5），因此动作会不同 |
+| `"gpu"`（`Policy` 在 CUDA 上的默认值） | 在设备上，由引擎完成。前端把每路 JPEG 视图的字节（其他编码在 CPU 上解码）或原始帧作为 `DeviceImage` 发送，附带从 JPEG 文件头读出的目标尺寸和模型的 resize 方案；在第一个阶段之前，引擎用 NVIDIA 的 nvImageCodec 一次批量解码该请求的全部 JPEG（有 JPEG 引擎的 GPU 上在 JPEG 引擎上解码，如 RTX 5090、Jetson Thor），并以 FP32 resize 各视图（[引擎](engine.zh-CN.md#设备图像)） | 不逐位一致：解码出的 JPEG 与 libjpeg-turbo 的结果相差不超过 1 级，但 FP32 resize 与 Pillow 的不同（torch 的 bicubic 用 a = −0.75，Pillow 用 −0.5），因此动作会不同 |
 
-`"gpu"` 需要 CUDA 设备和 torchvision ≥ 0.19（`pip install -e '.[gpu-image]'`）；否则每个请求都会失败，`xinfer serve --warmup` 会在启动时失败。解码器为第一个请求创建，使用 `--warmup` 时即为一个预热请求。视图形状不变，因此两种模式下的 CUDA graph 相同。
+`"gpu"` 需要 CUDA 设备和 NVIDIA 的 nvImageCodec（`pip install -e '.[gpu-image]'`，即 CUDA 13 版的 `nvidia-nvimgcodec-cu13`）；没有时 `Policy` 默认 `"cpu"`，显式指定 `"gpu"` 会在启动时抛出 `ConfigError`。解码器为第一个请求创建，使用 `--warmup` 时即为一个预热请求。视图形状不变，因此两种模式下的 CUDA graph 相同。
 
-Wall-OSS MXFP8 在 RTX 5090 上启用 CUDA graph，使用 `benchmarks/request_latency.py` 运行 50 次的单请求 P50（ms）：
+Wall-OSS（默认 BF16 组合）在 RTX 5090 上启用 CUDA graph，使用 `benchmarks/request_latency.py` 运行 50 次的单请求 P50（ms；nvImageCodec 0.10，xcompute `7336b0d`）：
 
 | 模型、请求 | `"cpu"`：总计（准备 / 引擎） | `"gpu"`：总计（准备 / 引擎） |
 |---|---|---|
-| Wall-OSS，x2robot dummy 客户端（一路 1280×720 原始前视图，两路 640×480 噪声 JPEG 腕部视图） | 40.4 (7.4 / 32.8) | 37.4 (3.1 / 34.2) |
-| Wall-OSS，三路机器人相机 JPEG 视图（1280×720 和 640×480） | 39.0 (6.1 / 32.8) | 35.7 (1.9 / 33.6) |
+| Wall-OSS，x2robot dummy 客户端（一路 1280×720 原始前视图，两路 640×480 噪声 JPEG 腕部视图） | 51.9 (7.3 / 44.4) | 49.1 (3.2 / 45.8) |
+| Wall-OSS，三路机器人相机 JPEG 视图（1280×720 和 640×480） | 50.9 (6.2 / 44.6) | 47.7 (2.0 / 45.5) |
 
-前端改为把解码和缩放交给引擎进程的设备图像线程，在该线程的 stream 上每个请求耗时 1.1–1.4 ms（[引擎](engine.zh-CN.md#设备图像)）。以 8 台机器人运行 Wall-OSS MXFP8 时，两种模式均达到 44.0–44.3 req/s。GPU 预处理的每轮 P50 为 83–93 ms，CPU 为 83–88 ms。相对 BF16 参考，GPU 预处理的 quick100 B1 GT-MSE 降低了 6.13%，CPU 预处理降低了 5.01%。证据见 [Wall-OSS 验证](models/wall_oss_validation.zh-CN.md)。
+前端改为把解码和缩放交给引擎进程的设备图像线程，在该线程的 stream 上每个请求约耗时 1 ms（[引擎](engine.zh-CN.md#设备图像)）。以 4 台机器人运行 Wall-OSS 时（单卡容量，[性能表](performance.zh-CN.md)口径，8 轮），各轮服务端 P50 / P95 的中位数在 GPU 预处理下为 94 / 104 ms，CPU 预处理下为 119 / 133 ms；同一配置的各轮之间相差几十毫秒（取决于各轮的起始相位）。两种模式都通过了内部精度门禁（[精度](precision.zh-CN.md#内部验证)）。
 
 尚未纳入解析：
 - 内存规划器（design §8.2）；

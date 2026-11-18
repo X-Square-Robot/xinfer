@@ -15,7 +15,7 @@
 `request_latency.py` 用 `xinfer.Policy` 加载模型，因此与 `xinfer-serve` 一样，需要已安装 XInfer（`pip install -e '.[models]'`）以及模型的资产：
 
 ```bash
-python benchmarks/request_latency.py --model wall_oss --checkpoint /path/to/5_25000 \
+python benchmarks/request_latency.py --model wall_oss --checkpoint /path/to/checkpoint \
   --model-options '{"quantization": "bf16"}' --requests-file flow.msgpack rtc.msgpack \
   --runs 50 --warmup-runs 5 --out artifacts/wall-oss-latency.json
 ```
@@ -52,7 +52,7 @@ python -m pip install numpy 'websockets>=12' msgpack msgpack-numpy opencv-python
 
 请求内容取决于模型：
 
-- **Wall-OSS 和 Wall-X 2B** 默认使用桌面机器人的合成观测，包含两路 640×480 JPEG 腕部视图、一路 1280×720 原始头部视图和随机的手臂位姿（xyz 在 0.5 m 内，roll/pitch/yaw 在 π 内，夹爪 0..1）。Wall-OSS 把状态以文本形式写入 prompt，因此 prompt 长度会变化，与真实机器人一样（200 个随机位姿为 739–756 token）。第一个响应之后，每个请求携带 RTC 字段：
+- **Wall-OSS 和 Wall-X 2B** 默认使用桌面机器人的合成观测，包含两路 640×480 JPEG 腕部视图、一路 1280×720 原始头部视图和随机的手臂位姿（xyz 在 0.5 m 内，roll/pitch/yaw 在 π 内，夹爪 0..1）。每台机器人预先生成一组相机图像并重复发送，每次请求重新生成位姿。Wall-OSS 把状态以文本形式写入 prompt，因此 prompt 长度会变化，与真实机器人一样（200 个随机位姿为 739–756 token）。第一个响应之后，每个请求携带 RTC 字段：
   - 上一个动作块，按已执行的步数平移；
   - `inference_delay`：最近五次延迟的第 75 百分位数（初始为 5），限制在 1..`--max-inference-delay` 个模型步之间，再加 2；
   - `num_flow_steps`：服务元数据帧声明的 flow 步数（`flow_steps` 或 `rtc.num_flow_steps`），未声明时为 5。
@@ -95,7 +95,7 @@ python benchmarks/robot_load.py --url ws://127.0.0.1:33985 --robots 7 --requests
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "Wall-OSS" --model wall_oss \
-  --checkpoint /path/to/5_25000 --latency-requests flow.msgpack rtc.msgpack \
+  --checkpoint /path/to/checkpoint --latency-requests flow.msgpack rtc.msgpack \
   --warmup flow.msgpack rtc.msgpack --robots 3 4 5 --out artifacts/perf-wall-oss
 ```
 
@@ -104,12 +104,13 @@ CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "Wall-OSS" --mode
 ```bash
 CUDA_VISIBLE_DEVICES=0 python benchmarks/performance.py --name "Wall-X 2B" --model wallx2b \
   --checkpoint /path/to/wallx2b-checkpoint --latency-requests requests.msgpack \
-  --warmup flow.msgpack rtc.msgpack --robots 14 15 16 --out artifacts/perf-wallx2b
+  --warmup flow.msgpack rtc.msgpack --robots 8 12 14 15 16 --out artifacts/perf-wallx2b
 ```
 
 - **单请求：** 对模型的请求集运行 `request_latency.py`（5 次预热后 50 次），视图在设备上解码和 resize（`image_preprocess_device="gpu"`，即 `Policy` 的默认值）。`--model-options` 中的 `image_preprocess_device` 同时作用于这一部分和负载部分。
 - **压测：** 按机器人数从小到大，每个数都新启动一个使用默认设置和模型预热文件的 `xinfer-serve`，然后按仓库口径运行 `robot_load.py`（每台机器人 80 个请求，丢弃前 20 个，8 轮，起步相位随机）。Wall-OSS 和 Wall-X 2B 都使用默认的合成桌面观测和 RTC 负载。传入 `--load-requests` 会改为回放指定请求。脚本在第一个未通过的机器人数后停止。
-- **容量：** 任何一轮都没有错误或缺失行、各轮服务端 P50 的中位数（8 轮各自 P50 的中位数）低于 150 ms，且所有更小的已测机器人数也都通过的最大机器人数。表中给出该机器人数各轮 P50 和 P95 的中位数；`row.json` 另外记录最差的一轮。若最大已测机器人数仍通过，脚本以 `≥` 标示容量下界。饱和吞吐是所有已测机器人数、所有轮次中每秒完成请求数的最大值。
+- **容量：** 从低于饱和点的机器人数开始逐档增加。若任意一轮出现错误或缺失响应，或某档 8 轮服务端 P50 的中位数超过上一档的 1.5 倍，则停止。第一档提供基线。容量取最后一档通过的机器人数，所有档位都通过时报告下界。容量点报告各轮 P50 和 P95 的中位数，并报告所有档位的最高吞吐。
+- **单请求分项：** 报告端到端时延中位数、主机上的输入和输出处理中位数之和，以及引擎执行时延中位数。
 - **输出：** `row.json` 记录全部数字、配置、环境以及每个机器人数前后的机器负载；表格行打印到标准输出。
 
 改变某个配置性能的合并请求要同时更新它的那一行，并在描述中写明之前的数值。PyTorch、xcompute 或口径变化后，所有受影响的行都要重新测量。

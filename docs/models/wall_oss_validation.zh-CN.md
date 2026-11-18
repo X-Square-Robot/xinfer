@@ -4,7 +4,7 @@
 
 导航：[用法](wall_oss.zh-CN.md) · [设计](wall_oss_design.zh-CN.md)
 
-当前状态在 RTX 5090（功耗上限 575 W，flash-attn 2.8.3.post1，`xcompute.so` sha256 `dbfb9da7…d0dc`）上使用内部 checkpoint `5_25000`（`model.safetensors` sha256 `37a4b2ea…f3024`，`config.json` `95e34cbd…0cd6`）验证。eager BF16 参考、与它的对照以及 optimized 组合的结果来自 torch 2.10.0+cu130，其余结果来自 torch 2.9.1+cu130，但默认后端上参考组合的组批、填充和延迟结果来自 torch 2.10.0+cu130，其 action 阶段在 cuBLAS 上运行（`xinfer-remove-batch-invariant-20261109.tar.gz`）。每项结果都注明其证据包（见文末表格）。
+当前状态在 RTX 5090（功耗上限 575 W，flash-attn 2.8.3.post1）上使用一个内部 checkpoint 验证。eager BF16 参考、与它的对照以及 optimized 组合的结果来自 torch 2.10.0+cu130，其余结果来自 torch 2.9.1+cu130，但默认后端上参考组合的组批、填充和延迟结果来自 torch 2.10.0+cu130，其 action 阶段在 cuBLAS 上运行。
 
 ## 摘要
 
@@ -13,7 +13,7 @@
 | 输入/输出处理 vs 服务 | CPU | 全部 42 个抓包请求逐位一致 |
 | prefill 和 action 阶段 vs eager BF16 模型 | 参考组合，参考算子 | 逐位一致（[下文](#参考算子模型)） |
 | 各阶段 vs eager BF16 模型（从其输入出发） | optimized 组合，7 个请求 | vision 1.5–2.7 %、prefill K/V 1.5–1.6 %、action 0.14–0.23 %（相对范数）；7 个请求的完整链路都比 MXFP8 服务更接近 eager BF16 模型（[下文](#optimized-组合)） |
-| 精度门禁：quick100 B1（[精度](../precision.zh-CN.md#wall-oss-quick100-门禁)） | optimized 组合 | **PASS**：相对原始 BF16 的 GT-MSE 为 −6.58 %，episode CI [−12.48, −0.34]（门限 ≤ +1 %） |
+| 数值一致性（[精度](../precision.zh-CN.md#如何检查一致性)） | optimized 组合 | **PASS**：内部精度门禁；与参考组合的一致性由 `tests/models/test_wall_oss_optimized.py` 和 `tests/models/test_wall_oss_parity.py` 检查 |
 | CUDA graph 回放 vs eager | optimized 组合；使用 flash-attn 的参考组合；7 个请求（flow，RTC 延迟 3–8） | 逐位一致 |
 | 每阶段 2 个通道上的并发请求 vs 单独运行 | 参考组合，参考算子，7 个请求提交 3 次 | 逐位一致 |
 | 组批的 action 阶段（B2–B8，不同 prompt 长度和 RTC 延迟）vs 单请求 | 参考组合，默认后端，16 个请求、4 种 prompt 长度，提交两次 | 相差在 3.4e-3 以内（动作的相对范数；测试上限 0.05） |
@@ -27,7 +27,7 @@
 
 | 参考 | 内容 | 用途 |
 |---|---|---|
-| 服务抓包 `ref-v1` | 42 个请求（flow 和 RTC 延迟 3–8）经过注入噪声的 embodied-serving Wall-X 4B MXFP8 服务：原始请求、模型输入、输出、响应 | 处理一致性；噪声；生产精度量级 |
+| 服务抓包 `ref-v1` | 42 个请求（flow 和 RTC 延迟 3–8）经过注入噪声的生产 Wall-X 4B MXFP8 服务：原始请求、模型输入、输出、响应 | 处理一致性；噪声；生产精度量级 |
 | Eager BF16 | Wall-X `02c5351d` 的 eager `Qwen2_5_VLMoEForAction`，BF16（其自定义算子使用 PyTorch 回退实现，ViT 用 flash-attn 2.8.3，LLM 用 SDPA），使用服务的模型输入和噪声，RTC 第 0 步的 attention 截断与服务一致；torch 2.10.0+cu130 | 模型数值 |
 
 ## 参考算子模型
@@ -83,7 +83,7 @@ optimized 组合各阶段的 kernel 时间（nsys）：vision 15.6 ms，其中 1
 xinfer-profile ops --model wall_oss --checkpoint <checkpoint> --requests <requests.msgpack> --out <directory>
 ```
 
-RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 2902 MHz，最高 3090 MHz），torch 2.10.0+cu130（CUDA 13.0），XInfer `5b142b0`，xcompute `0c48a46`。请求：[参考算子模型](#参考算子模型)检查的 7 个请求（服务抓包 `ref-v1`：3 个 flow，4 个延迟 3–8 的 RTC），合成一个请求文件（sha256 `0eb0db3e…`），prompt 桶 768。峰值：`PEAKS` 表（[性能剖析](../profiling.zh-CN.md#roofline-下限)：BF16 220.1 TFLOP/s，DRAM 1522 GB/s）。证据包：`xinfer-xcompute-prepack-20261108.tar.gz`（sha256 `5b6701637a9064bb04213ea0cc0a078054d25a844aed8b1ebd3b9394e76fe9d8`）。
+RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 2902 MHz，最高 3090 MHz），torch 2.10.0+cu130（CUDA 13.0），XInfer `5b142b0`，xcompute `0c48a46`。请求：[参考算子模型](#参考算子模型)检查的 7 个请求（服务抓包 `ref-v1`：3 个 flow，4 个延迟 3–8 的 RTC），合成一个请求文件，prompt 桶 768。峰值：`PEAKS` 表（[性能剖析](../profiling.zh-CN.md#roofline-下限)：BF16 220.1 TFLOP/s，DRAM 1522 GB/s）。
 
 均为每请求的值。每个请求先运行两次预热，然后全部在剖析器下以 eager 模式运行：算子时间是这次运行的 kernel 时间，按算子调用归属；graph 回放时间是相同请求回放其 CUDA graph（即服务路径）时该阶段的 GPU 区间。占比是占该阶段 eager GPU 时间的比例；下限是单次调用的 roofline 下限，效率为下限 / 时间；`generic` 标记只按数据搬运计代价的算子。访存受限的调用效率超过 100 % 时，其数据仍在 L2 中。
 
@@ -138,7 +138,7 @@ RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 290
 | 测试 | 依赖 | 检查内容 |
 |---|---|---|
 | `tests/models/test_wall_oss_tiny.py` | CPU | 两种组合（optimized 组合运行在其算子的 torch 参考实现上）：权重映射完整性、引擎运行、精确的 RTC 固定、确定性、填充的 prompt；optimized 组合与参考组合相差在 5 % 以内；阶段拆分 = 联合前向；prompt 填充布局及其对算子的要求；使用 `image_preprocess_device="gpu"` 时视角图像是 `DeviceImage` |
-| `tests/models/test_image_preprocess.py` | GPU、torchvision、checkpoint、服务抓包 | `image_preprocess_device="gpu"`：设备端视角图像与 CPU 视角图像的差异在规定容差内（原始帧：平均 ≤ 0.01，最大 ≤ 1 级；抓包中的均匀噪声腕部视图编码为 JPEG：平均 ≤ 8，最大 ≤ 96）；由用 CPU 准备的请求预热的 graph 提供服务，预热后无捕获 |
+| `tests/models/test_image_preprocess.py` | GPU、nvImageCodec、checkpoint、服务抓包 | `image_preprocess_device="gpu"`：设备端视角图像与 CPU 视角图像的差异在规定容差内（原始帧：平均 ≤ 0.01，最大 ≤ 1 级；抓包中的均匀噪声腕部视图编码为 JPEG：平均 ≤ 0.05，最大 ≤ 2；实测 0.0007 / 1）；由用 CPU 准备的请求预热的 graph 提供服务，预热后无捕获 |
 | `tests/models/test_wall_oss_processing.py` | checkpoint、服务抓包 | 处理一致性，逐位一致；分桶的 prompt = 精确 prompt 加填充 |
 | `tests/unit/test_image_pack.py` | CPU；GPU | 视角图像归一化（逐通道和共享查找表）以及 vision 阶段的打包与 NumPy 计算结果一致；在 CUDA 上以及用新像素做 CUDA graph 回放时同样一致 |
 | `tests/unit/test_model_processing.py` | CPU | 视角图像按相机顺序并发处理，错误会传到调用方；`SegmentTokenizer` 在一个小型字节级 BPE 上与 tokenizer 一致；JPEG 帧头（baseline、progressive）以及把视角图像带到引擎的 `DeviceImage` 值 |
@@ -152,42 +152,16 @@ RTX 5090（驱动 595.91.07，功率上限 575 W，运行结束时 SM 时钟 290
 | `tests/unit/test_shm.py` | CPU | 张量和 `DeviceImage` 数据通过共享内存从前端传入，图像尺寸记录在清单（manifest）中 |
 | `tests/unit/test_serve.py` | CPU | 引擎 + 2 个前端进程 + WebSocket 客户端：元数据、并发、错误、健康检查、干净关闭 |
 
-本模型的 GPU 测试在 RTX 5090 上通过，每个测试模块一个进程，配置了全部资源、xcompute `651195d`、flash-attn、Triton 和 torchvision（2026-11-07，torch 2.10.0+cu130；`xinfer-wall-oss-optimized-20261107.tar.gz`）：`test_wall_oss_optimized` 2 个、`test_wall_oss_parity` 8 个、`test_image_preprocess` 4 个、`test_fused_ops` 连同极小模型和服务测试共 61 个。
+本模型的 GPU 测试在 RTX 5090 上通过，每个测试模块一个进程，配置了全部资源、xcompute `651195d`、flash-attn、Triton 和 torchvision（2026-11-07，torch 2.10.0+cu130）：`test_wall_oss_optimized` 2 个、`test_wall_oss_parity` 8 个、`test_image_preprocess` 4 个、`test_fused_ops` 连同极小模型和服务测试共 61 个。
 
 资产：`XINFER_WALL_OSS_CHECKPOINT`、`XINFER_WALL_OSS_REFERENCE`（包含 `requests.pkl` 和 `reference.npz` 的目录 = `ref-v1` 抓包）以及 `XINFER_WALL_OSS_BF16_REFERENCE`（`bf16_reference.npz/.json`）。
-
-## 证据
-
-每个证据包都包含被测源码和生成其结果的脚本；添加某项结果的 merge request 记录了对应证据包的存放位置。
-
-| 证据包（sha256） | 本页中的结果 |
-|---|---|
-| `xinfer-remove-batch-invariant-20261109.tar.gz`（`f2e3863b4fa2b89aebf09b48336a5882a80195d6a3ad3d952e09c752b088924c`） | 默认后端上 action 阶段使用 cuBLAS 的参考组合：组批和填充的请求、阶段与 `Policy.infer` 延迟、测试 |
-| `xinfer-xcompute-main-20261109.tar.gz`（`a15e9f7632b36be4c2f0b86dc9aa05a0314012865387796c614f63192ab40ee4`） | xcompute `7336b0d`：optimized 组合在 18 个请求上的动作（单请求和并发）与 `0c48a46` 上的逐位一致，因此 `0c48a46` 上的结果对它同样成立；GPU 测试 |
-| `xinfer-xcompute-prepack-20261108.tar.gz`（`5b6701637a9064bb04213ea0cc0a078054d25a844aed8b1ebd3b9394e76fe9d8`） | optimized 组合在 xcompute `0c48a46` 上打包 GEMM 权重的结果：逐算子表、时延、quick100 B1、动作与 `651195d` 上的对比 |
-| `xinfer-wall-oss-optimized-20261107.tar.gz`（`aebb58f9ffd571d4947a6953cb2a534c2c58776d5ca5060064c125b6122a7a38`） | optimized 组合在 `651195d` 上的结果：阶段误差、kernel 剖析、quick100 B1、GPU 测试 |
-| `xinfer-torch210-v3-20261107.tar.gz`（`79579b493a0b1c89bfaeaf8985d4f6e737d4b1104afea58783a8c6fc71f242a0`） | 同一棵树上 torch 2.10.0+cu130 与 2.9.1+cu130 的对比：重新生成的 eager BF16 参考及其差异、GPU 测试套件、18 个请求的动作、单请求时延、一次 8 台压测 |
-| `xinfer-gpu-image-preprocess-v3-20261106.tar.gz`（`85d80bc1c7db8b3ec1ad98c983d435c8e470a4a80e43e4d700a8722bf6e94852`） | 使用 `DeviceImage` 输入的 `image_preprocess_device="gpu"`：42 个请求的动作和视角图像与下一个证据包中所测代码的结果逐位一致，默认路径与 main 逐位一致，每个模型一次压测，GPU 测试套件 |
-| `xinfer-gpu-image-preprocess-v2-20261105.tar.gz`（`9ec8364a0d1eb0e7673e5c96c104bf88cb26cfe31f9f98df8ba331b43bebae67`） | `image_preprocess_device="gpu"`：视角图像 vs CPU 路径 |
-| `xinfer-prompt-buckets-20261104.tar.gz`（`2364bedfc2e2eca3715c86b4a4d230fc47beb14261c54bff882d0738a5c5e61f`） | 填充 vs 精确 prompt、prefill 长度扫描、GPU 测试套件、使用填充 prompt 的 quick100 |
-| `xinfer-engine-fixes-v3-20261103.tar.gz`（`bfd95a27eed09d4e373f1af2ad6f81f4dedd47878bb2db27954b1b4cf4785726`） | GPU 测试套件和被测源码的源码归档、无捕获的服务检查 |
-| `xinfer-config-defaults-20261103.tar.gz`（`6f85d5eb17df2d16cf7d4d583c0a06b10e2eee255f6b544eb639b42c698f43d2`） | 配置默认值的 GPU 测试和容量压测（早先的 MXFP8 组合；docs/configuration.md 引用） |
-| `xinfer-consolidated-20261102.tar.gz`（`5723c59bc59582d463d4c553557c2f16513787e0db3323069fd5eab23acd35e5`） | 2026-11-02 各代码树的 GPU 测试套件和源码归档 |
-| `xinfer-rotary-20261102.tar.gz`（`adf681a9059e532e912493e698b00b6c95c76d2e08a735cfb08e331bbc601959`） | 旋转检查、42 个请求上的 graph 回放 |
-| `xinfer-action-batching-20261101.tar.gz`（`73d40300f6b1fd994506f8184dcd513b053c51b4d83cbd125a9fca666ff4475f`） | 组批 vs 单请求、MSE 完全相同的较早 quick100 运行 |
-| `xinfer-flash-attn-20261101.tar.gz`（`859386445082b71360f25e4501ed9609f3b6d2ee24c254319a360efb72b03eb7`） | attention 后端对比和 action 通道压测（早先的 MXFP8 组合；docs/configuration.md 引用） |
-| `xinfer-scheduler-20261101.tar.gz`（`24b2fabb8afd789dbf41165393e72f259cec057f05b7b9448d3d034f05149d29`） | 多通道并发请求 |
-| `xinfer-frontend-20261101.tar.gz`（`e6edc1da59652e55615cdfcec5b44852568acd4e0ca1661db69659e0558bb976`） | 传输协议兼容性 |
-| `xinfer-wallx4b-20261101.tar.gz`（`4266abc3332908604af082c361872baabe77674e8596c013086279c21054291c`） | 处理一致性、参考算子模型检查、eager BF16 参考输出 |
-
-服务抓包 `ref-v1`（重建版）与其他测试资产一起保存（`XINFER_WALL_OSS_REFERENCE`）。
 
 ## 未验证
 
 - optimized 组合使用 prompt 桶时的预热覆盖。
-- optimized 组合的 quick100 组批场景（其 action 阶段每次派发一个请求）。
+- optimized 组合的 action 阶段组批请求（其 action 阶段每次派发一个请求）。
 - MXFP8 和 NVFP4。
 - JPEG 编码视角图像的处理一致性：抓包中保存的是原始数组。压测会解码 JPEG 视角图像，但不做一致性检查。
-- `image_preprocess_device="gpu"` 在离线门禁之外的表现：闭环行为。
+- `image_preprocess_device="gpu"` 在离线检查之外的表现：闭环行为。
 - Thor（SM110）。
-- 闭环任务质量；本页涵盖数值等价性、quick100 离线门禁和速度。
+- 闭环任务质量；本页涵盖数值等价性、离线精度检查和速度。

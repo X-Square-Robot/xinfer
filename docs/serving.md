@@ -77,7 +77,7 @@ the device-image thread in [Device images](engine.md#device-images).
 ## Run
 
 ```bash
-python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/5_25000 \
+python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkpoint \
   --port 33985 --warmup flow.msgpack rtc.msgpack \
   --model-options '{"quantization": "bf16", "processing": {"instruction_override": null}}'
 ```
@@ -92,7 +92,7 @@ python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/5_2500
 | `--resolved-config`, `--dry-run` | write the resolved settings with their sources; print them and exit |
 | `--profile-dir` | record the engine's spans and write each request's engine segments to this directory at shutdown; for profiling runs (`xinfer-profile load --serve`, [profiling](profiling.md#through-xinfer-serve---serve)), the records grow with the requests |
 | `--disable-metrics` | record no Prometheus metrics; `GET /metrics` answers 404 ([metrics](metrics.md)) |
-| `--reference-ops`, `--op-backends` | use only torch reference operators; pin an implementation per operator by backend, library or both (`op=cuda`, `op=xcompute`, `op=cuda:xcompute`, `op=reference`), pins win over `--reference-ops` |
+| `--reference-ops`, `--op-backends` | use only torch reference operators; pin an implementation per operator by backend, library or both (`op=cuda`, `op=kernels`, `op=cuda:kernels`, `op=reference`), pins win over `--reference-ops` |
 
 SIGINT/SIGTERM stops the frontends, releases graphs and pinned buffers, and
 exits 0. The server checks `Engine.health()` every 0.5 s; when the engine can

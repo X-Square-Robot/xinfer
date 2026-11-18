@@ -14,18 +14,26 @@ import torch
 from torch import nn
 
 from xinfer.models.layers.basic import _meta_param
+from xinfer.models.layers.quantization import QuantConfig, quant_config
 from xinfer.models.layers.image_pack import ImagePack
 from xinfer.models.layers.qwen3_5 import ActionLayer, AdaptiveRMSNorm, PrefillLayer, prompt_keep_mask
 from xinfer.models.layers.vision.qwen3_5_vit import Qwen35VisionTower
 from xinfer.loader import SafetensorsCheckpoint, Source, load_mapped
 from xinfer.models.interface import HandoffSpec, OutputSpec, Stage, StageGraph, TensorSpec, VLAModel
 from xinfer.models.processing import view_inputs
-from xinfer.models.wallx.optimized import OptimizedPrefill, OptimizedVision
+from xinfer.models.wallx.optimized import QUANT_METHODS, OptimizedPrefill, OptimizedVision
 from xinfer.models.wallx.processing import pad_prompt, pixel_lookup_table
 from xinfer.ops import active_ops, use_ops
 
 DTYPE = torch.bfloat16
 NUMERICS = ("optimized", "reference")
+QUANT_GROUPS = ("vision", "prefill")  # stages whose GEMMs may run quantized
+QUANT_PRESETS = {
+    "bf16": QuantConfig(),
+    "mxfp8": QuantConfig(groups={group: "mxfp8" for group in QUANT_GROUPS}),
+    # the Wall-X NVFP4 recipe: amax weight scales in the ViT, MSE weight scales with a global scale in the prompt stream
+    "nvfp4": QuantConfig(groups={"vision": "nvfp4", "prefill": "nvfp4_mse"}),
+}
 
 
 def text_inverse_frequencies(rotary_dim: int, theta: float) -> torch.Tensor:
@@ -65,8 +73,10 @@ class WallXQwen35(VLAModel, nn.Module):
         checkpoint: Checkpoint directory (kept for the processors).
         embedding_rows: Rows of the token embedding table in the checkpoint.
         processing: ``ProcessingConfig``, dict or ``None``, passed to the processors.
-        numerics: ``"optimized"`` (xcompute's operators) or ``"reference"`` (the Wall-X model under BF16
+        numerics: ``"optimized"`` (the CUDA backend's kernels) or ``"reference"`` (the Wall-X model under BF16
             autocast).
+        quant: Stage of the optimized composition (``"vision"``, ``"prefill"``) → the format of its GEMMs
+            (``"mxfp8"``, ``"nvfp4"``, ``"nvfp4_mse"``); the other stages run BF16.
 
     Attributes:
         config_class: The model's configuration class, with ``load(path)``.
@@ -102,10 +112,13 @@ class WallXQwen35(VLAModel, nn.Module):
     config_class: ClassVar[type]
 
     def __init__(self, config, checkpoint=None, *, embedding_rows: int, processing=None,
-                 numerics: str = "optimized"):
+                 numerics: str = "optimized", quant=None):
         nn.Module.__init__(self)
+        quant = dict(quant or {})
         if numerics not in NUMERICS:
             raise ValueError(f"numerics must be one of {NUMERICS}, got {numerics!r}")
+        if quant and numerics != "optimized":
+            raise ValueError("quantized GEMMs need numerics='optimized'")
         self.config, self.checkpoint, self.processing, self.numerics = config, checkpoint, processing, numerics
         g = self.geometry
         self.image_pack = ImagePack(pixel_lookup_table(*self.image_normalization()), patch_size=g.vision.patch_size,
@@ -116,8 +129,8 @@ class WallXQwen35(VLAModel, nn.Module):
         self.register_buffer("inv_freq", text_inverse_frequencies(g.rotary_dim, g.rope_theta), persistent=False)
         self._op_table = active_ops()
         if numerics == "optimized":
-            self.vision = OptimizedVision(g.vision)
-            self.prefill_stack = OptimizedPrefill(g)
+            self.vision = OptimizedVision(g.vision, quant=quant.get("vision"))
+            self.prefill_stack = OptimizedPrefill(g, quant=quant.get("prefill"))
             self.action = self.build_optimized_action()
             return
         self.vision = Qwen35VisionTower(g.vision)
@@ -160,7 +173,8 @@ class WallXQwen35(VLAModel, nn.Module):
 
     # ------------------------------------------------------------------ load
     @classmethod
-    def from_checkpoint(cls, path, *, device, ops=None, processing=None, numerics="optimized", **_ignored):
+    def from_checkpoint(cls, path, *, device, ops=None, processing=None, numerics="optimized", quantization=None,
+                        **_ignored):
         """Load a checkpoint directory (configuration, ``model.safetensors``).
 
         Args:
@@ -170,22 +184,36 @@ class WallXQwen35(VLAModel, nn.Module):
                 built.
             processing: ``ProcessingConfig``, dict or ``None``, kept for the processors.
             numerics: ``"optimized"`` or ``"reference"``.
+            quantization: ``None`` or ``"bf16"``; ``"mxfp8"`` (the GEMMs of the ViT blocks and the prompt stream in
+                MXFP8, the action stage BF16; their weights are quantized after loading); ``"nvfp4"`` (the GEMMs of the
+                ViT blocks and merger in NVFP4 with amax weight scales, those of the prompt stream except the DeltaNet
+                z/b/a projection with MSE weight scales, the action stage BF16); or a ``QuantConfig`` or dict mapping
+                the groups ``"vision"`` and ``"prefill"`` to ``"bf16"``, ``"mxfp8"``, ``"nvfp4"`` or ``"nvfp4_mse"``.
 
         Returns:
             The model on ``device`` in eval mode, with ``load_report`` set.
 
         Raises:
-            ValueError: An unknown ``numerics``.
+            ValueError: An unknown ``numerics`` or another quantization.
         """
+        quant = quant_config(quantization, QUANT_PRESETS)
+        if (quant.default != "bf16" or quant.options or not set(quant.groups).issubset(QUANT_GROUPS)
+                or not set(quant.groups.values()).issubset({"bf16", *QUANT_METHODS})):
+            raise ValueError(f"{cls.__name__} runs in BF16 with optional {'/'.join(QUANT_METHODS)} GEMMs in "
+                             f"{QUANT_GROUPS}; quantization {quantization!r} is not supported")
+        stages = {group: quant.method_for(group) for group in QUANT_GROUPS if quant.method_for(group) != "bf16"}
         config = cls.config_class.load(path)
         checkpoint = SafetensorsCheckpoint(path)
         rows = checkpoint.shape("model.language_model.embed_tokens.weight")[0]
-        model = cls(config, Path(path), embedding_rows=rows, processing=processing, numerics=numerics)
+        model = cls(config, Path(path), embedding_rows=rows, processing=processing, numerics=numerics, quant=stages)
         model.load_report = load_mapped(model, model.checkpoint_mapping(), checkpoint, device=device)
         model = model.to(device).eval()
         if numerics == "optimized":
             with use_ops(model._op_table):
                 model.action.prepare()
+                for stage in (model.vision, model.prefill_stack):
+                    if stage.quant is not None:
+                        stage.quantize_weights()
         return model
 
     # ------------------------------------------------------- model interface

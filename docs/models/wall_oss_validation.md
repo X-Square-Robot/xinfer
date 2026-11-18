@@ -4,12 +4,10 @@ English | [简体中文](wall_oss_validation.zh-CN.md)
 
 Navigation: [usage](wall_oss.md) · [design](wall_oss_design.md)
 
-The current state, validated on an RTX 5090 (power limit 575 W, flash-attn 2.8.3.post1, `xcompute.so` sha256
-`dbfb9da7…d0dc`) with the internal checkpoint `5_25000` (`model.safetensors` sha256 `37a4b2ea…f3024`, `config.json`
-`95e34cbd…0cd6`). The eager BF16 reference, the checks against it and the optimized composition's results are from
+The current state, validated on an RTX 5090 (power limit 575 W, flash-attn 2.8.3.post1) with an internal
+checkpoint. The eager BF16 reference, the checks against it and the optimized composition's results are from
 torch 2.10.0+cu130, the other results from torch 2.9.1+cu130, except the reference composition on the default
-backends: its batching, padding and latency results are from torch 2.10.0+cu130 with its action stage on cuBLAS
-(`xinfer-remove-batch-invariant-20261109.tar.gz`). Every result names its evidence archive (table at the end).
+backends: its batching, padding and latency results are from torch 2.10.0+cu130 with its action stage on cuBLAS.
 
 ## Summary
 
@@ -18,7 +16,7 @@ backends: its batching, padding and latency results are from torch 2.10.0+cu130 
 | Input/output processing vs the service | CPU | bitwise on all 42 captured requests |
 | Prefill and action stages vs the eager BF16 model | reference composition, reference operators | bitwise ([below](#reference-operator-model)) |
 | Each stage vs the eager BF16 model, from its inputs | optimized composition, 7 requests | vision 1.5–2.7 %, prefill K/V 1.5–1.6 %, action 0.14–0.23 % (relative norm); the full chain closer to the eager BF16 model than the MXFP8 service on all 7 ([below](#optimized-composition)) |
-| Precision gate: quick100 B1 ([precision](../precision.md#wall-oss-quick100-gate)) | optimized composition | **PASS**: −6.58 % GT-MSE vs the original BF16, episode CI [−12.48, −0.34] (gate ≤ +1 %) |
+| Numerical agreement ([precision](../precision.md#how-agreement-is-checked)) | optimized composition | **PASS**: the internal precision gate; agreement with the reference composition checked by `tests/models/test_wall_oss_optimized.py` and `tests/models/test_wall_oss_parity.py` |
 | CUDA graph replay vs eager | optimized composition; reference composition with flash-attn; 7 requests (flow, RTC delays 3–8) | bitwise |
 | Concurrent requests on 2 lanes per stage vs alone | reference composition, reference operators, 7 requests submitted 3 times | bitwise |
 | Batched action stage (B2–B8, different prompt lengths and RTC delays) vs single requests | reference composition, default backends, 16 requests with 4 prompt lengths, submitted twice | within 3.4e-3 (relative norm of the actions; test bound 0.05) |
@@ -33,7 +31,7 @@ composition's other operators on their torch references; the optimized compositi
 
 | Reference | What it is | Used for |
 |---|---|---|
-| Service capture `ref-v1` | 42 requests (flow and RTC delays 3–8) through the embodied-serving Wall-X 4B MXFP8 service with injected noise: raw requests, model inputs, outputs, responses | processing parity; noise; production-precision scale |
+| Service capture `ref-v1` | 42 requests (flow and RTC delays 3–8) through the production Wall-X 4B MXFP8 service with injected noise: raw requests, model inputs, outputs, responses | processing parity; noise; production-precision scale |
 | Eager BF16 | Wall-X `02c5351d` eager `Qwen2_5_VLMoEForAction` in BF16 (PyTorch fallbacks for its custom ops, ViT with flash-attn 2.8.3, LLM with SDPA), the service's model inputs and noise, RTC step-0 attention cut as served; torch 2.10.0+cu130 | model numerics |
 
 ## Reference-operator model
@@ -114,10 +112,9 @@ xinfer-profile ops --model wall_oss --checkpoint <checkpoint> --requests <reques
 
 RTX 5090 (driver 595.91.07, power limit 575 W, SM clock 2902 MHz at the end of the run, maximum 3090 MHz), torch
 2.10.0+cu130 (CUDA 13.0), XInfer `5b142b0`, xcompute `0c48a46`. Requests: the 7 of the [reference-operator model
-check](#reference-operator-model) (service capture `ref-v1`: 3 flow, 4 RTC with delays 3–8) in one request file (sha256
-`0eb0db3e…`), prompt bucket 768. Peaks: the `PEAKS` table ([profiling](../profiling.md#roofline-bound): BF16 220.1
-TFLOP/s, DRAM 1522 GB/s). Evidence archive: `xinfer-xcompute-prepack-20261108.tar.gz` (sha256
-`5b6701637a9064bb04213ea0cc0a078054d25a844aed8b1ebd3b9394e76fe9d8`).
+check](#reference-operator-model) (service capture `ref-v1`: 3 flow, 4 RTC with delays 3–8) in one request file,
+prompt bucket 768. Peaks: the `PEAKS` table ([profiling](../profiling.md#roofline-bound): BF16 220.1
+TFLOP/s, DRAM 1522 GB/s).
 
 Values per request. Each request runs twice to warm up, then all of them run eagerly under the profiler: the operator
 times are the kernel times of that run, each attributed to its operator call, and the graph replay time is the stage's
@@ -179,7 +176,7 @@ movement only. A memory-bound call above 100 % read data still in L2.
 | Test | Needs | Checks |
 |---|---|---|
 | `tests/models/test_wall_oss_tiny.py` | CPU | both compositions (the optimized one on its operators' torch references): weight mapping completeness, engine run, exact RTC pin, determinism, padded prompts; the optimized composition within 5 % of the reference; stage split = joint forward; prompt padding layout and its operator requirement; with `image_preprocess_device="gpu"` the processor sends the views as `DeviceImage` values (JPEG bytes or frames, target sizes, resize recipe) and every other input unchanged; the option's validation |
-| `tests/models/test_image_preprocess.py` | GPU, torchvision, checkpoint, service capture | `image_preprocess_device="gpu"`: device views within the stated tolerance of the CPU views (raw frame: mean ≤ 0.01, max ≤ 1 level; the capture's uniform-noise wrist views as JPEG: mean ≤ 8, max ≤ 96); served from the graphs warmed with CPU-prepared requests, no capture after warmup |
+| `tests/models/test_image_preprocess.py` | GPU, nvImageCodec, checkpoint, service capture | `image_preprocess_device="gpu"`: device views within the stated tolerance of the CPU views (raw frame: mean ≤ 0.01, max ≤ 1 level; the capture's uniform-noise wrist views as JPEG: mean ≤ 0.05, max ≤ 2; measured 0.0007 / 1); served from the graphs warmed with CPU-prepared requests, no capture after warmup |
 | `tests/models/test_wall_oss_processing.py` | checkpoint, service capture | processing parity, bitwise; bucketed prompts = exact prompts padded |
 | `tests/unit/test_image_pack.py` | CPU; GPU | view normalization (per-channel and shared tables) and the vision stage's packing equal the NumPy computation; on CUDA and through CUDA graph replay with new pixels |
 | `tests/unit/test_model_processing.py` | CPU | views processed concurrently in camera order, errors reach the caller; `SegmentTokenizer` equals the tokenizer on a small byte-level BPE; JPEG frame headers (baseline, progressive) and the `DeviceImage` values that carry views to the engine |
@@ -193,44 +190,18 @@ movement only. A memory-bound call above 100 % read data still in L2.
 | `tests/unit/test_shm.py` | CPU | tensors and `DeviceImage` data cross from a frontend through shared memory, with the image sizes in the manifest |
 | `tests/unit/test_serve.py` | CPU | engine + 2 frontend processes + WebSocket clients: metadata, concurrency, errors, health, clean shutdown |
 
-The model's GPU tests passed on the RTX 5090, one process per test module, with all assets, xcompute `651195d`, flash-attn, Triton and torchvision configured (2026-11-07, torch 2.10.0+cu130; `xinfer-wall-oss-optimized-20261107.tar.gz`): `test_wall_oss_optimized` 2, `test_wall_oss_parity` 8, `test_image_preprocess` 4, `test_fused_ops` with the tiny and serving tests 61.
+The model's GPU tests passed on the RTX 5090, one process per test module, with all assets, xcompute `651195d`, flash-attn, Triton and torchvision configured (2026-11-07, torch 2.10.0+cu130): `test_wall_oss_optimized` 2, `test_wall_oss_parity` 8, `test_image_preprocess` 4, `test_fused_ops` with the tiny and serving tests 61.
 
 Assets: `XINFER_WALL_OSS_CHECKPOINT`, `XINFER_WALL_OSS_REFERENCE` (directory with
 `requests.pkl` and `reference.npz` = the `ref-v1` capture) and
 `XINFER_WALL_OSS_BF16_REFERENCE` (`bf16_reference.npz/.json`).
 
-## Evidence
-
-Each archive holds the tested source and the scripts that produced its results; the merge request that added a result records where its archive is stored.
-
-| Archive (sha256) | Results on this page |
-|---|---|
-| `xinfer-remove-batch-invariant-20261109.tar.gz` (`f2e3863b4fa2b89aebf09b48336a5882a80195d6a3ad3d952e09c752b088924c`) | the reference composition on the default backends with its action stage on cuBLAS: batched and padded requests, stage and `Policy.infer` latency, the tests |
-| `xinfer-xcompute-main-20261109.tar.gz` (`a15e9f7632b36be4c2f0b86dc9aa05a0314012865387796c614f63192ab40ee4`) | xcompute `7336b0d`: the optimized composition's actions on 18 requests, single and concurrent, equal those on `0c48a46` bit for bit, so the results on `0c48a46` hold for it; the GPU tests |
-| `xinfer-xcompute-prepack-20261108.tar.gz` (`5b6701637a9064bb04213ea0cc0a078054d25a844aed8b1ebd3b9394e76fe9d8`) | the optimized composition on xcompute `0c48a46` with the packed GEMM weights: the per-operator tables, latency, quick100 B1, its actions against those on `651195d` |
-| `xinfer-wall-oss-optimized-20261107.tar.gz` (`aebb58f9ffd571d4947a6953cb2a534c2c58776d5ca5060064c125b6122a7a38`) | the optimized composition on `651195d`: stage errors, kernel profiles, quick100 B1, the GPU tests |
-| `xinfer-torch210-v3-20261107.tar.gz` (`79579b493a0b1c89bfaeaf8985d4f6e737d4b1104afea58783a8c6fc71f242a0`) | torch 2.10.0+cu130 against 2.9.1+cu130 on one tree: the eager BF16 reference regenerated and its differences, the GPU suite, actions of 18 requests, single-request latency, an 8-robot load run |
-| `xinfer-gpu-image-preprocess-v3-20261106.tar.gz` (`85d80bc1c7db8b3ec1ad98c983d435c8e470a4a80e43e4d700a8722bf6e94852`) | `image_preprocess_device="gpu"` with `DeviceImage` inputs: actions and views of 42 requests bitwise equal to those of the code measured in the next archive, the default path bitwise equal to main, a load run per model, the GPU suite |
-| `xinfer-gpu-image-preprocess-v2-20261105.tar.gz` (`9ec8364a0d1eb0e7673e5c96c104bf88cb26cfe31f9f98df8ba331b43bebae67`) | `image_preprocess_device="gpu"`: views vs the CPU path |
-| `xinfer-prompt-buckets-20261104.tar.gz` (`2364bedfc2e2eca3715c86b4a4d230fc47beb14261c54bff882d0738a5c5e61f`) | padded vs exact prompts, prefill length sweep, the GPU suite, quick100 with padded prompts |
-| `xinfer-engine-fixes-v3-20261103.tar.gz` (`bfd95a27eed09d4e373f1af2ad6f81f4dedd47878bb2db27954b1b4cf4785726`) | the GPU suite and source archive of the tested source, serving check without captures |
-| `xinfer-config-defaults-20261103.tar.gz` (`6f85d5eb17df2d16cf7d4d583c0a06b10e2eee255f6b544eb639b42c698f43d2`) | the configuration defaults' GPU suite and capacity runs (the earlier MXFP8 composition; cited by docs/configuration.md) |
-| `xinfer-consolidated-20261102.tar.gz` (`5723c59bc59582d463d4c553557c2f16513787e0db3323069fd5eab23acd35e5`) | the 2026-11-02 trees' GPU suites and source archives |
-| `xinfer-rotary-20261102.tar.gz` (`adf681a9059e532e912493e698b00b6c95c76d2e08a735cfb08e331bbc601959`) | rotary checks, graph replay on 42 requests |
-| `xinfer-action-batching-20261101.tar.gz` (`73d40300f6b1fd994506f8184dcd513b053c51b4d83cbd125a9fca666ff4475f`) | batched vs single requests, earlier quick100 runs with identical MSEs |
-| `xinfer-flash-attn-20261101.tar.gz` (`859386445082b71360f25e4501ed9609f3b6d2ee24c254319a360efb72b03eb7`) | attention backend comparisons and action-lane runs (the earlier MXFP8 composition; cited by docs/configuration.md) |
-| `xinfer-scheduler-20261101.tar.gz` (`24b2fabb8afd789dbf41165393e72f259cec057f05b7b9448d3d034f05149d29`) | concurrent multi-lane requests |
-| `xinfer-frontend-20261101.tar.gz` (`e6edc1da59652e55615cdfcec5b44852568acd4e0ca1661db69659e0558bb976`) | wire compatibility |
-| `xinfer-wallx4b-20261101.tar.gz` (`4266abc3332908604af082c361872baabe77674e8596c013086279c21054291c`) | processing parity, reference-operator model check, eager BF16 reference outputs |
-
-The service capture `ref-v1` (rebuilt) is kept with the other test assets (`XINFER_WALL_OSS_REFERENCE`).
-
 ## Not validated
 
 - The optimized composition's warmup coverage with prompt buckets.
-- The quick100 batch scenarios for the optimized composition (its action stage takes one request per dispatch).
+- Batched action requests in the optimized composition (its action stage takes one request per dispatch).
 - MXFP8 and NVFP4.
 - Processing parity for JPEG-encoded views: the capture holds raw arrays. The load runs decode JPEG views without a parity check.
-- `image_preprocess_device="gpu"` beyond the offline gate: closed-loop behaviour.
+- `image_preprocess_device="gpu"` beyond the offline checks: closed-loop behaviour.
 - Thor (SM110).
-- Closed-loop task quality; this page covers numerical equivalence, the quick100 offline gate and speed.
+- Closed-loop task quality; this page covers numerical equivalence, the offline precision checks and speed.

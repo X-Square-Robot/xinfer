@@ -7,6 +7,7 @@ window order, attention segments) is computed on the host by
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -67,6 +68,8 @@ def vision_layout(grids, config: VisionTowerConfig) -> dict:
     be partial); ``cu_window`` holds cumulative patch counts of the windows in window order, ``cu_full``
     those of each image frame.
 
+    The layout is computed once per grid list (a robot's cameras keep their sizes) and copied on each call.
+
     Args:
         grids: Patch grid ``(t, h, w)`` of each image, in packing order; ``h`` and ``w`` must be multiples of
             ``spatial_merge_size``.
@@ -79,13 +82,17 @@ def vision_layout(grids, config: VisionTowerConfig) -> dict:
     Raises:
         ValueError: A grid side is not divisible by the merge size.
     """
-    m = config.spatial_merge_size
+    layout = _layout(tuple((int(t), int(h), int(w)) for t, h, w in grids), config.spatial_merge_size,
+                     config.window_size // config.spatial_merge_size // config.patch_size)
+    return {name: value.clone() if torch.is_tensor(value) else list(value) for name, value in layout.items()}
+
+
+@functools.lru_cache(maxsize=64)
+def _layout(grids, m, window) -> dict:
     unit = m * m
-    window = config.window_size // m // config.patch_size
     positions, window_index, cu_window, cu_full = [], [], [0], [0]
     offset = 0
     for t, h, w in grids:
-        t, h, w = int(t), int(h), int(w)
         if h % m or w % m:
             raise ValueError(f"grid {h}x{w} is not divisible by the merge size {m}")
         row_index = np.broadcast_to(np.arange(h)[:, None], (h, w)).reshape(h // m, m, w // m, m)
