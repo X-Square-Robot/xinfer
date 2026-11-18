@@ -31,18 +31,14 @@
 
 ## 昇腾 950DT
 
-两行均于 2026-11-13 在独占预留的 Ascend 950DT（CANN 9.1.1、TorchNPU 2.10.0.post4）上、本分支版本 `0864476` 测得，交付版 `xcompute.so`（SHA-256 `be3ee3e46e58…`）经 `XINFER_XCOMPUTE_LIBRARY` 与配套 Python 包加载。两模型均使用默认算子选择：两模型调用的每一个算子都解析到 `ascend:xcompute`，且对完整请求通过的逐 layout 分发审计确认每次调用都运行在 xcompute 入口上（Wall-X 2B：21/21 个算子、全部调用 layout 准入；Wall-OSS：11/11）。任一基准中都没有算子回退到 torch 参考实现。[昇腾指南](ascend950dt.zh-CN.md)列出每个算子的入口。
+每个模型均在单张昇腾 950DT 上测试，使用 CANN 9.3.0-beta.1、CPU 图像处理及[昇腾指南](ascend950dt.zh-CN.md)中的 BF16 配方，测试进程绑定到设备所在的 CPU NUMA 节点。压测使用带 RTC 的合成桌面观测，每台机器人发送 80 个请求，丢弃前 20 个。所有已测轮次均无错误或缺失响应。
 
-| 模型 | 精度与组合 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 最高实测吞吐 | 数值一致性 |
-|---|---|---|---|---|---|---|---|
-| Wall-OSS | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s | 内部精度门禁（DVPP 图像）：PASS |
-| Wall-X 2B | BF16、全部算子走 xcompute 入口、DVPP 图像处理 | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s | 固定噪声动作与参考组合相差 max_abs 0.0472 以内：PASS |
+| # | 模型 | 精度、组合 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 饱和吞吐 | 数值一致性 |
+|---|---|---|---|---|---|---|---|---|
+| 5 | Wall-OSS | BF16，优化组合 | 42.0 ms | ≥ 5 | 105 ms | 125 ms | 27.7 req/s | 两个固定请求逐位一致 |
+| 6 | Wall-X 2B | BF16，优化组合 | 35.4 ms | 15 | 129 ms | 162 ms | 84.3 req/s | 八个固定单请求的输出逐位一致 |
 
-- **Wall-OSS** 的单请求集与服务端预热各用一个普通请求与一个 RTC 请求，`image_preprocess_device` 在 NPU（DVPP）上，合成桌面负载带 RTC 跑 2、3 台——共十六轮，零错误、零缺失响应、零 underflow。2 台时各轮服务端 P50 分布 118–121 ms、中位 120.1 ms、最差轮 P95 为 130.2 ms；3 台实测 161–166 ms，高于 150 ms 判定线，容量有界于 2 台。单请求分解为 prepare 2.23 ms、engine 78.42 ms、output 0.15 ms。
-- **Wall-X 2B** 的单请求集为 216 个请求的延迟采集（固定噪声种子 20261112），服务端预热用两个请求，合成桌面负载带 RTC 跑 2 台——共 八 轮，零 错误、零 缺失响应。其单请求分解为 prepare 2.80 ms、engine 76.76 ms、output 0.15 ms。
+### 条件
 
-两模型的行都报告同一接线：xcompute 包自身的入口——其在 xcompute 内部混合使用 CANN ACLNN Matmul、FusedInferAttentionScore V5 与官方算子，以及 TileLang 和 AOT 自定义内核。在后端选择层面，两模型默认都指向 xcompute；TorchNPU 官方算子与 CANN 桥接保持为显式 pin（`--op-backends linear=ascend:torch_npu`）。
-
-两项检查都是端到端的。Wall-OSS 在图像预处理位于 NPU（DVPP）上、与基准同路径的条件下通过了内部精度门禁。Wall-X 2B 跑固定噪声动作检查：十个注入确定性初始噪声的请求分别过默认分发与同一构建的参考组合，端到端比较去归一化后的动作预测。
-
-算子与图的配置见[昇腾指南](ascend950dt.zh-CN.md)。
+- **Wall-OSS** 用 flow 和 RTC 请求测量单请求时延并预热服务。3、4、5 台三个档位各跑八轮，均通过[共享容量判定规则](benchmark.zh-CN.md#性能表)。
+- **Wall-X 2B** 用抓包请求集测量单请求时延。服务使用两个请求预热，RTC 夹爪限值为 5.0，并设置 `--lanes vision=1,prefill=3,action=2` 和 `--max-batch action=4`。每次压测在 8、12、14、15、16 台各跑两轮。容量取各轮服务端 P50 中位数在 150 ms 以内的最高档位。两次压测均通过 15 台，表中列出第一次的结果。

@@ -59,6 +59,4 @@ CUDA kernel library for this GPU: docs/kernels.md
 
 ## 昇腾
 
-`ascend` 后端通过 `xinfer/ops/backends/_xcompute.py` 绑定外部的 xcompute 构建，使用
-`XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0` 设置。可用实现会自动选中；不支持的调用使用 torch 回退。
-运行环境、图像处理和 NPU 图执行见[昇腾指南](ascend950dt.zh-CN.md)。
+[昇腾后端](../xinfer/ops/backends/ascend/) 按算子类别注册实现并构建 `xinfer_kernels_ascend.so`。构建和使用方法见[昇腾指南](ascend950dt.zh-CN.md)。

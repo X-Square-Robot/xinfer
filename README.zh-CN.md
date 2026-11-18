@@ -29,7 +29,7 @@ XInfer 的设计与评测见我们的论文 [Scaling VLA Serving Under Robotic E
 - **单卡服务多机器人**　多台机器人共享模型权重，不同请求的视觉编码与动作生成可重叠执行。
 - **低精度量化**　支持按层组对线性层使用 MXFP8 或 NVFP4。
 - **多硬件后端**　NVIDIA RTX 5090、Jetson Thor、昇腾 950DT、Huixi Rhino RPU（R1，适配中）。
-- **高性能算子库**　使用 Xcompute 融合算子，支持 FlashAttention，也可接入其他算子库。
+- **高性能算子库**　使用仓内算子，支持 FlashAttention，也可接入其他算子库。
 
 ## 为什么选择 XInfer
 
@@ -89,10 +89,10 @@ finally:
 
 | 模型 | 模型 ID | 精度 | 实时分块（real-time chunking） | 指南 |
 |---|---|---|---|---|
-| Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（Xcompute；参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
+| Wall-OSS · 内部 checkpoint | `wall_oss` | BF16（仓内算子或参考算子） | 支持 | [安装与输入](docs/models/wall_oss.zh-CN.md) |
 | Wall-X 2B | `wallx2b` | BF16；视觉和预填充可选 MXFP8 或 NVFP4，动作阶段保留 BF16 | 支持 | [安装与输入](docs/models/wallx2b.zh-CN.md) |
 
-Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。两款模型在 RTX 5090 上的单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)；昇腾 950DT 上的数据在同一张表内，各模型在该平台承接的算子见[昇腾指南](docs/ascend950dt.zh-CN.md)。
+Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wall-X 2B 指南](docs/models/wallx2b.zh-CN.md)。单请求时延、单卡机器人数和吞吐量见[性能表](docs/performance.zh-CN.md)。在昇腾 950DT 上的构建和部署方式见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
 | 硬件 | 设备 | 运行时 |
 |---|---|---|
@@ -104,7 +104,7 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 
 每个加速器运行各自的引擎（Engine）和权重。
 
-优化的 CUDA 执行路径使用由本仓库编译的 kernel 库和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。Ascend 绑定预构建的昇腾 **xcompute** 构建，支持 NPU 图和 DVPP 设备图像；见[昇腾指南](docs/ascend950dt.zh-CN.md)。
+优化的 CUDA 执行路径使用由本仓库编译的 kernel 库和可选的 FlashAttention 后端；见 [kernel](docs/kernels.zh-CN.md)。昇腾算子库同样由本仓库编译，见[昇腾指南](docs/ascend950dt.zh-CN.md)。
 
 ## 性能
 
@@ -116,16 +116,14 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 | 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
 | 3 | Wall-OSS | BF16，优化组合 | Jetson AGX Thor | 95.4 ms | 2 | 123 ms | 141 ms | 11.5 req/s |
 | 4 | Wall-X 2B | 视觉和预填充 NVFP4，优化组合 | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
-| 5 | Wall-OSS | BF16，优化组合 | 昇腾 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
-| 6 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
 
 ## 工作原理
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.svg" alt="模型阶段调用加载时选定的算子实现。X-Square Robot 自研的 Xcompute 提供融合算子，也可选择 CUDA FlashAttention、PyTorch 参考算子或第三方插件。引擎支持 RTX 5090、Jetson AGX Thor、昇腾 950DT 和 CPU。Huixi R1 走独立的实验路径。" width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="模型阶段调用加载时选定的算子实现。仓内 CUDA 与昇腾算子库提供融合算子，也可选择 CUDA FlashAttention、PyTorch 参考算子或第三方插件。引擎支持 RTX 5090、Jetson AGX Thor、昇腾 950DT 和 CPU。Huixi R1 走独立的实验路径。" width="100%">
 </p>
 
-前端（Frontend）负责输入处理和输出处理。模型定义各阶段的计算和张量交接；引擎管理准入、队列、组批和资源生命周期。加载模型时，算子注册表为目标设备上的每个算子选择实现。X-Square Robot 自研的 **Xcompute** 提供 QKV 投影与 RoPE、残差加法与 RMSNorm 等融合算子。同一注册表也支持 CUDA 上可选的 FlashAttention、PyTorch 参考算子和第三方算子库。平台适配器负责设备执行。在 CUDA、昇腾和 CPU 上，Python API 与网络服务共用同一引擎。虚线表示正在适配的 Huixi R1 路径，Wall-X 2B 通过进程内 Python 接口调用 Rhino Launch SDK。执行模型见[引擎指南](docs/engine.zh-CN.md)，默认值与覆盖方式见[配置](docs/configuration.zh-CN.md)。
+前端（Frontend）负责输入处理和输出处理。模型定义各阶段的计算和张量交接；引擎管理准入、队列、组批和资源生命周期。加载模型时，算子注册表为目标设备上的每个算子选择实现。仓内算子库提供 QKV 投影与 RoPE、残差加法与 RMSNorm 等融合算子。同一注册表也支持 CUDA 上可选的 FlashAttention、PyTorch 参考算子和第三方算子库。平台适配器负责设备执行。在 CUDA、昇腾和 CPU 上，Python API 与网络服务共用同一引擎。虚线表示正在适配的 Huixi R1 路径，Wall-X 2B 通过进程内 Python 接口调用 Rhino Launch SDK。执行模型见[引擎指南](docs/engine.zh-CN.md)，默认值与覆盖方式见[配置](docs/configuration.zh-CN.md)。
 
 ## 基准测试
 

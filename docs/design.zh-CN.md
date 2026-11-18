@@ -57,7 +57,7 @@
 | §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过内部精度门禁。 Wall-X 2B 使用 Qwen3.5 骨干，支持桌面双臂 RTC。 |
 | §12 量化 | 部分实现 | 框架支持按模块组配置 `QuantConfig`。Wall-OSS 使用 BF16。MXFP8 和 NVFP4 具有 PyTorch 参考实现，详见[量化](quantization.zh-CN.md)。 |
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
-| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；CUDA 使用仓内原生库和 flash-attn，Ascend 在其他 provider 之外仍保留外部 xcompute 兼容 provider（§14.2）；`xinfer.ops.conformance` 未实现 |
+| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；CUDA 和 Ascend 使用各自的仓内原生库；CUDA 还使用 flash-attn（§14.2）；`xinfer.ops.conformance` 未实现 |
 | §15 协议与前端 | 部分实现 | WebSocket + msgpack，兼容 x2robot 客户端；`xinfer.Policy` 进程内 API；Client SDK 与兼容适配未实现 |
 | §16 可观测性与基准工具 | 部分实现 | 服务通过 [/metrics](metrics.zh-CN.md) 导出 Prometheus 指标。使用[压测工具](benchmark.zh-CN.md)测单请求延迟和闭环容量，或用 [xinfer-profile](profiling.zh-CN.md) 分析算子、排队及各阶段执行时间。 |
 | §17 测试 | 部分实现 | CPU 单元与契约测试；GPU 与资产测试需要本地资产，手动运行；CI（GitHub Actions，`.github/workflows/ci.yml`）跑 ruff、仓库与文档检查和 CPU 测试 |
@@ -123,7 +123,7 @@
 | 层 | 用词 | 出现在 | 不用于 |
 |---|---|---|---|
 | torch 设备 | `npu` | 设备串 `npu:0`、`torch.npu` / `torch_npu` 接口、`platforms/npu.py`（解析 torch 设备的模块）、`Platform.is_npu`、`NpuJpegDecoder` | 后端或厂商标识 |
-| 平台与后端 | `ascend` | `PlatformCapabilities.device_type == "ascend"`、平台名 `ascend-<arch>`、`xinfer/ops/backends/ascend/`、选择名 `ascend:xcompute` 与 `ascend:torch` | torch 设备串 |
+| 平台与后端 | `ascend` | `PlatformCapabilities.device_type == "ascend"`、平台名 `ascend-<arch>`、`xinfer/ops/backends/ascend/`、算子选择 `ascend:kernels` | torch 设备串 |
 | 工具链 | `cann` | 关于 DVPP、ACLNN、FIA 的正文与错误文本；`load_npu_media` 导入 CANN 的 Python ACL | 任何选择器 |
 
 规则：
@@ -131,7 +131,7 @@
 1. torch 设备串、以及吃设备串的 torch 接口，用 `npu`。
 2. 标识"由哪块硬件、哪个后端来服务"的东西——`device_type`、平台名、后端包、选择名——用 `ascend`。
 3. 厂商软件栈用 `cann`，只出现在正文与错误信息里，从不作为选择器。
-4. 因此 `Platform.name` 是 `ascend-<arch>`，例如 `ascend-950dt9582`，与它的 `device_type` 和后端一致。
+4. `Platform.name` 采用 `ascend-<arch>`，与它的 `device_type` 和后端一致。
    `Platform.is_npu` 与 `platforms/npu.py` 里的 `npu` 回答的是设备层的问题"这是不是一个 torch NPU 设备"，
    所以这两处保留 `npu`。
 5. 外部名字保持原拼写：`npu-smi`、`torch_npu`、`ASCEND_HOME` 与厂商错误文本按原样引用，不按上述规则改写。
@@ -607,7 +607,7 @@ RPU 的预构建执行接口显式管理常驻缓冲区、准备与完成状态�
 
 原生后端位于 `xinfer/ops/backends/<backend>/`：Python 绑定与 `src/` 中维护的源码和 CMake 构建配套。CUDA 构建 `xinfer_kernels.so`，RPU 构建 `xinfer_rpu.so`，均经 TVM-FFI 加载 AOT 库；导入 Python 包不会编译设备代码。构建方法见 [CUDA kernel](kernels.zh-CN.md) 和 独立算子变更中的 `docs/rpu_ops.zh-CN.md`。
 
-对于注册表中的张量算子，后端表示硬件（`cuda`、`ascend`）；torch 参考实现（`reference`）可用于受支持的 torch 设备。`cuda/attn.py`、`gemm.py`、`norm.py`、`flow.py` 等分类模块使用 `xinfer.ops.register` 声明实现，把库作为 `requires` 传入。可选库不可用时，其实现不注册，选择过程可以使用有效的参考实现。CUDA 的 `_native.py` 加载仓内原生库，记录目标架构和构建指纹。Ascend 仍由 `backends/_xcompute.py` 加载外部 xcompute 兼容 provider，检查配对的 Python 包与共享库；本次移植不把该 provider 的实现迁入 XInfer。
+对于注册表中的张量算子，后端表示硬件（`cuda`、`ascend`）；torch 参考实现（`reference`）可用于受支持的 torch 设备。`cuda/attn.py`、`gemm.py`、`norm.py`、`flow.py` 等分类模块使用 `xinfer.ops.register` 声明实现，把库作为 `requires` 传入。可选库不可用时，其实现不注册，选择过程可以使用有效的参考实现。CUDA 和 Ascend 分别通过各自的 `_native.py` 加载仓内原生库，记录支持的硬件与构建指纹。
 
 ```python
 try:
@@ -619,7 +619,7 @@ except ImportError:
 def causal_attention(q, k, v, *, scale=None): ...
 ```
 
-`register` 直接写入进程级 registry，因此 import 后端模块即完成其实现的注册；`OpRegistry.load_plugins()` 先 import 内置后端模块，再 import `xinfer.ops` 入口点指向的模块。`OpRegistry.add` 是写入 registry 的唯一入口，在已有参考实现时检查实现参数与其一致，以 `backend:library`（`cuda:kernels`）注册。`XINFER_KERNELS=0`、`XINFER_XCOMPUTE=0` 和 `XINFER_FLASH_ATTN=0` 不使用对应的库。进程级 registry 在第一次 `build_table` 前自动加载插件。固定选择（`--op-backends`）可以写后端、库或两者。
+`register` 直接写入进程级 registry，因此 import 后端模块即完成其实现的注册；`OpRegistry.load_plugins()` 先 import 内置后端模块，再 import `xinfer.ops` 入口点指向的模块。`OpRegistry.add` 是写入 registry 的唯一入口，在已有参考实现时检查实现参数与其一致，以 `backend:library`（`cuda:kernels`、`ascend:kernels`）注册。`XINFER_KERNELS=0`、`XINFER_ASCEND_KERNELS=0` 和 `XINFER_FLASH_ATTN=0` 不使用对应的库。进程级 registry 在第一次 `build_table` 前自动加载插件。固定选择（`--op-backends`）可以写后端、库或两者。
 
 - 在模型构建时选定实现，不在每次调用时分派。只支持算子部分调用的实现自行把其余调用交给参考实现，例如 CUDA 原生 `prefix_kvcache_attention` 对 kernel 不支持的 cache 形状就这样处理。
 - 在 CUDA 设备上，模型调用的算子落到融合算子的参考实现时，一条告警列出这些算子。`XINFER_OPS_STRICT=1` 把这条告警变成错误（用于 CI 和 benchmark）。
@@ -810,8 +810,7 @@ XInfer/
 │   │   ├── reference/              # 受支持 torch 平台上的参考实现：attn.py、gemm.py、norm.py、flow.py、rope.py、elementwise.py、conv.py、mxfp8.py、nvfp4.py
 │   │   ├── layout/                 # 低精度格式的存储布局：mxfp8.py、nvfp4.py
 │   │   ├── backends/
-│   │   │   ├── _xcompute.py        # 外部 Ascend 兼容 provider 加载器
-│   │   │   ├── ascend/             # 当前 Ascend 适配，含外部 xcompute provider
+│   │   │   ├── ascend/             # Ascend 算子绑定、原生加载器与 src/ AOT 构建
 │   │   │   ├── cuda/               # 算子分类绑定、原生加载器与 src/ AOT 构建
 │   │   │   └── rpu/                # 算子族／预构建绑定、资产校验与 src/ 主机／设备源码
 │   │   └── conformance/            # 规划中的后端共享一致性套件
@@ -855,12 +854,12 @@ XInfer/
 
 ### 18.2 原生算子源码与接入边界
 
-原生算子实现在 `xinfer/ops/backends/<backend>/src` 中维护，与 Python 绑定和测试配套。框架与算子层在同一仓库中分工，单独安装的 xcompute 包不再是原生 CUDA 或 RPU kernel 的默认来源。现有 Ascend xcompute 兼容 provider 在其实现明确迁移前仍是外部依赖。接入与交付要求如下：
+原生算子实现在 `xinfer/ops/backends/<backend>/src` 中维护，与 Python 绑定和测试配套。框架与算子层在同一仓库中分工。接入与交付要求如下：
 
 | 项 | 约定 |
 |---|---|
 | 实现 | 仓内原生源码、通用算子族绑定和 catalog 条目覆盖受支持模型所需的算子；模型特定的打包、常量与算子顺序留在模型接入层 |
-| 绑定 | 经 TVM-FFI 加载 AOT 库：CUDA 张量算子使用 `xinfer_kernels.so`，RPU 预构建执行使用 `xinfer_rpu.so`；按明确的 PyTorch 集成需求增加 `torch.library` 适配（§14.2） |
+| 绑定 | 经 TVM-FFI 加载 AOT 库：CUDA 张量算子使用 `xinfer_kernels.so`，Ascend 张量算子使用 `xinfer_kernels_ascend.so`，RPU 预构建执行使用 `xinfer_rpu.so`；按明确的 PyTorch 集成需求增加 `torch.library` 适配（§14.2） |
 | 验证 | 主机契约与构建检查独立于设备源码编译、真机数值、重放和模型精度／性能门禁（§14.1、§17）；host-only 或 SDK stub 测试不能证明设备验收通过 |
 | 版本与发布 | 记录库身份、哈希和支持能力，验证后端特定的 ABI／构建元数据；RPU 还需匹配原生 catalog 与外部资产 manifest（§14.3） |
 | 第三方依赖 | 保留上游源码归属和适用的原许可证副本；厂商 SDK、编译器与生成的 RPU 资产仍为外部依赖。归属及条款见对应算子变更随附的 `THIRD_PARTY_NOTICES.md` |

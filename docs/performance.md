@@ -31,30 +31,14 @@ See [Wall-OSS validation](models/wall_oss_validation.md) for the latency and mea
 
 ## Ascend 950DT
 
-Both rows were measured on 2026-11-13 on one exclusively reserved Ascend 950DT (CANN 9.1.1, TorchNPU
-2.10.0.post4), revision `0864476` of this branch, with the delivery `xcompute.so` (SHA-256
-`be3ee3e46e58…`) loaded through `XINFER_XCOMPUTE_LIBRARY` with its matching Python package. Both models ran
-with their default operator selection: every operator either model calls resolves to `ascend:xcompute`, and a
-per-layout dispatch audit of a full request pass confirmed every call ran on an xcompute entry (Wall-X 2B:
-21 of its 21 operators, all call layouts admitted; Wall-OSS: 11 of its 11). No operator ran on a torch
-reference in either benchmark. The [Ascend guide](ascend950dt.md) lists each operator's entry.
+Each model ran on one Ascend 950DT with CANN 9.3.0-beta.1, CPU image processing, device-local NUMA binding and the BF16 recipe in the [Ascend guide](ascend950dt.md). Fleet tests used synthetic desktop observations with RTC, 80 requests per robot and the first 20 discarded. All measured rounds had zero errors and zero missing responses.
 
-| Model | Precision and composition | Single request P50 | Robots per NPU | Server P50 at capacity | Server P95 at capacity | Highest measured rate | Numerical agreement |
-|---|---|---|---|---|---|---|---|
-| Wall-OSS | BF16, every operator on xcompute entries, DVPP images | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s | internal precision gate with DVPP images: PASS |
-| Wall-X 2B | BF16, every operator on xcompute entries, DVPP images | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s | fixed-noise actions within max_abs 0.0472 of the reference composition: PASS |
+| # | Model | Precision, composition | Single request P50 | Robots per device | Server P50 at capacity | Server P95 at capacity | Saturation | Numerical agreement |
+|---|---|---|---|---|---|---|---|---|
+| 5 | Wall-OSS | BF16, optimized | 42.0 ms | ≥ 5 | 105 ms | 125 ms | 27.7 req/s | Bitwise agreement on two fixed requests |
+| 6 | Wall-X 2B | BF16, optimized | 35.4 ms | 15 | 129 ms | 162 ms | 84.3 req/s | Bitwise agreement on eight fixed single requests |
 
-- **Wall-OSS** used a flow and an RTC request as the single-request set and service warmup, `image_preprocess_device` on the NPU (DVPP), and the synthetic desktop load with RTC at 2 and 3 robots — sixteen rounds, zero errors, zero missing responses, zero underflow. At two robots the per-round server P50 spans 118–121 ms with a median of 120.1 ms and a worst-round P95 of 130.2 ms; three robots measured 161–166 ms, above the 150 ms rule, so the capacity is bounded at two. The single request splits into prepare 2.23 ms, engine 78.42 ms and output 0.15 ms.
-- **Wall-X 2B** used the 216-request latency capture as the single-request set (fixed noise seed 20261112), two requests as service warmup, and the synthetic desktop load with RTC at 2 robots — 八 rounds, 零 errors, 零 missing responses. Its single request splits into prepare 2.80 ms, engine 76.76 ms and output 0.15 ms.
+### Conditions
 
-Both models' rows report one wiring: the xcompute package's own entries, which mix CANN ACLNN Matmul,
-FusedInferAttentionScore V5 and official operators with TileLang and AOT custom kernels inside xcompute. At the
-backend-selection level both models name xcompute by default; TorchNPU's own operators and the CANN bridge
-remain opt-in pins (`--op-backends linear=ascend:torch_npu`).
-
-Both checks are end to end. Wall-OSS passed the internal precision gate with image preprocessing on the NPU
-(DVPP), the same path the benchmark used. Wall-X 2B ran a fixed-noise action check: ten requests with injected
-deterministic initial noise through the default dispatch and through the reference composition of the same
-build, comparing the denormalized action predictions end to end.
-
-See the [Ascend guide](ascend950dt.md) for the operator and graph configuration.
+- **Wall-OSS** used the flow and RTC requests for single-request timing and server warmup. The 3, 4 and 5 robot tiers each ran eight rounds and passed the [shared capacity rule](benchmark.md#performance-table).
+- **Wall-X 2B** used the captured request set for single-request timing. The service used two warmup requests, the 5.0 RTC gripper limit, `--lanes vision=1,prefill=3,action=2` and `--max-batch action=4`. Each sweep ran two rounds at 8, 12, 14, 15 and 16 robots. Capacity is the largest tier whose median server P50 across rounds stayed within 150 ms. Both sweeps passed at 15 robots. The table reports the first sweep.
