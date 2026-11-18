@@ -178,7 +178,7 @@
 | 模块 | 可以依赖 | 不得依赖 |
 |---|---|---|
 | `engine/` | `platforms/`、模型接口（抽象类）、`observability.annotate`（阶段 span） | 任何具体模型、量化方法、kernel 包；`config/`、`models/layers/`、`loader/`、`ops/`、`frontend/` |
-| `models/` | `models/layers/`（含 `models/layers/quantization/` 接口）、`ops/`、`loader/` | `engine/` 内部、具体平台 |
+| `models/` | `models/layers/`（含 `models/layers/quantization/` 接口）、`ops/`、`loader/`；后端专属实现中的平台契约 | `engine/` 内部；共享模型代码中的具体平台 |
 | `models/layers/`（含 `models/layers/quantization/`） | `ops/` | 具体 kernel 包（只能经 ops 注册） |
 | `ops/` | `platforms/` | 模型、`observability/` |
 | `frontend/` | 模型的 Input/OutputProcessor | `engine/` 等运行时内部；`torch.cuda` 与任何设备运行时（Frontend 进程不初始化 CUDA 或其他设备运行时） |
@@ -189,7 +189,7 @@
 
 启动顺序是：构建模型（算子在此时选定）→ `config.resolve` 读取已构建模型的 `capabilities()` 与平台能力 → 创建 Engine。所以已构建模型支持的能力（例如批大小）经模型接口交给 engine，engine 不依赖 ops，也不依赖 config；Frontend 的共享内存与 Engine 之间由 `entrypoints/serve.py` 衔接，engine 不依赖 frontend。
 
-**RPU 包的职责边界。** `models/wallx2b/rpu/` 负责模型配置、权重、请求处理和常驻阶段计划。`engine/rpu/engine.py` 通过模型的 RPU 钩子负责请求准入、提交、完成、重置和关闭。平台包负责设备资源：`platforms/rpu/platform.py` 描述设备及其能力，`resources.py` 管理原生缓冲区与准备操作，`execution.py` 管理有序执行，`context.py` 管理执行上下文及其资源生命周期。`engine/rpu/` 和 `platforms/rpu/` 通过 `__init__.py` 导出公共类型，保留原有导入路径。
+**RPU 包的职责边界。** `models/wallx2b/rpu/` 负责模型配置、权重、请求处理和常驻阶段计划。`engine/rpu/engine.py` 通过模型的 RPU 钩子负责请求准入、提交、完成、重置和关闭。平台包负责设备资源：`platforms/rpu/platform.py` 描述能力，`resources.py` 管理缓冲区和操作，`execution.py` 管理有序执行，`context.py` 管理上下文生命周期。`platforms/rpu/plan.py` 定义后端模型和引擎共同使用的 RPU 请求契约；共享模型接口不依赖厂商执行类型。`config/rpu.py` 提供 RPU 请求和通道默认值，通用解析器继续负责 frontend 和共享内存设置。包的导出接口保留原有引擎和平台导入路径。
 
 `test_layering.py` 检查上表中包之间的依赖方向，以及 `platforms/interface.py`、`models/interface.py` 不 import torch。下面的设备边界是目标，尚未实现，也未检查。
 

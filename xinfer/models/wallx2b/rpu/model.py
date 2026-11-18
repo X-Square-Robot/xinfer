@@ -12,7 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
-from xinfer.models.interface import CameraSpec, Capabilities, IOSchema, RpuRequestPlan, Stage, StageGraph, VLAModel
+from xinfer.models.interface import CameraSpec, Capabilities, IOSchema, Stage, StageGraph, VLAModel
+from xinfer.platforms.rpu.plan import RpuRequestPlan
 
 from .config import WallX2BConfig, preflight_checkpoint
 
@@ -81,6 +82,7 @@ class WallX2B(VLAModel):
         model = cls()
         model.checkpoint, model.config = Path(path), manifest.config
         model.manifest = manifest
+        model.quantization = quantization
         model.rpu_allow_candidate = True
         model.max_cached_signatures = capacity
         model.prefill_collective_window = window
@@ -249,17 +251,17 @@ class WallX2B(VLAModel):
         return plan
 
     def _request_rollback(self, release, error):
-        """Release a partial binding and rebuild plans while native work is idle."""
+        """Release a partial binding without recovering the invalidated plans."""
         self._invalid = True
-        self._request_release = None
+        self._request_release = release
         try:
             if release is not None:
                 release()
-            self._close_resources(r for r in self.context._resources if r not in self._base_resources)
-            self._build_plans()
         except BaseException as cleanup_error:
             if hasattr(error, "add_note"):
                 error.add_note(f"RPU request rollback failed: {cleanup_error}")
+        else:
+            self._request_release = None
 
     def _incomplete_request(self, release):
         self._invalid = True
@@ -268,8 +270,8 @@ class WallX2B(VLAModel):
     def rollback_rpu_request(self, error):
         """Release a request which failed before its plan was returned.
 
-        This is not a reset. If rebuilding fails, the original error is annotated
-        and the engine still requires its explicit reset before further requests.
+        Captured plans remain invalid until explicit reset. A failed binding
+        release is retained for retry without replacing the original error.
         """
         self._invalid = True
         release, self._request_release = self._request_release, None
@@ -352,7 +354,10 @@ class WallX2B(VLAModel):
     def reset_rpu(self):
         """Rebuild captured generations while retaining immutable packed weights."""
         self._invalid = True
-        self._request_release = None
+        release = self._request_release
+        if release is not None:
+            release()
+            self._request_release = None
         self._close_resources(r for r in self.context._resources if r not in self._base_resources)
         self._build_plans()
         self.stats["resets"] += 1

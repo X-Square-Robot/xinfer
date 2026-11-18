@@ -5,7 +5,8 @@ import threading
 import numpy as np
 import pytest
 
-from xinfer.config import ConfigError, ExplicitSettings, resolve
+from xinfer.config import ConfigError, ExplicitSettings
+from xinfer.config.rpu import resolve
 from xinfer.engine.core import AdmitError, Engine
 from xinfer.engine.executor import Lane
 from xinfer.engine.rpu import RpuEngine, RpuRequestPlan
@@ -111,7 +112,7 @@ class TwoStageModel:
         self.resets = 0
 
     def capabilities(self):
-        return Capabilities(batch_sizes={"vision": (1,), "action": (1, 2)}, num_steps=8)
+        return Capabilities(batch_sizes={"vision": (1,), "action": (1,)}, num_steps=8)
 
     def shape_buckets(self):
         return {}
@@ -157,18 +158,21 @@ def test_engine_invokes_model_rollback_when_plan_creation_fails(context):
     engine.shutdown()
 
 
-def test_wallx2b_vision_failure_rolls_back_with_real_engine(context):
+@pytest.mark.parametrize("failure_stage", ["action", "vision"])
+def test_wallx2b_binding_failure_waits_for_reset_before_rebuilding(context, failure_stage):
     from collections import Counter
     from types import SimpleNamespace
     from xinfer.models.wallx2b.rpu.model import WallX2B
 
     model = WallX2B()
     model.context = context
-    model._initial_resources, model._base_resources = frozenset(), frozenset(context._resources)
-    model._signatures, model.weights = {}, {}
+    model._initial_resources = frozenset(context._resources)
+    weight = context.prepare_weight(np.ones(2, np.float16), layout="row_major")
+    model._base_resources = frozenset(context._resources)
+    stale = context.empty((2,), state_kind="state")
+    model._signatures, model.weights = {}, {"weight": weight}
     model.prepare_rpu = lambda native: setattr(model, "_prepared", True)
     model._invalid = False
-    model._base_resources = frozenset(context._resources)
     model.stats = Counter()
     state = SimpleNamespace(invalidate=lambda: None)
     model.prefix_state = SimpleNamespace(recurrent=state, history=state, history_out=state,
@@ -177,6 +181,7 @@ def test_wallx2b_vision_failure_rolls_back_with_real_engine(context):
 
     def rebuild():
         observations.append(model._invalid)
+        assert stale.closed and not weight.closed
         with pytest.raises(RuntimeError, match="recovered"):
             model.begin_rpu_request(PreparedRequest({}), context)
         setattr(model, "vision", SimpleNamespace(bind=False))
@@ -186,18 +191,40 @@ def test_wallx2b_vision_failure_rolls_back_with_real_engine(context):
 
     model._build_plans = rebuild
     model._prefix_plan = lambda prepared: SimpleNamespace(bind=lambda *args, **kwargs: None)
-    model.action = SimpleNamespace(bind=lambda prepared: SimpleNamespace(
-        close=lambda: released.append(True)), destination_caches=[])
-    model.vision = SimpleNamespace(bind=lambda pixels: (_ for _ in ()).throw(ValueError("bad pixels")))
+    primary = ValueError(f"bad {failure_stage}")
+
+    def bind_action(prepared):
+        if failure_stage == "action":
+            raise primary
+        return SimpleNamespace(close=lambda: released.append(True))
+
+    def bind_vision(pixels):
+        raise primary
+
+    model.action = SimpleNamespace(bind=bind_action, destination_caches=[])
+    model.vision = SimpleNamespace(bind=bind_vision)
     engine = RpuEngine(model, resolve_platform("rpu"), context=context)
+    allocations = context.stats["allocations"]
     prepared = PreparedRequest(dict(pixel_values=object(), position_ids=object(), input_ids=object()))
-    with pytest.raises(ValueError, match="bad pixels"):
-        engine.run(prepared)
-    assert released == [True] and observations == [True]
-    model.rollback_rpu_request(RuntimeError("duplicate rollback"))
-    assert released == [True]
-    assert context.needs_reset
-    engine.shutdown()
+    try:
+        with pytest.raises(ValueError, match=f"bad {failure_stage}") as caught:
+            engine.run(prepared)
+        assert caught.value is primary
+        assert released == ([True] if failure_stage == "vision" else [])
+        assert not observations and model._invalid and context.needs_reset
+        assert not stale.closed and not weight.closed and context.native.async_starts == 0
+        assert context.stats["allocations"] == allocations
+        model.rollback_rpu_request(RuntimeError("duplicate rollback"))
+        assert released == ([True] if failure_stage == "vision" else [])
+        with pytest.raises(RuntimeError, match="explicit reset"):
+            engine.run(prepared)
+        assert not observations
+        engine.reset()
+        assert observations == [True] and not model._invalid and not context.needs_reset
+        assert stale.closed and not weight.closed and model.weights["weight"] is weight
+        assert context.native.async_starts == 0
+    finally:
+        engine.shutdown()
 
 def test_rpu_platform_does_not_use_torch_device(monkeypatch):
     import torch
@@ -224,9 +251,10 @@ def test_rpu_resolution_limits_admission_before_building_a_device_context():
     resolved = resolve(model, platform, model_name="test", cpus=32, tuned=None)
     assert resolved.value("max_running_requests") == 1
     assert resolved.value("max_queued_requests") == 1
-    assert resolved.value("frontends") == 1
+    assert resolved.value("frontends") == 2
     assert all(resolved.value(f"lanes.{stage.name}") == 1 for stage in model.stage_graph)
     assert resolved.value("batch_sizes.action") == [1]
+    assert resolved.settings["batch_sizes.action"].source == "model:declares B1 only"
     with pytest.raises(ConfigError, match="requires lanes.action=1"):
         resolve(model, platform, model_name="test", explicit=ExplicitSettings(lanes={"action": 2}))
     with pytest.raises(ValueError, match="execution_model='cuda-lanes'"):

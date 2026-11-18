@@ -1,4 +1,4 @@
-"""Single dispatch site for engine selection by platform capability.
+"""Single dispatch site for engine and configuration selection by platform capability.
 
 This is the only place engine classes are picked from a resolved ``Platform``: vendor identity
 never leaks into branches here, only ``capabilities.execution_model`` (docs/design.md §13.1).
@@ -11,6 +11,23 @@ allowed to import from ``engine/`` (``platforms/interface.py`` stays torch- and 
 from __future__ import annotations
 
 from xinfer.platforms.interface import Platform
+
+
+def resolve_config(model, platform: Platform, **kwargs):
+    """Resolve settings with the configuration adapter for the execution model.
+
+    ``kwargs`` are the generic resolver's model name, quantization, explicit
+    settings, CPU quota and tuned-table options.
+    """
+    if platform.capabilities.execution_model == "explicit-completion":
+        from xinfer.config.rpu import resolve
+
+        return resolve(model, platform, **kwargs)
+    if platform.capabilities.execution_model == "cuda-lanes":
+        from xinfer.config import resolve
+
+        return resolve(model, platform, **kwargs)
+    raise ValueError(f"unknown execution_model {platform.capabilities.execution_model!r} on {platform.name}")
 
 
 def create_engine(platform: Platform, model, config=None):

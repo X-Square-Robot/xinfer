@@ -83,7 +83,7 @@ def test_split_finish_failure_retains_release_owner_without_admitting_rebuild():
     model.stats = Counter()
     model.prefix_state = SimpleNamespace(recurrent=state, history=state, history_out=state,
                                          key_caches={}, value_caches={})
-    released = []
+    released, rebuilt = [], []
     binding = SimpleNamespace(close=lambda: released.append(True))
     model._prefix_plan = lambda prepared: SimpleNamespace(bind=lambda *args, **kwargs: None)
     model.action = SimpleNamespace(bind=lambda prepared: binding, destination_caches=[])
@@ -94,6 +94,7 @@ def test_split_finish_failure_retains_release_owner_without_admitting_rebuild():
         assert model._invalid
         with pytest.raises(RuntimeError, match="recovered"):
             model.begin_rpu_request(prepared, model.context)
+        rebuilt.append(True)
         setattr(model, "_invalid", False)
     model._build_plans = rebuild
     model._close_resources = lambda resources: []
@@ -103,9 +104,14 @@ def test_split_finish_failure_retains_release_owner_without_admitting_rebuild():
         model.finish_rpu_request(binding, prepared)
     assert model._invalid and not released
     model.rollback_rpu_request(RuntimeError("request was not admitted"))
-    assert released == [True] and not model._invalid
+    assert released == [True] and model._invalid and not rebuilt
+    with pytest.raises(RuntimeError, match="recovered"):
+        model.begin_rpu_request(prepared, model.context)
+    model.reset_rpu()
+    assert released == [True] and rebuilt == [True] and not model._invalid
 
-def test_early_action_binding_failure_rebuilds_owners_without_native_recovery():
+
+def test_early_action_binding_failure_waits_for_reset_to_rebuild_owners():
     model = WallX2B()
     retired, retained, rebuilt = object(), object(), []
     model.context = SimpleNamespace(_resources=[retired, retained])
@@ -122,16 +128,49 @@ def test_early_action_binding_failure_rebuilds_owners_without_native_recovery():
         raise ValueError("bad action")
     model.action = SimpleNamespace(bind=reject, destination_caches=[])
     model._build_plans = lambda: (rebuilt.append(True), setattr(model, "_invalid", False))
+    prepared = PreparedRequest(dict(position_ids=object(), input_ids=object()))
     with pytest.raises(ValueError, match="bad action"):
-        model.begin_rpu_request(PreparedRequest(dict(position_ids=object(), input_ids=object())), model.context)
-    assert model._invalid and not rebuilt
-    model._request_rollback(None, ValueError("bad action"))
-    assert closed == [retired] and rebuilt == [True] and not model._invalid
-    with pytest.raises(ValueError, match="bad action"):
-        model.create_rpu_request(PreparedRequest(dict(position_ids=object(), input_ids=object())), model.context)
+        model.create_rpu_request(prepared, model.context)
     model.rollback_rpu_request(RuntimeError("bad action"))
-    assert model._invalid  # No Action binding exists to release or rebuild.
+    assert model._invalid and not closed and not rebuilt
+    with pytest.raises(RuntimeError, match="recovered"):
+        model.begin_rpu_request(prepared, model.context)
+    model.reset_rpu()
     assert closed == [retired] and rebuilt == [True]
+    assert not model._invalid and model.context._resources[-1] is retained
+
+
+def test_failed_request_release_keeps_cleanup_retry_for_explicit_reset():
+    model = WallX2B()
+    retired, retained = object(), object()
+    model.context = SimpleNamespace(_resources=[retired, retained])
+    model._base_resources = frozenset((retained,))
+    model._invalid = True
+    model.stats = Counter()
+    closed, released, rebuilt = [], [], []
+
+    def release():
+        released.append(True)
+        if len(released) < 3:
+            raise RuntimeError("request release failed")
+
+    model._request_release = release
+    model._close_resources = lambda resources: closed.extend(resources)
+    model._build_plans = lambda: (rebuilt.append(True), setattr(model, "_invalid", False))
+    primary = ValueError("pixel upload failed")
+    model.rollback_rpu_request(primary)
+    assert released == [True] and not closed and not rebuilt
+    assert model._invalid and model._request_release is release
+    if hasattr(primary, "__notes__"):
+        assert any("request release failed" in note for note in primary.__notes__)
+
+    with pytest.raises(RuntimeError, match="request release failed"):
+        model.reset_rpu()
+    assert model._invalid and not closed and not rebuilt
+    assert model._request_release is release
+    model.reset_rpu()
+    assert released == [True, True, True] and closed == [retired] and rebuilt == [True]
+    assert not model._invalid and model._request_release is None
 
 
 def test_device_dispatch_preserves_operator_table_and_device(monkeypatch):
@@ -207,4 +246,5 @@ def test_prefill_window_options_are_retained_without_device_initialization(monke
     monkeypatch.setattr(WallX2B, "build_processors", classmethod(lambda cls, path, **kw: (object(), object(), None)))
     model = WallX2B.from_checkpoint("unused", device="rpu:0", allow_candidate=True, **options)
     assert model.prefill_collective_window == expected and model.context is None
+    assert model.quantization == "fp16"
     assert not model._prepared and not model._attempted

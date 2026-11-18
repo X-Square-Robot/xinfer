@@ -181,7 +181,7 @@ Two principles:
 | Module | May depend on | Must not depend on |
 |---|---|---|
 | `engine/` | `platforms/`, the model interface (abstract classes), `observability.annotate` (stage spans) | Any concrete model, quantization method or kernel package; `config/`, `models/layers/`, `loader/`, `ops/`, `frontend/` |
-| `models/` | `models/layers/` (including the `models/layers/quantization/` interface), `ops/`, `loader/` | `engine/` internals, concrete platforms |
+| `models/` | `models/layers/` (including the `models/layers/quantization/` interface), `ops/`, `loader/`; platform contracts in backend-specific implementations | `engine/` internals; concrete platforms in shared model code |
 | `models/layers/` (including `models/layers/quantization/`) | `ops/` | Concrete kernel packages (only through ops registration) |
 | `ops/` | `platforms/` | Models, `observability/` |
 | `frontend/` | The model's Input/OutputProcessor | `engine/` and other runtime internals; `torch.cuda` and any device runtime (Frontend processes do not initialize CUDA or any other device runtime) |
@@ -192,7 +192,7 @@ Two principles:
 
 The startup order is: build the model (operators are selected here) → `config.resolve` reads the built model's `capabilities()` and the platform capabilities → create the Engine. So what the built model supports, such as its batch sizes, reaches the engine through the model interface, and the engine depends on neither ops nor config; the Frontend's shared memory and the Engine are connected by `entrypoints/serve.py`, so the engine does not depend on frontend.
 
-**RPU package boundaries.** `models/wallx2b/rpu/` owns model configuration, weights, request processing and resident stage plans. `engine/rpu/engine.py` owns request admission, submission, completion, reset and shutdown through the model's RPU hooks. The platform package owns device resources: `platforms/rpu/platform.py` describes the device and its capabilities, `resources.py` owns native buffers and prepared operations, `execution.py` owns ordered executions, and `context.py` owns the execution context and its resource lifecycle. The `engine/rpu/` and `platforms/rpu/` packages expose their public types through `__init__.py`, preserving the existing import paths.
+**RPU package boundaries.** `models/wallx2b/rpu/` owns model configuration, weights, request processing and resident stage plans. `engine/rpu/engine.py` owns request admission, submission, completion, reset and shutdown through the model's RPU hooks. The platform package owns device resources: `platforms/rpu/platform.py` describes capabilities, `resources.py` owns buffers and operations, `execution.py` owns ordered executions, and `context.py` owns context lifecycle. `platforms/rpu/plan.py` defines the RPU request contract consumed by the backend model and engine; the shared model interface stays independent of vendor execution types. `config/rpu.py` supplies RPU request and lane defaults while the generic resolver keeps frontend and shared-memory settings. The package facades preserve the existing engine and platform imports.
 
 `test_layering.py` checks the package dependency directions in the table above, and that `platforms/interface.py` and `models/interface.py` do not import torch. The device boundary below is a target; it is neither implemented nor checked.
 

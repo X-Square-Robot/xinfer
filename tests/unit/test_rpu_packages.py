@@ -9,13 +9,13 @@ import textwrap
 import pytest
 
 
-def test_legacy_engine_imports_share_the_model_request_contract():
+def test_legacy_engine_imports_share_the_rpu_request_contract():
     from xinfer.engine.rpu import RpuEngine, RpuRequestPlan
     from xinfer.engine.rpu.engine import RpuEngine as EngineImplementation
-    from xinfer.models.interface import RpuRequestPlan as ModelRequestPlan
+    from xinfer.platforms.rpu.plan import RpuRequestPlan as BackendRequestPlan
 
     assert RpuEngine is EngineImplementation
-    assert RpuRequestPlan is ModelRequestPlan
+    assert RpuRequestPlan is BackendRequestPlan
 
 
 @pytest.mark.parametrize(("name", "module"), [

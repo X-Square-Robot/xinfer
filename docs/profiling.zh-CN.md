@@ -147,6 +147,8 @@ xinfer-profile ops --model wall_oss --checkpoint /path/to/checkpoint \
 
 ## 负载剖析（`xinfer-profile load`）
 
+此命令需要通道引擎的准入和阶段 span，不支持使用显式完成的 RPU 配置；RPU 推理使用进程内 `Policy` 接口。
+
 ```bash
 xinfer-profile load --model wall_oss --checkpoint /path/to/checkpoint --requests observation.msgpack \
   --robots 8 --out artifacts/wall-oss-load

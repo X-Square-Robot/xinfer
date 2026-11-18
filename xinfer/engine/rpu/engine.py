@@ -17,7 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import numpy as np
 
 from xinfer.engine.core import AdmitError, EngineConfig
-from xinfer.models.interface import RpuRequestPlan
+from xinfer.platforms.rpu.plan import RpuRequestPlan
 from xinfer.platforms.rpu import RpuExecution, RpuExecutionContext
 
 

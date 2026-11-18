@@ -32,6 +32,13 @@ the in-process `Policy` interface. The frozen-request format below describes
 inputs for inspection, not an additional execution command; this profile does
 not add an RPU mode to `xinfer-serve`.
 
+The model/profile supplies the FP16 default used by `Policy` for configuration
+and tuned-table lookup. The RPU
+configuration adapter supplies the one-request and one-lane defaults; B1 comes
+from the model and stream-priority support from the platform. `xinfer-profile load`
+is unsupported because this engine does not emit the admission and stage spans
+required by load profiling.
+
 ## Board-free checkpoint inspection
 
 Install the model-processing dependencies, for example in an environment
@@ -155,7 +162,8 @@ for real completion because the public TP ABI has no nonblocking completion
 query or mid-execution cancellation.
 
 A preparation, execution or collection error blocks further requests until an
-explicit reset. Model plans do not replay partially executed work. Reset must
+explicit reset. Rollback releases request bindings and marks plans invalid; only
+explicit reset rebuilds the full plans. Model plans do not replay partially executed work. Reset must
 be called while the engine is idle and open; it invalidates state generations,
 resets native state owners and rebuilds plans while retaining packed weights.
 If reset fails, the engine remains blocked. Neither recovery nor a fallback to
