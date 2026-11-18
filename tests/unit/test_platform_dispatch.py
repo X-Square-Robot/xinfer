@@ -2,8 +2,9 @@
 
 These tests are intentionally vendor-name-generic: they assert the capability-shaped dispatch,
 not the presence/absence of any particular ``is_<vendor>`` predicate. When a new vendor wants to
-add an accelerator, adding ``platforms/<kind>.py`` plus one lazy branch in ``detect.py`` and
-declaring the right capabilities is meant to be the entire job (docs/design.md §13, §18.3).
+add an accelerator, adding ``platforms/<kind>.py`` or ``platforms/<kind>/`` plus one lazy branch
+in ``detect.py`` and declaring the right capabilities defines its platform dispatch surface
+(docs/design.md §13, §18.3).
 """
 
 from __future__ import annotations

@@ -1,12 +1,13 @@
 """Resolve the platform for a device string.
 
-One module per device kind holds its description — ``cuda``, ``npu``, ``rpu`` and ``cpu``, alongside
-this package, the way ``xinfer/ops/backends/`` holds one package per hardware — and this module only
-parses the device string and dispatches to it, importing the module lazily so a process serving one
-device kind never loads another's runtime (including its vendor SDK).
+One module or package per device kind holds its description — ``cuda``, ``npu``, ``rpu`` and ``cpu`` —
+the way ``xinfer/ops/backends/`` holds one package per hardware. This module only parses the device
+string and dispatches to it, importing the implementation lazily so a process serving one device
+kind never loads another's runtime (including its vendor SDK).
 
 To add another accelerator family:
-  1. Create ``platforms/<kind>.py`` exposing ``<kind>_platform(device) -> Platform``.
+  1. Create ``platforms/<kind>.py`` or ``platforms/<kind>/`` exposing
+     ``<kind>_platform(device) -> Platform`` from its public module or package.
   2. Add one branch below dispatching by the device-string prefix to that factory.
 
 Keep dispatch here; do not leak vendor-specific literals into callers.
