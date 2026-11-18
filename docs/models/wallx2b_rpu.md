@@ -169,6 +169,10 @@ resets native state owners and rebuilds plans while retaining packed weights.
 If reset fails, the engine remains blocked. Neither recovery nor a fallback to
 another runtime is automatic.
 
+Request outcome statistics include binding cleanup. A request is completed only
+after output collection and binding release both succeed. A release failure
+counts once as failed and requires reset.
+
 `Policy.close()` drains outstanding engine work, then closes the model's
 execution resources and input processor. `RpuEngine.shutdown()` performs the
 same drain and model/context cleanup; an externally supplied execution context

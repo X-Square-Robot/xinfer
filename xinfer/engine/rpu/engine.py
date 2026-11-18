@@ -144,9 +144,12 @@ class RpuEngine:
             if self.context.needs_reset:
                 raise RuntimeError("RPU context requires explicit reset before another request")
             # Plan construction failures are released by the model's request
-            # rollback hook. A returned plan owns its abort/release callbacks.
-            plan = self.model.create_rpu_request(prepared, self.context)
-            if not isinstance(plan, RpuRequestPlan) or set(plan.stages) != set(self.order):
+            # rollback hook. A type-validated plan owns its cleanup callbacks.
+            raw_plan = self.model.create_rpu_request(prepared, self.context)
+            if not isinstance(raw_plan, RpuRequestPlan):
+                raise ValueError("RPU request plan must contain exactly the model StageGraph stages")
+            plan = raw_plan
+            if set(plan.stages) != set(self.order):
                 raise ValueError("RPU request plan must contain exactly the model StageGraph stages")
             for stage in self.order:
                 executions = plan.stages[stage]
@@ -158,11 +161,9 @@ class RpuEngine:
                     execution.execute().wait()
                 self.stats[f"dispatch_{stage}_b1"] += 1
             result = {key: _owned_cpu(value) for key, value in plan.collect().items()}
-            self.stats["requests_completed"] += 1
             return result
         except BaseException as error:
             request_error = error
-            self.stats["requests_failed"] += 1
             # An error from plan preparation/materialization also invalidates
             # request state. There is no implicit replay of a partly run plan.
             self.context.needs_reset = True
@@ -176,20 +177,24 @@ class RpuEngine:
             elif plan is not None and plan.abort is not None:
                 try:
                     plan.abort(error)
-                except Exception as cleanup_error:
+                except BaseException as cleanup_error:
                     if hasattr(error, "add_note"):
                         error.add_note(f"RPU abort cleanup failed: {cleanup_error}")
             raise
         finally:
-            if plan is not None and plan.release is not None:
-                try:
+            try:
+                if plan is not None and plan.release is not None:
                     plan.release()
-                except BaseException as cleanup_error:
-                    self.context.needs_reset = True
-                    if request_error is None:
-                        raise
-                    if hasattr(request_error, "add_note"):
-                        request_error.add_note(f"RPU request release failed: {cleanup_error}")
+            except BaseException as cleanup_error:
+                self.context.needs_reset = True
+                if request_error is None:
+                    request_error = cleanup_error
+                    raise
+                if hasattr(request_error, "add_note"):
+                    request_error.add_note(f"RPU request release failed: {cleanup_error}")
+            finally:
+                outcome = "requests_failed" if request_error is not None else "requests_completed"
+                self.stats[outcome] += 1
 
     def warmup(self, requests):
         # Exactly one execution per supplied request; no eager-then-capture

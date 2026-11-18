@@ -1,6 +1,7 @@
 """Board-free lifecycle tests; fake SDK work is not model/board qualification."""
 
 import threading
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -156,6 +157,121 @@ def test_engine_invokes_model_rollback_when_plan_creation_fails(context):
     assert model.events == [("rollback", "bad admission")]
     assert context.needs_reset
     engine.shutdown()
+
+
+@pytest.mark.parametrize(("collect_fails", "release_fails"), [
+    (False, False), (False, True), (True, False), (True, True),
+])
+def test_request_outcome_counts_include_collection_and_release(context, collect_fails, release_fails):
+    model = TwoStageModel()
+    create = model.create_rpu_request
+    primary = ValueError("collection failed")
+    cleanup = RuntimeError("request release failed")
+    events = []
+
+    def request(prepared, native):
+        plan = create(prepared, native)
+
+        def collect():
+            events.append("collect")
+            if collect_fails:
+                raise primary
+            return plan.collect()
+
+        def release():
+            events.append("release")
+            if release_fails:
+                raise cleanup
+
+        return replace(plan, collect=collect, release=release)
+
+    model.create_rpu_request = request
+    engine = RpuEngine(model, resolve_platform("rpu"), context=context)
+    try:
+        failed = collect_fails or release_fails
+        if failed:
+            expected = primary if collect_fails else cleanup
+            with pytest.raises(type(expected)) as caught:
+                engine.run(PreparedRequest({"value": 3}))
+            assert caught.value is expected
+            if collect_fails and release_fails and hasattr(primary, "add_note"):
+                assert any("request release failed" in note for note in primary.__notes__)
+        else:
+            result = engine.run(PreparedRequest({"value": 3}))
+            np.testing.assert_array_equal(result["actions"], np.full((1, 2), 3, np.float32))
+        assert events == ["collect", "release"]
+        assert context.native.trace == ["vision", "action"]
+        assert context.needs_reset is failed
+        assert engine.stats["requests_completed"] == int(not failed)
+        assert engine.stats["requests_failed"] == int(failed)
+    finally:
+        engine.shutdown()
+
+
+def test_non_plan_return_preserves_validation_error_and_model_rollback(context):
+    model = TwoStageModel()
+    model.create_rpu_request = lambda prepared, native: object()
+    rolled_back = []
+    model.rollback_rpu_request = rolled_back.append
+    engine = RpuEngine(model, resolve_platform("rpu"), context=context)
+    try:
+        with pytest.raises(ValueError, match="RPU request plan") as caught:
+            engine.run(PreparedRequest({"value": 1}))
+        assert rolled_back == [caught.value]
+        assert context.native.async_starts == 0
+        assert context.needs_reset
+        assert engine.stats["requests_completed"] == 0
+        assert engine.stats["requests_failed"] == 1
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(("abort_fails", "release_fails"), [(False, False), (False, True), (True, True)])
+def test_invalid_stage_layout_preserves_plan_cleanup_and_validation_error(context, abort_fails, release_fails):
+    class AbortCleanupFailure(BaseException):
+        pass
+
+    model = TwoStageModel()
+    request_buffer = context.empty((2,))
+    abort_cleanup = AbortCleanupFailure("invalid plan abort failed")
+    cleanup = RuntimeError("invalid plan release failed")
+    aborted, released, rolled_back = [], [], []
+
+    def abort(error):
+        aborted.append(error)
+        if abort_fails:
+            raise abort_cleanup
+
+    def release():
+        released.append(True)
+        request_buffer.close()
+        if release_fails:
+            raise cleanup
+
+    plan = RpuRequestPlan(
+        stages={"vision": ()},
+        collect=lambda: pytest.fail("invalid stage layout must not be collected"),
+        abort=abort,
+        release=release,
+    )
+    model.create_rpu_request = lambda prepared, native: plan
+    model.rollback_rpu_request = rolled_back.append
+    engine = RpuEngine(model, resolve_platform("rpu"), context=context)
+    try:
+        with pytest.raises(ValueError, match="RPU request plan") as caught:
+            engine.run(PreparedRequest({"value": 1}))
+        assert aborted == [caught.value] and released == [True] and not rolled_back
+        assert request_buffer.closed
+        if release_fails and hasattr(caught.value, "add_note"):
+            assert any("invalid plan release failed" in note for note in caught.value.__notes__)
+            if abort_fails:
+                assert any("invalid plan abort failed" in note for note in caught.value.__notes__)
+        assert context.native.async_starts == 0
+        assert context.needs_reset
+        assert engine.stats["requests_completed"] == 0
+        assert engine.stats["requests_failed"] == 1
+    finally:
+        engine.shutdown()
 
 
 @pytest.mark.parametrize("failure_stage", ["action", "vision"])
