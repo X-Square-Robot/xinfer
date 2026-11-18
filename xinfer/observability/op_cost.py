@@ -97,7 +97,7 @@ def _attention(q, pairs: int, read: int, written: int = 0) -> OpCost:
     return OpCost(4 * q.shape[-1] * pairs, read, _bytes(q) + written, _PIPES[q.dtype])
 
 
-def causal_attention(q, k, v, *, scale=None) -> OpCost:
+def causal_attention(q, k, v, *, scale=None, return_bnsd=False) -> OpCost:
     """Exact causal work: ``L(L+1)/2`` pairs per row and head."""
     b, n, h, _ = q.shape
     return _attention(q, b * h * n * (n + 1) // 2, _bytes(q, k, v))
@@ -258,7 +258,8 @@ def qkv_rope_kvcache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_hea
     return _gemm(_PIPES[x.dtype], x, None, weight, None, bias, x.shape[1], weight.shape[0], (cos, sin))
 
 
-def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None) -> OpCost:
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
+                             all_keep=False, return_bnsd=False) -> OpCost:
     """Padded layout: every query sees cache rows ``[0, new_pos + M)``, the prefix padded to ``new_pos`` and the own
     keys (prefix lengths and ``flash_mask`` are device data); reads those rows of both caches."""
     b, m, h, _ = q.shape

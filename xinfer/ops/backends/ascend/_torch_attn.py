@@ -2,6 +2,7 @@
 
 The FP32 matmul/softmax primitive avoids SDPA's unjoined side stream during NPU graph capture. Layouts, masks
 and cache updates use the reference composition helpers; the CPU/CUDA reference keeps its SDPA primitive.
+Contracts against the torch references: tolerance (the torch attention backends).
 """
 
 import torch
@@ -37,8 +38,9 @@ def varlen_attention(q, k, v, cu_seqlens, *, scale=None):
 
 
 @register("causal_attention", backend="ascend", requires=torch, priority=0)
-def causal_attention(q, k, v, *, scale=None):
-    return reference._causal_attention(_graph_safe_attention, q, k, v, scale=scale)
+def causal_attention(q, k, v, *, scale=None, return_bnsd=False):
+    return reference._causal_attention(
+        _graph_safe_attention, q, k, v, scale=scale, return_bnsd=return_bnsd)
 
 
 @register("action_attention", backend="ascend", requires=torch, priority=0)
@@ -64,9 +66,11 @@ def kvcache_attention(q, k, v, k_cache, v_cache, cache_start, cache_valid, *, sc
 
 
 @register("prefix_kvcache_attention", backend="ascend", requires=torch, priority=0)
-def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
+                             all_keep=False, return_bnsd=False):
     return reference._prefix_kvcache_attention(
-        _graph_safe_attention, q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+        _graph_safe_attention, q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale,
+        all_keep=all_keep, return_bnsd=return_bnsd)
 
 
 # ---------------------------------------------------------------- Wall-X 2B attention family

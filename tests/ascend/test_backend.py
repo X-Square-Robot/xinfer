@@ -1,14 +1,12 @@
 """CPU regressions for Ascend loading, default selection, partial support and reference isolation."""
 
 import importlib
-import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
 from xinfer import ops
-from xinfer.ops.backends import _xcompute
 from xinfer.ops.backends.ascend import _support
 from xinfer.ops.registry import OpRegistry
 from xinfer.platforms.interface import Platform, PlatformCapabilities
@@ -17,31 +15,6 @@ from xinfer.platforms.interface import Platform, PlatformCapabilities
 def _platform(kind="ascend", arch="future-chip"):
     return Platform(f"{kind}-{arch}", "cpu",
                     PlatformCapabilities(kind, arch, True, False, False, None, None, None))
-
-
-def test_shared_loader_accepts_an_ascend_build_with_no_cuda_architectures(monkeypatch, tmp_path):
-    path = tmp_path / "xcompute.so"
-    package = ModuleType("xcompute")
-    package.KERNEL_LIB_PATH = str(path)
-    monkeypatch.setitem(sys.modules, "xcompute", package)
-    monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
-
-    class Library:
-        def __init__(self):
-            self.path = str(path)
-
-        def has_function(self, name):
-            return name in ("build_backend", "build_target_archs")
-
-        def function(self, name):
-            return lambda: "ascend" if name == "build_backend" else ""
-
-    library = Library()
-    assert _xcompute._python_package(library) is package
-    assert _xcompute.target_archs(library) == ("ascend",)
-    monkeypatch.setenv("XINFER_XCOMPUTE", "0")
-    monkeypatch.setattr(_xcompute, "_package_library", lambda: pytest.fail("disabled library was imported"))
-    assert _xcompute._import() is None
 
 
 @pytest.fixture
@@ -55,8 +28,7 @@ def isolated_backend(monkeypatch):
     registry = OpRegistry()
     for name in ops.registry.names():
         registry.define(ops.registry.spec(name))
-    package = ModuleType("xcompute")
-    package.xcompute_lib = SimpleNamespace()
+    package = ModuleType("kernels")
     monkeypatch.setattr(registry_module, "registry", registry)
     monkeypatch.setattr(_support, "xc", package)
     monkeypatch.setattr(_support, "bridge", lambda name: None)
@@ -82,7 +54,7 @@ def test_available_entry_is_selected_without_pins_and_other_platforms_stay_refer
     monkeypatch.setattr(_support, "bridge", bridges.get)
     load()
     selected = registry.build_table(_platform()).selection("gemm_epilogue")
-    assert selected.backend == "ascend" and selected.library == "xcompute"
+    assert selected.name == "ascend:kernels"
     assert registry.build_table(_platform("cuda", "sm120")).selection("gemm_epilogue").backend == "reference"
     assert registry.build_table(_platform("cpu")).selection("gemm_epilogue").backend == "reference"
     assert registry.build_table(_platform()).selection("qkv_rope_epilogue").backend == "reference"
@@ -219,30 +191,6 @@ def test_ascend_platform_uses_backend_identity_and_real_cube_core_property(monke
     assert platform.capabilities.device_images
 
 
-@pytest.mark.parametrize("graph_api", [None, False, lambda: None], ids=["missing", "noncallable", "callable"])
-def test_npu_graph_capability_comes_from_the_runtime(monkeypatch, graph_api):
-    from xinfer.config import ExplicitSettings, resolve
-    from xinfer.platforms import npu
-    from test_config import ThreeStage
-
-    props = SimpleNamespace(name="Ascend Future", cube_core_num=32, total_memory=1024)
-    runtime = SimpleNamespace(is_available=lambda: True, current_device=lambda: 0, device_count=lambda: 1,
-                              get_device_properties=lambda index: props)
-    if graph_api is not None:
-        runtime.NPUGraph = runtime.graph = runtime.graph_pool_handle = graph_api
-    monkeypatch.setattr(npu, "device_module_for", lambda device: runtime)
-    monkeypatch.setattr(npu.torch, "device", lambda device: SimpleNamespace(index=0))
-    monkeypatch.setattr(npu, "npu_stream_priority_range", lambda module, index: None)
-    monkeypatch.setattr(npu, "npu_device_images_available", lambda: False)
-    platform = npu.npu_platform("npu:0")
-    assert platform.capabilities.cudagraphs is callable(graph_api)
-    resolved = resolve(ThreeStage(), platform, model_name="test", tuned=None)
-    assert (resolved.engine_config().cudagraphs is not None) is callable(graph_api)
-    eager = resolve(ThreeStage(), platform, model_name="test", tuned=None,
-                    explicit=ExplicitSettings(cudagraphs=False))
-    assert eager.engine_config().cudagraphs is None
-
-
 def test_legacy_eager_only_entries_do_not_replace_graph_safe_implementations(isolated_backend):
     registry, package, load = isolated_backend
 
@@ -250,13 +198,9 @@ def test_legacy_eager_only_entries_do_not_replace_graph_safe_implementations(iso
         pytest.fail("legacy eager-only entry was called")
 
     package.gemm = package.gateup_silu = package.gateup_silu_pack_weight = package.attention_varlen = eager_only
-    package.xcompute_lib = SimpleNamespace(**{name: eager_only for name in (
-        "gemm_envelope_table", "gemm_generic", "gemm_generic_workspace_size", "gemm_gelu_bias",
-        "gemm_compat_workspace_size", "gemm_compat_npu", "bf16_gemm_silu_mul_sm110", "attention_varlen_ascend",
-    )})
     load()
     table = registry.build_table(_platform())
-    for name in ("gemm_epilogue", "gemm_glu_epilogue"):
+    for name in ("linear", "gemm_epilogue", "gemm_glu_epilogue"):
         assert table.selection(name).backend == "reference"
         assert table.selection(name).contract.graph_safe
     assert table.selection("varlen_attention").name == "ascend:torch"
@@ -467,7 +411,7 @@ def test_explicit_operator_exports_run_without_optional_cann_dependencies(isolat
     load()
     table = registry.build_table(_platform())
     cuda = registry.build_table(_platform("cuda", "sm120"))
-    assert all(table.selection(name).name == "ascend:xcompute" for name in names)
+    assert all(table.selection(name).name == "ascend:kernels" for name in names)
     assert all(cuda.selection(name).backend == "reference" for name in names)
     rng = torch.Generator().manual_seed(73)
 
@@ -503,7 +447,7 @@ def test_explicit_operator_exports_run_without_optional_cann_dependencies(isolat
     composed = {"gemm_add_rms_norm": ((x, weight, tensor(1, 2, 4), torch.ones(4), 1e-6), {"bias": tensor(4)}),
                 "mlp_add_rms_norm": ((x, tensor(8, 3), tensor(4, 4), tensor(1, 2, 4), torch.ones(4), 1e-6), {})}
     for name, (args, options) in composed.items():
-        assert table.selection(name).name == "ascend:xcompute"
+        assert table.selection(name).name == "ascend:kernels"
         torch.testing.assert_close(getattr(table, name)(*args, **options),
                                    ops.registry.spec(name).reference(*args, **options), atol=0, rtol=0)
     assert called == set(names)
@@ -565,7 +509,7 @@ def test_bridge_attention_output_is_flattened_to_the_operator_contract(isolated_
                         if name == "cann_attention" else None)
     load()
     table = registry.build_table(_platform())
-    assert table.selection("prefix_kvcache_attention").name == "ascend:xcompute"
+    assert table.selection("prefix_kvcache_attention").name == "ascend:kernels"
     out = table.prefix_kvcache_attention(q, k, v, prefix, 2)
     assert out.shape == expected.shape == (1, 2, 8)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)

@@ -1,7 +1,13 @@
-"""Ascend attention through OpSpec-named exports, optional CANN bridges and raw xcompute entries.
+"""Attention and gated DeltaNet operators on Ascend.
 
-Unsupported layouts fall back per cached call key to the graph-safe Ascend Torch composition;
-the platform-independent reference remains SDPA. Legacy eager-only variable-length entries are not registered.
+| Operator | Implementation |
+|---|---|
+| ``varlen_attention``, ``segment_attention`` | Variable-length attention on packed tokens |
+| ``causal_attention``, ``prefix_kvcache_attention`` | CANN attention over causal tokens or the active KV cache |
+| ``gated_causal_attention``, ``gated_kvcache_attention`` | Causal or cache attention with an output gate |
+| ``gated_delta_net`` | ``CannGatedDeltaNet`` |
+
+Unsupported layouts use the graph-safe Ascend Torch composition.
 """
 
 import math
@@ -9,7 +15,10 @@ import math
 import torch
 
 from xinfer.ops.backends.ascend import _torch_attn
+from xinfer.ops.backends.ascend._gated_pack import gated_pack
 from xinfer.ops.backends.ascend._support import (
+    PLATFORMS,
+    PRIORITY,
     VERSION,
     bridge,
     call_key,
@@ -77,36 +86,56 @@ def _varlen_key(q, k, v, cu_seqlens, *, scale=None):
     return call_key((q, k, v, bounds), {"scale": scale})
 
 
-@register("varlen_attention", backend="ascend", requires=xc if callable(native_varlen) else None,
-          version=VERSION)
+@register("varlen_attention", backend="ascend", priority=PRIORITY, requires=xc if callable(native_varlen) else None,
+          version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.varlen_attention, key=_varlen_key)
 def varlen_attention(q, k, v, cu_seqlens, *, scale=None):
     return native_varlen(q, k, v, cu_seqlens, scale=scale)
 
 
-@register("causal_attention", backend="ascend", requires=xc if callable(native_causal) else None,
-          version=VERSION)
+@register("causal_attention", backend="ascend", priority=PRIORITY, requires=xc if callable(native_causal) else None,
+          version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.causal_attention)
-def causal_attention(q, k, v, *, scale=None):
-    return native_causal(q, k, v, scale=scale)
+def causal_attention(q, k, v, *, scale=None, return_bnsd=False):
+    return native_causal(q, k, v, scale=scale, return_bnsd=return_bnsd)
 
 
-def _prefix_supported(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+def _prefix_supported(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None, all_keep=False,
+                      return_bnsd=False):
     return callable(native_cache) or _cache_supported(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
 
 
-@register("prefix_kvcache_attention", backend="ascend", requires=xc if callable(native_cache) else raw_cache,
-          version=VERSION)
+@register("prefix_kvcache_attention", backend="ascend", priority=PRIORITY,
+          requires=xc if callable(native_cache) else raw_cache,
+          version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.prefix_kvcache_attention, check=_prefix_supported)
-def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
+                             all_keep=False, return_bnsd=False):
     # The OpSpec contract is [B, M, HD]: a provider that returns [B, M, H, D] must be flattened here, and for a
     # provider that already returns [B, M, HD] this reshape is the identity. Never trust the provider's shape.
     if callable(native_cache):
-        out = native_cache(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+        out = native_cache(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale,
+                           all_keep=all_keep, return_bnsd=return_bnsd)
     else:
+        if all_keep and flash_mask is not None:
+            raise ValueError("all_keep cannot be combined with a flash mask")
         out = xc.attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=new_pos,
-                                   flash_mask=flash_mask, softmax_scale=scale, backend="ascend_tilelang", pdl=False)
+                                   flash_mask=None if all_keep else flash_mask, softmax_scale=scale,
+                                   backend="ascend_tilelang", pdl=False)
+        if return_bnsd:
+            b, m, h, d = q.shape
+            out = out.view(b, m, h, d).transpose(1, 2)
+    if return_bnsd:
+        return out
     return out.reshape(q.shape[0], q.shape[1], -1)
+
+
+# The cache-attention metadata scope rides the prefix attention: models open it around their action loop so the
+# dense drop mask is built once per forward from the live flash mask instead of once per call. The torch
+# composition keeps a null context (the model's getattr default).
+_action_scope = getattr(attention, "action_scope", None) if attention is not None else None
+if callable(_action_scope):
+    prefix_kvcache_attention.action_scope = _action_scope
 
 
 # ---------------------------------------------------------------- Wall-X 2B attention family
@@ -171,8 +200,9 @@ def _segment_supported(q, k, v, cu_seqlens, *, scale=None):
                                 max_seqlen=_segment_longest(cu_seqlens), causal=False))
 
 
-@register("segment_attention", backend="ascend", requires=xc if callable(_attention_varlen) else None,
-          version=VERSION)
+@register("segment_attention", backend="ascend", priority=PRIORITY,
+          requires=xc if callable(_attention_varlen) else None,
+          version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.segment_attention, check=_segment_supported)
 def segment_attention(q, k, v, cu_seqlens, *, scale=None):
     t, heads, dim = q.shape
@@ -184,8 +214,41 @@ def segment_attention(q, k, v, cu_seqlens, *, scale=None):
 _bridge_gated_causal = getattr(attention, "gated_causal_attention", None) if attention is not None else None
 
 
-@register("gated_causal_attention", backend="ascend", requires=xc if callable(_attention_varlen) else None,
-          version=VERSION)
+def _gqa_bhsd():
+    import os
+
+    return "bhsd" in os.environ.get("XINFER_GQA_GLUE", "")
+
+
+def _gqa_causal_bnsd(q, k, v, scale):
+    """GQA-GLUE knife 1: dense causal FIA over head-major [H, L, D] GQA q/k/v.
+
+    A byte-for-byte copy of the bridge's ``causal_attention`` with the
+    single change that q/k/v are already head-major contiguous -- the three
+    materializing ``t.transpose(1, 2).contiguous()`` copies of the token-major
+    path disappear. Dense drop mask, workspace warm-cache machinery and the
+    FIA launch are identical; the output keeps the released transpose-view
+    tail (the caller's flatten + sigmoid*mul bytes are unchanged).
+    """
+    batch, length, dim = 1, q.shape[1], q.shape[2]
+    if scale is None:
+        scale = dim ** -0.5
+    key = attention._key("causal-bnsdq", q[None], k[None], scale)
+
+    query, keys, values = q[None], k[None], v[None]
+    with attention._lock:
+        drop_mask = attention._warmed(
+            ("mask", *key),
+            lambda: torch.ones((batch, 1, length, length), dtype=torch.bool, device=q.device).triu(1),
+        )
+        out = attention._run(query, keys, values, key, (drop_mask, scale, 0, 0),
+                             attention._bnsd_query, attention._bnsd_launch)
+    return out.transpose(1, 2)
+
+
+@register("gated_causal_attention", backend="ascend", priority=PRIORITY,
+          requires=xc if (callable(_attention_varlen) or _bridge_gated_causal is not None) else None,
+          version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.gated_causal_attention,
          check=lambda q, k, v, gate, *, scale=None: _packed_supported(q, k, v)
          and gate.dtype == torch.bfloat16 and gate.device == q.device
@@ -193,6 +256,20 @@ _bridge_gated_causal = getattr(attention, "gated_causal_attention", None) if att
          and (_bridge_gated_causal is not None
               or _varlen_accepts(q, k, v, seg_len=q.shape[0], causal=True, out_gate=gate)))
 def gated_causal_attention(q, k, v, gate, *, scale=None):
+    # Recover native head-major storage from the canonical token-major views.
+    bq, bk, bv = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+    if (_gqa_bhsd()
+            and q.ndim == 3 and q.shape[1] == 8 and bq.is_contiguous()
+            and k.ndim == 3 and k.shape[1] == 2 and bk.is_contiguous()
+            and v.shape == k.shape and bv.is_contiguous()
+            and q.dtype == torch.bfloat16 and k.dtype == q.dtype
+            and v.dtype == q.dtype and q.device.type == "npu"
+            and k.shape[0] == q.shape[0]
+            and torch.is_tensor(gate) and gate.dtype == torch.bfloat16
+            and tuple(gate.shape) == (q.shape[0], q.shape[1] * q.shape[2])
+            and gate.device == q.device):
+        out = _gqa_causal_bnsd(bq, bk, bv, scale)
+        return out[0].flatten(1) * torch.sigmoid(gate)
     # The entry expects one head count for queries and keys, as the reference's helper does: repeat the grouped
     # keys and values up to the query heads. One sequence per call, so the segment length is the row count; the
     # entry returns [T, H*D] with the gate applied, which is this operator's contract.
@@ -208,19 +285,41 @@ def gated_causal_attention(q, k, v, gate, *, scale=None):
     return _attention_varlen(q, k, v, seg_len=q.shape[0], causal=True, softmax_scale=scale, out_gate=gate)
 
 
-@register("gated_kvcache_attention", backend="ascend",
+@register("gated_kvcache_attention", backend="ascend", priority=PRIORITY,
           requires=xc if callable(native_cache) or raw_cache is not None else None,
-          version=VERSION)
+          version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.gated_kvcache_attention,
          check=lambda q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None:
          _cache_supported(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
          and gate.dtype == torch.bfloat16 and gate.device == q.device
          and gate.shape == (q.shape[0], q.shape[1], q.shape[2] * q.shape[3]))
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
-    # The same two steps as the reference — the cache attention, then the BF16 gated product — with the attention
-    # served by the native entry above instead of SDPA.
-    out = prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
-    return _sigmoid_gate(out, gate)
+    # FIA-FUSE (env XINFER_FIA_FUSE, default off): the 2B decode family takes the
+    # specialized scan+reduce pair that fuses the cache attention call and the
+    # gated pack tail; every other shape falls through unchanged.
+    from xinfer.ops.backends.ascend import fia_fuse_route
+
+    fused = fia_fuse_route.try_route(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask, scale)
+    if fused is not None:
+        return fused
+    out = prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask,
+                                  scale=scale, return_bnsd=True)
+    packed = gated_pack(out, gate)
+    if packed is not None:
+        return packed
+    batch, heads, rows, dim = out.shape
+    packed = torch.empty((batch, rows, heads * dim), dtype=out.dtype, device=out.device)
+    # Reuse the original folded tail: preserve the native output layout until the gated store.
+    torch.mul(out, torch.sigmoid(gate).view(batch, rows, heads, dim).transpose(1, 2),
+              out=packed.view(batch, rows, heads, dim).transpose(1, 2))
+    return packed
+
+
+# The same metadata scope the prefix entry carries: the Wall-X 2B action loop drives this operator
+# once per layer per flow step and opens the scope around the whole forward, so all of the loop's
+# calls share the one dense drop mask instead of each rebuilding it.
+if callable(_action_scope):
+    gated_kvcache_attention.action_scope = _action_scope
 
 
 def _sigmoid_gate(out, gate):
@@ -232,8 +331,8 @@ def _sigmoid_gate(out, gate):
     return (out.to(gate.dtype) * torch.sigmoid(gate)).to(out.dtype)
 
 
-@register("gated_delta_net", backend="ascend", requires=xc if _gated_delta_net is not None else None,
-          version=VERSION)
+@register("gated_delta_net", backend="ascend", priority=PRIORITY, requires=xc if _gated_delta_net is not None else None,
+          version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.gated_delta_net,
          check=lambda qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads,
          head_k_dim, head_v_dim, eps:
