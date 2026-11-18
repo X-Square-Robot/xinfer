@@ -87,8 +87,10 @@ def environment(npu: bool = False) -> dict:
     """Where the row was measured (device name comes from ``request_latency.py``)."""
     import torch
 
-    if npu:  # the external library the Ascend backend binds
-        library = os.environ.get("XINFER_XCOMPUTE_LIBRARY")
+    if npu:
+        from xinfer.ops.backends.ascend import _native
+
+        library = _native.LIBRARY_PATH
     else:  # the kernel library built from this repository
         from xinfer.ops.backends.cuda import _native
 
@@ -99,9 +101,24 @@ def environment(npu: bool = False) -> dict:
               "torch": torch.__version__, "kernel_library": library,
               "kernel_library_sha256": hashlib.sha256(Path(library).read_bytes()).hexdigest() if library else None}
     if npu:
-        from importlib.metadata import version
+        from importlib.metadata import PackageNotFoundError, version
+        from importlib.util import find_spec
 
         result["torch_npu"] = version("torch-npu")
+        try:
+            tilelang_version = version("tilelang")
+        except PackageNotFoundError:
+            tilelang_version = None
+        try:
+            ascend_jit_available = find_spec("tilelang.ascend.torch_exchange") is not None
+        except ImportError:
+            ascend_jit_available = False
+        jit_source = Path(_native.__file__).parent / "src" / "gemm" / "g2112_tilelang.py"
+        result["tilelang"] = dict(version=tilelang_version, ascend_available=ascend_jit_available,
+                                  jit_source=str(jit_source.resolve()),
+                                  jit_source_sha256=hashlib.sha256(jit_source.read_bytes()).hexdigest(),
+                                  bisheng_home=os.environ.get("BISHENG_HOME"),
+                                  cache_dir=os.environ.get("TILELANG_CACHE_DIR"))
     return result
 
 
