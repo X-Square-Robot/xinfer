@@ -174,57 +174,13 @@ _fused_projection = getattr(xc, "qkv_proj_rope", None) if xc is not None else No
 _qk_norm = getattr(xc, "QkNorm", None) if xc is not None else None
 
 
-# ``qkv_rope_kvcache`` takes the CANN action bridge first: its fused prefill finish (one staged pass for bias,
-# RoPE, the head-major K/V append and the Q write) and the M16 action epilogue are the wall-oss fast kernels,
-# and its Q returns in whichever layout the kernel writes — BNSD ``[H, M, D]`` for the fused routes, packed
-# ``[M, H·D]`` for compositions. The M16 route that rides the merged ``action_qkv_gemm_norm_rope`` entry
-# allocates a 2-D ``[16, 2048]`` buffer and writes it head-major (``H == M == 16`` makes the shape alone
-# ambiguous), so the form is disambiguated once per process against the reference composition and normalized
-# to the unambiguous 3-D BNSD view. The unified projection entry stays the fallback for builds and shapes
-# without the bridge (it serves the same call bit-exactly through its generic route, as the
-# reference-composed quick100 gate validated end to end).
-_m16_q_is_bnsd: bool | None = None
-
-
-def _normalize_m16_q(result, args):
-    """The M16 Q in its unambiguous form: 3-D BNSD ``[H, M, D]``, or the packed ``[M, H·D]`` rows as returned."""
-    global _m16_q_is_bnsd
-    x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim = args
-    if result.ndim != 2 or result.shape != (num_heads, num_heads * head_dim) or bias is None:
-        return result  # only the square M == H form is ambiguous; 3-D returns are already BNSD
-    if _m16_q_is_bnsd is None:
-        rows = result.shape[0]
-        # A synthetic probe (the live inputs could be degenerate enough to be permutation-invariant): the
-        # same M/N/K/cache layout the call came with, random values, its own cache clones.
-        generator = torch.Generator(device="cpu").manual_seed(20261113)
-        probe_x = torch.randn(rows, x.shape[1], generator=generator).to(x.dtype).to(x.device) * 0.5
-        probe_w = torch.randn(weight.shape, generator=generator).to(weight.dtype).to(weight.device) * 0.02
-        probe_bias = torch.randn(weight.shape[0], generator=generator).to(bias.dtype).to(bias.device) * 0.02
-        angles = torch.randn(rows, cos.shape[-1], generator=generator).to(cos.device) * 3
-        probe_cos, probe_sin = angles.cos().to(cos.dtype), angles.sin().to(sin.dtype)
-        probe_k, probe_v = k_cache.clone(), v_cache.clone()
-        native = native_cache(probe_x, probe_w, probe_bias, probe_cos, probe_sin, probe_k, probe_v, start,
-                              num_heads, num_kv_heads, head_dim)
-        probe_k2, probe_v2 = k_cache.clone(), v_cache.clone()
-        packed = reference.qkv_rope_kvcache(probe_x, probe_w, probe_bias, probe_cos, probe_sin, probe_k2, probe_v2,
-                                            start, num_heads, num_kv_heads, head_dim)
-        bnsd_read = native.view(num_heads, rows, head_dim).transpose(0, 1).reshape(rows, -1)
-        _m16_q_is_bnsd = bool((bnsd_read.float() - packed.float()).abs().max().item()
-                              <= (native.reshape(rows, -1).float() - packed.float()).abs().max().item())
-    if _m16_q_is_bnsd:
-        return result.view(num_heads, result.shape[0], head_dim)
-    return result
-
-
 @register("qkv_rope_kvcache", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
           requires=xc if callable(_fused_projection) or callable(native_cache) else None,
           version=VERSION, deterministic=False)
 @partial(reference.qkv_rope_kvcache)
 def qkv_rope_kvcache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim):
     if callable(native_cache):
-        result = native_cache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim)
-        return _normalize_m16_q(result, (x, weight, bias, cos, sin, k_cache, v_cache, int(start), num_heads,
-                                         num_kv_heads, head_dim))
+        return native_cache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim)
     return _fused_projection(x.contiguous(), weight, bias, cos=cos, sin=sin, rotary_dim=2 * cos.shape[-1],
                              num_heads=num_heads, num_kv_heads=num_kv_heads, head_dim=head_dim,
                              kv_cache=(k_cache, v_cache, int(start)), backend="auto")

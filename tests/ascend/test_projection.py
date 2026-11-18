@@ -102,3 +102,58 @@ def test_untuned_qkv_layout_uses_reference():
     actual = gemm.qkv_norm_split(packed, q_weight, k_weight, 2, 1, 2, 1e-6)
     for result, reference_value in zip(actual, expected):
         torch.testing.assert_close(result, reference_value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused_first", [False, True], ids=["packed-first", "head-major-first"])
+def test_m16_qkv_layout_is_specific_to_each_call(monkeypatch, fused_first):
+    from xinfer.ops.backends.ascend import cann_action, gemm
+
+    rows, heads, kv_heads, head_dim, start = 16, 16, 2, 128, 768
+    q_width, kv_width = heads * head_dim, kv_heads * head_dim
+    width = q_width + 2 * kv_width
+    projected = torch.arange(rows, dtype=torch.float32)[:, None] + torch.arange(width) / 32
+    expected_q, expected_k, expected_v = projected.bfloat16().split((q_width, kv_width, kv_width), dim=1)
+    expected_head_major_q = expected_q.view(rows, heads, head_dim).transpose(0, 1)
+    expected_k = expected_k.view(rows, kv_heads, head_dim).transpose(0, 1)
+    expected_v = expected_v.view(rows, kv_heads, head_dim).transpose(0, 1)
+    calls = []
+
+    @contextmanager
+    def accumulate(x, weight):
+        calls.append("project")
+        yield projected
+
+    def launch(lib, name, tensors, scalars):
+        calls.append(name)
+        assert scalars == (start + rows, start)
+        q, keys, values, *_ = tensors
+        q.view(heads, rows, head_dim).copy_(expected_head_major_q)
+        keys[:, start:].copy_(expected_k)
+        values[:, start:].copy_(expected_v)
+
+    action = cann_action.CannAction.__new__(cann_action.CannAction)
+    action._accumulator = accumulate
+    action._rotary = None
+    action._use_qk_rms = False
+    action._qkv_bias_rope_prefill = None
+    action._qkv_bias_rope_m16 = None
+    monkeypatch.setattr(action, "_check_qkv", lambda *args, **kwargs: (rows, width))
+    monkeypatch.setattr(gemm, "native_cache", action.qkv_rope_kvcache)
+    monkeypatch.setattr(_native, "core_library", lambda: object())
+    monkeypatch.setattr(core, "_launch", launch)
+
+    x = torch.zeros(rows, 1024, dtype=torch.bfloat16)
+    weight = torch.zeros(width, 1024, dtype=torch.bfloat16)
+    cos, sin = torch.ones(rows, head_dim // 2), torch.zeros(rows, head_dim // 2)
+    for fused in (fused_first, not fused_first):
+        bias = torch.zeros(width, dtype=torch.bfloat16 if fused else torch.float32)
+        keys = torch.zeros(kv_heads, start + rows, head_dim, dtype=torch.bfloat16)
+        values = torch.zeros_like(keys)
+        q = gemm.qkv_rope_kvcache(x, weight, bias, cos, sin, keys, values, start, heads, kv_heads, head_dim)
+        torch.testing.assert_close(q, expected_head_major_q if fused else expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(keys[:, start:], expected_k, rtol=0, atol=0)
+        torch.testing.assert_close(values[:, start:], expected_v, rtol=0, atol=0)
+
+    fused_calls = ["project", "gemm_qkv_cache_bias_rope_m16"]
+    packed_calls = ["project"]
+    assert calls == (fused_calls + packed_calls if fused_first else packed_calls + fused_calls)

@@ -665,7 +665,11 @@ class CannAction:
         num_kv_heads,
         head_dim,
     ):
-        """Project BF16 rows, apply FP32 bias and RoPE, and append BF16 K/V."""
+        """Project BF16 rows, apply FP32 bias and RoPE, and append BF16 K/V.
+
+        Fused finishes return head-major Q ``[H, M, D]``. The composed path
+        returns packed token rows ``[M, H*D]``.
+        """
         m, n = self._check_qkv(
             x,
             weight,
@@ -721,7 +725,7 @@ class CannAction:
                 # The fused M16 epilogue rides the NV-named entry's cache-append
                 # form: input=FP32 accumulator, q/k_weight=K/V caches,
                 # rotary=start row, epsilon=0 (weight is not re-read).
-                query = x.new_empty((16, 2048))
+                query = x.new_empty((num_heads, m, head_dim))
                 CORE.action_qkv_gemm_norm_rope(
                     query, projected, weight, bias, k_cache, v_cache, cos, sin,
                     int(start), 0.0,
