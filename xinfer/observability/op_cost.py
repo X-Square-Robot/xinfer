@@ -283,6 +283,7 @@ FORMULAS: dict[str, Callable[..., OpCost]] = {formula.__name__: formula for form
     nvfp4_gemm, nvfp4_gemm_epilogue, nvfp4_gemm_glu_quantize, nvfp4_qkv_rope_epilogue, gemm_epilogue,
     gemm_glu_epilogue, gemm_add_rms_norm, mlp_add_rms_norm, qkv_rope_epilogue, qkv_rope_kvcache,
     prefix_kvcache_attention, flow_velocity_euler)}
+FORMULAS["qkv_rope_split"] = qkv_rope_epilogue
 
 
 def op_cost(name: str, args: tuple, kwargs: Mapping[str, object], outputs) -> OpCost:

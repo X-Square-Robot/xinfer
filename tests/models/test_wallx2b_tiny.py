@@ -124,33 +124,72 @@ def test_the_optimized_composition_is_the_default(tiny_optimized):
     assert tiny_optimized.numerics == "optimized"
 
 
-@pytest.mark.parametrize("platform_name,split", [("cuda-sm120", False), ("ascend-950dt9582", True)])
-def test_bf16_vision_and_prefill_use_the_selected_projection_ops(tiny, platform_name, split):
+def test_bf16_vision_uses_the_selected_projection_op(tiny, split_vision_ops):
     from xinfer.models.wallx2b.model import Wallx2b
 
-    qkv_calls, scaled_calls = set(), set()
+    qkv_calls = set()
 
     def record(implementation):
         def call(*args, **kwargs):
             if implementation.op in ("qkv_rope_split", "qkv_rope_epilogue"):
-                qkv_calls.add(implementation.op)
-            if "row_scale" in kwargs:
-                scaled_calls.add(implementation.op)
+                qkv_calls.add((implementation.op, implementation.backend))
             return implementation.function(*args, **kwargs)
 
         return call
 
-    table = ops.registry.build_table(resolve_platform("cpu"))
-    table.platform_name = platform_name
-    with ops.use_ops(table.wrapped(record)):
+    with ops.use_ops(split_vision_ops.wrapped(record)):
         model = Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu")
-    _sample(model, _inputs(model))
-    vision_op = "qkv_rope_split" if split else "qkv_rope_epilogue"
-    assert qkv_calls == {vision_op}
-    assert scaled_calls == {"gemm_split" if split else "gemm_epilogue"}
+    _run(model, "vision", _inputs(model))
+    assert qkv_calls == {("qkv_rope_split", "test-vision")}
     stages = model.capabilities().stage_ops
-    assert set(stages["vision"]) & {"qkv_rope_split", "qkv_rope_epilogue"} == {vision_op}
-    assert ("gemm_split" in stages["prefill"]) == split
+    assert set(stages["vision"]) & {"qkv_rope_split", "qkv_rope_epilogue"} == {"qkv_rope_split"}
+
+
+def test_bf16_prefill_uses_the_selected_split_and_layer_norms(tiny):
+    from xinfer.models.wallx2b.model import Wallx2b
+
+    registry = ops.OpRegistry()
+    for name in ops.registry.names():
+        registry.define(ops.registry.spec(name))
+    split_ref = registry.spec("gemm_split").reference
+    norm_ref = registry.spec("add_zero_centered_rms_norm").reference
+    split_calls, bindings, norm_calls = [], [], []
+
+    def split(x, weight, split_size, *, row_scale=None):
+        assert row_scale is not None
+        split_calls.append(split_size)
+        return split_ref(x, weight, split_size, row_scale=row_scale)
+
+    def norm(x, residual, weight, eps):
+        pytest.fail("prefill called the unbound residual norm")
+
+    def bind_norm(*, layer_index):
+        bindings.append(layer_index)
+
+        def bound(x, residual, weight, eps):
+            norm_calls.append(layer_index)
+            return norm_ref(x, residual, weight, eps)
+
+        return bound
+
+    norm.bind = bind_norm
+    for name, implementation in (("gemm_split", split), ("add_zero_centered_rms_norm", norm)):
+        registry.add(name, implementation, backend="test-prefill", platforms=("cpu",),
+                     contract=ops.Contract(numerics="bitwise"))
+    pins = dict.fromkeys(("gemm_split", "add_zero_centered_rms_norm"), "test-prefill")
+    table = registry.build_table(resolve_platform("cpu"), backends=pins, reference_only=True)
+    with ops.use_ops(table):
+        model = Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu")
+
+    prefill = model.prefill_stack
+    assert bindings == list(range(len(prefill.layers)))
+    inputs = _inputs(model)
+    inputs["image_embeds"] = _run(model, "vision", inputs)["image_embeds"]
+    _run(model, "prefill", inputs)
+    layer_types = prefill.config.layer_types[:len(prefill.layers)]
+    assert split_calls == [prefill.conv_dim] * layer_types.count("linear_attention")
+    assert norm_calls == [i for i in range(len(prefill.layers) - 1) for _ in range(2)]
+    assert set(pins) <= set(model.capabilities().stage_ops["prefill"])
 
 
 @pytest.mark.parametrize("size", [2, 4])

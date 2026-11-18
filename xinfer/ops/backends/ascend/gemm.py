@@ -124,16 +124,20 @@ def mlp_add_rms_norm(x, gate_up, down, residual, weight, eps):
     return gemm_add_rms_norm(gemm_glu_epilogue(x, gate_up), down, residual, weight, eps)
 
 
-@register("qkv_rope_epilogue", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
-          requires=xc if callable(native_qkv) else None,
-          version=VERSION)
 @partial(reference.qkv_rope_epilogue)
-def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
+def _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order):
     return native_qkv(x, weight, bias, cos, sin, num_heads, head_dim)  # the standard order serves "any" too
 
 
+@register("qkv_rope_epilogue", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,
+          requires=xc if callable(native_qkv) else None,
+          version=VERSION)
+def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
+    return _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+
+
 def _qkv_rope_split_fallback(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
-    out = qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+    out = _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
     from xinfer.ops.backends.ascend.copykill_r2 import enabled
 
     if enabled("k3"):

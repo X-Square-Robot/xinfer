@@ -102,6 +102,7 @@ FORMULA_CASES = {
 
 
 def test_formulas_are_registered_operators_with_the_reference_parameters():
+FORMULA_CASES["qkv_rope_split"] = FORMULA_CASES["qkv_rope_epilogue"]
     assert set(FORMULA_CASES) == set(FORMULAS) and set(FORMULAS) <= set(ops.registry.names())
     for name, formula in FORMULAS.items():
         reference = ops.registry.spec(name).reference

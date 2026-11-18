@@ -136,8 +136,8 @@ def test_engine_runs_three_stages(composition):
     assert torch.isfinite(out["predict_action"]).all()
 
 
-@pytest.mark.parametrize("platform_name,split", [("cuda-sm120", False), ("ascend-950dt9582", True)])
-def test_optimized_ops_follow_the_selected_projection_and_mask_route(tiny, platform_name, split):
+@pytest.mark.parametrize("platform_name,ascend", [("test-cpu", False), ("ascend-950dt", True)])
+def test_optimized_ops_follow_the_selected_projection_and_mask_route(tiny, split_vision_ops, platform_name, ascend):
     from xinfer.models.wall_oss.model import WallOSS
 
     vision_calls, mask_calls = set(), set()
@@ -145,27 +145,25 @@ def test_optimized_ops_follow_the_selected_projection_and_mask_route(tiny, platf
     def record(implementation):
         def call(*args, **kwargs):
             if implementation.op in ("qkv_rope_split", "qkv_rope_epilogue"):
-                vision_calls.add(implementation.op)
-            if implementation.op == "prefix_kvcache_attention":
-                mask_calls.add((kwargs["all_keep"], kwargs["flash_mask"] is None))
+                vision_calls.add((implementation.op, implementation.backend))
+            if implementation.op in ("prefix_kvcache_attention", "prefix_kvcache_attention_bnsd"):
+                mask_calls.add((kwargs.get("all_keep", False), kwargs["flash_mask"] is None))
             return implementation.function(*args, **kwargs)
 
         return call
 
     platform = resolve_platform("cpu")
-    table = ops.registry.build_table(platform)
-    table.platform_name = platform_name
-    with ops.use_ops(table.wrapped(record)):
+    split_vision_ops.platform_name = platform_name
+    with ops.use_ops(split_vision_ops.wrapped(record)):
         model = WallOSS.from_checkpoint(tiny.root, device="cpu", processing={"prompt_bucket": 0})
     request = _request(model)
     request.tensors["mask_all_keep"] = True
     Engine(model, platform).run(request)
-    vision_op = "qkv_rope_split" if split else "qkv_rope_epilogue"
-    assert vision_calls == {vision_op}
+    assert vision_calls == {("qkv_rope_split", "test-vision")}
     stages = model.capabilities().stage_ops
-    assert set(stages["vision"]) & {"qkv_rope_split", "qkv_rope_epilogue"} == {vision_op}
-    assert ("gemm_add_rms_norm" in stages["action"]) == split
-    assert mask_calls == {(split, split)}
+    assert set(stages["vision"]) & {"qkv_rope_split", "qkv_rope_epilogue"} == {"qkv_rope_split"}
+    assert ("gemm_add_rms_norm" in stages["action"]) == ascend
+    assert mask_calls == {(ascend, ascend)}
 
 
 def test_split_equals_joint_prefill_action_forward(tiny):

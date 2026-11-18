@@ -29,13 +29,15 @@ def test_split_projections_keep_the_existing_rounding_and_values():
 def test_cuda_split_adapters_reuse_the_existing_entries(monkeypatch):
     from xinfer.ops.backends.cuda import gemm
 
-    monkeypatch.setattr(gemm, "qkv_rope_epilogue", reference.qkv_rope_epilogue)
-    monkeypatch.setattr(gemm, "gemm_epilogue", reference.gemm_epilogue)
-    x, weight, bias = torch.ones(5, 16).bfloat16(), torch.ones(48, 16).bfloat16(), torch.zeros(48).bfloat16()
+    x, weight, bias = torch.ones(5, 16).bfloat16(), torch.ones(48, 16).bfloat16(), torch.arange(48).bfloat16()
     cos, sin = torch.ones(5, 4), torch.zeros(5, 4)
+    packed = reference.qkv_rope_epilogue(x, weight, bias, cos, sin, 2, 8)
+    monkeypatch.setattr(gemm, "qkv_proj_rope", lambda *args, **kwargs: packed)
+    monkeypatch.setattr(gemm, "gemm_epilogue", reference.gemm_epilogue)
+    assert gemm.qkv_rope_epilogue(x, weight, bias, cos, sin, 2, 8) is packed
     q, k, v = gemm.qkv_rope_split(x, weight, bias, cos, sin, 2, 8)
     assert q.stride() == (48, 8, 1)  # the existing CUDA path's views, without a packing copy
-    assert torch.equal(q, k) and torch.equal(k, v)
+    torch.testing.assert_close(torch.stack((q, k, v), 1).reshape_as(packed), packed, rtol=0, atol=0)
     left, right = gemm.gemm_split(x, weight, 32)
     torch.testing.assert_close(torch.cat((left, right), 1), reference.gemm_epilogue(x, weight), rtol=0, atol=0)
 

@@ -409,9 +409,11 @@ def test_explicit_operator_exports_run_without_optional_cann_dependencies(isolat
 
     monkeypatch.setattr(_support, "bridge", unavailable_bridge)
     load()
-    table = registry.build_table(_platform())
+    qkv_pins = dict.fromkeys(("qkv_rope_epilogue", "qkv_rope_split"), "ascend:kernels")
+    table = registry.build_table(_platform(), backends=qkv_pins)
     cuda = registry.build_table(_platform("cuda", "sm120"))
     assert all(table.selection(name).name == "ascend:kernels" for name in names)
+    assert table.selection("qkv_rope_split").name == "ascend:kernels"
     assert all(cuda.selection(name).backend == "reference" for name in names)
     rng = torch.Generator().manual_seed(73)
 
@@ -435,6 +437,10 @@ def test_explicit_operator_exports_run_without_optional_cann_dependencies(isolat
                                         torch.tensor([1], dtype=torch.int32), 2), {}),
         "add_rms_norm": ((x, tensor(2, 3), torch.ones(3), 1e-6), {}),
     }
+    qkv_args, qkv_options = calls["qkv_rope_epilogue"]
+    packed_qkv = table.qkv_rope_epilogue(*qkv_args, **qkv_options)
+    expected_split = packed_qkv.view(2, 3, 2, 4).unbind(1)
+    torch.testing.assert_close(table.qkv_rope_split(*qkv_args, **qkv_options), expected_split, atol=0, rtol=0)
     for name, (args, options) in calls.items():
         copied = tuple(value.clone() if torch.is_tensor(value) else value for value in args)
         expected = ops.registry.spec(name).reference(*copied, **options)

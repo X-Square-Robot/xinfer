@@ -134,6 +134,10 @@ def qkv_rope_epilogue(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
     Returns:
         ``[M, 3·H·D]`` in ``x.dtype``.
     """
+    return _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+
+
+def _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order):
     if qk_order not in ("standard", "any"):
         raise ValueError(f"qkv_rope_epilogue: qk_order must be 'standard' or 'any', got {qk_order!r}")
     y = x.float() @ weight.float().t() + bias.float()
@@ -149,7 +153,7 @@ def qkv_rope_split(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, co
     projection may write separate Q/K/V planes directly. RoPE tables are immutable while reused
     across a forward, so a backend may cache their expanded representation for their lifetime.
     """
-    out = qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+    out = _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
     return out.view(x.shape[0], 3, num_heads, head_dim).unbind(1)
 
 

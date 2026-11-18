@@ -80,10 +80,7 @@ class OptimizedVision(nn.Module):
         self.register_buffer("inv_freq", 1.0 / (c.rope_theta ** (torch.arange(0, half, 2, dtype=torch.float) / half)),
                              persistent=False)
         self.ops = active_ops()
-        self._ascend = self.ops.platform_name.startswith("ascend-")
         self.stage_ops = OPTIMIZED_STAGE_OPS["vision"]
-        if not self._ascend:
-            self.stage_ops = tuple("qkv_rope_epilogue" if op == "qkv_rope_split" else op for op in self.stage_ops)
 
     def forward(self, pixel_values, layout):
         """Image token embeddings (see ``VisionTower.forward``; the same layout and output order).
@@ -107,13 +104,8 @@ class OptimizedVision(nn.Module):
         normed = ops.rms_norm(x, self.blocks[0].norm1, eps)
         for i, block in enumerate(self.blocks):
             cu_seqlens = layout["cu_full"] if i in c.fullatt_block_indexes else layout["cu_window"]
-            if self._ascend:
-                q, k, v = ops.qkv_rope_split(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d,
-                                             qk_order="any")
-            else:
-                qkv = ops.qkv_rope_epilogue(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d,
-                                            qk_order="any")
-                q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+            q, k, v = ops.qkv_rope_split(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d,
+                                         qk_order="any")
             o = ops.varlen_attention(q, k, v, cu_seqlens).reshape(n, -1)
             x, normed = ops.gemm_add_rms_norm(o, block.proj_weight, x, block.norm2, eps, bias=block.proj_bias)
             hidden = ops.gemm_glu_epilogue(normed, block.gate_up_weight, bias=block.gate_up_bias)
