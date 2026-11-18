@@ -124,6 +124,63 @@ def test_the_optimized_composition_is_the_default(tiny_optimized):
     assert tiny_optimized.numerics == "optimized"
 
 
+@pytest.mark.parametrize("platform_name,split", [("cuda-sm120", False), ("ascend-950dt9582", True)])
+def test_bf16_vision_and_prefill_use_the_selected_projection_ops(tiny, platform_name, split):
+    from xinfer.models.wallx2b.model import Wallx2b
+
+    qkv_calls, scaled_calls = set(), set()
+
+    def record(implementation):
+        def call(*args, **kwargs):
+            if implementation.op in ("qkv_rope_split", "qkv_rope_epilogue"):
+                qkv_calls.add(implementation.op)
+            if "row_scale" in kwargs:
+                scaled_calls.add(implementation.op)
+            return implementation.function(*args, **kwargs)
+
+        return call
+
+    table = ops.registry.build_table(resolve_platform("cpu"))
+    table.platform_name = platform_name
+    with ops.use_ops(table.wrapped(record)):
+        model = Wallx2b.from_checkpoint(tiny.checkpoint, device="cpu")
+    _sample(model, _inputs(model))
+    vision_op = "qkv_rope_split" if split else "qkv_rope_epilogue"
+    assert qkv_calls == {vision_op}
+    assert scaled_calls == {"gemm_split" if split else "gemm_epilogue"}
+    stages = model.capabilities().stage_ops
+    assert set(stages["vision"]) & {"qkv_rope_split", "qkv_rope_epilogue"} == {vision_op}
+    assert ("gemm_split" in stages["prefill"]) == split
+
+
+@pytest.mark.parametrize("size", [2, 4])
+def test_explicit_action_batch_preserves_individual_rtc_requests(tiny_optimized, size):
+    from xinfer.config import ExplicitSettings, resolve
+    from xinfer.engine.batching import merge, ragged_inputs
+
+    model = tiny_optimized
+    default = resolve(model, resolve_platform("cpu"), model_name="wallx2b", tuned=None)
+    assert default.value("batch_sizes.action") == [1]
+    selected = resolve(model, resolve_platform("cpu"), model_name="wallx2b", tuned=None,
+                       explicit=ExplicitSettings(max_batch={"action": size}))
+    assert max(selected.value("batch_sizes.action")) == size
+    inputs, expected = [], []
+    for index in range(size):
+        value = _inputs(model, rtc_delay=index + 1, seed=index)
+        value["image_embeds"] = _run(model, "vision", value)["image_embeds"]
+        value["prompt_kv"] = _run(model, "prefill", value)["prompt_kv"]
+        expected.append(_run(model, "action", value)["predict_action_norm"])
+        inputs.append(value)
+    axes = dict(model.batch_axes, prompt_kv=2)
+    merged = merge(inputs, axes, ragged_inputs(model, "action"))
+    result = torch.empty(size, H, D)
+    with torch.no_grad():
+        model.denoise(StageBatch("action", size, merged, {"predict_action_norm": result}))
+    torch.testing.assert_close(result, torch.cat(expected), rtol=1e-3, atol=1e-4)
+    for index in range(size):
+        assert torch.equal(result[index, :index + 1], inputs[index]["rtc_actions"][0, :index + 1])
+
+
 def test_quantization_selects_only_the_requested_stage(tiny):
     from xinfer.models.wallx2b.model import Wallx2b
 
@@ -248,3 +305,35 @@ def test_warmed_prompt_buckets_replay_without_capture(tiny):
     finally:
         engine.shutdown()
         eager.shutdown()
+
+
+def test_prefill_with_as_many_tokens_as_kv_heads():
+    from types import SimpleNamespace
+
+    from xinfer.models.wallx.optimized import OptimizedPrefill
+    from xinfer.ops.reference.gemm import qkv_norm_split
+    from xinfer.ops.reference.rope import rope_full
+
+    config = SimpleNamespace(hidden_size=8, intermediate_size=8, num_attention_heads=4,
+                             num_key_value_heads=2, head_dim=2, rotary_dim=2,
+                             linear_heads=(1, 1, 2, 2, 3), layer_types=('full_attention',),
+                             full_attention_layers=(0,), rms_norm_eps=1e-6)
+    with ops.use_ops(ops.registry.build_table(resolve_platform('cpu'))):
+        model = OptimizedPrefill(config).to_empty(device='cpu')
+    with torch.no_grad():
+        layer = model.layers[0]
+        layer.input_norm.zero_()
+        layer.q_norm.zero_()
+        layer.k_norm.zero_()
+        layer.qkv.copy_(torch.arange(layer.qkv.numel()).view_as(layer.qkv) * 0.01)
+        h = torch.arange(16, dtype=torch.bfloat16).view(1, 2, 8) * 0.1
+        cos, sin = torch.ones(1, 2, 1), torch.zeros(1, 2, 1)
+        _, x = model._norm(h, layer.input_norm, 'full_attention')
+        q, k, v, _ = qkv_norm_split(model._qkv(x, layer).view(1, 2, -1), layer.q_norm,
+                                    layer.k_norm, 4, 2, 2, 1e-6)
+        _, k = rope_full(q, k, cos, sin, 2)
+        assert not torch.equal(v, v.transpose(1, 2))
+        cache = torch.empty(1, 2, 1, 2, 2, 2, dtype=torch.bfloat16)
+        model(h, cos, sin, cache, torch.ones(2))
+    assert torch.equal(cache[0, 0], k.transpose(1, 2))
+    assert torch.equal(cache[0, 1], v.transpose(1, 2))

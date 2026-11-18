@@ -248,15 +248,16 @@ class Capabilities:
     settings; it and the engine call ``VLAModel.capabilities()`` once at startup.
 
     Attributes:
-        batch_sizes: per stage, the batch sizes its method accepts; the stage batches up to the largest by
-            default. Size 1 is always allowed; a stage missing from the mapping is treated as B1 only. A model
-            declares sizes above 1 only for a stage whose batched results pass its precision gate.
+        batch_sizes: per stage, the batch sizes its method accepts. Size 1 is always allowed; a stage missing
+            from the mapping is treated as B1 only. A model declares sizes above 1 only for a stage whose
+            batched results pass its precision gate.
         num_steps: denoising steps of the action stage, as declared by the model (the v1 runtime
             does not read it).
         rtc: whether the model accepts real-time-chunking requests.
         rtc_delay_range: inclusive range of accepted RTC inference delays, when ``rtc`` is True.
         stage_ops: per stage, the operators its method calls. ``Policy`` and ``xinfer-serve`` warn at startup
             when one of them has no backend kernel loaded and runs on a fused operator's torch reference.
+        default_batch_sizes: optional subset for stages that require an explicit opt-in to larger sizes.
     """
 
     batch_sizes: Mapping[str, tuple[int, ...]]
@@ -265,6 +266,7 @@ class Capabilities:
     rtc_delay_range: tuple[int, int] | None = None  # inclusive, when rtc is True
     # Operators each stage calls, for the startup check of slow fallbacks.
     stage_ops: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    default_batch_sizes: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

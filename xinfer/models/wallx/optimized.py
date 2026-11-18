@@ -26,9 +26,11 @@ from xinfer.loader import Source
 from xinfer.ops import active_ops
 
 DTYPE = torch.bfloat16
-VISION_STAGE_OPS = ("gemm_epilogue", "qkv_rope_epilogue", "layer_norm_cast", "pos_embed_interp", "rot_pos",
+
+
+VISION_STAGE_OPS = ("gemm_epilogue", "qkv_rope_split", "layer_norm_cast", "pos_embed_interp", "rot_pos",
                     "segment_attention")
-PREFILL_STAGE_OPS = ("gemm_epilogue", "gemm_glu_epilogue", "linear", "zero_centered_rms_norm",
+PREFILL_STAGE_OPS = ("gemm_epilogue", "gemm_split", "gemm_glu_epilogue", "linear", "zero_centered_rms_norm",
                      "add_zero_centered_rms_norm", "qkv_norm_split", "rope_full", "gated_causal_attention",
                      "gated_delta_net")
 # With MXFP8 GEMMs (``quant="mxfp8"``): the patch embedding and the merger stay BF16
@@ -50,7 +52,6 @@ PREFILL_STAGE_OPS_NVFP4 = ("gemm_epilogue", "zero_centered_rms_norm", "add_zero_
 QUANT_METHODS = ("mxfp8", "nvfp4", "nvfp4_mse")  # the GEMM formats of a stage; None: BF16
 
 
-
 class _FormatStage(nn.Module):
     """A stage whose GEMMs run in one format: BF16 (``quant`` None), MXFP8 or NVFP4 (``"nvfp4"``, ``"nvfp4_mse"``)."""
 
@@ -61,6 +62,7 @@ class _FormatStage(nn.Module):
         self.quant = quant
         self.fmt = None if quant is None else "mxfp8" if quant == "mxfp8" else "nvfp4"
         self.ops = active_ops()
+        self._ascend_bf16 = self.fmt is None and self.ops.platform_name.startswith("ascend-")
 
     def _op(self, name: str):
         """The operator ``name`` of the format: ``name`` in BF16, else ``mxfp8_name`` or ``nvfp4_name``."""
@@ -91,6 +93,8 @@ class OptimizedVision(_FormatStage):
         self.config = c = config
         self.stage_ops = {None: VISION_STAGE_OPS, "mxfp8": VISION_STAGE_OPS_MXFP8,
                           "nvfp4": VISION_STAGE_OPS_NVFP4}[self.fmt]
+        if self.fmt is None and not self._ascend_bf16:
+            self.stage_ops = tuple("qkv_rope_epilogue" if op == "qkv_rope_split" else op for op in self.stage_ops)
         h, i = c.hidden_size, c.intermediate_size
         self.patch = ParamGroup(weight=(h, c.in_features), bias=(h,))
         self.pos_embed = _meta_param(c.num_position_embeddings, h)
@@ -136,14 +140,17 @@ class OptimizedVision(_FormatStage):
     def _block(self, block, x, cos, sin, cu_seqlens):
         """One ViT block. With MXFP8 or NVFP4 GEMMs every GEMM input is the BF16 tensor of the BF16 block, quantized:
         the LayerNorms and fc1 write the next GEMM's quantized input, the attention output is quantized for the
-        projection."""
+        projection. The Ascend BF16 QKV split returns separate views without prescribing their strides."""
         c, ops = self.config, self.ops
         n, h, heads, d = x.shape[0], c.hidden_size, c.num_heads, c.head_dim
         norm = ops.layer_norm_cast if self.fmt is None else self._op("layer_norm_quantize")
         normed = norm(x, block.norm1_weight, block.norm1_bias, c.eps)
-        qkv = self._op("qkv_rope_epilogue")(normed, self._weight(block, "qkv_weight"), block.qkv_bias, cos, sin, heads,
-                                            d)
-        q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+        if self._ascend_bf16:
+            q, k, v = ops.qkv_rope_split(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d)
+        else:
+            qkv = self._op("qkv_rope_epilogue")(normed, self._weight(block, "qkv_weight"), block.qkv_bias, cos, sin,
+                                                heads, d)
+            q, k, v = qkv.view(n, 3, heads, d).unbind(1)
         o = ops.segment_attention(q, k, v, cu_seqlens, scale=d ** -0.5).reshape(n, h)
         x = self._gemm(o, block, "proj_weight", block.proj_bias, residual=x)
         normed = norm(x, block.norm2_weight, block.norm2_bias, c.eps)
@@ -175,6 +182,8 @@ class OptimizedPrefill(_FormatStage):
         self.config = c = config
         self.stage_ops = {None: PREFILL_STAGE_OPS, "mxfp8": PREFILL_STAGE_OPS_MXFP8,
                           "nvfp4": PREFILL_STAGE_OPS_NVFP4}[self.fmt]
+        if self.fmt is None and not self._ascend_bf16:
+            self.stage_ops = tuple(op for op in self.stage_ops if op != "gemm_split")
         hk, hv, dk, dv, kernel = c.linear_heads
         d, heads, kv = c.hidden_size, c.num_attention_heads, c.num_key_value_heads
         self.conv_dim = conv = 2 * hk * dk + hv * dv  # the DeltaNet convolution's channels: [q | k | v]
@@ -189,6 +198,8 @@ class OptimizedPrefill(_FormatStage):
                 shapes.update(qkv_zba=(conv + hv * dv + 2 * hv, d), conv_weight=(conv, kernel), A_log=(hv,),
                               dt_bias=(hv,), norm_weight=(dv,), out=(d, hv * dv))
             self.layers.append(ParamGroup(**shapes))
+        self._residual_norms = tuple(self.ops.bind("add_zero_centered_rms_norm", layer_index=i)
+                                    for i in range(len(self.layers))) if self._ascend_bf16 else ()
 
     def forward(self, h, cos, sin, prompt_kv, keep):
         """Run the prompt stream and write the post-RoPE K and the V of every full-attention layer.
@@ -213,8 +224,8 @@ class OptimizedPrefill(_FormatStage):
         h, x = self._norm(h, self.layers[0].input_norm, c.layer_types[0])
         for i, layer in enumerate(self.layers):
             if c.layer_types[i] == "full_attention":
-                q, k, v, gate = ops.qkv_norm_split(self._qkv(x, layer).view(1, p, -1), layer.q_norm, layer.k_norm,
-                                                   heads, kv_heads, d, eps)
+                q, k, v, gate = ops.qkv_norm_split(self._qkv(x, layer).view(1, p, -1), layer.q_norm,
+                                                   layer.k_norm, heads, kv_heads, d, eps)
                 q, k = ops.rope_full(q, k, cos, sin, c.rotary_dim)
                 slot = full.index(i)
                 prompt_kv[slot, 0].copy_(k.transpose(1, 2))
@@ -228,10 +239,11 @@ class OptimizedPrefill(_FormatStage):
                 o = ops.gated_delta_net(qkv.view(1, p, -1), zba.view(1, p, -1), layer.conv_weight, layer.A_log,
                                         layer.dt_bias, layer.norm_weight, hk, hv, dk, dv, eps)
                 mixed = self._gemm(o.view(p, -1), layer, "out")
-            h, x = self._norm(h, layer.post_norm, "mlp", mixed)
-            h, x = self._norm(h, self.layers[i + 1].input_norm, c.layer_types[i + 1], self._mlp(x, layer))
+            h, x = self._norm(h, layer.post_norm, "mlp", mixed, layer_idx=i)
+            h, x = self._norm(h, self.layers[i + 1].input_norm, c.layer_types[i + 1], self._mlp(x, layer),
+                              layer_idx=i)
 
-    def _norm(self, h, weight, consumer: str, branch=None):
+    def _norm(self, h, weight, consumer: str, branch=None, layer_idx=-1):
         """Add ``branch`` (``[P, hidden]``, None for the first layer) to the stream ``h`` (``[1, P, hidden]``) and
         give the zero-centered RMSNorm of the sum in the form ``consumer`` (a layer type or ``"mlp"``) takes: BF16
         ``[P, hidden]``, or its MXFP8 or NVFP4. NVFP4 gives a DeltaNet layer the BF16 norm (``_delta_input``).
@@ -242,7 +254,8 @@ class OptimizedPrefill(_FormatStage):
             branch = branch.view(h.shape)
             if quantized:
                 return self._op("add_zero_centered_rms_norm_quantize")(branch, h, weight, eps)
-            h, normed = ops.add_zero_centered_rms_norm(branch, h, weight, eps)
+            norm = self._residual_norms[layer_idx] if self._ascend_bf16 else ops.add_zero_centered_rms_norm
+            h, normed = norm(branch, h, weight, eps)
         elif quantized and self.fmt == "mxfp8":
             return h, ops.mxfp8_zero_centered_rms_norm_quantize(h, weight, eps)
         else:
@@ -263,7 +276,9 @@ class OptimizedPrefill(_FormatStage):
         if self.fmt == "nvfp4":
             masked = x * rows
             return self._gemm(masked, layer, "qkv"), self.ops.gemm_epilogue(masked, layer.zba)
-        # BF16 scales the output rows by keep, MXFP8 masks the quantized input's rows
+        # BF16 scales output rows before the single rounding; MXFP8 masks quantized input rows.
+        if self._ascend_bf16:
+            return self.ops.gemm_split(x, layer.qkv_zba, self.conv_dim, row_scale=rows)
         padding = dict(row_scale=rows) if self.fmt is None else dict(row_mask=rows)
         qkv_zba = self._gemm(x, layer, "qkv_zba", **padding)
         return qkv_zba[:, :self.conv_dim], qkv_zba[:, self.conv_dim:]

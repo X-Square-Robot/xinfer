@@ -86,6 +86,7 @@ class Wallx2b(WallXQwen35):
     action expert: ``FlowHead``, the action stage with RTC and the processing.
     """
 
+    batch_axes = {"action_positions": 1}
     config_class = Wallx2bConfig
 
     @classmethod
@@ -155,12 +156,14 @@ class Wallx2b(WallXQwen35):
             self.config.max_seq_length - self.config.action_horizon)}
 
     def capabilities(self) -> Capabilities:
-        """One request per dispatch in every stage; ``config.num_steps`` Euler steps."""
+        """One request by default, with explicit action batching for the optimized model."""
         stage_ops = self.stage_ops
         if self.numerics == "optimized":
             stage_ops = dict(OPTIMIZED_STAGE_OPS, vision=self.vision.stage_ops, prefill=self.prefill_stack.stage_ops)
-        return Capabilities(batch_sizes={"vision": (1,), "prefill": (1,), "action": (1,)},
-                            num_steps=self.config.num_steps, stage_ops=stage_ops)
+        batches = (1, 2, 4) if self.numerics == "optimized" else (1,)
+        return Capabilities(batch_sizes={"vision": (1,), "prefill": (1,), "action": batches},
+                            num_steps=self.config.num_steps, stage_ops=stage_ops,
+                            default_batch_sizes={"action": (1,)})
 
     def action_outputs(self, batch):
         """``predict_action_norm`` ``[B, H, D]`` FP32, the actions in normalized units."""
@@ -195,6 +198,10 @@ class Wallx2b(WallXQwen35):
         if self.numerics == "optimized":
             cos, sin = text_rope_tables(self.inv_freq, x["action_positions"], m.mrope_section)
             half = m.rotary_dim // 2
+            if batch.batch_size > 1:
+                self.action.forward_batch(x, kv, cos[:, :, 0, :half].contiguous(),
+                                          sin[:, :, 0, :half].contiguous(), batch.out["predict_action_norm"])
+                return
             self.action(x, kv, cos[0, :, 0, :half].contiguous(), sin[0, :, 0, :half].contiguous(),
                         batch.out["predict_action_norm"])
             return

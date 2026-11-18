@@ -136,6 +136,38 @@ def test_engine_runs_three_stages(composition):
     assert torch.isfinite(out["predict_action"]).all()
 
 
+@pytest.mark.parametrize("platform_name,split", [("cuda-sm120", False), ("ascend-950dt9582", True)])
+def test_optimized_ops_follow_the_selected_projection_and_mask_route(tiny, platform_name, split):
+    from xinfer.models.wall_oss.model import WallOSS
+
+    vision_calls, mask_calls = set(), set()
+
+    def record(implementation):
+        def call(*args, **kwargs):
+            if implementation.op in ("qkv_rope_split", "qkv_rope_epilogue"):
+                vision_calls.add(implementation.op)
+            if implementation.op == "prefix_kvcache_attention":
+                mask_calls.add((kwargs["all_keep"], kwargs["flash_mask"] is None))
+            return implementation.function(*args, **kwargs)
+
+        return call
+
+    platform = resolve_platform("cpu")
+    table = ops.registry.build_table(platform)
+    table.platform_name = platform_name
+    with ops.use_ops(table.wrapped(record)):
+        model = WallOSS.from_checkpoint(tiny.root, device="cpu", processing={"prompt_bucket": 0})
+    request = _request(model)
+    request.tensors["mask_all_keep"] = True
+    Engine(model, platform).run(request)
+    vision_op = "qkv_rope_split" if split else "qkv_rope_epilogue"
+    assert vision_calls == {vision_op}
+    stages = model.capabilities().stage_ops
+    assert set(stages["vision"]) & {"qkv_rope_split", "qkv_rope_epilogue"} == {vision_op}
+    assert ("gemm_add_rms_norm" in stages["action"]) == split
+    assert mask_calls == {(split, split)}
+
+
 def test_split_equals_joint_prefill_action_forward(tiny):
     """Step-0 velocity from (prefill stage + action stage) equals one joint pass."""
     request = _request(tiny)
@@ -205,7 +237,7 @@ def test_the_optimized_composition_is_the_default_and_takes_one_request_per_acti
 
     assert tiny_optimized.numerics == "optimized"
     assert tiny_optimized.capabilities().batch_sizes["action"] == (1,)
-    assert tiny_optimized.capabilities().stage_ops == OPTIMIZED_STAGE_OPS  # what the startup check reads
+    assert tiny_optimized.capabilities().stage_ops["prefill"] == OPTIMIZED_STAGE_OPS["prefill"]
 
 
 @pytest.mark.parametrize(("delay", "rtc_rows"), [(0, 0), (3, 15)])
@@ -225,8 +257,11 @@ def test_pad_prompt_keeps_the_valid_tokens_and_the_action_tokens(tiny):
 
     x = _request(tiny).tensors
     p = x["prompt_len"]
+    x["mask_all_keep"] = True
+    assert pad_prompt(x, p)["mask_all_keep"]
     padded = pad_prompt(x, 32)
     assert padded["prompt_len"] == 32 and padded["prompt_valid"].tolist() == [p]
+    assert not padded["mask_all_keep"]
     assert padded["prompt_valid"].dtype == torch.int32
     ids, positions = padded["input_ids"], padded["position_ids"]
     assert ids.shape == (1, 32 + H) and positions.shape == (3, 1, 32 + H)
