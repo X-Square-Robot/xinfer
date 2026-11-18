@@ -608,7 +608,7 @@ Validation requirements:
 
 ### 14.2 Backend registration and selection
 
-Native backends live under `xinfer/ops/backends/<backend>/`: Python bindings accompany the maintained source and CMake build in `src/`. CUDA builds `xinfer_kernels.so`; RPU builds `xinfer_rpu.so`. Both load AOT libraries through TVM-FFI; importing a Python package does not compile device code. Build instructions are in [CUDA kernels](kernels.md) and [RPU operators](rpu_ops.md).
+Native backends live under `xinfer/ops/backends/<backend>/`: Python bindings accompany the maintained source and CMake build in `src/`. CUDA builds `xinfer_kernels.so`; RPU builds `xinfer_rpu.so`. Both load AOT libraries through TVM-FFI; importing a Python package does not compile device code. Build instructions are in [CUDA kernels](kernels.md) and `docs/rpu_ops.md` in the separate operator-source change.
 
 For registered tensor operators, a backend names the hardware (`cuda`, `ascend`); the torch reference (`reference`) is available on supported torch devices. Operator-category modules such as `cuda/attn.py`, `gemm.py`, `norm.py` and `flow.py` declare implementations with `xinfer.ops.register`, passing the library as `requires`. If an optional library is unavailable, its implementations are not registered and selection may use a valid reference implementation. CUDA's `_native.py` loads the in-tree native library and records its target architectures and fingerprint. Ascend still uses `backends/_xcompute.py` for its external xcompute compatibility provider, checking the paired Python package and shared library; this port does not migrate that provider's implementations into XInfer.
 
@@ -866,9 +866,9 @@ Native operator implementation is maintained in `xinfer/ops/backends/<backend>/s
 | Binding | AOT libraries loaded through TVM-FFI: `xinfer_kernels.so` for CUDA tensor operators and `xinfer_rpu.so` for RPU prepared execution; `torch.library` adapters are added for concrete PyTorch integration needs (§14.2) |
 | Validation | Host contracts and build checks are separate from device-source compilation, real-device numerics, replay and model precision/performance gates (§14.1, §17); a host-only or SDK-stub test establishes no device acceptance |
 | Versioning and release | Record library identity, hash and supported capabilities, and validate the backend-specific ABI/build metadata; RPU also matches the native catalog and external asset manifest (§14.3) |
-| Third-party dependencies | Preserve upstream source attribution and applicable license copies; vendor SDKs, compilers and generated RPU assets remain external. See [third-party notices](../THIRD_PARTY_NOTICES.md) |
+| Third-party dependencies | Preserve upstream source attribution and applicable license copies; vendor SDKs, compilers and generated RPU assets remain external. Attribution and terms accompany the operator change in `THIRD_PARTY_NOTICES.md` |
 
-The [RPU operator guide](rpu_ops.md) documents the host-only build, runtime SDK build and explicit `.rc`-to-`.ref` asset build. Source availability does not supply the SDK or generated assets, or establish numerical or performance acceptance. The separate RPU model/runtime integration supplies the model-bound factory injection and execution lifecycle; the operator package alone cannot run a model.
+The separate operator change's `docs/rpu_ops.md` documents the host-only build, runtime SDK build and explicit `.rc`-to-`.ref` asset build. Source availability does not supply the SDK or generated assets, or establish numerical or performance acceptance. The separate RPU model/runtime integration supplies the model-bound factory injection and execution lifecycle; the operator package alone cannot run a model.
 
 ### 18.3 Extensions: plugin entry points
 

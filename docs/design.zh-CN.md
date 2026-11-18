@@ -605,7 +605,7 @@ RPU 的预构建执行接口显式管理常驻缓冲区、准备与完成状态�
 
 ### 14.2 后端注册与选择
 
-原生后端位于 `xinfer/ops/backends/<backend>/`：Python 绑定与 `src/` 中维护的源码和 CMake 构建配套。CUDA 构建 `xinfer_kernels.so`，RPU 构建 `xinfer_rpu.so`，均经 TVM-FFI 加载 AOT 库；导入 Python 包不会编译设备代码。构建方法见 [CUDA kernel](kernels.zh-CN.md) 和 [RPU 算子](rpu_ops.zh-CN.md)。
+原生后端位于 `xinfer/ops/backends/<backend>/`：Python 绑定与 `src/` 中维护的源码和 CMake 构建配套。CUDA 构建 `xinfer_kernels.so`，RPU 构建 `xinfer_rpu.so`，均经 TVM-FFI 加载 AOT 库；导入 Python 包不会编译设备代码。构建方法见 [CUDA kernel](kernels.zh-CN.md) 和 独立算子变更中的 `docs/rpu_ops.zh-CN.md`。
 
 对于注册表中的张量算子，后端表示硬件（`cuda`、`ascend`）；torch 参考实现（`reference`）可用于受支持的 torch 设备。`cuda/attn.py`、`gemm.py`、`norm.py`、`flow.py` 等分类模块使用 `xinfer.ops.register` 声明实现，把库作为 `requires` 传入。可选库不可用时，其实现不注册，选择过程可以使用有效的参考实现。CUDA 的 `_native.py` 加载仓内原生库，记录目标架构和构建指纹。Ascend 仍由 `backends/_xcompute.py` 加载外部 xcompute 兼容 provider，检查配对的 Python 包与共享库；本次移植不把该 provider 的实现迁入 XInfer。
 
@@ -863,9 +863,9 @@ XInfer/
 | 绑定 | 经 TVM-FFI 加载 AOT 库：CUDA 张量算子使用 `xinfer_kernels.so`，RPU 预构建执行使用 `xinfer_rpu.so`；按明确的 PyTorch 集成需求增加 `torch.library` 适配（§14.2） |
 | 验证 | 主机契约与构建检查独立于设备源码编译、真机数值、重放和模型精度／性能门禁（§14.1、§17）；host-only 或 SDK stub 测试不能证明设备验收通过 |
 | 版本与发布 | 记录库身份、哈希和支持能力，验证后端特定的 ABI／构建元数据；RPU 还需匹配原生 catalog 与外部资产 manifest（§14.3） |
-| 第三方依赖 | 保留上游源码归属和适用的原许可证副本；厂商 SDK、编译器与生成的 RPU 资产仍为外部依赖。见[第三方声明](../THIRD_PARTY_NOTICES.md) |
+| 第三方依赖 | 保留上游源码归属和适用的原许可证副本；厂商 SDK、编译器与生成的 RPU 资产仍为外部依赖。归属及条款见对应算子变更随附的 `THIRD_PARTY_NOTICES.md` |
 
-[RPU 算子指南](rpu_ops.zh-CN.md)说明 host-only 构建、运行时 SDK 构建和显式的 `.rc` 到 `.ref` 资产构建。提供源码并不附带 SDK 或生成资产，也不表示数值或性能验收通过。独立的 RPU 模型／运行时接入负责 model-bound 工厂注入和执行生命周期；仅有算子包不能运行模型。
+独立算子变更中的 `docs/rpu_ops.zh-CN.md` 说明 host-only 构建、运行时 SDK 构建和显式的 `.rc` 到 `.ref` 资产构建。提供源码并不附带 SDK 或生成资产，也不表示数值或性能验收通过。独立的 RPU 模型／运行时接入负责 model-bound 工厂注入和执行生命周期；仅有算子包不能运行模型。
 
 ### 18.3 扩展方式：插件入口
 
