@@ -114,6 +114,11 @@ class CannAttention:
         launch(out, workspace, q, k, v, *parameters)
         return out
 
+    @staticmethod
+    def supports_packed_output(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+        return _decodeattn_r4 is not None and _decodeattn_r4.supports_packed_output(
+            q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+
     def prefix_kvcache_attention(self, q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
                                 all_keep=False, return_bnsd=False):
         """Attend to the visible cache prefix and new rows, returning BF16 [B,M,H*D].

@@ -1,5 +1,6 @@
 """Attention adapters preserve layout and native error boundaries."""
 from inspect import unwrap
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
@@ -9,11 +10,63 @@ from xinfer.ops.backends.ascend import (
     _gated_pack,
     _native,
     attn,
+    cann_attention,
     cann_gated_delta_net,
     conv_gemm,
+    decodeattn_r4,
     fia_fuse_route,
     soup2,
 )
+
+
+@pytest.mark.parametrize(("entry", "reduce", "new_pos", "all_keep"), [
+    ("prefix_kvcache_attention", "decodeattn_r4_reduce_row", 768, False),
+    ("prefix_kvcache_attention_bnsd", "decodeattn_r4_reduce", 768, False),
+    ("prefix_kvcache_attention_bnsd", None, 767, False),
+    ("prefix_kvcache_attention_bnsd", None, 768, True),
+])
+def test_cache_attention_preserves_the_selected_output_contract(monkeypatch, entry, reduce, new_pos, all_keep):
+    monkeypatch.setenv("XINFER_DECODEATTN_R4_ROW", "1")
+    monkeypatch.setattr(decodeattn_r4, "applies", lambda q, k, v, prefix, pos, mask, scale: pos == 768
+                        and mask is not None)
+    monkeypatch.setattr(decodeattn_r4, "_SCAN_VARIANT", "b")
+    monkeypatch.setattr(decodeattn_r4, "_SEEN", set())
+    monkeypatch.setattr(decodeattn_r4, "_entry", lambda *args: (None, None))
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: False,
+                        current_stream=lambda device: SimpleNamespace(npu_stream=0)), raising=False)
+    monkeypatch.setattr(cann_attention, "_check_qkv", lambda *args: None)
+    launches = []
+
+    def launch(name, tensors, *args):
+        launches.append((name, tensors))
+        return True
+
+    def launch_fia(out, workspace, q, k, v, drop_mask, *args):
+        assert (drop_mask is None) == all_keep
+        launches.append(("fia", (q, k, v, out)))
+
+    native = cann_attention.CannAttention.__new__(cann_attention.CannAttention)
+    native._lock, native._buffers = Lock(), {}
+    native._bnsd_query = lambda *args: 0
+    native._bnsd_launch = launch_fia
+    monkeypatch.setattr(attn, "native_cache", native.prefix_kvcache_attention)
+    monkeypatch.setattr(attn, "native_cache_bnsd", native.prefix_kvcache_attention)
+    monkeypatch.setattr(_native, "launch_kernel", launch)
+    q = torch.empty(1, 16, 16, 128, dtype=torch.bfloat16).transpose(1, 2)
+    k, v = (torch.empty(1, 2, 784, 128, dtype=torch.bfloat16).transpose(1, 2) for _ in range(2))
+    prefix = torch.tensor([new_pos], dtype=torch.int32)
+    mask = None if all_keep else torch.zeros(1, 1, 784, 2, dtype=torch.int32)
+    kwargs = {"flash_mask": mask}
+    if all_keep:
+        kwargs["all_keep"] = True
+    result = unwrap(getattr(attn, entry))(q, k, v, prefix, new_pos, **kwargs)
+    assert [name for name, _ in launches] == (["decodeattn_r4_scan_b", reduce] if reduce else ["fia"])
+    query, keys, values = launches[0][1][:3]
+    output = launches[1][1][1] if reduce else launches[0][1][3]
+    shape = (1, 16, 2048) if entry == "prefix_kvcache_attention" else (1, 16, 16, 128)
+    assert [t.data_ptr() for t in (query, keys, values)] == [t.data_ptr() for t in (q, k, v)]
+    assert result.shape == shape and result.is_contiguous()
+    assert result.data_ptr() == output.data_ptr()
 
 
 def test_admitted_fia_launch_failure_propagates(monkeypatch):
@@ -72,10 +125,9 @@ def test_gated_attention_materializes_only_the_final_packed_output(monkeypatch, 
     def prefix(q, *args, **kwargs):
         assert q.shape == (batch, 16, 8, 256) and q.data_ptr() == native_query.data_ptr()
         assert q.transpose(1, 2).is_contiguous()
-        assert kwargs["return_bnsd"]
         return native_output
 
-    monkeypatch.setattr(attn, "prefix_kvcache_attention", prefix)
+    monkeypatch.setattr(attn, "prefix_kvcache_attention_bnsd", prefix)
     output = attn.gated_kvcache_attention.__wrapped__(native_query.transpose(1, 2), None, None, None, 0, gate)
     expected = native_output.transpose(1, 2).reshape(batch, 16, 2048) * torch.sigmoid(gate)
     assert output.shape == expected.shape and output.is_contiguous()

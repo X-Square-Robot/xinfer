@@ -100,8 +100,7 @@ def applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):
         or new_pos != _L - _M
     ):
         return False
-    # The M-major [M, H*D] packing behind the [1, M, H, D] view (the bridge
-    # convention) and the [KV, L, D]-major cache views.
+    # The bridge views must recover dense head-major Q and cache storage.
     if not (
         q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
         and q.device.type == "npu"
@@ -133,6 +132,11 @@ def applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):
     return True
 
 
+def supports_packed_output(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+    """Whether the row reducer can write this call's packed output directly."""
+    return _row_enabled() and applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
+
+
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale, return_bnsd):
     """The decode-family route; ``applies`` must have accepted the call."""
     if torch.npu.is_current_stream_capturing():
@@ -143,7 +147,7 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mas
     variant = _SCAN_VARIANT
     scan_name = f"decodeattn_r4_scan_{variant}"
     call, err = _entry(scan_name, 6, (ctypes.c_int64, ctypes.c_int64))
-    row = _row_enabled()
+    row = not return_bnsd and _row_enabled()
     reduce_call, reduce_err = _entry(
         "decodeattn_r4_reduce_row" if row else "decodeattn_r4_reduce", 2, ())
     stream = torch.npu.current_stream(q.device).npu_stream

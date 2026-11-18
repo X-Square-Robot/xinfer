@@ -107,11 +107,10 @@ key and never under CUDA graph capture (the engine runs each graph key eagerly b
 
 ```python
 @register("prefix_kvcache_attention", backend="cuda", **NATIVE)
-def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
-                             all_keep=False, return_bnsd=False):
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
     if not _kvcache_listed(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):  # cached per shape key
         return reference.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask,
-                                                  scale=scale, all_keep=all_keep, return_bnsd=return_bnsd)
+                                                  scale=scale)
     ...
 ```
 

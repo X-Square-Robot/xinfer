@@ -71,10 +71,11 @@ attention = (_attention() if any(function is None for function in
                                 (canonical_varlen, canonical_causal, canonical_cache)) else None)
 native_varlen = canonical_varlen or _route(attention, "varlen_attention", "_tnd_launch", "_tnd_query",
                                          ("cann_fia_vision_probe", "cann_fia_vision_probe_workspace_size"))
-native_causal = canonical_causal or _route(attention, "causal_attention", "_bnsd_launch", "_bnsd_query",
-                                         ("cann_fia_v5_probe", "cann_fia_v5_probe_workspace_size"))
-native_cache = canonical_cache or _route(attention, "prefix_kvcache_attention", "_bnsd_launch", "_bnsd_query",
-                                        ("cann_fia_v5_probe", "cann_fia_v5_probe_workspace_size"))
+_BNSD_SYMBOLS = ("cann_fia_v5_probe", "cann_fia_v5_probe_workspace_size")
+native_causal_bnsd = _route(attention, "causal_attention", "_bnsd_launch", "_bnsd_query", _BNSD_SYMBOLS)
+native_cache_bnsd = _route(attention, "prefix_kvcache_attention", "_bnsd_launch", "_bnsd_query", _BNSD_SYMBOLS)
+native_causal = canonical_causal or native_causal_bnsd
+native_cache = canonical_cache or native_cache_bnsd
 raw_cache = (entry("attention_kvcache") if native_cache is None
              and any(has_functions(name) for name in _CACHE_SYMBOLS) else None)
 
@@ -96,46 +97,71 @@ def varlen_attention(q, k, v, cu_seqlens, *, scale=None):
 @register("causal_attention", backend="ascend", priority=PRIORITY, requires=xc if callable(native_causal) else None,
           version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.causal_attention)
-def causal_attention(q, k, v, *, scale=None, return_bnsd=False):
-    return native_causal(q, k, v, scale=scale, return_bnsd=return_bnsd)
+def causal_attention(q, k, v, *, scale=None):
+    return native_causal(q, k, v, scale=scale)
 
 
-def _prefix_supported(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None, all_keep=False,
-                      return_bnsd=False):
+@register("causal_attention_bnsd", backend="ascend", priority=PRIORITY,
+          requires=xc if callable(native_causal) else None, version=VERSION, platforms=PLATFORMS)
+@partial(_torch_attn.causal_attention_bnsd)
+def causal_attention_bnsd(q, k, v, *, scale=None):
+    if callable(native_causal_bnsd):
+        return native_causal_bnsd(q, k, v, scale=scale, return_bnsd=True)
+    return native_causal(q, k, v, scale=scale).transpose(1, 2)
+
+
+def _prefix_supported(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None, all_keep=False):
     return callable(native_cache) or _cache_supported(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
+
+
+def _packed_cache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):
+    if callable(native_cache):
+        return native_cache(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+    return xc.attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=new_pos,
+                               flash_mask=flash_mask, softmax_scale=scale, backend="ascend_tilelang", pdl=False)
 
 
 @register("prefix_kvcache_attention", backend="ascend", priority=PRIORITY,
           requires=xc if callable(native_cache) else raw_cache,
           version=VERSION, platforms=PLATFORMS)
 @partial(_torch_attn.prefix_kvcache_attention, check=_prefix_supported)
-def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
-                             all_keep=False, return_bnsd=False):
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
     # The OpSpec contract is [B, M, HD]: a provider that returns [B, M, H, D] must be flattened here, and for a
     # provider that already returns [B, M, HD] this reshape is the identity. Never trust the provider's shape.
-    if callable(native_cache):
-        out = native_cache(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale,
-                           all_keep=all_keep, return_bnsd=return_bnsd)
-    else:
-        if all_keep and flash_mask is not None:
-            raise ValueError("all_keep cannot be combined with a flash mask")
-        out = xc.attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=new_pos,
-                                   flash_mask=None if all_keep else flash_mask, softmax_scale=scale,
-                                   backend="ascend_tilelang", pdl=False)
-        if return_bnsd:
-            b, m, h, d = q.shape
-            out = out.view(b, m, h, d).transpose(1, 2)
-    if return_bnsd:
-        return out
+    out = _packed_cache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
     return out.reshape(q.shape[0], q.shape[1], -1)
 
 
+@register("prefix_kvcache_attention_bnsd", backend="ascend", priority=PRIORITY,
+          requires=xc if callable(native_cache) else raw_cache, version=VERSION, platforms=PLATFORMS)
+@partial(_torch_attn.prefix_kvcache_attention_bnsd, check=_prefix_supported)
+def prefix_kvcache_attention_bnsd(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
+                                  all_keep=False):
+    if all_keep and flash_mask is not None:
+        raise ValueError("all_keep cannot be combined with a flash mask")
+    if callable(native_cache_bnsd):
+        return native_cache_bnsd(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale,
+                                 all_keep=all_keep, return_bnsd=True)
+    out = _packed_cache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
+    return out.reshape(q.shape).transpose(1, 2)
+
+
+prefix_kvcache_attention_bnsd.supports_all_keep = True
+
+
 # The cache-attention metadata scope rides the prefix attention: models open it around their action loop so the
-# dense drop mask is built once per forward from the live flash mask instead of once per call. The torch
-# composition keeps a null context (the model's getattr default).
+# dense drop mask is built once per forward from the live flash mask instead of once per call.
 _action_scope = getattr(attention, "action_scope", None) if attention is not None else None
 if callable(_action_scope):
     prefix_kvcache_attention.action_scope = _action_scope
+    prefix_kvcache_attention_bnsd.action_scope = _action_scope
+
+# Only a paired provider can switch entries without changing backend selection.
+if callable(native_cache) and native_cache is native_cache_bnsd:
+    _supports_packed_output = getattr(attention, "supports_packed_output", None)
+    if callable(_supports_packed_output):
+        prefix_kvcache_attention.supports_packed_output = _supports_packed_output
+        prefix_kvcache_attention_bnsd.supports_packed_output = _supports_packed_output
 
 
 # ---------------------------------------------------------------- Wall-X 2B attention family
@@ -302,8 +328,7 @@ def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, f
     fused = fia_fuse_route.try_route(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask, scale)
     if fused is not None:
         return fused
-    out = prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask,
-                                  scale=scale, return_bnsd=True)
+    out = prefix_kvcache_attention_bnsd(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
     packed = gated_pack(out, gate)
     if packed is not None:
         return packed

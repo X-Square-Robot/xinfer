@@ -140,6 +140,50 @@ def test_the_process_wide_registry_loads_the_plugins_before_it_selects(cuda_ops,
     assert loaded == [True]
 
 
+def test_legacy_attention_plugin_loads_before_cpu_platform_filter(tmp_path, monkeypatch):
+    import importlib
+    import importlib.metadata
+    import sys
+
+    module_name = "legacy_attention_plugin"
+    (tmp_path / f"{module_name}.py").write_text(
+        """from xinfer.ops import register
+
+@register("causal_attention", backend="legacy-attention", platforms=("cuda",))
+def causal_attention(q, k, v, *, scale=None):
+    return q
+
+@register("prefix_kvcache_attention", backend="legacy-attention", platforms=("cuda",))
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+    return q.flatten(-2)
+"""
+    )
+    distribution_path = tmp_path / "legacy_attention_plugin-1.0.dist-info"
+    distribution_path.mkdir()
+    (distribution_path / "entry_points.txt").write_text(f"[xinfer.ops]\nlegacy_attention_plugin = {module_name}\n")
+    distribution = importlib.metadata.Distribution.at(distribution_path)
+    monkeypatch.setattr(importlib.metadata, "entry_points", lambda group: distribution.entry_points.select(group=group))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delenv("XINFER_LEGACY_ATTENTION_PLUGIN", raising=False)
+
+    reg = OpRegistry()
+    names = ("causal_attention", "prefix_kvcache_attention")
+    for name in names:
+        reg.define(ops.registry.spec(name))
+    registry_module = importlib.import_module("xinfer.ops.registry")
+    monkeypatch.setattr(registry_module, "registry", reg)
+    monkeypatch.setattr(registry_module, "BUILTIN_MODULES", ())
+
+    try:
+        cpu = reg.build_table(_platform("cpu", None, "cpu"))
+        cuda = reg.build_table(_platform())
+        assert module_name in sys.modules
+        assert [cpu.selection(name).backend for name in names] == ["reference", "reference"]
+        assert [cuda.selection(name).backend for name in names] == ["legacy-attention", "legacy-attention"]
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_an_implementation_takes_the_parameters_of_its_reference():
     with pytest.raises(TypeError, match=r"fast implements 'double' with parameters \['y'\], the reference takes"):
         _registry().add("double", lambda y: y, backend="fast", contract=TOL)

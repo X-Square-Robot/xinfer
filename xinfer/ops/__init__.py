@@ -42,7 +42,8 @@ logger = logging.getLogger(__name__)
 # xinfer/ops/reference/); ``warn_slow_fallbacks`` reports these when they run on the reference.
 FUSED_OPS = frozenset({"gemm_epilogue", "gemm_split", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_split",
                        "qkv_rope_kvcache",
-                       "prefix_kvcache_attention", "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm",
+                       "prefix_kvcache_attention", "prefix_kvcache_attention_bnsd", "add_rms_norm",
+                       "gemm_add_rms_norm", "mlp_add_rms_norm",
                        "flow_velocity_euler", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
                        "mxfp8_qkv_rope_epilogue"})
 
@@ -83,10 +84,12 @@ for _spec in (
            reference.rotary_embedding_rounded),
     OpSpec(
         "causal_attention",
-        "causal_attention(q[B, L, H, D], k[B, L, KV, D], v, *, scale=None, return_bnsd=False)"
-        " -> [B, L, H, D], or [B, H, L, D] with return_bnsd",
+        "causal_attention(q[B, L, H, D], k[B, L, KV, D], v, *, scale=None) -> [B, L, H, D]",
         reference.causal_attention,
     ),
+    OpSpec("causal_attention_bnsd",
+           "causal_attention_bnsd(q[B, L, H, D], k[B, L, KV, D], v, *, scale=None) -> [B, H, L, D]",
+           attn.causal_attention_bnsd),
     OpSpec(
         "action_attention",
         "action_attention(q[B, L, H, D], k[B, L, KV, D], v, k_prompt[B, KV, P, D], v_prompt, num_pinned[B],"
@@ -252,9 +255,12 @@ for _spec in (
            gemm.qkv_rope_split),
     OpSpec("prefix_kvcache_attention",
            "prefix_kvcache_attention(q[B, M, H, D], k_cache[B, L, KV, D], v_cache, prefix_len[B], new_pos, *,"
-           " flash_mask=None, scale=None, all_keep=False, return_bnsd=False) -> [B, M, HD],"
-           " or [B, H, M, D] with return_bnsd  # keys [0, prefix) ∪ [new_pos, new_pos + M)",
+           " flash_mask=None, scale=None) -> [B, M, HD]  # keys [0, prefix) ∪ [new_pos, new_pos + M)",
            attn.prefix_kvcache_attention),
+    OpSpec("prefix_kvcache_attention_bnsd",
+           "prefix_kvcache_attention_bnsd(q[B, M, H, D], k_cache[B, L, KV, D], v_cache, prefix_len[B], new_pos, *,"
+           " flash_mask=None, scale=None, all_keep=False) -> [B, H, M, D]",
+           attn.prefix_kvcache_attention_bnsd),
     OpSpec("qkv_rope_kvcache",
            "qkv_rope_kvcache(x[M, K], weight[(H + 2KV)D, K], bias, cos[M, R/2], sin, k_cache[KV, rows, D], v_cache,"
            " start, H, KV, D) -> [M, HD], or backend q[H, M, D]  # K/V written in place",

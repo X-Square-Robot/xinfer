@@ -505,6 +505,9 @@ def qkv_rope_kvcache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_hea
                             kv_cache=(k_cache, v_cache, int(start)))
 
 
+qkv_rope_kvcache.packed_q_only = True
+
+
 @register("mxfp8_quantize", backend="cuda", **NATIVE)
 def mxfp8_quantize(x, *, share_scale_128=True):
     return quantize_mxfp8(x.contiguous(), scale_block=128 if share_scale_128 else 32)

@@ -97,7 +97,7 @@ def _attention(q, pairs: int, read: int, written: int = 0) -> OpCost:
     return OpCost(4 * q.shape[-1] * pairs, read, _bytes(q) + written, _PIPES[q.dtype])
 
 
-def causal_attention(q, k, v, *, scale=None, return_bnsd=False) -> OpCost:
+def causal_attention(q, k, v, *, scale=None) -> OpCost:
     """Exact causal work: ``L(L+1)/2`` pairs per row and head."""
     b, n, h, _ = q.shape
     return _attention(q, b * h * n * (n + 1) // 2, _bytes(q, k, v))
@@ -258,14 +258,18 @@ def qkv_rope_kvcache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_hea
     return _gemm(_PIPES[x.dtype], x, None, weight, None, bias, x.shape[1], weight.shape[0], (cos, sin))
 
 
-def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
-                             all_keep=False, return_bnsd=False) -> OpCost:
+def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None) -> OpCost:
     """Padded layout: every query sees cache rows ``[0, new_pos + M)``, the prefix padded to ``new_pos`` and the own
     keys (prefix lengths and ``flash_mask`` are device data); reads those rows of both caches."""
     b, m, h, _ = q.shape
     rows = int(new_pos) + m
     cached = _bytes(k_cache, v_cache) * rows // k_cache.shape[1]
     return _attention(q, b * h * m * rows, _bytes(q, prefix_len, flash_mask) + cached)
+
+
+def prefix_kvcache_attention_bnsd(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
+                                  all_keep=False) -> OpCost:
+    return prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
 
 
 def flow_velocity_euler(x, h, weight, dt, dof_mask=None, padding_velocity=None, pinned=None,
@@ -282,7 +286,8 @@ FORMULAS: dict[str, Callable[..., OpCost]] = {formula.__name__: formula for form
     mxfp8_gemm_residual, mxfp8_gemm_epilogue, mxfp8_gemm_glu_quantize, mxfp8_qkv_rope_epilogue,
     nvfp4_gemm, nvfp4_gemm_epilogue, nvfp4_gemm_glu_quantize, nvfp4_qkv_rope_epilogue, gemm_epilogue,
     gemm_glu_epilogue, gemm_add_rms_norm, mlp_add_rms_norm, qkv_rope_epilogue, qkv_rope_kvcache,
-    prefix_kvcache_attention, flow_velocity_euler)}
+    prefix_kvcache_attention, prefix_kvcache_attention_bnsd, flow_velocity_euler)}
+FORMULAS["causal_attention_bnsd"] = causal_attention
 FORMULAS["qkv_rope_split"] = qkv_rope_epilogue
 
 

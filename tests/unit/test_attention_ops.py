@@ -33,6 +33,32 @@ def test_causal_attention_reference_is_the_masked_prefill():
                                    rtol=1e-5, atol=1e-5)
 
 
+def test_head_major_causal_attention_matches_the_original_layout():
+    table = ops.registry.build_table(resolve_platform("cpu"), reference_only=True)
+    q, k, v = _qkv(2, 7)
+    out = table.causal_attention_bnsd(q, k, v)
+    assert out.shape == (2, 4, 7, 32)
+    torch.testing.assert_close(out.transpose(1, 2), table.causal_attention(q, k, v), atol=0, rtol=0)
+
+@pytest.mark.parametrize("all_keep", [True, False])
+def test_head_major_cache_attention_matches_the_original_layout(all_keep):
+    table = ops.registry.build_table(resolve_platform("cpu"), reference_only=True)
+    q, k, v = _qkv(2, 7)
+    q = q[:, :3]
+    if all_keep:
+        prefix_len = torch.tensor([4, 4], dtype=torch.int32)
+        mask = None
+    else:
+        prefix_len = torch.tensor([4, 2], dtype=torch.int32)
+        mask = torch.zeros(2, 1, 7, 2, dtype=torch.int32)
+        mask[..., 0] = 3
+        mask[..., 0, 0] = 1
+    out = table.prefix_kvcache_attention_bnsd(q, k, v, prefix_len, 4, flash_mask=mask, all_keep=all_keep)
+    assert out.shape == (2, 4, 3, 32)
+    expected = table.prefix_kvcache_attention(q, k, v, prefix_len, 4, flash_mask=mask)
+    torch.testing.assert_close(out.transpose(1, 2).flatten(-2), expected)
+
+
 def test_action_attention_reference_pins_a_closed_group():
     q, k, v = _qkv(3, 6, seed=1)
     _, kp, vp = _qkv(3, 5, seed=2)

@@ -269,14 +269,17 @@ def qkv_rope_kvcache(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
     Returns:
         ``[M, H·D]`` BF16: ``Q``, rotated.
 
-    This reference and CUDA return packed rows. An Ascend fused implementation may return
-    head-major ``[H, M, D]`` instead; model callers distinguish that three-dimensional form.
+    Callers distinguish packed rows from the head-major ``[H, M, D]`` layout by rank.
+    An implementation that always returns packed rows can set ``packed_q_only = True`` for stage planning.
     """
     y = x.float() @ weight.float().t()
     if bias is not None:
         y = y + bias.float()
     return _qk_norm_rope_kvcache(y, x.dtype, None, None, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads,
                                  head_dim, 0.0)
+
+
+qkv_rope_kvcache.packed_q_only = True
 
 
 # ---------------------------------------------------------------- Wall-X 2B fused operators

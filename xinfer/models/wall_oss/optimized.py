@@ -5,7 +5,7 @@ operators of ``xinfer/ops/reference/`` (each a kernel call where the CUDA backen
 reference). GEMM weights are ``[N, K]``; the action stage's output and down projections are stored ``[K, N]``,
 which selects the small-M kernel. On the Ascend provider the ``[N, K]`` projections are read as given (a
 transposed view would cost the v22 CANN route a full materialization per call) and the action loop feeds its
-projections the attention output's native BNSD form. Differences to the reference:
+projections the attention kernel's native output layout. Differences to the reference:
 
 - every residual add and the RMSNorm after it are one call (``add_rms_norm``), the sum rounded to BF16 as before;
   in the ViT the projection before it joins them (``gemm_add_rms_norm``), which on integrated GPUs adds the residual
@@ -20,7 +20,7 @@ projections the attention output's native BNSD form. Differences to the referenc
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import ExitStack
 
 import torch
 from torch import nn
@@ -37,10 +37,11 @@ OPTIMIZED_STAGE_OPS = {
     "vision": ("gemm_epilogue", "gemm_glu_epilogue", "gemm_add_rms_norm", "qkv_rope_split", "rms_norm",
                "varlen_attention"),
     "prefill": ("gemm_epilogue", "qkv_rope_kvcache", "mlp_add_rms_norm", "rms_norm", "add_rms_norm",
-                "causal_attention"),
-    "action": ("gemm_epilogue", "gemm_add_rms_norm", "gemm_glu_epilogue", "qkv_rope_kvcache",
+                "causal_attention", "causal_attention_bnsd"),
+    "action": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache",
                "prefix_kvcache_attention",
-               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "prefetch_weights", "join_prefetch"),
+               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "silu", "prefetch_weights",
+               "join_prefetch"),
 }
 
 
@@ -169,11 +170,9 @@ class OptimizedPrefill(nn.Module):
             # widths keep the packed view.
             bnsd = q.ndim == 3
             q_arg = q.transpose(0, 1)[None] if bnsd else q.view(1, p, heads, d)
-            # With ``return_bnsd`` the pinned causal op hands back its native BNSD [1, H, P, D] buffer and the
-            # o-projection reads it directly (the M768 Cube route folds the packed reshape copy and the finish
-            # round); fallback widths keep the packed view and the old chain.
-            o = ops.causal_attention(q_arg, keys.transpose(0, 1)[None], values.transpose(0, 1)[None],
-                                     return_bnsd=bnsd)
+            # The head-major contract lets the projection consume the attention buffer directly.
+            attention = ops.causal_attention_bnsd if bnsd else ops.causal_attention
+            o = attention(q_arg, keys.transpose(0, 1)[None], values.transpose(0, 1)[None])
             rows = o[0] if bnsd else o.reshape(p, -1)
             h, normed = ops.add_rms_norm(ops.gemm_epilogue(rows, layer.o).view(1, p, -1), h,
                                          layer.post_norm, eps)
@@ -201,10 +200,19 @@ class OptimizedAction(nn.Module):
         self.action_head = action_head
         self.register_buffer("inv_freq", inverse_frequencies(c.head_dim, c.rope_theta), persistent=False)
         self.ops = active_ops()
-        self._ascend = self.ops.platform_name.startswith("ascend-")
+        bnsd_attention = self.ops.prefix_kvcache_attention_bnsd
+        # Opt into the mask-free path when the selected provider implements it.
+        self._supports_all_keep = getattr(bnsd_attention, "supports_all_keep", False)
+        packed = getattr(self.ops.prefix_kvcache_attention, "supports_packed_output", None)
+        paired = callable(packed) and packed is getattr(bnsd_attention, "supports_packed_output", None)
+        self._supports_packed_output = packed if paired else None
+        # The QKV contract permits either layout unless the selected implementation promises packed Q.
+        self._may_return_head_major = not getattr(self.ops.qkv_rope_kvcache, "packed_q_only", False)
         self.stage_ops = OPTIMIZED_STAGE_OPS["action"]
-        if not self._ascend:
-            self.stage_ops = tuple(op for op in self.stage_ops if op != "gemm_add_rms_norm")
+        if self._may_return_head_major:
+            self.stage_ops += ("gemm_add_rms_norm",)
+        if self._may_return_head_major or self._supports_all_keep:
+            self.stage_ops += ("prefix_kvcache_attention_bnsd",)
         self._steps: dict[int, list[float]] = {}
 
     def step_sizes(self, steps: int, device) -> list[float]:
@@ -238,10 +246,8 @@ class OptimizedAction(nn.Module):
             shifted = (rows >= delay) & (delay > 0) & (delay < horizon)
             positions = positions + shifted.to(positions.dtype)[None] * c.rtc_rope_gap
         cos, sin = compact_rope(self.inv_freq, positions[None].expand(3, 1, horizon), c.mrope_section)
-        # The host all-keep guarantee (processor-computed: delay == 0 and prompt_valid == p). A host input the
-        # stage reads keys the NPU graph, so the per-forward flash-mask build (13.4 us) and the FIA mask read
-        # disappear on the flow path; RTC and padded prompts keep the mask.
-        all_keep = self._ascend and "mask_all_keep" in x_in and bool(x_in["mask_all_keep"])
+        # The processor guarantees that all keys are visible when delay is zero and the prompt is unpadded.
+        all_keep = self._supports_all_keep and bool(x_in.get("mask_all_keep", False))
         if all_keep:
             flash_mask = None
         else:
@@ -267,10 +273,19 @@ class OptimizedAction(nn.Module):
         pinned_rows = delay.to(torch.int32) if rtc else None
         last = len(self.layers) - 1
         # The prefix-attention metadata scope: the native cache-attention bridge exposes it, and one open
-        # scope per forward lets all of the loop's prefix calls share the dense drop mask (built once from
-        # the live flash_mask/prefix_len instead of once per call). The torch reference keeps a null context.
-        scope = getattr(ops.prefix_kvcache_attention, "action_scope", nullcontext)
-        with scope():
+        # scope per forward lets the loop's prefix calls share the drop mask built from live inputs.
+        packed_attention, bnsd_attention = ops.prefix_kvcache_attention, ops.prefix_kvcache_attention_bnsd
+        may_return_head_major = self._may_return_head_major
+        supports_packed_output = self._supports_packed_output
+        prefetch_weights, qkv_rope_kvcache = ops.prefetch_weights, ops.qkv_rope_kvcache
+        gemm_epilogue, gemm_glu_epilogue = ops.gemm_epilogue, ops.gemm_glu_epilogue
+        add_rms_norm = ops.add_rms_norm
+        scopes = dict.fromkeys(getattr(attention, "action_scope", None)
+                               for attention in (packed_attention, bnsd_attention))
+        with ExitStack() as attention_scope:
+            for scope in scopes:
+                if scope is not None:
+                    attention_scope.enter_context(scope())
             for step in range(steps):
                 tau = torch.where(pinned, torch.ones_like(times[step]), times[step])
                 h = self.action_head.embed(x, tau, dof).to(DTYPE)
@@ -278,35 +293,36 @@ class OptimizedAction(nn.Module):
                 for i, layer in enumerate(self.layers):
                     # this layer's later weights and the next layer's QKV, read while the QKV and attention run
                     following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
-                    ops.prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
+                    prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
                     keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
-                    q = ops.qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin,
-                                             keys[0], values[0], p, heads, kv_heads, d)
-                    # The NPU M16 epilogue returns Q already in BNSD [H, M, D] order (ACLNN FIA rejects the
-                    # strided-query descriptor, error 561103, so the kernel writes the layout the attention
-                    # consumes). The strided [1, M, H, D] view turns contiguous inside the attention
-                    # transpose; the reference and CUDA backends return packed [M, H*D].
-                    bnsd = q.ndim == 3
+                    q = qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin,
+                                         keys[0], values[0], p, heads, kv_heads, d)
+                    # Both Q layouts become views of [1, M, H, D]. Attention can recover a head-major
+                    # producer's original storage with a transpose.
+                    bnsd = may_return_head_major and q.ndim == 3
                     q_arg = q.transpose(0, 1)[None] if bnsd else q.view(1, horizon, heads, d)
-                    # The attention output follows the same economy as the prefill site above: the BNSD
-                    # [H, M, D] form only when the NPU's fused QKV armed it (its o-projection reads the
-                    # transpose folded into the Cube A-load), the packed [1, M, H*D] form otherwise — the
-                    # o-projection's gemm contract ([M, K] rows) that every backend takes directly.
-                    o = ops.prefix_kvcache_attention(q_arg, keys.transpose(1, 2),
-                                                     values.transpose(1, 2), start, p, flash_mask=flash_mask,
-                                                     all_keep=all_keep, return_bnsd=bnsd)
+                    k_arg, v_arg = keys.transpose(1, 2), values.transpose(1, 2)
+                    # Packed kernel output can feed the same fused projection even with head-major Q.
+                    direct_packed = (bnsd and flash_mask is not None and supports_packed_output is not None
+                                     and supports_packed_output(q_arg, k_arg, v_arg, start, p, flash_mask=flash_mask))
+                    if all_keep or (bnsd and not direct_packed):
+                        o = bnsd_attention(q_arg, k_arg, v_arg, start, p, flash_mask=flash_mask, all_keep=all_keep)
+                        if not bnsd:
+                            o = o.transpose(1, 2).reshape(1, horizon, -1)
+                    else:
+                        o = packed_attention(q_arg, k_arg, v_arg, start, p, flash_mask=flash_mask)
                     if bnsd:
                         h, normed = ops.gemm_add_rms_norm(o[0], layer.o_t.t(), h, layer.post_norm, eps)
                     else:
-                        h, normed = ops.add_rms_norm(ops.gemm_epilogue(o[0], layer.o_t.t())[None], h,
-                                                      layer.post_norm, eps)
-                    hidden = ops.gemm_glu_epilogue(normed[0], layer.gate_up)
+                        h, normed = add_rms_norm(gemm_epilogue(o[0], layer.o_t.t())[None], h,
+                                                 layer.post_norm, eps)
+                    hidden = gemm_glu_epilogue(normed[0], layer.gate_up)
                     following = self.final_norm if i == last else self.layers[i + 1].input_norm
                     if bnsd:
                         h, normed = ops.gemm_add_rms_norm(hidden, layer.down_t.t(), h, following, eps)
                     else:
-                        h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down_t.t())[None], h,
-                                                      following, eps)
+                        h, normed = add_rms_norm(gemm_epilogue(hidden, layer.down_t.t())[None], h,
+                                                 following, eps)
                 x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
                                             pinned_rows, prefix)
             ops.join_prefetch()

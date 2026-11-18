@@ -93,8 +93,7 @@ def _varlen_attention(sdpa, q, k, v, cu_seqlens, *, scale=None):
     return out
 
 
-def causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, scale: float | None = None,
-                      return_bnsd: bool = False) -> torch.Tensor:
+def causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, scale: float | None = None) -> torch.Tensor:
     """Causal self-attention on sequence-major tensors.
 
     ``q [B, L, H, D]``, ``k``/``v [B, L, KV, D]`` → ``[B, L, H, D]``.
@@ -106,14 +105,17 @@ def causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, scale
         k: ``[B, L, KV, D]`` keys; ``H`` must be a multiple of ``KV``.
         v: ``[B, L, KV, D]`` values.
         scale: softmax scale; None for ``1/sqrt(D)``.
-        return_bnsd: Return the native head-major ``[B, H, L, D]`` result instead of the transposed view, so a
-            projection that follows reads it without a copy.
 
     Returns:
-        ``[B, L, H, D]`` in ``q.dtype`` (a transposed, non-contiguous view), or ``[B, H, L, D]`` with
-        ``return_bnsd``.
+        ``[B, L, H, D]`` in ``q.dtype`` (a transposed, non-contiguous view).
     """
-    return _causal_attention(F.scaled_dot_product_attention, q, k, v, scale=scale, return_bnsd=return_bnsd)
+    return _causal_attention(F.scaled_dot_product_attention, q, k, v, scale=scale)
+
+
+def causal_attention_bnsd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
+                           scale: float | None = None) -> torch.Tensor:
+    """Causal attention on sequence-major inputs with head-major ``[B, H, L, D]`` output."""
+    return _causal_attention(F.scaled_dot_product_attention, q, k, v, scale=scale, return_bnsd=True)
 
 
 def _causal_attention(sdpa, q, k, v, *, scale=None, return_bnsd=False):
@@ -319,8 +321,7 @@ def _kvcache_attention(sdpa, q, k, v, k_cache, v_cache, cache_start, cache_valid
 
 def prefix_kvcache_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                              prefix_len: torch.Tensor, new_pos: int, *, flash_mask: torch.Tensor | None = None,
-                             scale: float | None = None, all_keep: bool = False,
-                             return_bnsd: bool = False) -> torch.Tensor:
+                             scale: float | None = None) -> torch.Tensor:
     """Attention of ``M`` new tokens over a cache prefix and their own keys (the CUDA backend's ``attention_kvcache``;
     the Ascend backend's cache-attention kernels serve it through the same contract).
 
@@ -335,23 +336,33 @@ def prefix_kvcache_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: to
         new_pos: First cache row of the new tokens' keys (``new_pos + M <= L``).
         flash_mask: Column mask or None.
         scale: Softmax scale; None for ``1/sqrt(D)``.
-        all_keep: Host guarantee that every cache row is visible (``prefix_len == L - M``, ``new_pos ==
-            prefix_len``, no flash mask); the visibility mask is then skipped.
-        return_bnsd: Return the attention output in its native head-major ``[B, H, M, D]`` order instead of
-            packed ``[B, M, H·D]``, so a projection that follows reads it without a copy.
 
     Returns:
-        ``[B, M, H·D]`` BF16, or ``[B, H, M, D]`` with ``return_bnsd``.
+        ``[B, M, H·D]`` BF16.
+    """
+    return _prefix_kvcache_attention(
+        F.scaled_dot_product_attention, q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+
+
+def prefix_kvcache_attention_bnsd(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                                  prefix_len: torch.Tensor, new_pos: int, *,
+                                  flash_mask: torch.Tensor | None = None, scale: float | None = None,
+                                  all_keep: bool = False) -> torch.Tensor:
+    """Cache attention with head-major ``[B, H, M, D]`` output.
+
+    ``all_keep`` guarantees every cache row is visible (``prefix_len == new_pos == L - M`` and no flash mask).
     """
     return _prefix_kvcache_attention(
         F.scaled_dot_product_attention, q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale,
-        all_keep=all_keep, return_bnsd=return_bnsd)
+        all_keep=all_keep, return_bnsd=True)
 
 
 def _prefix_kvcache_attention(sdpa, q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
                               all_keep=False, return_bnsd=False):
     b, m = q.shape[:2]
     if all_keep:
+        if flash_mask is not None:
+            raise ValueError("all_keep cannot be combined with a flash mask")
         keep = None
     else:
         rows = torch.arange(k_cache.shape[1], device=q.device)
