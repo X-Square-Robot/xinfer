@@ -107,8 +107,9 @@ TensorList DescribeSingletonRaw(void* data, const int64_t* shape, int64_t rank, 
 
 
 Call PrepareRawBnsd(void* out, void* q, void* k, void* v, void* drop, const int64_t* dims,
-                    double scale, int64_t inner_precise) {
+                    double scale, int64_t inner_precise, bool bsnd_output) {
   const int64_t bnsd[4] = {dims[0], dims[1], dims[2], dims[3]};
+  const int64_t bsnd[4] = {dims[0], dims[2], dims[1], dims[3]};
   const int64_t kv[4] = {dims[0], dims[4], dims[5], dims[3]};
   const int64_t mask[4] = {dims[0], 1, dims[2], dims[5]};
   Call call;
@@ -116,9 +117,10 @@ Call PrepareRawBnsd(void* out, void* q, void* k, void* v, void* drop, const int6
   call.k = DescribeSingletonRaw(k, kv, 4, ACL_BF16);
   call.v = DescribeSingletonRaw(v, kv, 4, ACL_BF16);
   call.mask = DescribeRaw(drop, mask, 4, ACL_BOOL);
-  call.out = DescribeRaw(out, bnsd, 4, ACL_BF16);
+  call.out = DescribeRaw(out, bsnd_output ? bsnd : bnsd, 4, ACL_BF16);
   char bnsd_layout[] = "BNSD";
-  BuildExecutor(call, bnsd_layout, dims[1], dims[4], scale, inner_precise);
+  char bsnd_output_layout[] = "BNSD_BSND";
+  BuildExecutor(call, bsnd_output ? bsnd_output_layout : bnsd_layout, dims[1], dims[4], scale, inner_precise);
   return call;
 }
 
@@ -160,14 +162,14 @@ int64_t WorkspaceBytes(const Call& call) {
 }
 
 int64_t RawBnsdWorkspaceBytes(void* out, void* q, void* k, void* v, void* drop, const int64_t* dims,
-                              double scale, int64_t inner_precise) {
-  return WorkspaceBytes(PrepareRawBnsd(out, q, k, v, drop, dims, scale, inner_precise));
+                              double scale, int64_t inner_precise, bool bsnd_output) {
+  return WorkspaceBytes(PrepareRawBnsd(out, q, k, v, drop, dims, scale, inner_precise, bsnd_output));
 }
 
 void RawBnsdLaunch(int32_t device, void* out, void* workspace, int64_t workspace_bytes, void* q,
                    void* k, void* v, void* drop, const int64_t* dims, double scale,
-                   int64_t inner_precise) {
-  auto call = PrepareRawBnsd(out, q, k, v, drop, dims, scale, inner_precise);
+                   int64_t inner_precise, bool bsnd_output) {
+  auto call = PrepareRawBnsd(out, q, k, v, drop, dims, scale, inner_precise, bsnd_output);
   EnqueueRaw(call, workspace, workspace_bytes, device);
 }
 
@@ -197,18 +199,28 @@ extern "C" const char* xinfer_cann_fia_v5_get_last_error() {
   return FiaError().c_str();
 }
 
-extern "C" int64_t xinfer_cann_fia_v5_probe_workspace_size(
-    int32_t device, void* out, void* q, void* k, void* v, void* drop,
-    const int64_t* dims, double scale, int64_t inner_precise) {
-  (void)device;
+static int64_t BnsdWorkspaceSize(void* out, void* q, void* k, void* v, void* drop,
+                                 const int64_t* dims, double scale, int64_t inner_precise, bool bsnd_output) {
   try {
-    return xinfer::cann_fia_v5::RawBnsdWorkspaceBytes(out, q, k, v, drop, dims, scale, inner_precise);
+    return xinfer::cann_fia_v5::RawBnsdWorkspaceBytes(out, q, k, v, drop, dims, scale, inner_precise, bsnd_output);
   } catch (const std::exception& error) {
     FiaError() = std::string("fia v5 workspace: ") + error.what();
   } catch (...) {
     FiaError() = "fia v5 workspace: unknown failure";
   }
   return -1;
+}
+
+extern "C" int64_t xinfer_cann_fia_v5_probe_workspace_size(
+    int32_t, void* out, void* q, void* k, void* v, void* drop,
+    const int64_t* dims, double scale, int64_t inner_precise) {
+  return BnsdWorkspaceSize(out, q, k, v, drop, dims, scale, inner_precise, false);
+}
+
+extern "C" int64_t xinfer_cann_fia_v5_bnsd_bsnd_workspace_size(
+    int32_t, void* out, void* q, void* k, void* v, void* drop,
+    const int64_t* dims, double scale, int64_t inner_precise) {
+  return BnsdWorkspaceSize(out, q, k, v, drop, dims, scale, inner_precise, true);
 }
 
 extern "C" int64_t xinfer_cann_fia_vision_probe_workspace_size(
@@ -225,12 +237,12 @@ extern "C" int64_t xinfer_cann_fia_vision_probe_workspace_size(
   return -1;
 }
 
-extern "C" int xinfer_cann_fia_v5_probe_launch(
-    int32_t device, void* out, void* workspace, int64_t workspace_bytes, void* q, void* k,
-    void* v, void* drop, const int64_t* dims, double scale, int64_t inner_precise) {
+static int BnsdLaunch(int32_t device, void* out, void* workspace, int64_t workspace_bytes, void* q, void* k,
+                      void* v, void* drop, const int64_t* dims, double scale, int64_t inner_precise,
+                      bool bsnd_output) {
   try {
     xinfer::cann_fia_v5::RawBnsdLaunch(device, out, workspace, workspace_bytes, q, k, v, drop,
-                                       dims, scale, inner_precise);
+                                       dims, scale, inner_precise, bsnd_output);
     return 0;
   } catch (const std::exception& error) {
     FiaError() = std::string("fia v5 launch: ") + error.what();
@@ -238,6 +250,18 @@ extern "C" int xinfer_cann_fia_v5_probe_launch(
     FiaError() = "fia v5 launch: unknown failure";
   }
   return 1;
+}
+
+extern "C" int xinfer_cann_fia_v5_probe_launch(
+    int32_t device, void* out, void* workspace, int64_t workspace_bytes, void* q, void* k,
+    void* v, void* drop, const int64_t* dims, double scale, int64_t inner_precise) {
+  return BnsdLaunch(device, out, workspace, workspace_bytes, q, k, v, drop, dims, scale, inner_precise, false);
+}
+
+extern "C" int xinfer_cann_fia_v5_bnsd_bsnd_launch(
+    int32_t device, void* out, void* workspace, int64_t workspace_bytes, void* q, void* k,
+    void* v, void* drop, const int64_t* dims, double scale, int64_t inner_precise) {
+  return BnsdLaunch(device, out, workspace, workspace_bytes, q, k, v, drop, dims, scale, inner_precise, true);
 }
 
 extern "C" int xinfer_cann_fia_vision_probe_launch(

@@ -8,6 +8,7 @@ from numbers import Integral, Real
 from threading import Lock
 
 import torch
+from xinfer.ops.backends.ascend import _native
 from xinfer.ops.backends.ascend.core import CORE
 from xinfer.ops.backends.ascend._cann_action_scope import action_scope, memo_action_metadata
 try:  # decodeattn-r4: opt-in decode-family kernel pair (XINFER_DECODEATTN_R4)
@@ -87,6 +88,7 @@ class CannAttention:
             tnd = _cann_primitives.tnd_pair()
             self._bnsd_query, self._bnsd_launch = bnsd if bnsd else (None, None)
             self._tnd_query, self._tnd_launch = tnd if tnd else (None, None)
+        self._bsnd_output = _native.BRIDGE.bnsd_pair(bsnd_output=True)
         self._buffers = {}
         self._lock = Lock()
 
@@ -101,10 +103,11 @@ class CannAttention:
             self._buffers[key] = create()
         return self._buffers[key]
 
-    def _run(self, q, k, v, key, parameters, query, launch):
+    def _run(self, q, k, v, key, parameters, query, launch, *, out=None):
         if query is None or launch is None:
             raise RuntimeError("the unified core library lacks the CANN FIA launchers")
-        out = torch.empty_like(q)
+        if out is None:
+            out = torch.empty_like(q)
 
         def allocate_workspace():
             size = query(out, q, k, v, *parameters)
@@ -113,6 +116,16 @@ class CannAttention:
         workspace = self._warmed(("workspace", *key), allocate_workspace)
         launch(out, workspace, q, k, v, *parameters)
         return out
+
+    def _run_bnsd(self, q, k, v, key, drop_mask, scale, inner_precise, *, return_bnsd=False):
+        batch, heads, rows, dim = q.shape
+        # Wall-OSS: keep Q/K/V dense BNSD and let FIA write the projection's token rows directly.
+        if not return_bnsd and self._bsnd_output is not None and (batch, heads, k.shape[1], dim) == (1, 16, 2, 128):
+            out = q.new_empty((batch, rows, heads, dim))
+            # The released CORE wrapper passes sparse_mode (0) to raw FIA as innerPrecise.
+            return self._run(q, k, v, (*key, "BNSD_BSND"), (drop_mask, scale, 0, 0), *self._bsnd_output, out=out)
+        out = self._run(q, k, v, key, (drop_mask, scale, inner_precise, 0), self._bnsd_query, self._bnsd_launch)
+        return out if return_bnsd else out.transpose(1, 2)
 
     def prefix_kvcache_attention(self, q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
                                 return_bnsd=False):
@@ -160,10 +173,7 @@ class CannAttention:
             # Feed ACLNN's BNSD layout without per-call copies where the
             # operator takes it: the wall-style caches arrive as permuted
             # (B, L, KV, D) views of contiguous (B, KV, L, D) buffers, so the
-            # transpose back to BNSD is a view. The query and the output keep
-            # one small transposed copy each: FIA V5 rejects a strided query
-            # descriptor (probe 2026-11-11, error 561103) and does not honor
-            # strided output writes (probe 2026-11-11 r2, wrong values).
+            # transpose back to BNSD is a view. FIA still needs dense input Q.
             def cache_bnsd(tensor):
                 view = tensor.transpose(1, 2)
                 return view if view.is_contiguous() else view.contiguous()
@@ -179,17 +189,10 @@ class CannAttention:
                 else:
                     query = query.contiguous()
             keys, values = cache_bnsd(k_cache), cache_bnsd(v_cache)
-            out = torch.empty((batch, heads, rows, dim), dtype=q.dtype, device=q.device)
-
-            def allocate_workspace():
-                size = self._bnsd_query(out, query, keys, values, drop_mask, scale, 2, 0)
-                return torch.empty(size, dtype=torch.uint8, device=q.device)
-
-            workspace = self._warmed(("workspace", *key), allocate_workspace)
-            self._bnsd_launch(out, workspace, query, keys, values, drop_mask, scale, 2, 0)
+            out = self._run_bnsd(query, keys, values, key, drop_mask, scale, 2, return_bnsd=return_bnsd)
         if return_bnsd:
             return out
-        return out.transpose(1, 2).reshape(batch, rows, heads * dim)
+        return out.reshape(batch, rows, heads * dim)
 
     def gated_kvcache_attention(self, q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
         """Attend to the visible cache prefix and new rows, then apply the BF16 gate."""
@@ -218,9 +221,7 @@ class CannAttention:
                 ("mask", *key),
                 lambda: torch.ones((batch, 1, length, length), dtype=torch.bool, device=q.device).triu(1),
             )
-            out = self._run(query, keys, values, key, (drop_mask, scale, 0, 0),
-                            self._bnsd_query, self._bnsd_launch)
-        return out.transpose(1, 2)
+            return self._run_bnsd(query, keys, values, key, drop_mask, scale, 0)
 
     def gated_causal_attention(self, q, k, v, gate, *, scale=None):
         """Attend causally over the entire padded prompt and apply the BF16 gate."""

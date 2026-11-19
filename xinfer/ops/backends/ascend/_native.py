@@ -453,10 +453,10 @@ class RawBridge:
         return typed_size
 
     # ---- FIA probes (cann_attention) ---------------------------------
-    def bnsd_pair(self):
-        """``(query, launch)`` over the masked BNSD FIA V5 composition."""
-        pair = self._pair("xinfer_cann_fia_v5_probe_workspace_size",
-                          "xinfer_cann_fia_v5_probe_launch",
+    def bnsd_pair(self, *, bsnd_output=False):
+        """``(query, launch)`` for BNSD inputs and native or token-major output, if provided by the library."""
+        name = "xinfer_cann_fia_v5_bnsd_bsnd" if bsnd_output else "xinfer_cann_fia_v5_probe"
+        pair = self._pair(f"{name}_workspace_size", f"{name}_launch",
                           "xinfer_cann_fia_v5_get_last_error")
         if pair is None:
             return None

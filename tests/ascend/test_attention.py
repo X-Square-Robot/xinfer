@@ -19,8 +19,8 @@ from xinfer.ops.backends.ascend import (
 )
 
 
-@pytest.mark.parametrize(("new_pos", "row_reduce"), [(768, True), (767, False)])
-def test_cache_attention_returns_packed_rows_from_decode_or_fia(monkeypatch, new_pos, row_reduce):
+@pytest.mark.parametrize(("new_pos", "mixed_output"), [(768, True), (767, True), (767, False)])
+def test_cache_attention_returns_packed_rows_from_decode_or_fia(monkeypatch, new_pos, mixed_output):
     monkeypatch.setenv("XINFER_DECODEATTN_R4_ROW", "1")
     monkeypatch.setattr(decodeattn_r4, "applies", lambda q, k, v, prefix, pos, mask, scale: pos == 768
                         and mask is not None)
@@ -38,15 +38,17 @@ def test_cache_attention_returns_packed_rows_from_decode_or_fia(monkeypatch, new
             tensors[1].copy_(q[0])
         return True
 
-    def launch_fia(out, workspace, q, k, v, drop_mask, *args):
+    def launch_fia(out, workspace, q, k, v, drop_mask, scale, inner_precise, sparse_mode):
         assert drop_mask is not None
-        out.copy_(q)
+        assert (inner_precise, sparse_mode) == ((0, 0) if mixed_output else (2, 0))
+        out.copy_(q.transpose(1, 2) if mixed_output else q)
         launches.append(("fia", (q, k, v, out)))
 
     native = cann_attention.CannAttention.__new__(cann_attention.CannAttention)
     native._lock, native._buffers = Lock(), {}
     native._bnsd_query = lambda *args: 0
     native._bnsd_launch = launch_fia
+    native._bsnd_output = (native._bnsd_query, launch_fia) if mixed_output else None
     monkeypatch.setattr(attn, "native_cache", native.prefix_kvcache_attention)
     monkeypatch.setattr(attn, "native_cache_bnsd", native.prefix_kvcache_attention)
     monkeypatch.setattr(_native, "launch_kernel", launch)
@@ -55,13 +57,37 @@ def test_cache_attention_returns_packed_rows_from_decode_or_fia(monkeypatch, new
     prefix = torch.tensor([new_pos], dtype=torch.int32)
     mask = torch.zeros(1, 1, 784, 2, dtype=torch.int32)
     result = unwrap(attn.prefix_kvcache_attention)(q, k, v, prefix, new_pos, flash_mask=mask)
-    names = ["decodeattn_r4_scan_b", "decodeattn_r4_reduce_row"] if row_reduce else ["fia"]
+    names = ["decodeattn_r4_scan_b", "decodeattn_r4_reduce_row"] if new_pos == 768 else ["fia"]
     assert [name for name, _ in launches] == names
     query, keys, values = launches[0][1][:3]
     torch.testing.assert_close(query.reshape(1, 16, 16, 128), q.transpose(1, 2), atol=0, rtol=0)
     assert keys.data_ptr() == k.data_ptr() and values.data_ptr() == v.data_ptr()
     torch.testing.assert_close(result, q.flatten(2), atol=0, rtol=0)
     assert result.is_contiguous()
+    if new_pos == 767 and mixed_output:
+        assert result.data_ptr() == launches[0][1][-1].data_ptr()
+
+
+def test_causal_fia_writes_sequence_major_output(monkeypatch):
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: False,
+                        current_stream=lambda device: SimpleNamespace(npu_stream=0)), raising=False)
+    monkeypatch.setattr(cann_attention, "_check_qkv", lambda *args: None)
+    native = cann_attention.CannAttention.__new__(cann_attention.CannAttention)
+    native._lock, native._buffers = Lock(), {}
+    q = torch.arange(7 * 16 * 128, dtype=torch.float32).bfloat16().view(1, 7, 16, 128)
+    k = q[:, :, :2].contiguous()
+    outputs = []
+
+    def launch(out, workspace, query, keys, values, mask, scale, inner_precise, sparse_mode):
+        assert query.is_contiguous() and query.shape == (1, 16, 7, 128)
+        assert out.is_contiguous() and out.shape == q.shape
+        out.copy_(query.transpose(1, 2))
+        outputs.append(out)
+
+    native._bsnd_output = (lambda *args: 0, launch)
+    result = native.causal_attention(q, k, k)
+    assert result is outputs[0]
+    torch.testing.assert_close(result, q, rtol=0, atol=0)
 
 
 def test_admitted_fia_launch_failure_propagates(monkeypatch):
