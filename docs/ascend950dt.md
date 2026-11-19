@@ -47,4 +47,4 @@ python benchmarks/performance.py --name "Wall-OSS · BF16 · Ascend 950DT" \
   --robots 3 4 5 --out artifacts/perf-wall-oss-ascend
 ```
 
-For Wall-X 2B, measure [single-request latency](benchmark.md#single-request) with its recipe and captured request set. Bind the test processes to the device's local CPU NUMA node. Restart `xinfer-serve` for each of the 8, 12, 14, 15 and 16 robot tiers, with the same two captured warmup requests and `--lanes vision=1,prefill=3,action=2 --max-batch action=4`. Run [robot load](benchmark.md#robot-load) for each tier with `--requests 80 --warmup-requests 20 --rounds 2`.
+For Wall-X 2B, measure [single-request latency](benchmark.md#single-request) with its recipe and captured request set. Bind the test processes to the device's local CPU NUMA node.

@@ -26,22 +26,6 @@ def _platform(cudagraphs=True, arch="sm120"):
                     capabilities=capabilities)
 
 
-def test_model_batch_default_preserves_single_request_until_explicit_opt_in():
-    class Conservative(ThreeStage):
-        def capabilities(self):
-            return Capabilities(num_steps=5, batch_sizes={"action": (1, 2, 4)},
-                                default_batch_sizes={"action": (1,)})
-
-    model = Conservative()
-    default = resolve(model, _platform(), model_name="m", tuned=None)
-    assert default.value("batch_sizes.action") == [1]
-    assert default.settings["batch_sizes.action"].source == "model:default sizes"
-    selected = resolve(model, _platform(), model_name="m", tuned=None,
-                       explicit=ExplicitSettings(max_batch={"action": 4}))
-    assert selected.value("batch_sizes.action") == [1, 2, 4]
-    assert selected.engine_config().max_batch == {"vision": 1, "prefill": 1, "action": 4}
-
-
 TABLE = TunedTable("m/sm120-mxfp8", lanes={"vision": 2, "prefill": 3, "action": 2},
                    measured={"commit": "abc1234", "date": "2026-11-01", "method": "test", "evidence": "test"})
 

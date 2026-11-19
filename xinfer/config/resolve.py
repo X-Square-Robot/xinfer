@@ -256,7 +256,7 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
     - ``stream_priorities.<stage>``: explicit, else -1 bounded by the platform's reported range for a final
       stage (one without consumers), else 0; unknown ranges keep default 0, and nonzero requires platform support.
     - ``batch_sizes.<stage>`` (allowed batch sizes, 1 always included): with an explicit ``max_batch``, the
-      declared sizes up to it; else the model's default sizes or every declared size.
+      declared sizes up to it; else every declared size.
     - ``cudagraphs``: explicit, else whether the platform supports graph capture.
     - ``frontends``: explicit, else 2, at most half the CPU quota.
     - ``frontend_workers``: explicit, else 4, with ``frontends × frontend_workers`` at most half the CPU quota.
@@ -348,11 +348,7 @@ def resolve(model, platform, *, model_name: str, quantization: str | None = None
         elif allowed == [1]:
             out[f"batch_sizes.{stage}"] = Setting([1], "model:declares B1 only")
         else:
-            defaults = sorted(set(capabilities.default_batch_sizes.get(stage, allowed)) | {1})
-            if not set(defaults).issubset(allowed):
-                raise ConfigError(f"stage {stage} default batch sizes {defaults} exceed supported sizes {allowed}")
-            out[f"batch_sizes.{stage}"] = Setting(defaults, "model:default sizes" if defaults != allowed
-                                                   else "model:declared sizes")
+            out[f"batch_sizes.{stage}"] = Setting(allowed, "model:declared sizes")
 
     if explicit.cudagraphs is not None:
         if explicit.cudagraphs and not platform.capabilities.cudagraphs:

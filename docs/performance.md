@@ -31,14 +31,14 @@ See [Wall-OSS validation](models/wall_oss_validation.md) for the latency and mea
 
 ## Ascend 950DT
 
-Each model ran on one Ascend 950DT with CANN 9.3.0-beta.1, CPU image processing, device-local NUMA binding and the BF16 recipe in the [Ascend guide](ascend950dt.md). Fleet tests used synthetic desktop observations with RTC, 80 requests per robot and the first 20 discarded. All measured rounds had zero errors and zero missing responses.
+Each model ran on one Ascend 950DT with CANN 9.3.0-beta.1, CPU image processing, device-local NUMA binding and the BF16 recipe in the [Ascend guide](ascend950dt.md). The Wall-OSS fleet tests used synthetic desktop observations with RTC, 80 requests per robot and the first 20 discarded. All measured rounds had zero errors and zero missing responses.
 
 | # | Model | Precision, composition | Single request P50 | Robots per device | Server P50 at capacity | Server P95 at capacity | Saturation | Numerical agreement |
 |---|---|---|---|---|---|---|---|---|
 | 5 | Wall-OSS | BF16, optimized | 42.0 ms | ≥ 5 | 105 ms | 125 ms | 27.7 req/s | Bitwise agreement on two fixed requests |
-| 6 | Wall-X 2B | BF16, optimized | 35.4 ms | 15 | 129 ms | 162 ms | 84.3 req/s | Bitwise agreement on eight fixed single requests |
+| 6 | Wall-X 2B | BF16, optimized | 35.4 ms | — | — | — | — | Bitwise agreement on eight fixed single requests |
 
 ### Conditions
 
 - **Wall-OSS** used the flow and RTC requests for single-request timing and server warmup. The 3, 4 and 5 robot tiers each ran eight rounds and passed the [shared capacity rule](benchmark.md#performance-table).
-- **Wall-X 2B** used the captured request set for single-request timing. The service used two warmup requests, the 5.0 RTC gripper limit, `--lanes vision=1,prefill=3,action=2` and `--max-batch action=4`. Each sweep ran two rounds at 8, 12, 14, 15 and 16 robots. Capacity is the largest tier whose median server P50 across rounds stayed within 150 ms. Both sweeps passed at 15 robots. The table reports the first sweep.
+- **Wall-X 2B** used the captured request set for single-request timing.

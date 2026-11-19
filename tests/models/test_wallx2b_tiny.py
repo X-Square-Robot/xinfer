@@ -192,34 +192,6 @@ def test_bf16_prefill_uses_the_selected_split_and_layer_norms(tiny):
     assert set(pins) <= set(model.capabilities().stage_ops["prefill"])
 
 
-@pytest.mark.parametrize("size", [2, 4])
-def test_explicit_action_batch_preserves_individual_rtc_requests(tiny_optimized, size):
-    from xinfer.config import ExplicitSettings, resolve
-    from xinfer.engine.batching import merge, ragged_inputs
-
-    model = tiny_optimized
-    default = resolve(model, resolve_platform("cpu"), model_name="wallx2b", tuned=None)
-    assert default.value("batch_sizes.action") == [1]
-    selected = resolve(model, resolve_platform("cpu"), model_name="wallx2b", tuned=None,
-                       explicit=ExplicitSettings(max_batch={"action": size}))
-    assert max(selected.value("batch_sizes.action")) == size
-    inputs, expected = [], []
-    for index in range(size):
-        value = _inputs(model, rtc_delay=index + 1, seed=index)
-        value["image_embeds"] = _run(model, "vision", value)["image_embeds"]
-        value["prompt_kv"] = _run(model, "prefill", value)["prompt_kv"]
-        expected.append(_run(model, "action", value)["predict_action_norm"])
-        inputs.append(value)
-    axes = dict(model.batch_axes, prompt_kv=2)
-    merged = merge(inputs, axes, ragged_inputs(model, "action"))
-    result = torch.empty(size, H, D)
-    with torch.no_grad():
-        model.denoise(StageBatch("action", size, merged, {"predict_action_norm": result}))
-    torch.testing.assert_close(result, torch.cat(expected), rtol=1e-3, atol=1e-4)
-    for index in range(size):
-        assert torch.equal(result[index, :index + 1], inputs[index]["rtc_actions"][0, :index + 1])
-
-
 def test_quantization_selects_only_the_requested_stage(tiny):
     from xinfer.models.wallx2b.model import Wallx2b
 

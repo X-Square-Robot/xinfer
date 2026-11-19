@@ -47,4 +47,4 @@ python benchmarks/performance.py --name "Wall-OSS · BF16 · Ascend 950DT" \
   --robots 3 4 5 --out artifacts/perf-wall-oss-ascend
 ```
 
-测量 Wall-X 2B 时，用对应配方和抓包请求集测[单请求时延](benchmark.zh-CN.md#单请求)，将测试进程绑定到设备所在的 CPU NUMA 节点。8、12、14、15、16 台逐档重启 `xinfer-serve`，每次用抓包中相同的两个请求预热，并指定 `--lanes vision=1,prefill=3,action=2 --max-batch action=4`。运行各档的[机器人负载测试](benchmark.zh-CN.md#机器人负载)时，指定 `--requests 80 --warmup-requests 20 --rounds 2`。
+测量 Wall-X 2B 时，用对应配方和抓包请求集测[单请求时延](benchmark.zh-CN.md#单请求)，将测试进程绑定到设备所在的 CPU NUMA 节点。
