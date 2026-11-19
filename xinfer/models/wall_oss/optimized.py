@@ -128,6 +128,14 @@ def _layer_params(hidden, intermediate, qkv_rows, q_width, down_t=False):
     return ParamGroup(**shapes)
 
 
+def _projection_input(o, supports_head_major):
+    """Give the selected projection packed token rows unless it accepts head-major attention output."""
+    x = o[0]
+    if not supports_head_major and x.ndim == 3:
+        return x.transpose(0, 1).reshape(x.shape[1], -1)
+    return x
+
+
 class OptimizedPrefill(nn.Module):
     """Expert 0 over the prompt: every layer's post-RoPE K and V.
 
@@ -144,6 +152,7 @@ class OptimizedPrefill(nn.Module):
         self.layers = nn.ModuleList(_layer_params(expert.hidden_size, expert.intermediate_size, rows, q_width)
                                     for _ in range(c.num_hidden_layers))
         self.ops = active_ops()
+        self._project_head_major = getattr(self.ops.gemm_epilogue, "supports_head_major_input", False)
 
     def forward(self, h, cos, sin, prompt_kv):
         """Run expert 0 and write ``prompt_kv`` ``[layers, 2, 1, kv_heads, P, head_dim]``.
@@ -170,10 +179,9 @@ class OptimizedPrefill(nn.Module):
             # widths keep the packed view.
             bnsd = q.ndim == 3
             q_arg = q.transpose(0, 1)[None] if bnsd else q.view(1, p, heads, d)
-            # The head-major contract lets the projection consume the attention buffer directly.
             attention = ops.causal_attention_bnsd if bnsd else ops.causal_attention
             o = attention(q_arg, keys.transpose(0, 1)[None], values.transpose(0, 1)[None])
-            rows = o[0] if bnsd else o.reshape(p, -1)
+            rows = _projection_input(o, self._project_head_major) if bnsd else o.reshape(p, -1)
             h, normed = ops.add_rms_norm(ops.gemm_epilogue(rows, layer.o).view(1, p, -1), h,
                                          layer.post_norm, eps)
             h, normed = ops.mlp_add_rms_norm(normed.view(p, -1), layer.gate_up, layer.down, h,
@@ -208,6 +216,7 @@ class OptimizedAction(nn.Module):
         self._supports_packed_output = packed if paired else None
         # The QKV contract permits either layout unless the selected implementation promises packed Q.
         self._may_return_head_major = not getattr(self.ops.qkv_rope_kvcache, "packed_q_only", False)
+        self._project_head_major = getattr(self.ops.gemm_add_rms_norm, "supports_head_major_input", False)
         self.stage_ops = OPTIMIZED_STAGE_OPS["action"]
         if self._may_return_head_major:
             self.stage_ops += ("gemm_add_rms_norm",)
@@ -312,7 +321,8 @@ class OptimizedAction(nn.Module):
                     else:
                         o = packed_attention(q_arg, k_arg, v_arg, start, p, flash_mask=flash_mask)
                     if bnsd:
-                        h, normed = ops.gemm_add_rms_norm(o[0], layer.o_t.t(), h, layer.post_norm, eps)
+                        rows = _projection_input(o, self._project_head_major)
+                        h, normed = ops.gemm_add_rms_norm(rows, layer.o_t.t(), h, layer.post_norm, eps)
                     else:
                         h, normed = add_rms_norm(gemm_epilogue(o[0], layer.o_t.t())[None], h,
                                                  layer.post_norm, eps)

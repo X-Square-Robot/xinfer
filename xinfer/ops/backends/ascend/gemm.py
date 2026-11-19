@@ -91,6 +91,9 @@ def gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, resid
                        row_class=row_class, row_scale=row_scale)
 
 
+gemm_epilogue.supports_head_major_input = True
+
+
 def _glu_supported(x, weight, *, bias=None, modulation=None, row_class=None, eps=1e-6):
     return canonical_glu is not None or modulation is None or callable(getattr(cann_action, "gemm_glu_epilogue", None))
 
@@ -115,6 +118,9 @@ def gemm_add_rms_norm(x, projection, residual, weight, eps, bias=None):
         projection = cann_projection._stable_contiguous(projection)
     normalize = add_rms_norm if norm_library is not None else reference.add_rms_norm
     return normalize(gemm_epilogue(x, projection, bias).view(residual.shape), residual, weight, eps)
+
+
+gemm_add_rms_norm.supports_head_major_input = True
 
 
 @register("mlp_add_rms_norm", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,

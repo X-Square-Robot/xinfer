@@ -239,6 +239,8 @@ def test_action_routes_attention_output_without_repacking(tiny, supports_row, ma
             call.supports_packed_output = supports_packed_output
         if name == "prefix_kvcache_attention_bnsd":
             call.supports_all_keep = supports_all_keep
+        if name == "gemm_add_rms_norm":
+            call.supports_head_major_input = True
         return call
 
     registry = ops.OpRegistry()
@@ -258,6 +260,47 @@ def test_action_routes_attention_output_without_repacking(tiny, supports_row, ma
     assert projected == [(outputs[expected].shape[1:], outputs[expected].data_ptr())] * layers
     assert len(support_calls) == (layers if paired and not all_keep else 0)
     assert action_calls <= set(model.capabilities().stage_ops["action"])
+
+
+@pytest.mark.parametrize("stage,projection", [("prefill", "gemm_epilogue"), ("action", "gemm_add_rms_norm")])
+def test_head_major_attention_feeds_a_strict_2d_projection(tiny_optimized, stage, projection):
+    from xinfer.models.wall_oss.model import WallOSS
+
+    registry = ops.OpRegistry()
+    for name in ops.registry.names():
+        registry.define(ops.registry.spec(name))
+    qkv = registry.spec("qkv_rope_kvcache").reference
+    project = registry.spec(projection).reference
+    calls = []
+
+    @wraps(qkv)
+    def head_major_q(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim):
+        rows = qkv(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim)
+        return rows.view(-1, num_heads, head_dim).transpose(0, 1).contiguous()
+
+    head_major_q.packed_q_only = False
+
+    @wraps(project)
+    def strict_projection(x, *args, **kwargs):
+        assert x.ndim == 2
+        calls.append(x.shape)
+        return project(x, *args, **kwargs)
+
+    for name, function in (("qkv_rope_kvcache", head_major_q), (projection, strict_projection)):
+        registry.add(name, function, backend="test-projection", platforms=("cpu",),
+                     contract=ops.Contract(numerics="bitwise"))
+    pins = dict.fromkeys(("qkv_rope_kvcache", projection), "test-projection")
+    table = registry.build_table(resolve_platform("cpu"), backends=pins, reference_only=True)
+    with ops.use_ops(table):
+        model = WallOSS.from_checkpoint(tiny_optimized.root, device="cpu", processing={"prompt_bucket": 0})
+    inputs = _request(model, delay=3, rtc_rows=H).tensors
+    inputs["image_embeds"] = run_stage(tiny_optimized, "vision", inputs, "cpu")["image_embeds"]
+    if stage == "action":
+        inputs["prompt_kv"] = run_stage(tiny_optimized, "prefill", inputs, "cpu")["prompt_kv"]
+    expected = run_stage(tiny_optimized, stage, inputs, "cpu")
+    actual = run_stage(model, stage, inputs, "cpu")
+    assert calls
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_split_equals_joint_prefill_action_forward(tiny):
