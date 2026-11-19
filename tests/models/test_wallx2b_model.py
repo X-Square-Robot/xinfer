@@ -244,7 +244,9 @@ def test_prefill_window_options_are_retained_without_device_initialization(monke
     manifest = SimpleNamespace(config=SimpleNamespace())
     monkeypatch.setattr("xinfer.models.wallx2b.rpu.model.preflight_checkpoint", lambda path: manifest)
     monkeypatch.setattr(WallX2B, "build_processors", classmethod(lambda cls, path, **kw: (object(), object(), None)))
-    model = WallX2B.from_checkpoint("unused", device="rpu:0", allow_candidate=True, **options)
+    table = object()
+    model = WallX2B.from_checkpoint("unused", device="rpu:0", ops=table, allow_candidate=True, **options)
     assert model.prefill_collective_window == expected and model.context is None
     assert model.quantization == "fp16"
+    assert model.ops is table
     assert not model._prepared and not model._attempted

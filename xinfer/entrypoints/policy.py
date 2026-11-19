@@ -86,18 +86,10 @@ class Policy:
             ValueError: unsupported device type.
         """
         self.platform = resolve_platform(device)
-        if self.platform.capabilities.op_selection == "model-bound":
-            if reference_ops or op_backends:
-                raise ValueError(f"platform {self.platform.name} selects operators through its own binding "
-                                 "(op_selection='model-bound'); Torch operator overrides are unsupported")
-            from xinfer.ops.registry import OpTable
-
-            self.op_table = OpTable(self.platform.name, {})
-        else:
-            ops.registry.load_plugins()
-            self.op_table = ops.registry.build_table(
-                self.platform, backends=op_backends, reference_only=reference_ops
-            )
+        ops.registry.load_plugins()
+        self.op_table = ops.registry.build_table(
+            self.platform, backends=op_backends, reference_only=reference_ops
+        )
         model_cls = get_model_class(model)
         model_options = apply_image_preprocess_device(
             {**model_options, "image_preprocess_device": image_preprocess_device}, self.platform)
@@ -106,8 +98,7 @@ class Policy:
                 checkpoint, device=self.platform.device, ops=self.op_table, **model_options
             )
         self.capabilities = self.model.capabilities()
-        if self.platform.capabilities.op_selection == "table":
-            ops.warn_slow_fallbacks(model, self.op_table, self.capabilities.stage_ops, self.platform.device)
+        ops.warn_slow_fallbacks(model, self.op_table, self.capabilities.stage_ops, self.platform.device)
         self.io_schema = self.model.io_schema()
         self._prepare = connect(self.model.input_processor())
         self.engine = None

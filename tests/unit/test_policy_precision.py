@@ -1,6 +1,5 @@
 """Configuration reports the model's effective precision, independent of its op binding."""
 
-from dataclasses import replace
 import importlib
 from types import SimpleNamespace
 
@@ -11,20 +10,18 @@ from xinfer.ops.registry import OpTable
 from xinfer.platforms.cpu import cpu_platform
 
 
-@pytest.mark.parametrize(("selection", "effective", "options", "expected"), [
-    ("model-bound", "bf16", {}, "bf16"),
-    ("model-bound", "fp16", {}, "fp16"),
-    ("table", "fp16", {}, "fp16"),
-    ("model-bound", "bf16", {"quantization": "auto"}, "bf16"),
-    ("table", None, {"quantization": "mxfp8"}, "mxfp8"),
-    ("model-bound", None, {}, "bf16"),
+@pytest.mark.parametrize(("effective", "options", "expected"), [
+    ("bf16", {}, "bf16"),
+    ("fp16", {}, "fp16"),
+    ("bf16", {"quantization": "auto"}, "bf16"),
+    (None, {"quantization": "mxfp8"}, "mxfp8"),
+    (None, {}, "bf16"),
 ])
 def test_policy_reports_effective_precision_without_choosing_a_model_default(
-        monkeypatch, selection, effective, options, expected):
+        monkeypatch, effective, options, expected):
     from xinfer.entrypoints import policy as policy_module
 
     platform = cpu_platform()
-    platform = replace(platform, capabilities=replace(platform.capabilities, op_selection=selection))
     graph = StageGraph(Stage("step", "step"))
     model = SimpleNamespace(
         stage_graph=graph,
@@ -78,6 +75,7 @@ def test_policy_routes_rpu_profile_defaults_to_the_rpu_engine(monkeypatch):
     def load(checkpoint, *, device, ops, quantization="fp16", **options):
         assert device == "rpu:0"
         model.quantization = quantization
+        model.ops = ops
         return model
 
     def tuned(model_name, arch, quantization):
@@ -86,7 +84,7 @@ def test_policy_routes_rpu_profile_defaults_to_the_rpu_engine(monkeypatch):
 
     monkeypatch.setattr(policy_module, "get_model_class", lambda name: SimpleNamespace(from_checkpoint=load))
     monkeypatch.setattr(policy_module._engine_factory, "_rpu_context",
-                        lambda **kwargs: context)
+                        lambda table, **kwargs: context)
     monkeypatch.setattr(importlib.import_module("xinfer.config.rpu"), "find_tuned", tuned)
 
     with policy_module.Policy("test", "unused", device="rpu") as policy:

@@ -1,16 +1,19 @@
 """The entry point assembles operators and platform owners without reversing dependencies."""
 
+import importlib
 import sys
 from types import SimpleNamespace
 
 import pytest
 
 from xinfer.entrypoints import _factory
+from xinfer.ops import Contract, OpRegistry, OpSpec, OpTable
 from xinfer.platforms import resolve_platform
 
 
 def _model(**attributes):
-    return SimpleNamespace(stage_graph=(), create_rpu_request=lambda prepared, context: None, **attributes)
+    return SimpleNamespace(stage_graph=(), create_rpu_request=lambda prepared, context: None,
+                           ops=attributes.pop("ops", OpTable("rpu", {})), **attributes)
 
 
 def _provider(monkeypatch, *, runtime=True):
@@ -29,7 +32,13 @@ def _provider(monkeypatch, *, runtime=True):
 
     provenance = {"library": "test-native-library", "abi_version": 11, "runtime_available": runtime}
     provider = SimpleNamespace(backend_factory=NativeContext, provenance=provenance)
-    monkeypatch.setattr(backends, "rpu", SimpleNamespace(load_backend=lambda: provider), raising=False)
+    def bind_ops(table):
+        def prepare(context, op, **arguments):
+            return getattr(table, "prepare_" + op)(context, **arguments)
+        return prepare
+
+    monkeypatch.setattr(backends, "rpu", SimpleNamespace(load_backend=lambda: provider, bind_ops=bind_ops),
+                        raising=False)
     return events, provenance
 
 
@@ -89,8 +98,60 @@ def test_engine_refuses_ambiguous_context_ownership():
 
 
 @pytest.mark.parametrize("overrides", [{"reference_ops": True}, {"op_backends": {"gemm": "reference"}}])
-def test_model_bound_policy_rejects_tensor_table_overrides_before_model_loading(overrides):
+def test_rpu_policy_passes_operator_options_to_the_shared_registry(monkeypatch, overrides):
     from xinfer import Policy
+    from xinfer.entrypoints import policy as policy_module
 
-    with pytest.raises(ValueError, match="op_selection='model-bound'"):
+    calls = []
+
+    def build_table(platform, **kwargs):
+        calls.append((platform, kwargs))
+        raise RuntimeError("table construction reached")
+
+    monkeypatch.setattr(policy_module.ops.registry, "load_plugins", lambda: None)
+    monkeypatch.setattr(policy_module.ops.registry, "build_table", build_table)
+    with pytest.raises(RuntimeError, match="table construction reached"):
         Policy("missing-model", "unused-checkpoint", device="rpu", **overrides)
+    assert calls == [(resolve_platform("rpu"), {
+        "backends": overrides.get("op_backends"), "reference_only": overrides.get("reference_ops", False),
+    })]
+
+
+@pytest.mark.parametrize("binding", ["test-double", "in-tree"])
+def test_factory_uses_the_pinned_prepared_implementation(monkeypatch, binding):
+    if binding == "in-tree":
+        try:
+            bind_ops = importlib.import_module("xinfer.ops.backends.rpu").bind_ops
+        except ImportError:
+            pytest.skip("requires the separate in-tree RPU operator change")
+    events, _ = _provider(monkeypatch)
+    if binding == "in-tree":
+        from xinfer.ops.backends import rpu
+
+        monkeypatch.setattr(rpu, "bind_ops", bind_ops)
+    registry = OpRegistry()
+
+    def reference(context, *, tensors, integers=None, scalars=None, **selectors):
+        raise AssertionError("the prepared operator must use the pinned implementation")
+
+    def selected(context, *, tensors, integers=None, scalars=None, **selectors):
+        events.append(("prepare", (context, tensors, integers, scalars, selectors)))
+        return SimpleNamespace(close=lambda: events.append(("operation_close", None)), entry="selected_fill")
+
+    registry.define(OpSpec("prepare_fill", "prepare_fill(context, *, tensors, **options)", reference))
+    registry.add("prepare_fill", selected, backend="rpu", platforms=("rpu",), library="selected",
+                 contract=Contract(numerics="tolerance", graph_safe=False))
+    platform = resolve_platform("rpu")
+    table = registry.build_table(platform, backends={"prepare_fill": "rpu:selected"})
+
+    def prepare(context):
+        operation = context.prepare("fill", tensors={}, scalars={"value": 3}, mode="broadcast")
+        assert operation.entry == "selected_fill"
+
+    engine = _factory.create_engine(platform, _model(ops=table, prepare_rpu=prepare))
+    try:
+        assert events[1] == ("prepare", (engine.context.native, {}, None, {"value": 3}, {"mode": "broadcast"}))
+        assert engine.context.stats["operation_preparations"] == 1
+        assert [row["library"] for row in table.report()] == ["selected"]
+    finally:
+        engine.shutdown()

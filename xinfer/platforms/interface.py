@@ -4,8 +4,8 @@ A platform describes what a device can do. The runtime derives defaults from
 these capabilities and rejects explicit settings a platform cannot honor; it
 never silently downgrades (docs/design.md §13).
 
-Engine dispatch reads ``capabilities.execution_model`` and operator selection
-reads ``capabilities.op_selection``. CUDA-specific integration uses
+Engine dispatch reads ``capabilities.execution_model``. All platforms select
+operators through the registry's OpTable. CUDA-specific integration uses
 ``Platform.is_cuda``.
 """
 
@@ -39,10 +39,6 @@ class PlatformCapabilities:
         execution_model: ``"cuda-lanes"`` selects the thread/lane/GPU-graph engine;
             ``"explicit-completion"`` selects a vendor SDK execution module (RPU's prepared-batch
             completion-wait model, no CUDA graph, no torch stream).
-        op_selection: ``"table"`` selects operators through :class:`xinfer.ops.OpTable` at build
-            time; ``"model-bound"`` records that the model binds prepared operations through its native
-            provider instead of the registered tensor-call interface. The shared model construction
-            context receives an empty table; this mode is independent of the source repository.
     """
 
     device_type: str  # "cuda", "ascend", "cpu" or "rpu"
@@ -56,7 +52,6 @@ class PlatformCapabilities:
     device_images: bool = False
     stream_priority_range: tuple[int, int] | None = None
     execution_model: Literal["cuda-lanes", "explicit-completion"] = "cuda-lanes"
-    op_selection: Literal["table", "model-bound"] = "table"
 
 
 @dataclass(frozen=True)

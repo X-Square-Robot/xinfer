@@ -7,8 +7,9 @@
 CPU、BF16 或 MXFP8 执行回退。
 
 此配置通过 Rhino Launch SDK 使用 Rhino RPU (R1)。SDK 单独安装，原生算子后端从
-`xinfer/ops/backends/rpu/src` 构建。框架接入与原生算子分别评审；实际执行前必须
-安装匹配的算子源码。
+`xinfer/ops/backends/rpu/src` 构建。框架接入与原生算子分别评审；实际执行需要
+匹配的整套算子变更，包括规格、注册表、RPU 注册和后端，仅有 RPU 目录或
+共享库并不够。
 
 执行属于实验特性，同时需要显式的候选准入和匹配的 AOT `xinfer_rpu.so` 库及外部算子资产。
 主机侧模型计划、处理与生命周期契约已经实现；用于生产前仍需完成板级数值、
@@ -82,9 +83,15 @@ with Policy("wallx2b", checkpoint, device="rpu:0", quantization="fp16",
 执行不会隐式启用候选能力。如果后端没有实现选定的 family、selector、
 集体窗口或融合队列，则准入失败，而不会静默替换为另一种执行计划。
 
-模型计划通过本仓算子 provider 的 family 入口准备，例如 `gemm`、`rmsnorm`、
-`qkv_proj`、`gemm_glu` 和 `attention`。family selector 原样传递给原生
-resolver；主机不选择物理 kernel 地址，也不为 catalog 名称维护别名表。
+RPU 与 CPU、CUDA、Ascend 使用同一注册表和 `build_table`。匹配的仓内算子包
+注册 `prepare_<family>` 调用，例如 `prepare_gemm` 和 `prepare_attention`，
+使用常驻缓冲区签名并报告 `numerics="unqualified"`。这些调用没有 Torch
+参考实现；固定选择不受支持或设置 `reference_ops=True` 时显式报错。
+空的 RPU 选择在绑定时报错；缺少某个调用时，在准备该操作时报错。
+
+工厂向平台上下文注入 `rpu.bind_ops(model.ops)`。模型计划继续调用
+`context.prepare(...)`，由表中选中的调用完成原生准备。family selector
+原样传给原生 resolver。批执行和完成等待保持不变，注册表选择不构成板级数值验收。
 
 ## 模型选项
 

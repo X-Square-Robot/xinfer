@@ -6,6 +6,7 @@ import math
 import threading
 import weakref
 from collections import Counter
+from functools import partial
 
 import numpy as np
 
@@ -28,7 +29,7 @@ class RpuExecutionContext:
     _owner = None
 
     def __init__(self, *, allow_candidate=False, retained_segments=128,
-                 file_descriptor_budget=None, backend_factory=None):
+                 file_descriptor_budget=None, backend_factory=None, operation_factory=None):
         if not isinstance(allow_candidate, bool):
             raise TypeError("allow_candidate must be bool")
         self._lock = threading.RLock()
@@ -57,6 +58,8 @@ class RpuExecutionContext:
             if retained_segments != 128:
                 options["retained_segments"] = retained_segments
             self.native = backend_factory(**options)
+            self._prepare_operation = (self.native.prepare if operation_factory is None else
+                                       partial(operation_factory, self.native))
             type(self)._owner = weakref.ref(self)
 
     def require_file_descriptor_budget(self, minimum):
@@ -169,8 +172,9 @@ class RpuExecutionContext:
     def prepare(self, op, *, tensors, integers=None, scalars=None, **selectors):
         """Prepare a family entry point (gemm, rmsnorm, ...) or a catalog entry.
 
+        The entry-point factory binds this call to the selected OpTable implementation.
         Selectors (parallel=, activation=, mode=, function=, operation=) pass
-        through to the native operator provider's family resolution unchanged.
+        through to that implementation unchanged.
         """
         with self._lock:
             self._check_idle()
@@ -178,8 +182,8 @@ class RpuExecutionContext:
                 if not isinstance(buffer, RpuBuffer) or buffer.context is not self:
                     raise ValueError(f"{name} must be an RPU buffer from this context")
                 buffer._check()
-            native = self.native.prepare(op, tensors={k: v.native for k, v in tensors.items()},
-                                         integers=integers, scalars=scalars, **selectors)
+            native = self._prepare_operation(op, tensors={k: v.native for k, v in tensors.items()},
+                                             integers=integers, scalars=scalars, **selectors)
             self.stats["operation_preparations"] += 1
             return RpuOperation(self, native, tensors, logical_op=op)
 

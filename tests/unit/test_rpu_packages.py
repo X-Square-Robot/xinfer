@@ -63,7 +63,6 @@ def test_rpu_platform_resolution_does_not_load_device_runtimes(tmp_path):
             assert platform == rpu_platform(device)
             assert platform.device == "rpu:0"
             assert platform.capabilities.execution_model == "explicit-completion"
-            assert platform.capabilities.op_selection == "model-bound"
 
         assert not attempts, attempts
         loaded = sorted(name for name in sys.modules if name.partition(".")[0] in forbidden)

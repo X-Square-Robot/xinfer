@@ -10,9 +10,9 @@ def rpu_platform(device: str):
     candidate ABI admission are checked when the execution context is created.
     An architecture match alone is not an operator support claim.
 
-    RPU execution carries its own kernel bindings (no torch op table) and waits
-    on explicit submission completion (no torch stream/event), declared through
-    the platform capabilities.
+    RPU operators use the shared OpTable with prepared-operation signatures.
+    Execution waits on explicit submission completion rather than torch streams
+    and events, as declared through the platform capabilities.
     """
     from xinfer.platforms.interface import Platform, PlatformCapabilities
 
@@ -24,6 +24,6 @@ def rpu_platform(device: str):
             device_type="rpu", arch="rpu-tp8", cudagraphs=False,
             stream_priorities=False, unified_memory=False,
             multiprocess_service=False, sm_count=None, total_memory_bytes=None,
-            execution_model="explicit-completion", op_selection="model-bound",
+            execution_model="explicit-completion",
         ),
     )

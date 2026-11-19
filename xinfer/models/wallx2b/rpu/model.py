@@ -82,6 +82,7 @@ class WallX2B(VLAModel):
         model = cls()
         model.checkpoint, model.config = Path(path), manifest.config
         model.manifest = manifest
+        model.ops = ops
         model.quantization = quantization
         model.rpu_allow_candidate = True
         model.max_cached_signatures = capacity

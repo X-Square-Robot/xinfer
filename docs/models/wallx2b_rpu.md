@@ -10,7 +10,9 @@ fallback.
 This profile targets Rhino RPU (R1) through Rhino Launch SDK. Install the SDK
 separately and build the native operator backend from
 `xinfer/ops/backends/rpu/src`. Framework integration and native operators are
-reviewed separately; the matching operator sources must be installed for execution.
+reviewed separately; execution needs the complete matching operator change,
+including specifications, registry, RPU registration and backend, not only the
+RPU directory or shared library.
 
 Execution is experimental and requires both explicit candidate admission and
 a matching AOT `xinfer_rpu.so` library and external kernel assets. Host-side model plans, processing
@@ -95,10 +97,18 @@ Execution never enables candidate capabilities implicitly. A backend that does
 not implement a selected family, selector, collective window or fused queue
 fails admission instead of silently substituting a different execution plan.
 
-Model plans prepare through the in-tree operator provider's family entry points such as `gemm`,
-`rmsnorm`, `qkv_proj`, `gemm_glu` and `attention`. Family selectors pass to the
-native resolver unchanged; the host does not choose physical kernel addresses
-or maintain an alias table for catalog names.
+RPU uses the same registry and `build_table` as CPU, CUDA and Ascend. The matching
+in-tree operator package registers `prepare_<family>` callables, such as
+`prepare_gemm` and `prepare_attention`, with resident-buffer signatures and
+`numerics="unqualified"`. They have no Torch reference: unsupported operator
+pins or `reference_ops=True` fail explicitly. An empty RPU selection fails when
+bound; a missing callable fails when that operation is prepared.
+
+The factory injects `rpu.bind_ops(model.ops)` into the platform context. Model
+plans keep calling `context.prepare(...)`; this invokes the table-selected
+callable and then native preparation. Family selectors pass to the native
+resolver unchanged. Batch execution and completion waits are unchanged, and
+registry selection does not establish board numerical acceptance.
 
 ## Model options
 

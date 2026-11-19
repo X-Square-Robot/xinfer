@@ -16,12 +16,12 @@ from xinfer.platforms.devices import device_module_for, jpeg_decoder_for
 from xinfer.platforms.interface import Platform, PlatformCapabilities
 
 
-def _platform(device="cpu", *, execution_model="cuda-lanes", op_selection="table"):
+def _platform(device="cpu", *, execution_model="cuda-lanes"):
     return Platform(f"test-{device}", device,
                     PlatformCapabilities(device_type=device.partition(":")[0], arch=None,
                                          cudagraphs=False, stream_priorities=False, unified_memory=True,
                                          multiprocess_service=False, sm_count=None, total_memory_bytes=None,
-                                         execution_model=execution_model, op_selection=op_selection))
+                                         execution_model=execution_model))
 
 
 def test_device_module_for_does_not_resolve_non_torch_devices():
@@ -55,7 +55,7 @@ def test_engine_factory_rpu_land_on_rpu_engine():
     # already matched, and the next failure is the model's missing RPU hook (not a wrong-engine
     # dispatch fallback).
     with pytest.raises(TypeError, match="RPU models must provide create_rpu_request"):
-        create_engine(_platform("rpu:0", execution_model="explicit-completion", op_selection="model-bound"), model,
+        create_engine(_platform("rpu:0", execution_model="explicit-completion"), model,
                       config=None)
 
     # Negative: the wrong engine class for a given cap is refused by that engine's own guard,
