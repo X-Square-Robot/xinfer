@@ -53,7 +53,6 @@ def cuda_platform(device: str) -> Platform:
         sm_count=props.multi_processor_count,
         total_memory_bytes=props.total_memory,
         device_images=_nvimgcodec_decoder(index) is not None,
-        cuda_interop=True,
     )
     return Platform(name=f"cuda-{arch}", device=f"cuda:{index}", capabilities=capabilities)
 

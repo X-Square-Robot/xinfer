@@ -333,16 +333,9 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
     Raises:
         RuntimeError: there are such operators and ``XINFER_OPS_STRICT`` is set.
     """
-    from xinfer.platforms.devices import device_module_for
-
-    if device_module_for(device) is None:
-        # CPU, non-torch vendor addresses or platforms whose model carries its own kernel
-        # binding (op_selection='model-bound') have no "slow torch fallback" to warn about;
-        # the caller already gates the call on op_selection=='table'.
+    kind = str(device).partition(":")[0]
+    if kind not in {"cuda", "npu"}:
         return []
-    import torch
-
-    kind = torch.device(device).type
 
     names = sorted({name for names in stage_ops.values() for name in names
                     if _is_slow_fallback(table.selection(name)) and name in FUSED_OPS})

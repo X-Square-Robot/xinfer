@@ -4,12 +4,9 @@ A platform describes what a device can do. The runtime derives defaults from
 these capabilities and rejects explicit settings a platform cannot honor; it
 never silently downgrades (docs/design.md §13).
 
-The runtime branches on capabilities, not on identity predicates: giving every
-vendor an ``is_<vendor>`` predicate and a sprinkle of ``if platform.is_<vendor>``
-branches is the ``platforms/`` layer leaking into shared code. The predicates
-below are documentation conveniences for layered drivers only; engine dispatch
-reads ``capabilities.execution_model`` and ops registration reads
-``capabilities.op_selection``.
+Engine dispatch reads ``capabilities.execution_model`` and operator selection
+reads ``capabilities.op_selection``. CUDA-specific integration uses
+``Platform.is_cuda``.
 """
 
 from __future__ import annotations
@@ -60,11 +57,6 @@ class PlatformCapabilities:
     stream_priority_range: tuple[int, int] | None = None
     execution_model: Literal["cuda-lanes", "explicit-completion"] = "cuda-lanes"
     op_selection: Literal["table", "model-bound"] = "table"
-    # Whether the runtime can register frontend shared memory for zero-copy DMA and whether kineto/
-    # torch.device profiler annotations apply. True for CUDA today; other vendors answer via their
-    # own platform factory when their runtime exposes equivalent primitives. The profiler and the
-    # frontend SHM reader branch on this capability, not on an ``is_cuda`` identity predicate.
-    cuda_interop: bool = False
 
 
 @dataclass(frozen=True)
@@ -85,7 +77,7 @@ class Platform:
 
     @property
     def is_cuda(self) -> bool:
-        """Documentation convenience. Core code reads ``capabilities``, not this attribute."""
+        """Whether the platform is a CUDA device."""
         return self.capabilities.device_type == "cuda"
 
     @property
@@ -95,5 +87,5 @@ class Platform:
 
     @property
     def is_rpu(self) -> bool:
-        """Documentation convenience. Core code reads ``capabilities``, not this attribute."""
+        """Whether the platform is an RPU device."""
         return self.capabilities.device_type == "rpu"

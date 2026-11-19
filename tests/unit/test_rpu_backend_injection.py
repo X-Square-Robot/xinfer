@@ -72,12 +72,12 @@ def test_preparation_failure_closes_the_owned_injected_context(monkeypatch):
     assert [kind for kind, _ in events] == ["create", "model_close", "close"]
 
 
-def test_missing_operator_package_reports_the_required_installation(monkeypatch):
+def test_missing_operator_package_preserves_import_error(monkeypatch):
     from xinfer.ops import backends
 
     monkeypatch.delattr(backends, "rpu", raising=False)
     monkeypatch.setitem(sys.modules, "xinfer.ops.backends.rpu", None)
-    with pytest.raises(RuntimeError, match="in-tree RPU operator backend is unavailable"):
+    with pytest.raises(ImportError, match="rpu"):
         _factory.create_engine(resolve_platform("rpu"), _model())
 
 

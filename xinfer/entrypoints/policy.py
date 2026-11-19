@@ -110,54 +110,45 @@ class Policy:
             ops.warn_slow_fallbacks(model, self.op_table, self.capabilities.stage_ops, self.platform.device)
         self.io_schema = self.model.io_schema()
         self._prepare = connect(self.model.input_processor())
-        self._finish = self.model.output_processor()
-        quantization = getattr(self.model, "quantization", model_options.get("quantization", "bf16"))
-        self.resolved = _engine_factory.resolve_config(
-            self.model, self.platform, model_name=model,
-            quantization=quantization if isinstance(quantization, str) else None,
-            explicit=ExplicitSettings(cudagraphs=None if cudagraphs is None else bool(cudagraphs),
-                                      stream_priorities=stream_priorities or {}))
-        graph_policy = cudagraphs if isinstance(cudagraphs, CUDAGraphConfig) else None
+        self.engine = None
         try:
+            self._finish = self.model.output_processor()
+            quantization = getattr(self.model, "quantization", model_options.get("quantization", "bf16"))
+            self.resolved = _engine_factory.resolve_config(
+                self.model, self.platform, model_name=model,
+                quantization=quantization if isinstance(quantization, str) else None,
+                explicit=ExplicitSettings(cudagraphs=None if cudagraphs is None else bool(cudagraphs),
+                                          stream_priorities=stream_priorities or {}))
+            graph_policy = cudagraphs if isinstance(cudagraphs, CUDAGraphConfig) else None
             self.engine = _engine_factory.create_engine(self.platform, self.model,
                                                         self.resolved.engine_config(graph_policy))
-        except BaseException:
-            close_processor = getattr(self._prepare, "close", None)
-            if close_processor is not None:
-                close_processor()
+        except BaseException as error:
+            self._cleanup(error)
             raise
 
+    def _cleanup(self, primary_error=None):
+        """Close both owned resources without replacing an already active error."""
+        error = primary_error
+        for close in (self.engine.shutdown if self.engine is not None else None,
+                      getattr(self._prepare, "close", None)):
+            if close is not None:
+                try:
+                    close()
+                except BaseException as cleanup_error:
+                    if error is None:
+                        error = cleanup_error
+        if primary_error is None and error is not None:
+            raise error
 
     def close(self) -> None:
-        """Drain outstanding work and release the model execution resources."""
-        failure = None
-        try:
-            self.engine.shutdown()
-        except BaseException as error:
-            failure = error
-        close_processor = getattr(self._prepare, "close", None)
-        if close_processor is not None:
-            try:
-                close_processor()
-            except BaseException as error:
-                if failure is None:
-                    failure = error
-                elif hasattr(failure, "add_note"):
-                    failure.add_note(f"Input processor cleanup failed: {error}")
-        if failure is not None:
-            raise failure
+        """Drain the engine and close the input processor."""
+        self._cleanup()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, error, traceback):
-        try:
-            self.close()
-        except BaseException as cleanup_error:
-            if error is None:
-                raise
-            if hasattr(error, "add_note"):
-                error.add_note(f"Policy cleanup failed: {cleanup_error}")
+        self._cleanup(error)
         return False
 
     def prepare(self, observation: Mapping[str, Any]) -> PreparedRequest:

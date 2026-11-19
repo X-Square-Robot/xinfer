@@ -201,6 +201,7 @@ def main(argv=None) -> None:
 
     from xinfer import ops
     from xinfer.config import ExplicitSettings, apply_image_preprocess_device, load_tuned, resolve
+    from xinfer.engine import Engine
     from xinfer.engine import AdmitError
     from xinfer.frontend.protocol import ADMIT_STATUS, INTERNAL_ERROR, OK, read_requests
     from xinfer.frontend.server import run_frontend
@@ -239,8 +240,7 @@ def main(argv=None) -> None:
                        explicit=explicit, tuned=tuned)
     logger.info("model loaded in %.1fs on %s; ops %s", time.perf_counter() - started, platform.name,
                 {r["op"]: f"{r['backend']}:{r['library']}" if r["library"] else r["backend"] for r in table.report()})
-    if platform.capabilities.op_selection == "table":
-        ops.warn_slow_fallbacks(args.model, table, model.capabilities().stage_ops, platform.device)
+    ops.warn_slow_fallbacks(args.model, table, model.capabilities().stage_ops, platform.device)
     logger.info("resolved configuration:\n%s", resolved.report())
     if args.resolved_config:
         resolved.write(args.resolved_config, model=args.model, platform=platform.name, ops=table.report(),
@@ -248,9 +248,7 @@ def main(argv=None) -> None:
     if args.dry_run:
         print(resolved.report(), flush=True)
         return
-    from xinfer.entrypoints._factory import create_engine
-
-    engine = create_engine(platform, model, resolved.engine_config())
+    engine = Engine(model, platform, resolved.engine_config())
     warmup = []
     if args.warmup:
         prepare, _, _ = model_cls.build_processors(args.checkpoint, **model_options)
@@ -268,7 +266,7 @@ def main(argv=None) -> None:
     if args.profile_dir:
         from xinfer.observability import annotate, load_profile
 
-        recorder = load_profile.SpanRecorder(platform.capabilities.cuda_interop)
+        recorder = load_profile.SpanRecorder(platform.is_cuda)
         annotate.configure(recorder)
 
     mp_context = mp.get_context("spawn")
@@ -278,7 +276,7 @@ def main(argv=None) -> None:
                    shm_prefix=f"xinfer-{uuid.uuid4().hex[:8]}")
     options["warmup"] = warmup  # the frontends run these requests through their processors before serving
     options["metrics"] = engine_metrics is not None
-    reader = ShmReader(register_cuda=platform.capabilities.cuda_interop)
+    reader = ShmReader(register_cuda=platform.is_cuda)
     reader_lock = threading.Lock()
     ready = threading.Semaphore(0)
     processes, pipes = [], []

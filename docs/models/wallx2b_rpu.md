@@ -187,8 +187,8 @@ execution resources and input processor. `RpuEngine.shutdown()` performs the
 same drain and model/context cleanup; an externally supplied execution context
 keeps its pre-existing resources. Repeated close calls are safe. Cleanup
 failure does not leave a failed native release advertised as an available
-context. A close requested while another body exception is active annotates
-that exception rather than replacing it.
+context. When a Policy context exits with an active error, cleanup preserves
+that original error.
 
 Prefix plans are bounded by `max_cached_signatures`. Request-owned resources
 are released after completion, while immutable weights and cached prepared

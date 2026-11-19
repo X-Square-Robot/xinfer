@@ -1,11 +1,8 @@
-"""Single dispatch site for engine and configuration selection by platform capability.
+"""Backend assembly for the in-process Policy.
 
-This is the only place engine classes are picked from a resolved ``Platform``: vendor identity
-never leaks into branches here, only ``capabilities.execution_model`` (docs/design.md §13.1).
-The CUDA-lanes engine is the default; vendor SDKs with their own submission model register a
-different value on their platform's capabilities and the matching engine class in a one-line
-branch below. Keep dependency direction intact: this module lives in ``entrypoints/`` and is
-allowed to import from ``engine/`` (``platforms/interface.py`` stays torch- and engine-free).
+Policy selects its configuration and engine by execution capability. This entry
+point may assemble ops, platform and engine objects without reversing package
+dependencies. Serving and load profiling explicitly require the lane engine.
 """
 
 from __future__ import annotations
@@ -32,11 +29,7 @@ def resolve_config(model, platform: Platform, **kwargs):
 
 def _rpu_context(**options):
     """Assemble the in-tree operator provider and the platform resource owner."""
-    try:
-        from xinfer.ops.backends import rpu
-    except ImportError as error:
-        raise RuntimeError("the in-tree RPU operator backend is unavailable; install the matching ops sources "
-                           "and build xinfer_rpu.so") from error
+    from xinfer.ops.backends import rpu
     from xinfer.platforms.rpu import RpuExecutionContext
 
     backend = rpu.load_backend()
@@ -64,8 +57,6 @@ def create_engine(platform: Platform, model, config=None):
     Raises:
         ValueError: an unsupported ``execution_model`` value.
     """
-    if config is not None and hasattr(config, "engine_config"):
-        raise TypeError("create_engine takes an EngineConfig, not a ResolvedConfig; call engine_config() first")
     if platform.capabilities.execution_model == "explicit-completion":
         from xinfer.engine.rpu import RpuEngine
 

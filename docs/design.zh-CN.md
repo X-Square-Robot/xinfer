@@ -40,7 +40,7 @@
 | 设计项 | 状态 | 现状 |
 |---|---|---|
 | §4 包间依赖方向 | 已实现 | `tests/unit/test_layering.py` 检查（含 `frontend/`、`observability/`）；`engine/` 不依赖 `ops/`、`frontend/` 两条尚未加入检查 |
-| §4 设备边界 | 部分实现 | `engine/` 不再直接写 `torch.cuda.*`：所有设备原语都经 `xinfer/platforms/devices.py` 的 `device_module_for` / `graph_api_for` / `jpeg_decoder_for` 解析，同一引擎面绑定不同 torch-vendor 运行时（当前 CUDA，未来 `torch.npu`）。平台工厂把厂商字符串收窄到 `platforms/detect.py`、`platforms/{cuda,cpu,npu}.py` 和 `platforms/rpu/`。engine/policy/serve/config 分支读 `capabilities.{execution_model,op_selection,cuda_interop}`，不再读 `is_<vendor>` 谓词；`frontend/shm.py` 仍直接调 `cudaHostRegister`，由 `capabilities.cuda_interop` 控制；`test_layering.py` 仍只查 `platforms/interface.py`、`models/interface.py` 不 import torch |
+| §4 设备边界 | 部分实现 | 部分设备原语经 `platforms/devices.py` 调用；共享引擎仍直接调用 `torch.cuda`，并按 `Platform.is_cuda` 分支。引擎和算子分派读取 `capabilities.{execution_model,op_selection}`；CUDA profiling 与 frontend 共享内存注册使用 `Platform.is_cuda`。`test_layering.py` 只检查 `platforms/interface.py`、`models/interface.py` 不 import torch |
 | §5 取消与单请求错误 | 部分实现 | 未发射的取消请求直接丢弃，已发射的跑完后丢弃结果；阶段执行、接纳时的上传或取批时出错，只让相应的请求失败，并释放其 slot。引擎线程或完成线程停止时 `xinfer-serve` 以状态 1 退出；设备粘滞错误的识别（`Platform.classify_error`）与 DRAINING 未实现 |
 | §6.3 三条调度规则 | 已实现 | 上游发射后请求即进入下游队列，下游 lane 在 GPU 上等待事件；零等待组批；完成线程只等最终事件（`xinfer/engine/core.py`） |
 | §6.4 组批精度 | 已实现 | Wall-OSS 参考组合允许 action 阶段使用 B1、B2、B4 和 B8。优化组合、vision 和 prefill 只使用 B1。 |
@@ -193,9 +193,9 @@
 
 **RPU 包的职责边界。** `models/wallx2b/rpu/` 负责模型配置、权重、请求处理和常驻阶段计划。`engine/rpu/engine.py` 通过模型的 RPU 钩子负责请求准入、提交、完成、重置和关闭。平台包负责设备资源：`platforms/rpu/platform.py` 描述能力，`resources.py` 管理缓冲区和操作，`execution.py` 管理有序执行，`context.py` 管理上下文生命周期。`platforms/rpu/plan.py` 定义后端模型和引擎共同使用的 RPU 请求契约；共享模型接口不依赖厂商执行类型。`config/rpu.py` 提供 RPU 请求和通道默认值，通用解析器继续负责 frontend 和共享内存设置。包的导出接口保留原有引擎和平台导入路径。入口工厂将本仓算子 provider 注入平台上下文；平台与引擎都不导入 ops。`op_selection="model-bound"` 表示由模型绑定准备好的算子，与源码所在仓库无关。
 
-`test_layering.py` 检查上表中包之间的依赖方向，以及 `platforms/interface.py`、`models/interface.py` 不 import torch。下面的设备边界是目标，尚未实现，也未检查。
+`test_layering.py` 检查上表中包之间的依赖方向，以及 `platforms/interface.py`、`models/interface.py` 不 import torch。下面的设备边界是目标，目前只部分实现，也未作为完整契约检查。
 
-**设备边界（目标）。** 设备运行时 API（`torch.cuda`、`torch.npu` 等）、设备字符串和架构判断（`sm_`、`gfx` 等）只允许出现在 `platforms/` 下的具体平台模块或包和 `ops/backends/`。ROCm 版 PyTorch 也用 `torch.cuda` 接口，所以边界按平台实现划分，不按 API 名划分。核心代码按 Platform 的能力判断，不按平台名判断（§13.1）。现状：`engine/` 不再直接写 `torch.cuda.*` —— stream/event/graph 原语经 `platforms/devices.device_module_for`，入口分派读 `capabilities.{execution_model,op_selection,cuda_interop}` —— 因此同一引擎面可绑定 torch-vendor 运行时（CUDA、`torch.npu`），厂商身份查询封闭在 `platforms/{cuda,npu,cpu}.py` 和 `platforms/rpu/` 内。`frontend/shm.py` 仍直接调 `cudaHostRegister`，由 `capabilities.cuda_interop` 控制；各模型的 `processing.py` 输出 torch CPU 张量，`frontend/` 因此 import torch，但不初始化 CUDA。
+**设备边界（目标）。** 设备运行时 API（`torch.cuda`、`torch.npu` 等）、设备字符串和架构判断（`sm_`、`gfx` 等）只允许出现在 `platforms/` 下的具体平台模块或包和 `ops/backends/`。ROCm 版 PyTorch 也用 `torch.cuda` 接口，所以边界按平台实现划分，不按 API 名划分。现状：部分 stream/event/graph 原语经 `platforms/devices.py` 调用，共享引擎仍保留直接的 `torch.cuda` 调用和 `Platform.is_cuda` 分支。引擎和算子分派读取 `capabilities.{execution_model,op_selection}`。CUDA profiling 与 `frontend/shm.py` 主机内存注册使用 `Platform.is_cuda`；后者直接调用 `cudaHostRegister`。各模型的 `processing.py` 输出 torch CPU 张量，`frontend/` 因此 import torch，但不初始化 CUDA。
 
 ---
 
@@ -550,7 +550,7 @@ class Platform:
 - **dtype 与量化是能力。** `supported_dtypes` 缺少模型所需的 dtype（例如部分 NPU 没有 bf16），或 `supported_quant` 不含所选量化方法时，在配置解析阶段报错，不等到模型构建。
 - **外部平台**通过 `xinfer.platforms` 入口注册（§18.3），内置的 cuda 和 cpu 走同一机制。
 - `ipc`、`mps`、`spatial_partition` 在 v1 没有代码读取（§9.3），需要时再加入。
-- **核心按能力判断，不按身份判断。** Platform 不提供 `is_cuda()` 一类的身份谓词；`engine/`、`models/layers/`、`models/` 只读 caps，未声明的 caps 取保守值（不支持）。Platform 的每个方法都必须有核心里的调用方和契约测试，否则不加（SGLang 的平台接口里有一批核心并未调用的方法，核心仍硬编码 `torch.cuda`，覆盖无效）。
+- **用能力描述执行契约。** 引擎分派读取 `execution_model`，算子选择读取 `op_selection`；CUDA 专属 profiling 和共享内存注册使用 `Platform.is_cuda`。未声明的能力取保守值（不支持）。每个新增的 Platform 方法都必须有调用方和契约测试。
 
 ### 13.2 首批平台
 
