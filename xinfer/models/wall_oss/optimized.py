@@ -267,6 +267,11 @@ class OptimizedAction(nn.Module):
             flash_mask = torch.stack((lts, ute), dim=-1).to(torch.int32)[None, None].contiguous()
         cache = torch.empty((*prompt_kv.shape[:-2], p + horizon, d), dtype=prompt_kv.dtype, device=device)
         cache[..., :p, :].copy_(prompt_kv)
+        # Writes and attention reads share the same per-layer cache across all Euler steps.
+        cache_views = []
+        for i in range(len(self.layers)):
+            keys, values = cache[i, 0], cache[i, 1]
+            cache_views.append((keys[0], values[0], keys.transpose(1, 2), values.transpose(1, 2)))
         start = torch.full((1,), p, dtype=torch.int32, device=device)
         dof = x_in["dof_mask"].to(torch.float32)
         x = x_in["noise"].to(torch.float32)
@@ -303,14 +308,13 @@ class OptimizedAction(nn.Module):
                     # this layer's later weights and the next layer's QKV, read while the QKV and attention run
                     following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
                     prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
-                    keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
+                    keys, values, k_arg, v_arg = cache_views[i]
                     q = qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin,
-                                         keys[0], values[0], p, heads, kv_heads, d)
+                                         keys, values, p, heads, kv_heads, d)
                     # Both Q layouts become views of [1, M, H, D]. Attention can recover a head-major
                     # producer's original storage with a transpose.
                     bnsd = may_return_head_major and q.ndim == 3
                     q_arg = q.transpose(0, 1)[None] if bnsd else q.view(1, horizon, heads, d)
-                    k_arg, v_arg = keys.transpose(1, 2), values.transpose(1, 2)
                     # Packed kernel output can feed the same fused projection even with head-major Q.
                     direct_packed = (bnsd and flash_mask is not None and supports_packed_output is not None
                                      and supports_packed_output(q_arg, k_arg, v_arg, start, p, flash_mask=flash_mask))
