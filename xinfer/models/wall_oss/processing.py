@@ -439,7 +439,6 @@ def pad_prompt(tensors: Mapping[str, Any], width: int) -> dict[str, Any]:
                                      positions[:, :, start:]], dim=2)
     out["prompt_len"] = width
     out["prompt_valid"] = torch.tensor([keep], dtype=torch.int32)
-    out["mask_all_keep"] = bool(tensors.get("mask_all_keep", False) and keep == width)
     return out
 
 
@@ -693,7 +692,6 @@ class WallOSSInputProcessor:
             if config.allow_client_num_steps and requested is not None and int(requested) > 0:
                 num_steps = int(requested)
         tensors["inference_delay"] = torch.tensor([meta["inference_delay"]], dtype=torch.int64)
-        tensors["mask_all_keep"] = meta["inference_delay"] == 0
         tensors["num_steps"] = num_steps
         if config.prompt_bucket:
             tensors = pad_prompt(tensors, self.bucket.width(prompt_len))

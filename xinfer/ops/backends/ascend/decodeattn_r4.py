@@ -100,13 +100,13 @@ def applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):
         or new_pos != _L - _M
     ):
         return False
-    # The bridge views must recover dense head-major Q and cache storage.
+    # Input may have packed query rows or native head-major strides; the scan consumes dense head-major Q.
     if not (
         q.dtype == k_cache.dtype == v_cache.dtype == torch.bfloat16
         and q.device.type == "npu"
         and k_cache.device == q.device
         and v_cache.device == q.device
-        and q.transpose(1, 2).is_contiguous()
+        and (q.is_contiguous() or q.transpose(1, 2).is_contiguous())
         and k_cache.transpose(1, 2).is_contiguous()
         and v_cache.transpose(1, 2).is_contiguous()
         and prefix_len.dtype == torch.int32
@@ -130,11 +130,6 @@ def applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale):
         _debug("REJECT-family", q, k_cache, flash_mask, new_pos, scale)
         return False
     return True
-
-
-def supports_packed_output(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
-    """Whether the row reducer can write this call's packed output directly."""
-    return _row_enabled() and applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
 
 
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale, return_bnsd):

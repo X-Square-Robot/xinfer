@@ -55,9 +55,6 @@ cann_projection = (_projection() if any(function is None for function in
                                        (canonical_gemm, canonical_glu, canonical_qkv, canonical_cache)) else None)
 cann_action = _action(cann_projection) if canonical_glu is None or canonical_cache is None else None
 native_gemm = canonical_gemm or getattr(cann_projection, "gemm_epilogue", None)
-# The bridge's projection reads a BNSD ``[H, M, D]`` attention output with the head transpose folded into its
-# Cube A-load (and pads any narrower flow width into its M768 kernel); the canonical entry takes 2-D rows only.
-bnsd_gemm = getattr(cann_projection, "gemm_epilogue", None)
 cann_glu = getattr(cann_projection, "gemm_glu_epilogue", None)
 native_qkv = canonical_qkv or getattr(cann_projection, "qkv_rope_epilogue", None)
 native_cache = canonical_cache or getattr(cann_action, "qkv_rope_kvcache", None)
@@ -75,23 +72,8 @@ native_2b_cache = getattr(cann_action, "qkv_norm_rope_kvcache", None)
 @partial(reference.gemm_epilogue)
 def gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, residual_gate=None,
                   row_class=None, row_scale=None):
-    if x.ndim == 3:
-        # A head-major attention output feeds the projection directly (the lineage r4 action / r8 prefill
-        # form). The bridge folds the head transpose into its Cube A-load and pads any narrower flow width
-        # into its M768 kernel; a layout its BNSD routes do not take falls through to the packed view every
-        # 2-D caller (and the reference below) reads, so other models keep their 2-D paths unchanged.
-        if callable(bnsd_gemm):
-            try:
-                return bnsd_gemm(x, weight, bias, activation=activation, residual=residual,
-                                 residual_gate=residual_gate, row_class=row_class, row_scale=row_scale)
-            except ValueError:
-                pass
-        x = x.transpose(0, 1).reshape(x.shape[1], -1)
     return native_gemm(x, weight, bias, activation=activation, residual=residual, residual_gate=residual_gate,
                        row_class=row_class, row_scale=row_scale)
-
-
-gemm_epilogue.supports_head_major_input = True
 
 
 def _glu_supported(x, weight, *, bias=None, modulation=None, row_class=None, eps=1e-6):
@@ -118,9 +100,6 @@ def gemm_add_rms_norm(x, projection, residual, weight, eps, bias=None):
         projection = cann_projection._stable_contiguous(projection)
     normalize = add_rms_norm if norm_library is not None else reference.add_rms_norm
     return normalize(gemm_epilogue(x, projection, bias).view(residual.shape), residual, weight, eps)
-
-
-gemm_add_rms_norm.supports_head_major_input = True
 
 
 @register("mlp_add_rms_norm", backend="ascend", priority=PRIORITY, platforms=PLATFORMS,

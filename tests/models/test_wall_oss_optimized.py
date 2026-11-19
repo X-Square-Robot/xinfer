@@ -50,7 +50,7 @@ def setup():
                                         processing=ProcessingConfig(instruction_override=INSTRUCTION, prompt_bucket=0))
     assert model.numerics == "optimized"
     kernel_ops = {op for stage in OPTIMIZED_STAGE_OPS.values() for op in stage} - {
-        "varlen_attention", "causal_attention", "causal_attention_bnsd", "linear", "silu"}
+        "varlen_attention", "causal_attention", "linear", "silu"}
     assert {op: table.selection(op).library for op in kernel_ops} == {op: "kernels" for op in kernel_ops}
     names = [r["name"] for r in json.loads((Path(BF16) / "bf16_reference.json").read_text())["requests"]]
     return dict(model=model, device=platform.device, prepare=model.input_processor(), names=names,

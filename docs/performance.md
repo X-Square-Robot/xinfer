@@ -40,5 +40,5 @@ Each model ran on one Ascend 950DT with CANN 9.3.0-beta.1, CPU image processing,
 
 ### Conditions
 
-- **Wall-OSS** used the flow and RTC requests for single-request timing and server warmup. The 3, 4 and 5 robot tiers each ran eight rounds and passed the [shared capacity rule](benchmark.md#performance-table).
+- **Wall-OSS** was measured before the model returned to the original attention interface. It used the flow and RTC requests for single-request timing and server warmup. The 3, 4 and 5 robot tiers each ran eight rounds and passed the [shared capacity rule](benchmark.md#performance-table).
 - **Wall-X 2B** used the captured request set for single-request timing.

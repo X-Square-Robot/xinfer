@@ -114,23 +114,9 @@ class CannAttention:
         launch(out, workspace, q, k, v, *parameters)
         return out
 
-    @staticmethod
-    def supports_packed_output(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
-        return _decodeattn_r4 is not None and _decodeattn_r4.supports_packed_output(
-            q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
-
     def prefix_kvcache_attention(self, q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
-                                all_keep=False, return_bnsd=False):
-        """Attend to the visible cache prefix and new rows, returning BF16 [B,M,H*D].
-
-        ``all_keep`` (r4): a host guarantee that every cache row is visible
-        (prefix_len == L - M, new_pos == prefix_len, no flash mask) -- the
-        wall_oss flow case. The drop-mask build and the FIA mask read are
-        skipped (``attenMask`` null, the pre/next-token window stays full).
-        ``return_bnsd`` (r4): return the attention output in its native BNSD
-        [B, H, M, D] buffer instead of a packed [B, M, H*D] copy, for callers
-        whose projection reads the BNSD layout directly.
-        """
+                                return_bnsd=False):
+        """Return packed [B,M,H*D], or the native buffer for the internal gated-attention store."""
         _check_qkv(q, k_cache, v_cache, 4)
         batch, rows, heads, dim = q.shape
         length = k_cache.shape[1]
@@ -141,17 +127,14 @@ class CannAttention:
         if flash_mask is not None:
             _check_tensor(flash_mask, q, "flash_mask", (batch, 1, length, 2), torch.int32)
         scale = _scale(scale, dim)
-        if all_keep and flash_mask is not None:
-            raise ValueError("all_keep cannot be combined with a flash mask")
         if (
             _decodeattn_r4 is not None
-            and not all_keep
             and _decodeattn_r4.applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
         ):
             return _decodeattn_r4.prefix_kvcache_attention(
                 q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale, return_bnsd
             )
-        key = self._key("cache", q, k_cache, scale, all_keep)
+        key = self._key("cache", q, k_cache, scale)
 
         def positions():
             columns = torch.arange(length, device=q.device)[None, None, None, :]
@@ -172,10 +155,8 @@ class CannAttention:
         # Native workspace belongs to this stream. Serialize host submission
         # when two callers share it.
         with self._lock:
-            drop_mask = (None if all_keep else
-                         memo_action_metadata(
-                             ("drop_mask", id(self), key, new_pos), (prefix_len, flash_mask), make_drop_mask
-                         ))
+            drop_mask = memo_action_metadata(("drop_mask", id(self), key, new_pos),
+                                             (prefix_len, flash_mask), make_drop_mask)
             # Feed ACLNN's BNSD layout without per-call copies where the
             # operator takes it: the wall-style caches arrive as permuted
             # (B, L, KV, D) views of contiguous (B, KV, L, D) buffers, so the
@@ -217,13 +198,8 @@ class CannAttention:
                                           flash_mask=flash_mask, scale=scale)
         return out * torch.sigmoid(gate)
 
-    def causal_attention(self, q, k, v, *, scale=None, return_bnsd=False):
-        """Attend causally over sequence-major BF16 [B,L,H,D] queries and grouped K/V.
-
-        ``return_bnsd`` (r8): return the attention output in its native BNSD
-        [B, H, L, D] buffer instead of the transposed [B, L, H, D] view, for
-        callers whose projection reads the BNSD layout directly.
-        """
+    def causal_attention(self, q, k, v, *, scale=None):
+        """Attend causally over sequence-major BF16 [B,L,H,D] queries and grouped K/V."""
         _check_qkv(q, k, v, 4)
         batch, length, _, dim = q.shape
         if k.shape[:2] != (batch, length):
@@ -244,8 +220,6 @@ class CannAttention:
             )
             out = self._run(query, keys, values, key, (drop_mask, scale, 0, 0),
                             self._bnsd_query, self._bnsd_launch)
-        if return_bnsd:
-            return out
         return out.transpose(1, 2)
 
     def gated_causal_attention(self, q, k, v, gate, *, scale=None):

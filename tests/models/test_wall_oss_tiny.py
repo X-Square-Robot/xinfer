@@ -9,7 +9,6 @@ import base64
 import json
 import re
 from dataclasses import replace
-from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -137,170 +136,60 @@ def test_engine_runs_three_stages(composition):
     assert torch.isfinite(out["predict_action"]).all()
 
 
-@pytest.mark.parametrize("supports_all_keep", [False, True])
-def test_optimized_ops_follow_the_selected_projection_and_mask_route(tiny, split_vision_ops, supports_all_keep):
+def test_bf16_vision_uses_the_selected_projection_op(tiny, split_vision_ops):
     from xinfer.models.wall_oss.model import WallOSS
 
-    vision_calls, mask_calls = set(), set()
-
-    class PackedActionQ(torch.Tensor):
-        @property
-        def ndim(self):
-            raise AssertionError("the action layout is already known from the selected projection")
-
-        def view(self, *shape):
-            return self.as_subclass(torch.Tensor).view(*shape)
+    calls = set()
 
     def record(implementation):
-        @wraps(implementation.function)
         def call(*args, **kwargs):
             if implementation.op in ("qkv_rope_split", "qkv_rope_epilogue"):
-                vision_calls.add((implementation.op, implementation.backend))
-            if implementation.op in ("prefix_kvcache_attention", "prefix_kvcache_attention_bnsd"):
-                mask_calls.add((kwargs.get("all_keep", False), kwargs["flash_mask"] is None))
-            result = implementation.function(*args, **kwargs)
-            if implementation.op == "qkv_rope_kvcache" and args[7] > 0:  # action appends after the prompt
-                return result.as_subclass(PackedActionQ)
-            return result
-
-        if implementation.op == "prefix_kvcache_attention_bnsd":
-            call.supports_all_keep = supports_all_keep
-        return call
-
-    platform = resolve_platform("cpu")
-    with ops.use_ops(split_vision_ops.wrapped(record)):
-        model = WallOSS.from_checkpoint(tiny.root, device="cpu", processing={"prompt_bucket": 0})
-    request = _request(model)
-    request.tensors["mask_all_keep"] = True
-    Engine(model, platform).run(request)
-    assert vision_calls == {("qkv_rope_split", "test-vision")}
-    stages = model.capabilities().stage_ops
-    assert set(stages["vision"]) & {"qkv_rope_split", "qkv_rope_epilogue"} == {"qkv_rope_split"}
-    assert "gemm_add_rms_norm" not in stages["action"]
-    assert ("prefix_kvcache_attention_bnsd" in stages["action"]) == supports_all_keep
-    assert mask_calls == {(supports_all_keep, supports_all_keep)}
-
-
-@pytest.mark.parametrize(
-    "supports_row,mask_all_keep,supports_all_keep,paired,expected",
-    [(True, False, True, True, "prefix_kvcache_attention"),
-     (False, False, True, True, "prefix_kvcache_attention_bnsd"),
-     (True, True, True, True, "prefix_kvcache_attention_bnsd"),
-     (True, False, True, False, "prefix_kvcache_attention_bnsd"),
-     (False, True, False, True, "prefix_kvcache_attention_bnsd")],
-    ids=("row-hit", "masked-miss", "all-keep", "unpaired-provider", "all-keep-unsupported"),
-)
-def test_action_routes_attention_output_without_repacking(tiny, supports_row, mask_all_keep, supports_all_keep,
-                                                            paired, expected):
-    from xinfer.models.wall_oss.model import WallOSS
-    from xinfer.observability.annotate import profiled_ops
-
-    c = tiny.config
-    heads, dim = c.num_attention_heads, c.head_dim
-    outputs = {"prefix_kvcache_attention": torch.zeros(1, H, heads * dim, dtype=torch.bfloat16),
-               "prefix_kvcache_attention_bnsd": torch.zeros(1, heads, H, dim, dtype=torch.bfloat16)}
-    queries, caches, calls, projected, support_calls = [], [], [], [], []
-    action_calls = set()
-    all_keep = mask_all_keep and supports_all_keep
-
-    def head_major_q(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim):
-        q = ops.reference.qkv_rope_kvcache(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads,
-                                           num_kv_heads, head_dim)
-        q = q.view(-1, num_heads, head_dim).transpose(0, 1).contiguous()
-        queries.append(q)
-        caches.append((k_cache.data_ptr(), v_cache.data_ptr()))
-        return q
-
-    def supports_packed_output(*args, flash_mask=None, **kwargs):
-        assert flash_mask is not None
-        support_calls.append(True)
-        return supports_row
-
-    def record(implementation):
-        name = implementation.op
-
-        @wraps(implementation.function)
-        def call(*args, **kwargs):
-            action_calls.add(name)
-            if name in outputs:
-                query, keys, values = args[:3]
-                assert query.shape == (1, H, heads, dim)
-                assert query.data_ptr() == queries[-1].data_ptr()
-                assert query.transpose(1, 2).is_contiguous()
-                assert (keys.data_ptr(), values.data_ptr()) == caches[-1]
-                assert (kwargs["flash_mask"] is None) == all_keep
-                calls.append((name, kwargs.get("all_keep", False)))
-                return outputs[name]
-            if name == "gemm_add_rms_norm" and args[1].shape[1] == heads * dim:
-                projected.append((args[0].shape, args[0].data_ptr()))
+                calls.add((implementation.op, implementation.backend))
             return implementation.function(*args, **kwargs)
 
-        if name in outputs and (paired or name == "prefix_kvcache_attention"):
-            call.supports_packed_output = supports_packed_output
-        if name == "prefix_kvcache_attention_bnsd":
-            call.supports_all_keep = supports_all_keep
-        if name == "gemm_add_rms_norm":
-            call.supports_head_major_input = True
         return call
 
-    registry = ops.OpRegistry()
-    for name in ops.registry.names():
-        registry.define(ops.registry.spec(name))
-    platform = replace(resolve_platform("cpu"), name="test-accelerator")
-    registry.add("qkv_rope_kvcache", head_major_q, backend="test-projection", platforms=(platform.name,),
-                 contract=ops.Contract(numerics="bitwise"))
-    table = registry.build_table(platform, backends={"qkv_rope_kvcache": "test-projection"}, reference_only=True)
-    with ops.use_ops(profiled_ops(table.wrapped(record))):
+    with ops.use_ops(split_vision_ops.wrapped(record)):
         model = WallOSS.from_checkpoint(tiny.root, device="cpu", processing={"prompt_bucket": 0})
-    inputs = _request(model, delay=0 if mask_all_keep else 3, rtc_rows=0 if mask_all_keep else 15).tensors
-    layers = c.num_hidden_layers
-    prompt_kv = outputs[expected].new_zeros((layers, 2, 1, c.num_key_value_heads, inputs["prompt_len"], dim))
-    run_stage(model, "action", dict(inputs, prompt_kv=prompt_kv, mask_all_keep=mask_all_keep, num_steps=1), "cpu")
-    assert calls == [(expected, all_keep)] * layers
-    assert projected == [(outputs[expected].shape[1:], outputs[expected].data_ptr())] * layers
-    assert len(support_calls) == (layers if paired and not all_keep else 0)
-    assert action_calls <= set(model.capabilities().stage_ops["action"])
+    run_stage(model, "vision", _request(model).tensors, "cpu")
+    assert calls == {("qkv_rope_split", "test-vision")}
 
 
-@pytest.mark.parametrize("stage,projection", [("prefill", "gemm_epilogue"), ("action", "gemm_add_rms_norm")])
-def test_head_major_attention_feeds_a_strict_2d_projection(tiny_optimized, stage, projection):
+@pytest.mark.parametrize(("delay", "rtc_rows"), [(0, 0), (3, H)])
+def test_public_attention_pins_serve_prefill_and_action(tiny_optimized, delay, rtc_rows):
     from xinfer.models.wall_oss.model import WallOSS
 
+    calls = {"causal_attention": 0, "prefix_kvcache_attention": 0}
+
+    def causal(q, k, v, *, scale=None):
+        calls["causal_attention"] += 1
+        return ops.reference.causal_attention(q, k, v, scale=scale)
+
+    def prefix(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+        calls["prefix_kvcache_attention"] += 1
+        assert flash_mask is not None
+        return ops.reference.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
+                                                       flash_mask=flash_mask, scale=scale)
+
     registry = ops.OpRegistry()
     for name in ops.registry.names():
         registry.define(ops.registry.spec(name))
-    qkv = registry.spec("qkv_rope_kvcache").reference
-    project = registry.spec(projection).reference
-    calls = []
-
-    @wraps(qkv)
-    def head_major_q(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim):
-        rows = qkv(x, weight, bias, cos, sin, k_cache, v_cache, start, num_heads, num_kv_heads, head_dim)
-        return rows.view(-1, num_heads, head_dim).transpose(0, 1).contiguous()
-
-    head_major_q.packed_q_only = False
-
-    @wraps(project)
-    def strict_projection(x, *args, **kwargs):
-        assert x.ndim == 2
-        calls.append(x.shape)
-        return project(x, *args, **kwargs)
-
-    for name, function in (("qkv_rope_kvcache", head_major_q), (projection, strict_projection)):
-        registry.add(name, function, backend="test-projection", platforms=("cpu",),
+    for name, function in (("causal_attention", causal), ("prefix_kvcache_attention", prefix)):
+        registry.add(name, function, backend="test-attention", platforms=("cpu",),
                      contract=ops.Contract(numerics="bitwise"))
-    pins = dict.fromkeys(("qkv_rope_kvcache", projection), "test-projection")
-    table = registry.build_table(resolve_platform("cpu"), backends=pins, reference_only=True)
+    platform = resolve_platform("cpu")
+    table = registry.build_table(platform, backends=dict.fromkeys(calls, "test-attention"), reference_only=True)
     with ops.use_ops(table):
         model = WallOSS.from_checkpoint(tiny_optimized.root, device="cpu", processing={"prompt_bucket": 0})
-    inputs = _request(model, delay=3, rtc_rows=H).tensors
-    inputs["image_embeds"] = run_stage(tiny_optimized, "vision", inputs, "cpu")["image_embeds"]
-    if stage == "action":
-        inputs["prompt_kv"] = run_stage(tiny_optimized, "prefill", inputs, "cpu")["prompt_kv"]
-    expected = run_stage(tiny_optimized, stage, inputs, "cpu")
-    actual = run_stage(model, stage, inputs, "cpu")
-    assert calls
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    inputs = _request(model, delay=delay, rtc_rows=rtc_rows).tensors
+    inputs.update(run_stage(model, "vision", inputs, "cpu"))
+    for stage in ("prefill", "action"):
+        expected = run_stage(tiny_optimized, stage, inputs, "cpu")
+        actual = run_stage(model, stage, inputs, "cpu")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        inputs.update(actual)
+    layers = model.config.num_hidden_layers
+    assert calls == {"causal_attention": layers - 1, "prefix_kvcache_attention": layers * inputs["num_steps"]}
 
 
 def test_split_equals_joint_prefill_action_forward(tiny):
@@ -372,7 +261,7 @@ def test_the_optimized_composition_is_the_default_and_takes_one_request_per_acti
 
     assert tiny_optimized.numerics == "optimized"
     assert tiny_optimized.capabilities().batch_sizes["action"] == (1,)
-    assert tiny_optimized.capabilities().stage_ops["prefill"] == OPTIMIZED_STAGE_OPS["prefill"]
+    assert tiny_optimized.capabilities().stage_ops == OPTIMIZED_STAGE_OPS
 
 
 @pytest.mark.parametrize(("delay", "rtc_rows"), [(0, 0), (3, 15)])
@@ -392,11 +281,8 @@ def test_pad_prompt_keeps_the_valid_tokens_and_the_action_tokens(tiny):
 
     x = _request(tiny).tensors
     p = x["prompt_len"]
-    x["mask_all_keep"] = True
-    assert pad_prompt(x, p)["mask_all_keep"]
     padded = pad_prompt(x, 32)
     assert padded["prompt_len"] == 32 and padded["prompt_valid"].tolist() == [p]
-    assert not padded["mask_all_keep"]
     assert padded["prompt_valid"].dtype == torch.int32
     ids, positions = padded["input_ids"], padded["position_ids"]
     assert ids.shape == (1, 32 + H) and positions.shape == (3, 1, 32 + H)

@@ -48,7 +48,6 @@ FORMULA_CASES = {
         OpCost(DELTA_RULE, 6400 + 6400 + 12800 + 800 + 400, 12800, "bf16")),
     # Attention: QKᵀ and PV are 2·D FLOPs each per (query, key) pair and head; D = 16, 4 heads.
     "causal_attention": ((Q, KV, KV), OpCost(4 * 16 * 2 * 4 * 15, 1280 + 640 + 640, 1280, "bf16")),  # 15 = 5·6/2
-    "causal_attention_bnsd": ((Q, KV, KV), OpCost(4 * 16 * 2 * 4 * 15, 1280 + 640 + 640, 1280, "bf16")),
     "action_attention": ((Q, KV, KV, PROMPT, PROMPT, t(2, dtype=I64), t(2, dtype=I64)),
                          OpCost(4 * 16 * 2 * 4 * 5 * 12, 1280 + 640 + 640 + 896 + 896 + 16 + 16, 1280, "bf16")),
     "masked_joint_attention": ((Q, KV, KV, PROMPT, PROMPT, t(2, 1, 5, 12, dtype=torch.bool)),
@@ -98,8 +97,6 @@ FORMULA_CASES = {
     # new_pos 5: every query sees cache rows [0, 10), 1280 bytes of each cache.
     "prefix_kvcache_attention": ((Q, KV_CACHE, KV_CACHE, t(2, dtype=I32), 5),
                                  OpCost(4 * 16 * 2 * 4 * 5 * 10, 1280 + 8 + 2 * 1280, 1280, "bf16")),
-    "prefix_kvcache_attention_bnsd": ((Q, KV_CACHE, KV_CACHE, t(2, dtype=I32), 5),
-                                      OpCost(4 * 16 * 2 * 4 * 5 * 10, 1280 + 8 + 2 * 1280, 1280, "bf16")),
     "flow_velocity_euler": ((VALUES, STREAM, t(4, 32), 0.1), OpCost(2 * 6 * 4 * 32, 96 + 384 + 256, 96, "bf16")),
 }
 FORMULA_CASES["qkv_rope_split"] = FORMULA_CASES["qkv_rope_epilogue"]

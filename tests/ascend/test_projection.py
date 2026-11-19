@@ -105,7 +105,7 @@ def test_untuned_qkv_layout_uses_reference():
 
 
 @pytest.mark.parametrize("fused_first", [False, True], ids=["packed-first", "head-major-first"])
-def test_m16_qkv_layout_is_specific_to_each_call(monkeypatch, fused_first):
+def test_m16_qkv_native_and_composed_finishes_both_return_packed_rows(monkeypatch, fused_first):
     from xinfer.ops.backends.ascend import cann_action, gemm
 
     rows, heads, kv_heads, head_dim, start = 16, 16, 2, 128, 768
@@ -150,7 +150,7 @@ def test_m16_qkv_layout_is_specific_to_each_call(monkeypatch, fused_first):
         keys = torch.zeros(kv_heads, start + rows, head_dim, dtype=torch.bfloat16)
         values = torch.zeros_like(keys)
         q = gemm.qkv_rope_kvcache(x, weight, bias, cos, sin, keys, values, start, heads, kv_heads, head_dim)
-        torch.testing.assert_close(q, expected_head_major_q if fused else expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
         torch.testing.assert_close(keys[:, start:], expected_k, rtol=0, atol=0)
         torch.testing.assert_close(values[:, start:], expected_v, rtol=0, atol=0)
 

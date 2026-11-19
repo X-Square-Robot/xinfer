@@ -112,18 +112,11 @@ def causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, scale
     return _causal_attention(F.scaled_dot_product_attention, q, k, v, scale=scale)
 
 
-def causal_attention_bnsd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
-                           scale: float | None = None) -> torch.Tensor:
-    """Causal attention on sequence-major inputs with head-major ``[B, H, L, D]`` output."""
-    return _causal_attention(F.scaled_dot_product_attention, q, k, v, scale=scale, return_bnsd=True)
-
-
-def _causal_attention(sdpa, q, k, v, *, scale=None, return_bnsd=False):
+def _causal_attention(sdpa, q, k, v, *, scale=None):
     n = q.shape[1]
     mask = torch.ones(n, n, dtype=torch.bool, device=q.device).tril()[None, None]
     q, k, v = (t.transpose(1, 2).contiguous() for t in (q, k, v))
-    out = _attention(sdpa, q, k, v, scale=scale, mask=mask)
-    return out if return_bnsd else out.transpose(1, 2)
+    return _attention(sdpa, q, k, v, scale=scale, mask=mask).transpose(1, 2)
 
 
 def rtc_pinned_mask(num_pinned: torch.Tensor, rows: int) -> torch.Tensor:
@@ -322,8 +315,7 @@ def _kvcache_attention(sdpa, q, k, v, k_cache, v_cache, cache_start, cache_valid
 def prefix_kvcache_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                              prefix_len: torch.Tensor, new_pos: int, *, flash_mask: torch.Tensor | None = None,
                              scale: float | None = None) -> torch.Tensor:
-    """Attention of ``M`` new tokens over a cache prefix and their own keys (the CUDA backend's ``attention_kvcache``;
-    the Ascend backend's cache-attention kernels serve it through the same contract).
+    """Attention of ``M`` new tokens over a cache prefix and their own keys (the CUDA backend's ``attention_kvcache``).
 
     Each query can attend to the valid prefix and the new keys. An optional column mask supplies the valid query
     row range for each key.
@@ -344,38 +336,16 @@ def prefix_kvcache_attention(q: torch.Tensor, k_cache: torch.Tensor, v_cache: to
         F.scaled_dot_product_attention, q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
 
 
-def prefix_kvcache_attention_bnsd(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
-                                  prefix_len: torch.Tensor, new_pos: int, *,
-                                  flash_mask: torch.Tensor | None = None, scale: float | None = None,
-                                  all_keep: bool = False) -> torch.Tensor:
-    """Cache attention with head-major ``[B, H, M, D]`` output.
-
-    ``all_keep`` guarantees every cache row is visible (``prefix_len == new_pos == L - M`` and no flash mask).
-    """
-    return _prefix_kvcache_attention(
-        F.scaled_dot_product_attention, q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale,
-        all_keep=all_keep, return_bnsd=True)
-
-
-def _prefix_kvcache_attention(sdpa, q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
-                              all_keep=False, return_bnsd=False):
+def _prefix_kvcache_attention(sdpa, q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
     b, m = q.shape[:2]
-    if all_keep:
-        if flash_mask is not None:
-            raise ValueError("all_keep cannot be combined with a flash mask")
-        keep = None
-    else:
-        rows = torch.arange(k_cache.shape[1], device=q.device)
-        keep = (rows[None] < prefix_len.reshape(-1, 1)) | ((rows >= new_pos) & (rows < new_pos + m))[None]
-        keep = keep[:, None, :].expand(b, m, -1)
-        if flash_mask is not None:
-            t = torch.arange(m, device=q.device)[None, :, None]
-            keep = keep & (t < flash_mask[:, 0, None, :, 0]) & (t >= flash_mask[:, 0, None, :, 1])
-        keep = keep[:, None]
+    rows = torch.arange(k_cache.shape[1], device=q.device)
+    keep = (rows[None] < prefix_len.reshape(-1, 1)) | ((rows >= new_pos) & (rows < new_pos + m))[None]
+    keep = keep[:, None, :].expand(b, m, -1)
+    if flash_mask is not None:
+        t = torch.arange(m, device=q.device)[None, :, None]
+        keep = keep & (t < flash_mask[:, 0, None, :, 0]) & (t >= flash_mask[:, 0, None, :, 1])
     o = _attention(sdpa, q.transpose(1, 2), k_cache.transpose(1, 2), v_cache.transpose(1, 2), scale=scale,
-                   mask=keep)
-    if return_bnsd:
-        return o
+                  mask=keep[:, None])
     return o.transpose(1, 2).reshape(b, m, -1)
 
 

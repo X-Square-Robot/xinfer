@@ -19,13 +19,8 @@ from xinfer.ops.backends.ascend import (
 )
 
 
-@pytest.mark.parametrize(("entry", "reduce", "new_pos", "all_keep"), [
-    ("prefix_kvcache_attention", "decodeattn_r4_reduce_row", 768, False),
-    ("prefix_kvcache_attention_bnsd", "decodeattn_r4_reduce", 768, False),
-    ("prefix_kvcache_attention_bnsd", None, 767, False),
-    ("prefix_kvcache_attention_bnsd", None, 768, True),
-])
-def test_cache_attention_preserves_the_selected_output_contract(monkeypatch, entry, reduce, new_pos, all_keep):
+@pytest.mark.parametrize(("new_pos", "row_reduce"), [(768, True), (767, False)])
+def test_cache_attention_returns_packed_rows_from_decode_or_fia(monkeypatch, new_pos, row_reduce):
     monkeypatch.setenv("XINFER_DECODEATTN_R4_ROW", "1")
     monkeypatch.setattr(decodeattn_r4, "applies", lambda q, k, v, prefix, pos, mask, scale: pos == 768
                         and mask is not None)
@@ -39,10 +34,13 @@ def test_cache_attention_preserves_the_selected_output_contract(monkeypatch, ent
 
     def launch(name, tensors, *args):
         launches.append((name, tensors))
+        if name == "decodeattn_r4_reduce_row":
+            tensors[1].copy_(q[0])
         return True
 
     def launch_fia(out, workspace, q, k, v, drop_mask, *args):
-        assert (drop_mask is None) == all_keep
+        assert drop_mask is not None
+        out.copy_(q)
         launches.append(("fia", (q, k, v, out)))
 
     native = cann_attention.CannAttention.__new__(cann_attention.CannAttention)
@@ -52,21 +50,18 @@ def test_cache_attention_preserves_the_selected_output_contract(monkeypatch, ent
     monkeypatch.setattr(attn, "native_cache", native.prefix_kvcache_attention)
     monkeypatch.setattr(attn, "native_cache_bnsd", native.prefix_kvcache_attention)
     monkeypatch.setattr(_native, "launch_kernel", launch)
-    q = torch.empty(1, 16, 16, 128, dtype=torch.bfloat16).transpose(1, 2)
+    q = torch.arange(16 * 16 * 128, dtype=torch.float32).to(torch.bfloat16).view(1, 16, 16, 128)
     k, v = (torch.empty(1, 2, 784, 128, dtype=torch.bfloat16).transpose(1, 2) for _ in range(2))
     prefix = torch.tensor([new_pos], dtype=torch.int32)
-    mask = None if all_keep else torch.zeros(1, 1, 784, 2, dtype=torch.int32)
-    kwargs = {"flash_mask": mask}
-    if all_keep:
-        kwargs["all_keep"] = True
-    result = unwrap(getattr(attn, entry))(q, k, v, prefix, new_pos, **kwargs)
-    assert [name for name, _ in launches] == (["decodeattn_r4_scan_b", reduce] if reduce else ["fia"])
+    mask = torch.zeros(1, 1, 784, 2, dtype=torch.int32)
+    result = unwrap(attn.prefix_kvcache_attention)(q, k, v, prefix, new_pos, flash_mask=mask)
+    names = ["decodeattn_r4_scan_b", "decodeattn_r4_reduce_row"] if row_reduce else ["fia"]
+    assert [name for name, _ in launches] == names
     query, keys, values = launches[0][1][:3]
-    output = launches[1][1][1] if reduce else launches[0][1][3]
-    shape = (1, 16, 2048) if entry == "prefix_kvcache_attention" else (1, 16, 16, 128)
-    assert [t.data_ptr() for t in (query, keys, values)] == [t.data_ptr() for t in (q, k, v)]
-    assert result.shape == shape and result.is_contiguous()
-    assert result.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(query.reshape(1, 16, 16, 128), q.transpose(1, 2), atol=0, rtol=0)
+    assert keys.data_ptr() == k.data_ptr() and values.data_ptr() == v.data_ptr()
+    torch.testing.assert_close(result, q.flatten(2), atol=0, rtol=0)
+    assert result.is_contiguous()
 
 
 def test_admitted_fia_launch_failure_propagates(monkeypatch):
@@ -127,7 +122,7 @@ def test_gated_attention_materializes_only_the_final_packed_output(monkeypatch, 
         assert q.transpose(1, 2).is_contiguous()
         return native_output
 
-    monkeypatch.setattr(attn, "prefix_kvcache_attention_bnsd", prefix)
+    monkeypatch.setattr(attn, "native_cache_bnsd", prefix)
     output = attn.gated_kvcache_attention.__wrapped__(native_query.transpose(1, 2), None, None, None, 0, gate)
     expected = native_output.transpose(1, 2).reshape(batch, 16, 2048) * torch.sigmoid(gate)
     assert output.shape == expected.shape and output.is_contiguous()

@@ -1,14 +1,4 @@
-"""The optimized action loop's o-projection on the CUDA kernel library (no Wall-OSS assets).
-
-The intree replay's BNSD economy (the wall-oss fast qkv/BNSD chains) has the NPU's fused routes hand
-the action loop a head-major ``[H, M, D]`` attention output, which the Ascend backend's o-projection
-reads directly. The reference composition normalizes that form; the CUDA backend's ``gemm`` takes
-packed ``[M, K]`` rows only, so the loop must ask the attention for the BNSD form only when its fused
-QKV armed it and feed the projection packed rows otherwise — the final-review round caught the loop
-passing ``return_bnsd=True`` unconditionally and the o-projection fallback then failing on CUDA with
-``x must be [M, K]``. This file reproduces that path on the tiny random checkpoint (the asset-gated
-tests skip without the Wall-OSS checkpoint, which left the composition unexercised on CUDA).
-"""
+"""Wall-OSS action on the CUDA kernel library, using a tiny random checkpoint."""
 
 import json
 from pathlib import Path
@@ -128,12 +118,7 @@ def tiny_on_cpu(tmp_path_factory):
 
 
 def test_the_action_loop_projects_packed_attention_rows_on_cuda(tiny_on_cuda):
-    """The o-projection fallback must take packed ``[M, H·D]`` rows on CUDA, not the NPU's BNSD form.
-
-    The loop's QKV on this backend returns packed Q, so its attention output must stay packed: with the
-    BNSD form asked for unconditionally the projection's gemm raises ``x must be [M, K]`` (the P0 of the
-    5090 final round; the Ascend backend accepts the BNSD form, which kept the NPU runs green).
-    """
+    """The CUDA action projection consumes packed attention rows."""
     request = _request(tiny_on_cuda)
     out = Engine(tiny_on_cuda, resolve_platform("cuda")).run(request)["predict_action"]
     assert out.shape == (1, H, D)

@@ -449,12 +449,6 @@ def test_explicit_operator_exports_run_without_optional_cann_dependencies(isolat
         for actual, expected_input in zip(args, copied):
             if torch.is_tensor(actual):
                 torch.testing.assert_close(actual, expected_input, atol=0, rtol=0)
-    for name in ("causal_attention", "prefix_kvcache_attention"):
-        bnsd = name + "_bnsd"
-        args, options = calls[name]
-        assert table.selection(bnsd).name == "ascend:kernels"
-        expected = ops.registry.spec(bnsd).reference(*args, **options)
-        torch.testing.assert_close(getattr(table, bnsd)(*args, **options), expected, atol=0, rtol=0)
     # the projections joined with the residual norm call the exports above in turn
     composed = {"gemm_add_rms_norm": ((x, weight, tensor(1, 2, 4), torch.ones(4), 1e-6), {"bias": tensor(4)}),
                 "mlp_add_rms_norm": ((x, tensor(8, 3), tensor(4, 4), tensor(1, 2, 4), torch.ones(4), 1e-6), {})}
@@ -504,8 +498,6 @@ def test_bridge_attention_output_is_flattened_to_the_operator_contract(isolated_
     The reference flattens the head dimension, so nothing else in the pipeline would notice a provider that did
     not: the ascend implementation owns this part of the contract.
     """
-    from xinfer.observability.annotate import profiled_ops
-
     registry, package, load = isolated_backend
     q = torch.randn(1, 2, 2, 4, dtype=torch.bfloat16)
     k = torch.randn(1, 4, 2, 4, dtype=torch.bfloat16)
@@ -514,23 +506,17 @@ def test_bridge_attention_output_is_flattened_to_the_operator_contract(isolated_
     expected = ops.reference.prefix_kvcache_attention(q, k, v, prefix, 2)
 
     def unflattened(*args, **kwargs):
-        """The bridge's own layout: head-major output, [B, M, H, D]."""
+        """The bridge's own layout: unflattened token rows, [B, M, H, D]."""
         return ops.reference.prefix_kvcache_attention(*args, **kwargs).reshape(q.shape[0], q.shape[1], q.shape[2], -1)
 
-    def supports_packed_output(*args, **kwargs):
-        return True
-
     attention = SimpleNamespace(_bnsd_launch=lambda *a, **k: None, _bnsd_query=lambda *a, **k: None,
-                                 prefix_kvcache_attention=unflattened, supports_packed_output=supports_packed_output)
+                                 prefix_kvcache_attention=unflattened)
     monkeypatch.setattr(_support, "bridge", lambda name: SimpleNamespace(CannAttention=lambda: attention)
                         if name == "cann_attention" else None)
     load()
-    pins = dict.fromkeys(("prefix_kvcache_attention", "prefix_kvcache_attention_bnsd"), "ascend:kernels")
-    table = registry.build_table(_platform(), backends=pins, reference_only=True)
-    profiled = profiled_ops(table)
-    for name in pins:
-        assert table.selection(name).name == "ascend:kernels"
-        assert getattr(profiled, name).supports_packed_output is supports_packed_output
+    table = registry.build_table(_platform(), backends={"prefix_kvcache_attention": "ascend:kernels"},
+                                 reference_only=True)
+    assert table.selection("prefix_kvcache_attention").name == "ascend:kernels"
     out = table.prefix_kvcache_attention(q, k, v, prefix, 2)
     assert out.shape == expected.shape == (1, 2, 8)
     torch.testing.assert_close(out, expected, atol=0, rtol=0)

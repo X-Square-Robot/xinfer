@@ -102,19 +102,6 @@ atexit.register(_bf16direct_dump)
 
 
 def _geometry(x, weight):
-    # r4: the attention output buffer in BNSD [16, 16, 128] head-major order
-    # against the [1024, 2048] o-projection weight. cann_mm_fp32 routes it to
-    # the TileLang BNSD Cube kernel (the out-finish transpose folds into the
-    # A-load; K order matches the ACLNN Mm bitwise on this shape).
-    # qkv-batch r1: the B2/B4 request-batch rows widen the accepted A to
-    # [16, rows, 128] with rows in {16, 32, 64}; the 32/64-row kernel forms
-    # keep the same per-row K order (16 sequential head steps).
-    if x.ndim == 3 and x.shape[0] == 16 and x.shape[2] == 128 and x.shape[1] in (16, 32, 64):
-        if (weight.ndim == 2 and tuple(weight.shape) == (1024, 2048)
-                and x.device.type == "npu" and weight.device == x.device
-                and x.dtype == weight.dtype == torch.bfloat16 and x.is_contiguous()):
-            return int(x.shape[1]), 1024, 2048
-        raise ValueError("BNSD input requires the [1024, 2048] KN o-projection weight on the same NPU")
     if (
         x.ndim != 2
         or weight.ndim != 2
@@ -286,7 +273,6 @@ class CannProjection:
         self._vision_rope_cube = _aot_ctypes_entry("gemm_qkv_vision_rope_cube")
         self._vision_cube_warmed = False
         self._buffers = {}
-        self._m768_warmed = False
         self._lock = Lock()
 
     def _stable_contiguous(self, weight):
@@ -327,9 +313,7 @@ class CannProjection:
         x = x.contiguous()
         weight = self._stable_contiguous(weight)
         stream = torch.npu.current_stream(device).npu_stream
-        # The BNSD layout carries its own (workspace-free) route; keep its
-        # buffers apart from the plain [M, K] shape of the same geometry.
-        key = (device, stream, m, n, k, x.ndim)
+        key = (device, stream, m, n, k)
         # Hold the lock until the epilogue has enqueued its consumers of the
         # temporary output. Calls sharing a stream can then safely reuse it.
         with self._lock:
@@ -390,31 +374,6 @@ class CannProjection:
         lib = _native.core_library()
         return (lib is not None
                 and _native.has_symbol(lib, "xinfer_aot_rms_consistent_generic_h1024_f32in_call"))
-
-    def _bnsd_m768(self, x, weight):
-        """The r8 prefill M768 BNSD route: BF16 out, zero workspace, no shared buffers.
-
-        Any M<=768 (the flow file is 752; other recorded widths differ) pads
-        into a fresh [16, 768, 128] buffer: the garbage tail rows only ever
-        compute into discarded output rows, so every valid row stays bitwise
-        vs the packed chain (output rows are independent).
-        """
-        rows = int(x.shape[1])
-        if torch.npu.is_current_stream_capturing() and not self._m768_warmed:
-            raise RuntimeError("warm up the BNSD M768 o-projection on this stream before graph capture")
-        a = x
-        if rows != 768:
-            a = x.new_empty((16, 768, 128), dtype=torch.bfloat16)
-            a[:, :rows].copy_(x)
-        out = a.new_empty((768, 2048), dtype=torch.bfloat16)
-        empty = a.new_empty((0,), dtype=torch.uint8)
-        if not self._m768_warmed:
-            size = self._query(out, a, weight, 0)
-            if size:
-                raise RuntimeError("the BNSD M768 o-projection route must not need workspace")
-            self._m768_warmed = True
-        self._launch(out, empty, a, weight, 0)
-        return out if rows == 768 else out[:rows]
 
     def _glu_deferred_workspace(self, x, weight, shape):
         """Per-stream uint8 workspace for the gemm_glu_fp32_npu entry."""
@@ -529,56 +488,6 @@ class CannProjection:
             # v2 card 5: -2.7/-5.3 us per call, hot==rot4).
             _BF16DIRECT_COUNT["routed"] += 1
             return torch.matmul(x, self._stable_contiguous(weight).t())
-        # smallm-r3: opt-in 32-block single-shot BNSD o-projection kernel
-        # (the shipped smallm_bnsd_o_proj runs 16 blocks; this one also folds
-        # the follow-up FP32->BF16 cast slot). Bitwise vs the shipped kernel
-        # + cast chain on the twin-fp32 reference (aot-verify, card 0).
-        if (smallm_r3 is not None and smallm_r3.enabled("oproj")
-                and bias is None and activation is None and residual is None
-                and residual_gate is None and row_class is None and row_scale is None
-                and x.ndim == 3 and tuple(x.shape) == (16, 16, 128)
-                and weight.ndim == 2 and tuple(weight.shape) == (1024, 2048)
-                and x.dtype == weight.dtype == torch.bfloat16
-                and x.is_contiguous() and weight.is_contiguous()
-                and x.device.type == "npu" and weight.device == x.device):
-            return smallm_r3.o_proj(x, weight)
-        # r8: the prefill causal out arrives BNSD [16, 768, 128] head-major.
-        # The dedicated Cube kernel folds the packed reshape copy and the
-        # finish round (bitwise vs the composite chain, probe r8); only the
-        # trivial epilogue qualifies -- every other finish keeps the FP32
-        # accumulator route. Unknown 3-D layouts still fall through to
-        # _geometry's ValueError.
-        if (x.ndim == 3 and bias is None and activation is None and residual is None
-                and residual_gate is None and row_class is None and row_scale is None
-                and x.dtype == weight.dtype == torch.bfloat16
-                and x.is_contiguous() and weight.is_contiguous()
-                and x.device.type == "npu" and weight.device == x.device):
-            # r8b/r8d: the flow prefill is M=752 and other recorded widths
-            # differ (the rtc file crashed e2e-r8c at a third width) -- any
-            # M<=768 pads into the M768 kernel inside the route, M=768 feeds
-            # it directly (output rows are independent, so the bitwise-vs-
-            # packed-chain argument holds for every row count). The [16, 16,
-            # 128] action input keeps its r4 BNSD case inside _geometry; any
-            # other 3-D shape flattens to the exact pre-r8 packed view
-            # (fallback beats loud error: two e2e crashes taught it).
-            if (tuple(weight.shape) == (2048, 2048)
-                    and x.shape[0] == 16 and x.shape[2] == 128
-                    and 0 < x.shape[1] <= 768):
-                return self._bnsd_m768(x, weight)
-            if tuple(x.shape) == (16, 16, 128):
-                pass  # the r4 action BNSD case routes inside _geometry
-            elif (x.ndim == 3 and x.shape[0] == 16 and x.shape[2] == 128
-                    and x.shape[1] in (32, 64)
-                    and tuple(weight.shape) == (1024, 2048)):
-                # Union fix (integration r2): the qkv-batch M32/64 action
-                # rows must reach _geometry's 3-D case (the smallm m32/m64
-                # fast plans). The r8 pass-list (16, 16, 128) predates them,
-                # so the merge let the else-branch transpose these rows back
-                # to the pre-r4 composite (9.42us vs the 6.58us receipt) and
-                # stranded the m32/m64 kernels.
-                pass
-            else:
-                x = x.transpose(0, 1).reshape(x.shape[1], -1)
         # FINISH-BF16 (XINFER_FINISHBF16, default off): the vision bias+
         # residual (finres) and bias+gelu_tanh (gelu) finishes read one
         # aclnnMatmul BF16 store (FP32 accumulate, single RNE -- bitwise the
@@ -813,8 +722,7 @@ class CannProjection:
         M=2112 pads into a [2176, 1280] activation (the 64 tail rows only compute
         into output rows the slice discards; valid rows are independent, the r8
         M768 o-projection argument), the kernel writes [2176, 3840] BF16 and the
-        route returns the [:2112] view. Warm up once per stream before capture,
-        exactly like the BNSD M768 route.
+        route returns the [:2112] view. Warm up once per stream before capture.
         """
         rows, columns, reduction = 2112, 3840, 1280
         if torch.npu.is_current_stream_capturing() and not self._vision_cube_warmed:

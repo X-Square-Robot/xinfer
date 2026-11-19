@@ -667,8 +667,7 @@ class CannAction:
     ):
         """Project BF16 rows, apply FP32 bias and RoPE, and append BF16 K/V.
 
-        Fused finishes return head-major Q ``[H, M, D]``. The composed path
-        returns packed token rows ``[M, H*D]``.
+        Return packed query rows ``[M, H*D]`` from both native and composed finishes.
         """
         m, n = self._check_qkv(
             x,
@@ -700,22 +699,10 @@ class CannAction:
                 and m % 4 == 0 and m > 16
                 and all(t.is_contiguous() for t in (projected, bias, cos, sin, k_cache, v_cache))
             ):
-                # r6: the prefill fused finish (gemm_qkv_cache_bias_rope_prefill)
-                # -- one ub-staged pass: bias + RoPE on the 18 Q/K heads, the
-                # head-major K/V append and the packed Q write (the m16
-                # kernel's structure at multi-row tiles; probe-r6). r7: Q
-                # lands BNSD [H, M, D] -- the head-major layout the prefill
-                # causal attention consumes, so the per-call transpose copy
-                # disappears (the m16 kernel's r3 pattern).
-                # qkv-batch r1: the K gate widens to the action family
-                # (K=1024), so the B2/B4 batch calls (M=32/64, cache rows
-                # [start, start + M)) ride the same fused finish instead of
-                # the torch fallback chain (37.7/41.9 -> 10.1/11.1 us,
-                # bench_qkv_batch_baseline). M=16 still rides the m16
-                # epilogue below (7.8 vs 9.5 us).
+                # The fused kernel writes Q in [H, M, D] order.
                 query = x.new_empty((num_heads, m, head_dim))
                 self._qkv_bias_rope_prefill(query, k_cache, v_cache, projected, bias, cos, sin, int(start))
-                return query
+                return query.transpose(0, 1).reshape(m, num_heads * head_dim)
             if (
                 (m, n, x.shape[1], num_heads, num_kv_heads, head_dim, start)
                 == (16, 2560, 1024, 16, 2, 128, 768)
@@ -730,7 +717,7 @@ class CannAction:
                     query, projected, weight, bias, k_cache, v_cache, cos, sin,
                     int(start), 0.0,
                 )
-                return query
+                return query.transpose(0, 1).reshape(m, num_heads * head_dim)
             if (
                 callable(self._qkv_bias_rope_m16)
                 and (m, n, x.shape[1], num_heads, num_kv_heads, head_dim)
@@ -738,11 +725,9 @@ class CannAction:
                 and bias is not None and bias.dtype == torch.bfloat16 and cos.shape == (16, 64)
                 and all(t.is_contiguous() for t in (projected, bias, cos, sin, k_cache, v_cache))
             ):
-                # r3: BNSD [H, M, D] -- the kernel writes the head-major layout
-                # the ACLNN FIA query consumes, so the attention transpose is a view.
                 query = x.new_empty((num_heads, m, head_dim))
                 self._qkv_bias_rope_m16(query, k_cache, v_cache, projected, bias, cos, sin, int(start))
-                return query
+                return query.transpose(0, 1).reshape(m, num_heads * head_dim)
             y = projected if bias is None else projected + bias.float()
             return self._write_qkv(
                 y,
