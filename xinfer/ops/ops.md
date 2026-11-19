@@ -97,7 +97,10 @@ named by the `xinfer.ops` entry point group. The process-wide registry calls it 
    error. `reference_only=True` selects the reference for every operator that is not pinned.
 3. Otherwise the highest-priority implementation is selected.
 
-The table binds the selected function itself, so a call costs nothing extra.
+`gemm_split` and `qkv_rope_split` can also use a packed projection followed by views. A split pin takes precedence.
+When only the packed operator is pinned, the split uses that provider's dedicated split or adapts the pinned
+projection. Without pins, a dedicated split wins and a selected packed implementation can supply the fallback.
+The table resolves the provider and binds the adapter once at build time.
 
 ### Partial support
 

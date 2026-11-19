@@ -245,14 +245,14 @@ for _spec in (
            gemm.gemm_glu_epilogue),
     OpSpec("gemm_split", "gemm_split(x[M, K], weight[N, K], split_size, *, row_scale[M]=None)"
            " -> ([M, split_size], [M, N - split_size])  # gemm_epilogue, split without another rounding",
-           gemm.gemm_split),
+           gemm.gemm_split, fallback=("gemm_epilogue", gemm.gemm_split_from)),
     OpSpec("qkv_rope_epilogue",
            "qkv_rope_epilogue(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads, head_dim, *,"
            " qk_order='standard') -> [Q | K | V]  # RoPE on the FP32 accumulator; 'any': Q/K channels may come in"
            " pair order", gemm.qkv_rope_epilogue),
     OpSpec("qkv_rope_split", "qkv_rope_split(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads,"
            " head_dim, *, qk_order='standard') -> (q[M,H,D], k[M,H,D], v[M,H,D])  # strides unspecified",
-           gemm.qkv_rope_split),
+           gemm.qkv_rope_split, fallback=("qkv_rope_epilogue", gemm.qkv_rope_split_from)),
     OpSpec("prefix_kvcache_attention",
            "prefix_kvcache_attention(q[B, M, H, D], k_cache[B, L, KV, D], v_cache, prefix_len[B], new_pos, *,"
            " flash_mask=None, scale=None) -> [B, M, HD]  # keys [0, prefix) ∪ [new_pos, new_pos + M)",

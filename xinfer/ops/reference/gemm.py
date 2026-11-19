@@ -78,7 +78,12 @@ def gemm_split(x: torch.Tensor, weight: torch.Tensor, split_size: int, *,
     ``([M, split_size], [M, N - split_size])``. The product and row scale are applied in FP32
     before the same single output rounding as ``gemm_epilogue``. Neither input is modified.
     """
-    out = gemm_epilogue(x, weight, row_scale=row_scale)
+    return gemm_split_from(gemm_epilogue, x, weight, split_size, row_scale=row_scale)
+
+
+def gemm_split_from(project, x, weight, split_size, *, row_scale=None):
+    """Bind a packed projection and return its two column views."""
+    out = project(x, weight, row_scale=row_scale)
     return out[:, :split_size], out[:, split_size:]
 
 
@@ -153,7 +158,12 @@ def qkv_rope_split(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, co
     projection may write separate Q/K/V planes directly. RoPE tables are immutable while reused
     across a forward, so a backend may cache their expanded representation for their lifetime.
     """
-    out = _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+    return qkv_rope_split_from(_qkv_rope_packed, x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+
+
+def qkv_rope_split_from(project, x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
+    """Bind a packed rotary projection and return its three attention views."""
+    out = project(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
     return out.view(x.shape[0], 3, num_heads, head_dim).unbind(1)
 
 
