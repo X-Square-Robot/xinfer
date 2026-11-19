@@ -19,8 +19,8 @@ The [performance table](performance.md) lists measurement conditions for Wall-OS
 |---|---|
 | Project name | XInfer |
 | Repository | X-Square-Robot/xinfer on GitHub. |
-| Kernels | Stay in the existing xcompute repository, owned by the operator team; XInfer integrates through the xcompute binding in the ops layer |
-| Operator binding | xcompute uses TVM-FFI by default; where there is a concrete PyTorch compile or export need, `torch.library` adapters are added as needed and reuse the underlying implementation (§14.2) |
+| Kernels | Maintain native operator sources and build definitions in `xinfer/ops/backends/<backend>/src`, with Python bindings in the backend package; build shared libraries ahead of time (AOT). External compatibility providers may remain where a backend still needs them (§18.2) |
+| Operator binding | Native libraries use TVM-FFI; all backends use the same operator registry and build-time selection. RPU registers prepared-operation signatures. `torch.library` adapters reuse the implementation where concrete PyTorch compile or export needs arise (§14.2) |
 | Deployment scenario | Each accelerator runs a model instance serving one or more robots. |
 | Bundled models | Wall-OSS and Wall-X 2B |
 | First hardware | RTX 5090 (sm120), Jetson Thor (sm110) |
@@ -35,10 +35,12 @@ The [performance table](performance.md) lists measurement conditions for Wall-OS
 
 The other sections describe the target design. The table below shows how far each design item is implemented on main; items marked "not implemented" are still reviewed against the original text until they are implemented.
 
+The native RPU operator package described in §14 and §18.2 is an operator-layer addition to this baseline. Its separate model/runtime integration is not implied by the framework status below.
+
 | Design item | Status | Current state |
 |---|---|---|
 | §4 Package dependency direction | Implemented | Checked by `tests/unit/test_layering.py` (including `frontend/` and `observability/`); the two rules that `engine/` does not depend on `ops/` or `frontend/` are not checked yet |
-| §4 Device boundary | Not implemented | `engine/` calls `torch.cuda` directly and branches on `Platform.is_cuda`; `test_layering.py` only checks that `platforms/interface.py` and `models/interface.py` do not import torch |
+| §4 Device boundary | Partially implemented | Some device primitives use `platforms/devices.py`; the shared engine still calls `torch.cuda` directly and branches on `Platform.is_cuda`. Engine dispatch uses `capabilities.execution_model`; all backends use the operator registry. CUDA profiling and frontend shared-memory registration use `Platform.is_cuda`. `test_layering.py` only checks that `platforms/interface.py` and `models/interface.py` do not import torch |
 | §5 Cancellation and per-request errors | Partially implemented | Cancelled requests that are not yet dispatched are dropped; dispatched ones run to completion and their results are discarded. An error during stage execution, during the upload at admission or while taking a batch fails only the affected requests and releases their slots. If the engine thread or the completion thread stops, `xinfer-serve` exits with status 1; recognizing sticky device errors (`Platform.classify_error`) and DRAINING are not implemented |
 | §6.3 Three scheduling rules | Implemented | A request enters the downstream queue as soon as its upstream is dispatched, and the downstream lane waits for the event on the GPU; zero-wait batching; the completion thread waits only for the final event (`xinfer/engine/core.py`) |
 | §6.4 Batched precision | Implemented | The Wall-OSS reference action stage supports B1, B2, B4 and B8. The optimized composition, vision and prefill run at B1. |
@@ -55,7 +57,7 @@ The other sections describe the target design. The table below shows how far eac
 | §11.4 Bundled models | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the internal precision gate. Wall-X 2B uses a Qwen3.5 backbone and supports RTC on the desktop dual-arm robot. |
 | §12 Quantization | Partially implemented | The framework supports per-group `QuantConfig`. Wall-OSS runs in BF16. MXFP8 and NVFP4 have PyTorch reference operators. See [quantization](quantization.md). |
 | §13 Platform | Partially implemented | Only device capability descriptions and CUDA / CPU resolution (`xinfer/platforms/`); streams, events, copy primitives, `register_host` (`frontend/shm.py` currently calls `cudaHostRegister` directly), `classify_error`, `derive` / `validate` and plugin activation are not implemented; Thor (sm110) is unverified |
-| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; backends are xcompute (TVM-FFI) and flash-attn, registered by the `cuda` backend modules and loaded with the `xinfer.ops` entry points (§14.2); `xinfer.ops.conformance` is not implemented |
+| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; CUDA uses the in-tree native library and flash-attn, while Ascend retains an external xcompute compatibility provider alongside its other providers (§14.2); `xinfer.ops.conformance` is not implemented |
 | §15 Protocol and frontend | Partially implemented | WebSocket + msgpack, compatible with the x2robot client; `xinfer.Policy` in-process API; Client SDK and compatibility adapters not implemented |
 | §16 Observability and benchmark tools | Partially implemented | The service exposes [Prometheus metrics](metrics.md). Use the [benchmarks](benchmark.md) for single-request latency and closed-loop capacity, and [xinfer-profile](profiling.md) to measure operator, queue and stage times. |
 | §17 Testing | Partially implemented | CPU unit and contract tests; GPU and asset tests need local assets and are run manually; CI (GitHub Actions, `.github/workflows/ci.yml`) runs ruff, the repository and documentation checks and the CPU tests |
@@ -161,10 +163,10 @@ Rules:
  ┌──────▼────────────────────────────────────────────────────────────────────────────────┐
  │ models/ (with models/layers/, models/layers/quantization/) · loader/                  │
  └──────┬────────────────────────────────────────────────────────────────────────────────┘
-        │ ops.<name>(...)
+        │ OpTable-selected tensor calls / prepared-operation calls
  ┌──────▼────────────────────────────────────────────────────────────────────────────────┐
  │ platforms/ (cuda: sm120, sm110; cpu reference) · ops/ (contracts + reference ops)     │
- │ xcompute (existing operator repo, ships high-performance kernels per platform)        │
+ │ ops/backends/<backend>/src (in-tree sources, AOT libraries, TVM-FFI bindings)           │
  └───────────────────────────────────────────────────────────────────────────────────────┘
  Optional: Router (session affinity, failure retry) · instance lifecycle · health checks
 ```
@@ -181,8 +183,8 @@ Two principles:
 | Module | May depend on | Must not depend on |
 |---|---|---|
 | `engine/` | `platforms/`, the model interface (abstract classes), `observability.annotate` (stage spans) | Any concrete model, quantization method or kernel package; `config/`, `models/layers/`, `loader/`, `ops/`, `frontend/` |
-| `models/` | `models/layers/` (including the `models/layers/quantization/` interface), `ops/`, `loader/` | `engine/` internals, concrete platforms |
-| `models/layers/` (including `models/layers/quantization/`) | `ops/` | Concrete kernel packages (only through ops registration) |
+| `models/` | `models/layers/` (including the `models/layers/quantization/` interface), `ops/`, `loader/`; platform contracts in backend-specific implementations | `engine/` internals; concrete platforms in shared model code |
+| `models/layers/` (including `models/layers/quantization/`) | `ops/` | Concrete kernel libraries (use OpTable-selected operator contracts) |
 | `ops/` | `platforms/` | Models, `observability/` |
 | `frontend/` | The model's Input/OutputProcessor | `engine/` and other runtime internals; `torch.cuda` and any device runtime (Frontend processes do not initialize CUDA or any other device runtime) |
 | `config/` | `platforms/`, `engine/` (`EngineConfig`), the built model | `frontend/`, `models/layers/`, `loader/` |
@@ -192,9 +194,11 @@ Two principles:
 
 The startup order is: build the model (operators are selected here) → `config.resolve` reads the built model's `capabilities()` and the platform capabilities → create the Engine. So what the built model supports, such as its batch sizes, reaches the engine through the model interface, and the engine depends on neither ops nor config; the Frontend's shared memory and the Engine are connected by `entrypoints/serve.py`, so the engine does not depend on frontend.
 
-`test_layering.py` checks the package dependency directions in the table above, and that `platforms/interface.py` and `models/interface.py` do not import torch. The device boundary below is a target; it is neither implemented nor checked.
+**RPU package boundaries.** `models/wallx2b/rpu/` owns model configuration, weights, request processing and resident stage plans. `engine/rpu/engine.py` owns request admission, submission, completion, reset and shutdown through the model's RPU hooks. The platform package owns device resources: `platforms/rpu/platform.py` describes capabilities, `resources.py` owns buffers and operations, `execution.py` owns ordered executions, and `context.py` owns context lifecycle. `platforms/rpu/plan.py` defines the RPU request contract consumed by the backend model and engine; the shared model interface stays independent of vendor execution types. `config/rpu.py` supplies RPU request and lane defaults while the generic resolver keeps frontend and shared-memory settings. The entry-point factory injects the native backend factory and `rpu.bind_ops(model.ops)` operation factory into the platform context. `context.prepare` calls the selected OpTable implementation, which prepares the native operation; neither the platform nor the engine imports ops. Ordered batch execution and completion waits remain separate from operator selection.
 
-**Device boundary (target).** Device runtime APIs (`torch.cuda`, `torch.npu`, etc.), device strings and architecture checks (`sm_`, `gfx`, etc.) may appear only in the concrete platform files under `platforms/` and in `ops/backends/`. The ROCm build of PyTorch also uses the `torch.cuda` interface, so the boundary is drawn by platform file, not by API name. Core code decides by Platform capabilities, not by platform name (§13.1). Current state: `engine/` uses torch tensors and `torch.cuda` streams, events, graphs and pinned memory directly, and branches on `Platform.is_cuda`; `frontend/shm.py` calls `cudaHostRegister` directly; each model's `processing.py` outputs torch CPU tensors, so `frontend/` imports torch, but it does not initialize CUDA.
+`test_layering.py` checks the package dependency directions in the table above, and that `platforms/interface.py` and `models/interface.py` do not import torch. The device boundary below is a target; it is only partly implemented and is not checked as a complete contract.
+
+**Device boundary (target).** Device runtime APIs (`torch.cuda`, `torch.npu`, etc.), device strings and architecture checks (`sm_`, `gfx`, etc.) may appear only in the concrete platform modules or packages under `platforms/` and in `ops/backends/`. The ROCm build of PyTorch also uses the `torch.cuda` interface, so the boundary is drawn by platform implementation, not by API name. Current state: some stream/event/graph primitives use `platforms/devices.py`, while the shared engine retains direct `torch.cuda` calls and `Platform.is_cuda` branches. Engine dispatch uses `capabilities.execution_model`; operator selection uses the shared registry and `build_table`. CUDA profiling and `frontend/shm.py` host-memory registration use `Platform.is_cuda`; the latter calls `cudaHostRegister` directly. Each model's `processing.py` outputs torch CPU tensors, so `frontend/` imports torch, but it does not initialize CUDA.
 
 ---
 
@@ -549,7 +553,7 @@ A platform declares its capabilities at build time. The runtime derives the conf
 - **dtypes and quantization are capabilities.** If `supported_dtypes` lacks a dtype the model needs (for example, some NPUs have no bf16), or `supported_quant` does not include the selected quantization method, configuration resolution fails, without waiting for model build.
 - **External platforms** register through the `xinfer.platforms` entry point (§18.3); the built-in cuda and cpu platforms use the same mechanism.
 - `ipc`, `mps` and `spatial_partition` are read by no code in v1 (§9.3); they will be added when needed.
-- **The core decides by capability, not by identity.** Platform provides no identity predicates such as `is_cuda()`; `engine/`, `models/layers/` and `models/` read only caps, and undeclared caps take conservative values (unsupported). Every Platform method must have a caller in the core and a contract test, or it is not added (SGLang's platform interface has a set of methods the core never calls, while the core still hard-codes `torch.cuda`, so overriding them has no effect).
+- **Use capabilities for execution contracts.** Engine dispatch reads `execution_model`; CPU, CUDA, Ascend and RPU share registry-based operator selection. CUDA-specific profiling and shared-memory registration use `Platform.is_cuda`. Undeclared capabilities take conservative values (unsupported). Every new Platform method must have a caller and a contract test.
 
 ### 13.2 First platforms
 
@@ -583,26 +587,30 @@ As an open-source project, XInfer integrates chips from different vendors whose 
 
 Each operator defines:
 
-- **Signature**: outputs are written to an `out` provided by the caller; a workspace, if needed, is also provided by the caller.
-- **torch reference implementation**.
-- **Numerical contract**: bitwise equal to the reference or within a given tolerance; whether it is deterministic.
+- **Signature**: tensor operators write to caller-provided `out` and workspace; prepared operators take a native context and resident tensor descriptions and return an operation for later execution.
+- **Reference implementation**, when available, with its supported platforms. RPU prepared operators have no Torch reference.
+- **Numerical contract**: bitwise, tolerance or `unqualified` (numerical qualification has not been established); whether it is deterministic.
 
 Determinism is declared, not required. An operator may give results that differ at rounding level between runs, for example stream-K GEMMs whose partial sums meet in a different order under concurrent load. What a model requires of its operators is that it passes its precision gate (docs/precision.md); for VLA models that is mainly the open-loop gate against recorded trajectories. Declaring `deterministic=False` tells tests and readers not to expect bitwise reproducibility.
 
-Calling conventions:
+Calling conventions for stream-based tensor operators:
 
 - Submit only on the current stream; no implicit synchronization; no internal memory allocation.
 - Operators that need workspace allocate it during warmup to avoid allocating memory during CUDA graph capture.
 - The conventions above on `out`, workspace, the current stream, and no implicit synchronization or allocation do not change with the TVM-FFI or `torch.library` binding.
 
+The RPU prepared interface instead makes resident buffers, preparation and completion explicit (§14.2); CUDA stream and graph conventions do not establish support for that interface.
+
 Validation requirements:
 
-- Every binding must be validated for numerical agreement with the reference implementation, for its declared determinism, and for its declared CUDA Graph capture and replay support; the binding method by itself guarantees none of these properties, nor any performance gain.
+- Every binding must be validated for numerical agreement with the reference implementation, for its declared determinism, and for its declared execution properties, such as CUDA Graph capture/replay or prepared RPU replay; the binding method by itself guarantees none of these properties, nor any performance gain.
 - When a `torch.library` adapter is introduced, additionally validate the registration contract with `torch.library.opcheck`, and test the compile or export paths actually supported, covering input mutation and alias declarations, FakeTensor/shape inference and similar behavior. `opcheck` does not replace numerical agreement tests.
 
 ### 14.2 Backend registration and selection
 
-A backend is the hardware an implementation runs on (`cuda`); the torch reference (`reference`) runs on every platform. Each backend is a package under `xinfer/ops/backends/` with one module per operator category (`cuda/attn.py`, `gemm.py`, `norm.py`, `flow.py`). Every module imports the kernel libraries it calls as it would any library and declares its implementations at module level with the same `xinfer.ops.register`, passing the library as `requires`. A library that does not import is None: its implementations are not registered and the operators run on their references. xcompute, which will serve more backends than CUDA, is imported once by `backends/_xcompute.py`, which checks that its Python package matches the shared library and passes the architectures the build targets as `platforms`.
+Native backends live under `xinfer/ops/backends/<backend>/`: Python bindings accompany the maintained source and CMake build in `src/`. CUDA builds `xinfer_kernels.so`; RPU builds `xinfer_rpu.so`. Both load AOT libraries through TVM-FFI; importing a Python package does not compile device code. Build instructions are in [CUDA kernels](kernels.md) and `docs/rpu_ops.md` in the separate operator-source change.
+
+For registered tensor operators, a backend names the hardware (`cuda`, `ascend`); the torch reference (`reference`) is available on supported torch devices. Operator-category modules such as `cuda/attn.py`, `gemm.py`, `norm.py` and `flow.py` declare implementations with `xinfer.ops.register`, passing the library as `requires`. If an optional library is unavailable, its implementations are not registered and selection may use a valid reference implementation. CUDA's `_native.py` loads the in-tree native library and records its target architectures and fingerprint. Ascend still uses `backends/_xcompute.py` for its external xcompute compatibility provider, checking the paired Python package and shared library; this port does not migrate that provider's implementations into XInfer.
 
 ```python
 try:
@@ -614,33 +622,37 @@ except ImportError:
 def causal_attention(q, k, v, *, scale=None): ...
 ```
 
-`register` adds to the process-wide registry, so importing a backend module registers its implementations; `OpRegistry.load_plugins()` imports the built-in backend modules, then the modules named by the `xinfer.ops` entry point group. `OpRegistry.add`, the one way into a registry, checks that each implementation takes the parameters of the operator's reference and registers it as `backend:library` (`cuda:xcompute`). `XINFER_XCOMPUTE=0` and `XINFER_FLASH_ATTN=0` leave a library out. The process-wide registry loads the plugins before its first `build_table`. A pin (`--op-backends`) names a backend, a library or both.
+`register` adds to the process-wide registry, so importing a backend module registers its implementations; `OpRegistry.load_plugins()` imports the built-in backend modules, then the modules named by the `xinfer.ops` entry point group. `OpRegistry.add`, the one way into a registry, checks implementation parameters against the reference when one exists and registers it as `backend:library` (`cuda:kernels`). `XINFER_KERNELS=0`, `XINFER_XCOMPUTE=0` and `XINFER_FLASH_ATTN=0` leave the corresponding libraries out. The process-wide registry loads the plugins before its first `build_table`. A pin (`--op-backends`) names a backend, a library or both.
 
-- The implementation is selected at model build time, not dispatched on every call. An implementation that supports only some calls of an operator runs the others on the reference itself, as xcompute's `prefix_kvcache_attention` does for the cache shapes its kernel does not take.
+- The implementation is selected at model build time, not dispatched on every call. An implementation that supports only some calls of an operator runs the others on the reference itself, as CUDA's native `prefix_kvcache_attention` does for the cache shapes its kernel does not take.
 - When operators a model calls run on a fused reference on a CUDA device, one warning names them. `XINFER_OPS_STRICT=1` turns this warning into an error (CI and benchmarks).
 - The selection, library versions and hashes are written to the engine metadata, and an "operator selection table" is printed at startup.
-- A missing implementation fails explicitly; it can also be configured to fall back to the reference implementation with a warning.
+- An unsupported pin fails explicitly; unpinned operators with no supported implementation are omitted. Reference fallback requires an available reference supporting the platform.
+
+RPU uses the same `OpRegistry` and `build_table` as CPU, CUDA and Ascend. Its `prepare_<family>` specifications select prepared callables taking a native context, resident tensors, scalar arguments and selectors, rather than Torch tensor-call signatures. They return a native operation without executing or waiting. These specifications have no Torch fallback and report `Contract(numerics="unqualified")`; unsupported pins and `reference_only` requests fail explicitly. The factory passes `rpu.bind_ops(model.ops)` to the platform context, so `context.prepare` calls the table-selected implementation and then native preparation. An empty RPU selection fails when bound; a missing callable fails when that operation is prepared. The model still owns tensor packing, operation order and collectives; batch execution and completion waits are unchanged. `rpu.resolve(...)` remains the generic family resolver. Registration and host contract tests do not establish device numerical qualification.
 
 **Operator binding strategy:**
 
-- **Default path**: xcompute integrates through TVM-FFI; `xinfer/ops/backends/_xcompute.py` imports it and the modules of `xinfer/ops/backends/cuda/` register its operators in XInfer's operator registry.
-- **Adapters as needed**: when an operator has a concrete PyTorch integration need such as `torch.compile` or `torch.export`, a `torch.library` registration is added. The wrapper reuses the existing underlying implementation and can call the same xcompute kernel through TVM-FFI, so two sets of kernels need not be maintained.
+- **Default path**: build native sources under `xinfer/ops/backends/<backend>/src` ahead of time and load the resulting library through TVM-FFI. Tensor and prepared-operation signatures share the registry and OpTable selection. Existing external compatibility providers retain their explicit loading and validation requirements.
+- **Adapters as needed**: when an operator has a concrete PyTorch integration need such as `torch.compile` or `torch.export`, a `torch.library` registration is added. The wrapper reuses the existing underlying implementation through TVM-FFI, so two sets of kernels need not be maintained.
 - **Responsibility boundary**: the `torch.library` adapter covers the operator signature, input mutation and alias declarations, and the required FakeTensor/shape inference rules; hardware implementation selection and numerical policy stay with XInfer's operator registry and contracts.
-- **Unified call surface**: models and layers call only XInfer's operator interface and do not depend directly on the binding method. Registering with XInfer is not the same as registering a PyTorch custom operator.
-- **Delivery scope**: an operator does not have to provide both entry points, and the default execution path does not have to go through two layers of wrappers. xcompute already uses TVM-FFI; `torch.library` adapters are implemented and validated as concrete needs arise, with no placeholder modules built in advance and no claim of a complete dual path.
+- **Unified call surface**: models and layers use OpTable-selected operator contracts; RPU model plans may retain the injected context's `prepare` facade. They do not load shared libraries or vendor SDKs directly. Registering with XInfer is not the same as registering a PyTorch custom operator.
+- **Delivery scope**: an operator does not have to provide both entry points, and the default execution path does not have to go through two layers of wrappers. `torch.library` adapters are implemented and validated as concrete needs arise, with no placeholder modules built in advance and no claim of a complete dual path.
 
 ### 14.3 Division of work
 
-| | XInfer repository (framework team) | xcompute repository (operator team) |
+| | Framework and model integration | Native operator implementation |
 |---|---|---|
-| Content | Operator signatures, reference implementations, conformance test suite, registration mechanism | High-performance implementations for each platform (CUDA/CuTe/Triton/HIP), with a wheel per platform |
-| Testing | Model-level alignment, runtime consistency | Runs `xinfer.ops.conformance` in CI (numerics, determinism, graph capture) and provides microbenchmarks |
-| Deliverables | The operator list and shapes for each model | A theoretical lower-bound (roofline) table for each implementation |
-| Versioning | Declares the compatible xcompute version range; checks the build fingerprint at startup | Semantic versioning; ABI changes bump the major version |
+| Content | Operator and prepared-backend contracts, references, registration, model packing and execution plans | In-tree `ops/backends/<backend>/src`, generic family bindings, catalog and AOT builds |
+| Testing | Model-level alignment and runtime consistency | Backend contract and numerical tests, supported replay checks and microbenchmarks; the planned `xinfer.ops.conformance` suite remains to be implemented |
+| Deliverables | Each model's operator list, shapes and precision requirements | Native library, build/capability metadata, build instructions and measured performance evidence where available |
+| Versioning | Defines the binding contract and verifies the backend's declared compatibility and identity | Records ABI/build identity and supported capabilities; documents incompatible changes |
+
+Both columns belong in the XInfer repository. External SDKs, compilers, model weights and generated RPU `.ref` assets keep their separate distribution and licensing boundaries.
 
 Tool: `xinfer profile ops --model wall_oss` reports each operator's time and theoretical lower bound for a model, so the operator team can set priorities.
 
-Vendor NPU implementations do not need to be merged into xcompute: a separate package that registers through the `xinfer.ops` and `xinfer.platforms` entry points is enough (§18.3).
+Vendor backends may use the same in-tree layout or a separately maintained package through the `xinfer.ops` and `xinfer.platforms` entry points (§18.3). Prepared backends declare their callable signatures and execution contracts through the same registry.
 
 ### 14.4 Wall-OSS operator list
 
@@ -689,7 +701,7 @@ These tools decide whether others can reproduce "how many robots per GPU", and t
 |---|---|---|
 | Contract tests | A fake model covers admission, slot lifecycle, cancellation, batching, chained dispatch and error paths; checks dependency direction (the device boundary is added with the device abstraction, §4). The CPU platform simulates asynchronous streams and events with threads | CPU, every MR |
 | Out-of-tree plugin path | A separate dummy platform package goes through discovery, activation and contract tests via the entry point (§13.3) | CPU, every MR |
-| Operator conformance | Each backend implementation against the reference implementation; every binding follows the execution and validation contracts of §14.1 | xcompute repository CI (GPU) |
+| Operator conformance | Each backend implementation against the reference implementation; every binding follows the execution and validation contracts of §14.1 | XInfer backend tests on the declared device; external providers retain their own checks |
 | PyTorch operator adapters (when introduced) | `torch.library.opcheck`, the compile/export paths actually supported, and numerical agreement after adaptation (§14.1) | Main repository CI, on the devices declared as supported |
 | Model alignment | Frozen inputs, noise and reference outputs, compared with the original implementation | GPU, every MR (small sample) |
 | Runtime consistency | Chained vs non-chained, B1 vs Bn, idle vs full-load replay: outputs pass the precision gate, and are bitwise equal at B1 where the operators are deterministic | GPU, nightly |
@@ -699,7 +711,7 @@ These tools decide whether others can reproduce "how many robots per GPU", and t
 
 ## 18. Repository and development process
 
-- XInfer integrates xcompute through the operator contracts, bindings and conformance checks in §14. External publication requires license and contribution-process approval.
+- XInfer maintains native operator sources, bindings and build definitions in the same repository as the framework, under the contracts and validation requirements in §14. Existing external providers remain explicit compatibility dependencies. External publication requires license and contribution-process approval.
 - **Conventions**:
   - MR descriptions must state the problem, changes, validation and limitations;
   - raw experiment data stays out of Git;
@@ -798,12 +810,14 @@ XInfer/
 │   ├── ops/
 │   │   ├── spec.py                 # operator signatures and numerical contracts
 │   │   ├── registry.py             # backend registration, build-time selection, selection table
-│   │   ├── reference/              # torch reference implementations on every platform: attn.py, gemm.py, norm.py, flow.py, rope.py, elementwise.py, conv.py, mxfp8.py, nvfp4.py
+│   │   ├── reference/              # references on supported torch platforms: attn.py, gemm.py, norm.py, flow.py, rope.py, elementwise.py, conv.py, mxfp8.py, nvfp4.py
 │   │   ├── layout/                 # storage layouts of the low-precision formats: mxfp8.py, nvfp4.py
 │   │   ├── backends/
-│   │   │   ├── _xcompute.py        # imports the xcompute library (currently via TVM-FFI), shared by the backends
-│   │   │   └── cuda/               # one module per operator category: attn.py, gemm.py, norm.py, flow.py
-│   │   └── conformance/            # conformance test suite (also run in the xcompute repository CI)
+│   │   │   ├── _xcompute.py        # external Ascend compatibility-provider loader
+│   │   │   ├── ascend/             # current Ascend adapters, including the external xcompute provider
+│   │   │   ├── cuda/               # operator-category bindings, native loader and src/ AOT build
+│   │   │   └── rpu/                # family/prepared bindings, asset validation and src/ host/device sources
+│   │   └── conformance/            # planned shared backend conformance suite
 │   │       ├── cases.py            # per-operator shape and dtype cases, taken from the first models
 │   │       └── checks.py           # numerics, determinism, graph capture checks
 │   ├── observability/
@@ -842,17 +856,19 @@ XInfer/
     └── Dockerfile.thor             # based on JetPack/L4T
 ```
 
-### 18.2 The xcompute repository and the integration boundary
+### 18.2 Native operator sources and the integration boundary
 
-The existing xcompute repository and its engineering structure are kept, maintained by the operator team; no separate operator repository is created. XInfer's integration and delivery requirements are:
+Native operator implementation is maintained in `xinfer/ops/backends/<backend>/src`, alongside its Python bindings and tests. The framework and operator layers have separate responsibilities within one repository; a separately installed xcompute package is not the default source of native CUDA or RPU kernels. The existing Ascend xcompute compatibility provider remains external until its implementation is explicitly migrated. Integration and delivery requirements are:
 
 | Item | Convention |
 |---|---|
-| Implementation | xcompute provides high-performance operators for each platform, such as GEMM, fused quantization, attention, norm/RoPE and image processing, with the scope driven by the first models' operator list |
-| Binding | By default wrapped and registered through TVM-FFI by XInfer's `ops/backends/cuda/`; `torch.library` adapters that reuse the underlying implementation are added for concrete PyTorch integration needs (§14.2) |
-| Validation | Besides xcompute's own tests, its CI runs `xinfer.ops.conformance`, and it delivers microbenchmarks and roofline tables; XInfer adds the §14.1 and §17 validation for new `torch.library` adapters |
-| Versioning and release | Build artifacts delivered per platform, recording the library version, hash and supported capabilities; XInfer checks the compatible range and the build fingerprint (§14.3) |
-| Third-party dependencies | xcompute keeps records of sources and licenses, reviewed before public release |
+| Implementation | In-tree native sources, generic family bindings and catalog entries cover the operators required by supported models; model-specific packing, constants and operation order stay in the model integration |
+| Binding | AOT libraries loaded through TVM-FFI: `xinfer_kernels.so` for CUDA tensor operators and `xinfer_rpu.so` for RPU prepared execution; `torch.library` adapters are added for concrete PyTorch integration needs (§14.2) |
+| Validation | Host contracts and build checks are separate from device-source compilation, real-device numerics, replay and model precision/performance gates (§14.1, §17); a host-only or SDK-stub test establishes no device acceptance |
+| Versioning and release | Record library identity, hash and supported capabilities, and validate the backend-specific ABI/build metadata; RPU also matches the native catalog and external asset manifest (§14.3) |
+| Third-party dependencies | Preserve upstream source attribution and applicable license copies; vendor SDKs, compilers and generated RPU assets remain external. Attribution and terms accompany the operator change in `THIRD_PARTY_NOTICES.md` |
+
+The separate operator change's `docs/rpu_ops.md` documents the host-only build, runtime SDK build and explicit `.rc`-to-`.ref` asset build. Source availability does not supply the SDK or generated assets, or establish numerical or performance acceptance. RPU model/runtime integration supplies the selected operation factory and execution lifecycle; the operator package alone cannot run a model.
 
 ### 18.3 Extensions: plugin entry points
 
@@ -860,7 +876,7 @@ XInfer does not import external extensions directly; it discovers them at startu
 
 | Entry-point group | Purpose | Example |
 |---|---|---|
-| `xinfer.ops` | Register operator implementations | The xcompute binding and other vendors' operator packages |
+| `xinfer.ops` | Register operator implementations | Out-of-tree operator packages; built-in CUDA and Ascend category modules use the same registry |
 | `xinfer.models` | Out-of-tree models | Private or third-party models |
 | `xinfer.policies` | Scheduling policies | SLO-aware schedulers |
 | `xinfer.platforms` | Register a Platform | Vendor NPU packages; the built-in cuda and cpu platforms use the same mechanism |
@@ -914,7 +930,7 @@ What is carried over are the logical stages and the batching and ownership rules
 
 | Milestone | Content | Acceptance |
 |---|---|---|
-| M-1 Review and repository setup | Main repository created, xcompute confirmed as the operator repository; review of this document and of the operator contracts pending; CPU CI set up | Repository arrangement decided; review and acceptance conclusions recorded once the other items of this milestone are done |
+| M-1 Review and repository setup | Main repository and CPU CI set up; native operators maintained in-tree; review of this document and of the operator contracts pending | Repository arrangement decided; review and acceptance conclusions recorded once the other items of this milestone are done |
 | M0 Data plane | Platform, operator backends, layers, Wall-OSS, single-lane dispatch and benchmarks | Wall-OSS meets its precision gate and records latency and graph dispatch costs on the target platform. |
 | M1 Fleet runtime | Multi-lane dispatch, zero-wait batching, frontend workers, slot lifecycle and configuration resolution | Measure fleet capacity, batched precision and dispatch overhead under load. |
 | M2 Quantization and extension | NVFP4 and model extensions | Record numerical results for each model and quantization method. |
@@ -936,7 +952,7 @@ What is carried over are the logical stages and the batching and ownership rules
 
 1. **External name conflict**: `xinfer` on PyPI is taken by dnth/xinfer (a computer-vision inference framework), and Xorbits' Xinference has a similar name. The repository stays XInfer; the pip package name is decided before going public.
 2. **Model weights**: external distribution of checkpoint files requires separate approval.
-3. **Scope and versions of PyTorch operator adapters**: the strategy of TVM-FFI by default with `torch.library` added as needed is settled (§0, §14.2); confirm with the operator team which operators need adapters first, which compile/export paths are actually supported, and the PyTorch, TVM-FFI and xcompute version ranges.
+3. **Scope and versions of PyTorch operator adapters**: the strategy of TVM-FFI by default with `torch.library` added as needed is settled (§0, §14.2); confirm with the operator team which operators need adapters first, which compile/export paths are actually supported, and the PyTorch, TVM-FFI and native binding compatibility ranges. External compatibility providers retain their own version requirements.
 4. **License**: to be approved before M3.
 5. **External stable surface and support tiers**: the starting API version number and the rules for breaking changes, and the admission criteria for Tier 2 (§13.3).
 6. **Timing and GPU models for AMD GPUs**: whether they enter v1; the GPU model determines the available quantization formats and kernel sources (§13.2).

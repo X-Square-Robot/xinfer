@@ -184,6 +184,9 @@ class Engine:
                 of its consumer.
             RuntimeError: ``config.cudagraphs`` is set but the platform does not support graph capture.
         """
+        if platform.capabilities.execution_model != "cuda-lanes":
+            raise ValueError("engine.core.Engine requires execution_model='cuda-lanes'; "
+                             f"got {platform.capabilities.execution_model!r} on {platform.name}")
         self.model = model
         self.platform = platform
         self.config = config = config or EngineConfig()

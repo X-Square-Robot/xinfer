@@ -19,8 +19,8 @@
 |---|---|
 | 项目名 | XInfer |
 | 仓库 | GitHub 上的 X-Square-Robot/xinfer。 |
-| kernel | 沿用现有 xcompute 仓库，由算子组负责；XInfer 通过 ops 层的 xcompute 绑定接入 |
-| 算子绑定 | xcompute 默认使用 TVM-FFI；有明确的 PyTorch 编译、导出需求时，按需增加 `torch.library` 适配并复用底层实现（§14.2） |
+| kernel | 原生算子源码和构建定义维护在 `xinfer/ops/backends/<backend>/src`，Python 绑定在后端包内，提前构建共享库（AOT）；后端仍有需要时保留外部兼容 provider（§18.2） |
+| 算子绑定 | 原生库使用 TVM-FFI；所有后端使用同一算子注册表和构建期选择。RPU 注册预构建算子签名；有明确的 PyTorch 编译、导出需求时，`torch.library` 适配复用已有实现（§14.2） |
 | 部署场景 | 每个加速器运行一个模型实例，为一台或多台机器人提供服务。 |
 | 内置模型 | Wall-OSS、Wall-X 2B |
 | 首批硬件 | RTX 5090（sm120）、Jetson Thor（sm110） |
@@ -35,10 +35,12 @@
 
 本文其余各节描述目标设计。下表列出各设计项在 main 上的实现情况；“未实现”的条目在实现前仍按原文评审。
 
+§14、§18.2 描述的原生 RPU 算子包是在此基线上增加的算子层实现。下列框架状态不表示其独立的模型／运行时接入已实现。
+
 | 设计项 | 状态 | 现状 |
 |---|---|---|
 | §4 包间依赖方向 | 已实现 | `tests/unit/test_layering.py` 检查（含 `frontend/`、`observability/`）；`engine/` 不依赖 `ops/`、`frontend/` 两条尚未加入检查 |
-| §4 设备边界 | 未实现 | `engine/` 直接调用 `torch.cuda`，并按 `Platform.is_cuda` 分支；`test_layering.py` 只检查 `platforms/interface.py`、`models/interface.py` 不 import torch |
+| §4 设备边界 | 部分实现 | 部分设备原语经 `platforms/devices.py` 调用；共享引擎仍直接调用 `torch.cuda`，并按 `Platform.is_cuda` 分支。引擎分派读取 `capabilities.execution_model`，所有后端使用算子注册表；CUDA profiling 与 frontend 共享内存注册使用 `Platform.is_cuda`。`test_layering.py` 只检查 `platforms/interface.py`、`models/interface.py` 不 import torch |
 | §5 取消与单请求错误 | 部分实现 | 未发射的取消请求直接丢弃，已发射的跑完后丢弃结果；阶段执行、接纳时的上传或取批时出错，只让相应的请求失败，并释放其 slot。引擎线程或完成线程停止时 `xinfer-serve` 以状态 1 退出；设备粘滞错误的识别（`Platform.classify_error`）与 DRAINING 未实现 |
 | §6.3 三条调度规则 | 已实现 | 上游发射后请求即进入下游队列，下游 lane 在 GPU 上等待事件；零等待组批；完成线程只等最终事件（`xinfer/engine/core.py`） |
 | §6.4 组批精度 | 已实现 | Wall-OSS 参考组合允许 action 阶段使用 B1、B2、B4 和 B8。优化组合、vision 和 prefill 只使用 B1。 |
@@ -55,7 +57,7 @@
 | §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过内部精度门禁。 Wall-X 2B 使用 Qwen3.5 骨干，支持桌面双臂 RTC。 |
 | §12 量化 | 部分实现 | 框架支持按模块组配置 `QuantConfig`。Wall-OSS 使用 BF16。MXFP8 和 NVFP4 具有 PyTorch 参考实现，详见[量化](quantization.zh-CN.md)。 |
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
-| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；后端为 xcompute（TVM-FFI）和 flash-attn，由 `cuda` 后端模块注册，与 `xinfer.ops` entry point 一起加载（§14.2）；`xinfer.ops.conformance` 未实现 |
+| §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；CUDA 使用仓内原生库和 flash-attn，Ascend 在其他 provider 之外仍保留外部 xcompute 兼容 provider（§14.2）；`xinfer.ops.conformance` 未实现 |
 | §15 协议与前端 | 部分实现 | WebSocket + msgpack，兼容 x2robot 客户端；`xinfer.Policy` 进程内 API；Client SDK 与兼容适配未实现 |
 | §16 可观测性与基准工具 | 部分实现 | 服务通过 [/metrics](metrics.zh-CN.md) 导出 Prometheus 指标。使用[压测工具](benchmark.zh-CN.md)测单请求延迟和闭环容量，或用 [xinfer-profile](profiling.zh-CN.md) 分析算子、排队及各阶段执行时间。 |
 | §17 测试 | 部分实现 | CPU 单元与契约测试；GPU 与资产测试需要本地资产，手动运行；CI（GitHub Actions，`.github/workflows/ci.yml`）跑 ruff、仓库与文档检查和 CPU 测试 |
@@ -158,10 +160,10 @@
  ┌──────▼──────────────────────────────────────────────────────────┐
  │ models/（含 models/layers/ 与其 quantization/）· loader/        │
  └──────┬──────────────────────────────────────────────────────────┘
-        │ ops.<name>(...)
+        │ OpTable 选择的张量调用 / 预构建算子调用
  ┌──────▼──────────────────────────────────────────────────────────┐
  │ platforms/（cuda: sm120, sm110；cpu 参考）· ops/（契约 + 参考实现）│
- │ xcompute（现有算子仓库，按平台交付高性能实现）                     │
+ │ ops/backends/<backend>/src（仓内源码、AOT 库、TVM-FFI 绑定）       │
  └─────────────────────────────────────────────────────────────────┘
  可选：Router（会话亲和、失败重试）· 实例生命周期 · 健康检查
 ```
@@ -178,8 +180,8 @@
 | 模块 | 可以依赖 | 不得依赖 |
 |---|---|---|
 | `engine/` | `platforms/`、模型接口（抽象类）、`observability.annotate`（阶段 span） | 任何具体模型、量化方法、kernel 包；`config/`、`models/layers/`、`loader/`、`ops/`、`frontend/` |
-| `models/` | `models/layers/`（含 `models/layers/quantization/` 接口）、`ops/`、`loader/` | `engine/` 内部、具体平台 |
-| `models/layers/`（含 `models/layers/quantization/`） | `ops/` | 具体 kernel 包（只能经 ops 注册） |
+| `models/` | `models/layers/`（含 `models/layers/quantization/` 接口）、`ops/`、`loader/`；后端专属实现中的平台契约 | `engine/` 内部；共享模型代码中的具体平台 |
+| `models/layers/`（含 `models/layers/quantization/`） | `ops/` | 具体 kernel 库（使用 OpTable 选择的算子契约） |
 | `ops/` | `platforms/` | 模型、`observability/` |
 | `frontend/` | 模型的 Input/OutputProcessor | `engine/` 等运行时内部；`torch.cuda` 与任何设备运行时（Frontend 进程不初始化 CUDA 或其他设备运行时） |
 | `config/` | `platforms/`、`engine/`（`EngineConfig`）、已构建的模型 | `frontend/`、`models/layers/`、`loader/` |
@@ -189,9 +191,11 @@
 
 启动顺序是：构建模型（算子在此时选定）→ `config.resolve` 读取已构建模型的 `capabilities()` 与平台能力 → 创建 Engine。所以已构建模型支持的能力（例如批大小）经模型接口交给 engine，engine 不依赖 ops，也不依赖 config；Frontend 的共享内存与 Engine 之间由 `entrypoints/serve.py` 衔接，engine 不依赖 frontend。
 
-`test_layering.py` 检查上表中包之间的依赖方向，以及 `platforms/interface.py`、`models/interface.py` 不 import torch。下面的设备边界是目标，尚未实现，也未检查。
+**RPU 包的职责边界。** `models/wallx2b/rpu/` 负责模型配置、权重、请求处理和常驻阶段计划。`engine/rpu/engine.py` 通过模型的 RPU 钩子负责请求准入、提交、完成、重置和关闭。平台包负责设备资源：`platforms/rpu/platform.py` 描述能力，`resources.py` 管理缓冲区和操作，`execution.py` 管理有序执行，`context.py` 管理上下文生命周期。`platforms/rpu/plan.py` 定义后端模型和引擎共同使用的 RPU 请求契约；共享模型接口不依赖厂商执行类型。`config/rpu.py` 提供 RPU 请求和通道默认值，通用解析器继续负责 frontend 和共享内存设置。入口工厂向平台上下文注入原生后端工厂和 `rpu.bind_ops(model.ops)` 算子工厂。`context.prepare` 调用 OpTable 选中的实现，再准备原生操作；平台与引擎都不导入 ops。有序批执行和完成等待独立于算子选择。
 
-**设备边界（目标）。** 设备运行时 API（`torch.cuda`、`torch.npu` 等）、设备字符串和架构判断（`sm_`、`gfx` 等）只允许出现在 `platforms/` 下的具体平台文件和 `ops/backends/`。ROCm 版 PyTorch 也用 `torch.cuda` 接口，所以边界按平台文件划分，不按 API 名划分。核心代码按 Platform 的能力判断，不按平台名判断（§13.1）。现状：`engine/` 直接使用 torch 张量和 `torch.cuda` 的 stream、event、graph 与 pinned 内存，并按 `Platform.is_cuda` 分支；`frontend/shm.py` 直接调用 `cudaHostRegister`；各模型的 `processing.py` 输出 torch CPU 张量，`frontend/` 因此 import torch，但不初始化 CUDA。
+`test_layering.py` 检查上表中包之间的依赖方向，以及 `platforms/interface.py`、`models/interface.py` 不 import torch。下面的设备边界是目标，目前只部分实现，也未作为完整契约检查。
+
+**设备边界（目标）。** 设备运行时 API（`torch.cuda`、`torch.npu` 等）、设备字符串和架构判断（`sm_`、`gfx` 等）只允许出现在 `platforms/` 下的具体平台模块或包和 `ops/backends/`。ROCm 版 PyTorch 也用 `torch.cuda` 接口，所以边界按平台实现划分，不按 API 名划分。现状：部分 stream/event/graph 原语经 `platforms/devices.py` 调用，共享引擎仍保留直接的 `torch.cuda` 调用和 `Platform.is_cuda` 分支。引擎分派读取 `capabilities.execution_model`；算子选择使用共享注册表和 `build_table`。CUDA profiling 与 `frontend/shm.py` 主机内存注册使用 `Platform.is_cuda`；后者直接调用 `cudaHostRegister`。各模型的 `processing.py` 输出 torch CPU 张量，`frontend/` 因此 import torch，但不初始化 CUDA。
 
 ---
 
@@ -546,7 +550,7 @@ class Platform:
 - **dtype 与量化是能力。** `supported_dtypes` 缺少模型所需的 dtype（例如部分 NPU 没有 bf16），或 `supported_quant` 不含所选量化方法时，在配置解析阶段报错，不等到模型构建。
 - **外部平台**通过 `xinfer.platforms` 入口注册（§18.3），内置的 cuda 和 cpu 走同一机制。
 - `ipc`、`mps`、`spatial_partition` 在 v1 没有代码读取（§9.3），需要时再加入。
-- **核心按能力判断，不按身份判断。** Platform 不提供 `is_cuda()` 一类的身份谓词；`engine/`、`models/layers/`、`models/` 只读 caps，未声明的 caps 取保守值（不支持）。Platform 的每个方法都必须有核心里的调用方和契约测试，否则不加（SGLang 的平台接口里有一批核心并未调用的方法，核心仍硬编码 `torch.cuda`，覆盖无效）。
+- **用能力描述执行契约。** 引擎分派读取 `execution_model`；CPU、CUDA、Ascend 和 RPU 共用注册表进行算子选择。CUDA 专属 profiling 和共享内存注册使用 `Platform.is_cuda`。未声明的能力取保守值（不支持）。每个新增的 Platform 方法都必须有调用方和契约测试。
 
 ### 13.2 首批平台
 
@@ -580,26 +584,30 @@ XInfer 作为开源项目接入不同厂商的芯片，厂商包在树外维护�
 
 每个算子定义以下内容：
 
-- **签名**：输出写入调用方提供的 `out`；需要 workspace 时由调用方提供。
-- **torch 参考实现**。
-- **数值契约**：与参考逐位一致还是给定容差；是否确定性。
+- **签名**：张量算子写入调用方提供的 `out` 和 workspace；预构建算子接收原生上下文与常驻张量描述，返回稍后执行的操作。
+- **参考实现**及其支持的平台（如有）；RPU 预构建算子没有 Torch 参考实现。
+- **数值契约**：逐位一致、给定容差或 `unqualified`（尚未建立数值验收结论）；是否确定性。
 
 确定性只需声明，不作要求。算子在多次运行之间可以有舍入量级的差异，例如 stream-K GEMM 在并发负载下部分和以不同的顺序相加。模型对算子的要求是能通过该模型的精度门禁（docs/precision.zh-CN.md）；对 VLA 模型来说主要是对照录制轨迹的开环门禁。声明 `deterministic=False` 是告诉测试和读者不要期待逐位可复现。
 
-调用约定：
+基于 stream 的张量算子调用约定：
 
 - 只在当前 stream 上提交；不隐式同步；不在内部分配显存。
 - 需要 workspace 的算子在预热期间完成首次分配，避免在 CUDA Graph 捕获期间分配内存。
 - 上述 `out`、workspace、当前 stream、无隐式同步与分配约定不因 TVM-FFI 或 `torch.library` 绑定而改变。
 
+RPU 的预构建执行接口显式管理常驻缓冲区、准备与完成状态（§14.2）；CUDA 的 stream 和 graph 约定不能证明该接口已经受支持。
+
 验证要求：
 
-- 每种绑定均需验证与参考实现的数值一致性、所声明的确定性，以及所声明的 CUDA Graph 捕获与重放能力；绑定方式本身不保证这些性质或性能收益。
+- 每种绑定均需验证与参考实现的数值一致性、所声明的确定性及执行属性，例如 CUDA Graph 捕获／重放或 RPU 预构建执行的重放；绑定方式本身不保证这些性质或性能收益。
 - 引入 `torch.library` 适配时，额外使用 `torch.library.opcheck` 验证注册契约，并测试实际支持的编译或导出路径，覆盖输入修改与别名声明、FakeTensor／形状推导等行为。`opcheck` 不替代数值一致性测试。
 
 ### 14.2 后端注册与选择
 
-后端指实现运行的硬件（`cuda`）；torch 参考实现（`reference`）在所有平台上运行。每个后端是 `xinfer/ops/backends/` 下的一个包，每类算子一个模块（`cuda/attn.py`、`gemm.py`、`norm.py`、`flow.py`）。每个模块像使用普通库一样直接 import 它调用的 kernel 库，在模块顶层用同一个 `xinfer.ops.register` 声明实现，并把库作为 `requires` 传入。库 import 失败时为 None：其实现不注册，这些算子运行参考实现。xcompute 以后会支持 CUDA 之外的后端，由各后端共用的 `backends/_xcompute.py` import 一次，它检查 Python 包与共享库是否属于同一构建，并把构建目标架构作为 `platforms` 传入。
+原生后端位于 `xinfer/ops/backends/<backend>/`：Python 绑定与 `src/` 中维护的源码和 CMake 构建配套。CUDA 构建 `xinfer_kernels.so`，RPU 构建 `xinfer_rpu.so`，均经 TVM-FFI 加载 AOT 库；导入 Python 包不会编译设备代码。构建方法见 [CUDA kernel](kernels.zh-CN.md) 和 独立算子变更中的 `docs/rpu_ops.zh-CN.md`。
+
+对于注册表中的张量算子，后端表示硬件（`cuda`、`ascend`）；torch 参考实现（`reference`）可用于受支持的 torch 设备。`cuda/attn.py`、`gemm.py`、`norm.py`、`flow.py` 等分类模块使用 `xinfer.ops.register` 声明实现，把库作为 `requires` 传入。可选库不可用时，其实现不注册，选择过程可以使用有效的参考实现。CUDA 的 `_native.py` 加载仓内原生库，记录目标架构和构建指纹。Ascend 仍由 `backends/_xcompute.py` 加载外部 xcompute 兼容 provider，检查配对的 Python 包与共享库；本次移植不把该 provider 的实现迁入 XInfer。
 
 ```python
 try:
@@ -611,33 +619,37 @@ except ImportError:
 def causal_attention(q, k, v, *, scale=None): ...
 ```
 
-`register` 直接写入进程级 registry，因此 import 后端模块即完成其实现的注册；`OpRegistry.load_plugins()` 先 import 内置后端模块，再 import `xinfer.ops` 入口点指向的模块。`OpRegistry.add` 是写入 registry 的唯一入口，它检查每个实现的参数与算子参考实现一致后，以 `backend:library`（`cuda:xcompute`）注册。`XINFER_XCOMPUTE=0` 和 `XINFER_FLASH_ATTN=0` 不使用对应的库。进程级 registry 在第一次 `build_table` 前自动加载插件。固定选择（`--op-backends`）可以写后端、库或两者。
+`register` 直接写入进程级 registry，因此 import 后端模块即完成其实现的注册；`OpRegistry.load_plugins()` 先 import 内置后端模块，再 import `xinfer.ops` 入口点指向的模块。`OpRegistry.add` 是写入 registry 的唯一入口，在已有参考实现时检查实现参数与其一致，以 `backend:library`（`cuda:kernels`）注册。`XINFER_KERNELS=0`、`XINFER_XCOMPUTE=0` 和 `XINFER_FLASH_ATTN=0` 不使用对应的库。进程级 registry 在第一次 `build_table` 前自动加载插件。固定选择（`--op-backends`）可以写后端、库或两者。
 
-- 在模型构建时选定实现，不在每次调用时分派。只支持算子部分调用的实现自行把其余调用交给参考实现，例如 xcompute 的 `prefix_kvcache_attention` 对 kernel 不支持的 cache 形状就这样处理。
+- 在模型构建时选定实现，不在每次调用时分派。只支持算子部分调用的实现自行把其余调用交给参考实现，例如 CUDA 原生 `prefix_kvcache_attention` 对 kernel 不支持的 cache 形状就这样处理。
 - 在 CUDA 设备上，模型调用的算子落到融合算子的参考实现时，一条告警列出这些算子。`XINFER_OPS_STRICT=1` 把这条告警变成错误（用于 CI 和 benchmark）。
 - 选择结果和库版本、哈希写入引擎元数据，启动时打印"算子选择表"。
-- 缺少实现时显式失败；也可配置为回退到参考实现，并告警。
+- 固定选择不受支持时显式失败；没有支持实现且未固定选择的算子省略。回退要求存在支持当前平台的参考实现。
+
+RPU 与 CPU、CUDA、Ascend 使用同一 `OpRegistry` 和 `build_table`。其 `prepare_<family>` 规格选择预构建调用，接收原生上下文、常驻张量、标量参数和 selector，区别于 Torch 张量调用签名；返回原生操作，不执行或等待。这些规格没有 Torch 回退，报告 `Contract(numerics="unqualified")`；固定选择不受支持或请求 `reference_only` 时显式报错。工厂向平台上下文传入 `rpu.bind_ops(model.ops)`，使 `context.prepare` 调用表中选中的实现，再完成原生准备。空的 RPU 选择在绑定时报错；缺少某个调用时，在准备该操作时报错。模型继续负责张量打包、算子顺序与集合通信；批执行和完成等待保持不变。`rpu.resolve(...)` 仍负责通用算子族解析。注册和主机契约测试不构成设备数值验收。
 
 **算子绑定策略：**
 
-- **默认路径**：xcompute 通过 TVM-FFI 接入，由 `xinfer/ops/backends/_xcompute.py` import，`xinfer/ops/backends/cuda/` 的模块把其算子注册到 XInfer 的算子注册表。
-- **按需适配**：当某个算子有明确的 `torch.compile`、`torch.export` 等 PyTorch 集成需求时，再增加 `torch.library` 注册。包装层复用已有底层实现，可通过 TVM-FFI 调用同一份 xcompute kernel，不要求维护两套 kernel。
+- **默认路径**：提前构建 `xinfer/ops/backends/<backend>/src` 中的原生源码，经 TVM-FFI 加载产物。张量和预构建算子签名共用注册表和 OpTable 选择；现有外部兼容 provider 保留各自的显式加载与验证要求。
+- **按需适配**：当某个算子有明确的 `torch.compile`、`torch.export` 等 PyTorch 集成需求时，再增加 `torch.library` 注册。包装层经 TVM-FFI 复用已有底层实现，不要求维护两套 kernel。
 - **职责边界**：`torch.library` 适配负责算子签名、输入修改与别名声明，以及所需的 FakeTensor／形状推导规则；硬件实现选择和数值策略仍由 XInfer 的算子注册表与契约管理。
-- **统一调用面**：模型和 layer 只调用 XInfer 的算子接口，不直接依赖绑定方式。注册到 XInfer 不等于注册为 PyTorch 自定义算子。
-- **交付范围**：不要求每个算子同时提供两种入口，也不要求默认执行路径经过两层包装。当前 xcompute 已采用 TVM-FFI；`torch.library` 适配随具体需求实现和验证，不预建占位模块，不声称已具备完整双路径。
+- **统一调用面**：模型和 layer 使用 OpTable 选择的算子契约；RPU 模型计划可以保留注入上下文的 `prepare` 门面。不直接加载共享库或厂商 SDK。注册到 XInfer 不等于注册为 PyTorch 自定义算子。
+- **交付范围**：不要求每个算子同时提供两种入口，也不要求默认执行路径经过两层包装。`torch.library` 适配随具体需求实现和验证，不预建占位模块，不声称已具备完整双路径。
 
 ### 14.3 分工
 
-| | XInfer 仓库（框架组） | xcompute 仓库（算子组） |
+| | 框架与模型接入 | 原生算子实现 |
 |---|---|---|
-| 内容 | 算子签名、参考实现、一致性测试套件、注册机制 | 各平台高性能实现（CUDA/CuTe/Triton/HIP），按平台出 wheel |
-| 测试 | 模型级对齐、运行时一致性 | 在 CI 中运行 `xinfer.ops.conformance`（数值、确定性、图捕获），并给出 microbenchmark |
-| 交付 | 每个模型的算子清单与形状 | 每个实现附理论下限表（roofline） |
-| 版本 | 声明兼容的 xcompute 版本范围；启动时校验构建指纹 | 语义化版本；ABI 变化要升主版本 |
+| 内容 | 算子与预构建后端契约、参考实现、注册、模型打包和执行计划 | 仓内 `ops/backends/<backend>/src`、通用算子族绑定、catalog 和 AOT 构建 |
+| 测试 | 模型级对齐、运行时一致性 | 后端契约与数值测试、受支持的重放检查和 microbenchmark；规划的 `xinfer.ops.conformance` 套件仍待实现 |
+| 交付 | 每个模型的算子清单、形状和精度要求 | 原生库、构建／能力元数据、构建说明，以及已有实测性能证据 |
+| 版本 | 定义绑定契约，验证后端声明的兼容性与身份 | 记录 ABI／构建身份和支持能力，说明不兼容的变更 |
+
+两列内容均维护在 XInfer 仓库。外部 SDK、编译器、模型权重和生成的 RPU `.ref` 资产保留各自的分发与许可边界。
 
 工具：`xinfer profile ops --model wall_oss` 按模型输出每个算子的耗时与理论下限，供算子组排定优先级。
 
-厂商 NPU 的实现不要求并入 xcompute：作为独立包，经 `xinfer.ops`、`xinfer.platforms` 入口注册即可（§18.3）。
+厂商后端可以采用相同的仓内布局，也可以通过 `xinfer.ops`、`xinfer.platforms` 入口作为独立包维护（§18.3）。预构建执行后端经同一注册表声明调用签名和执行契约。
 
 ### 14.4 Wall-OSS 算子清单
 
@@ -686,7 +698,7 @@ def causal_attention(q, k, v, *, scale=None): ...
 |---|---|---|
 | 契约测试 | 用假模型覆盖接纳、slot 生命周期、取消、组批、链式发射、错误路径；检查依赖方向（设备边界随设备抽象补上，§4）。CPU 平台用线程模拟异步 stream 与 event | CPU，每个 MR |
 | 树外插件路径 | 独立的 dummy 平台包经入口点完成发现、激活与契约测试（§13.3） | CPU，每个 MR |
-| 算子一致性 | 每个后端实现对照参考实现；各绑定遵守 §14.1 的执行与验证契约 | xcompute 仓库 CI（GPU） |
+| 算子一致性 | 每个后端实现对照参考实现；各绑定遵守 §14.1 的执行与验证契约 | XInfer 后端测试，在声明的设备上运行；外部 provider 保留自己的检查 |
 | PyTorch 算子适配（引入时） | `torch.library.opcheck`、实际支持的编译／导出路径，以及适配后的数值一致性（§14.1） | 主仓库 CI，按声明支持的设备执行 |
 | 模型对齐 | 冻结输入、噪声和参考输出，与原始实现对比 | GPU，每个 MR（小样本） |
 | 运行时一致性 | 链式 vs 非链式、B1 vs Bn、空载 vs 满载回放：输出通过精度门禁；算子确定时 B1 输出逐位相同 | GPU，夜间 |
@@ -696,7 +708,7 @@ def causal_attention(q, k, v, *, scale=None): ...
 
 ## 18. 仓库与开发流程
 
-- XInfer 通过 §14 中的算子契约、绑定和一致性检查接入 xcompute。
+- XInfer 在框架仓库内维护原生算子的源码、绑定和构建定义，遵守 §14 的契约与验证要求；现有外部 provider 保留为显式兼容依赖。对外发布仍须完成许可与贡献流程审批。
 - **规范**：
   - MR 描述必须写明问题、改动、验证和限制；
   - 实验原始数据不进 Git；
@@ -795,12 +807,14 @@ XInfer/
 │   ├── ops/
 │   │   ├── spec.py                 # 算子签名与数值契约
 │   │   ├── registry.py             # 后端注册、构建时选择、选择表
-│   │   ├── reference/              # 所有平台上的 torch 参考实现：attn.py、gemm.py、norm.py、flow.py、rope.py、elementwise.py、conv.py、mxfp8.py、nvfp4.py
+│   │   ├── reference/              # 受支持 torch 平台上的参考实现：attn.py、gemm.py、norm.py、flow.py、rope.py、elementwise.py、conv.py、mxfp8.py、nvfp4.py
 │   │   ├── layout/                 # 低精度格式的存储布局：mxfp8.py、nvfp4.py
 │   │   ├── backends/
-│   │   │   ├── _xcompute.py        # import xcompute 库（现用 TVM-FFI），各后端共用
-│   │   │   └── cuda/               # 每类算子一个模块：attn.py、gemm.py、norm.py、flow.py
-│   │   └── conformance/            # 一致性测试套件（xcompute 仓库 CI 也运行）
+│   │   │   ├── _xcompute.py        # 外部 Ascend 兼容 provider 加载器
+│   │   │   ├── ascend/             # 当前 Ascend 适配，含外部 xcompute provider
+│   │   │   ├── cuda/               # 算子分类绑定、原生加载器与 src/ AOT 构建
+│   │   │   └── rpu/                # 算子族／预构建绑定、资产校验与 src/ 主机／设备源码
+│   │   └── conformance/            # 规划中的后端共享一致性套件
 │   │       ├── cases.py            # 各算子的形状与 dtype 用例，取自首批模型
 │   │       └── checks.py           # 数值、确定性、图捕获检查
 │   ├── observability/
@@ -839,17 +853,19 @@ XInfer/
     └── Dockerfile.thor             # 基于 JetPack/L4T
 ```
 
-### 18.2 xcompute 仓库与接入边界
+### 18.2 原生算子源码与接入边界
 
-沿用现有 xcompute 仓库及其工程结构，由算子组维护；不另建算子仓库。XInfer 的接入与交付要求如下：
+原生算子实现在 `xinfer/ops/backends/<backend>/src` 中维护，与 Python 绑定和测试配套。框架与算子层在同一仓库中分工，单独安装的 xcompute 包不再是原生 CUDA 或 RPU kernel 的默认来源。现有 Ascend xcompute 兼容 provider 在其实现明确迁移前仍是外部依赖。接入与交付要求如下：
 
 | 项 | 约定 |
 |---|---|
-| 实现 | xcompute 提供各平台的 GEMM、量化融合、注意力、norm/RoPE、图像处理等高性能算子，范围由首批模型的算子清单驱动 |
-| 绑定 | 默认由 XInfer 的 `ops/backends/cuda/` 通过 TVM-FFI 包装并注册；按明确的 PyTorch 集成需求增加复用底层实现的 `torch.library` 适配（§14.2） |
-| 验证 | xcompute 自有测试之外，在其 CI 中运行 `xinfer.ops.conformance`，交付 microbenchmark 与 roofline 表；XInfer 为新增的 `torch.library` 适配补充 §14.1、§17 的验证 |
-| 版本与发布 | 按平台交付构建产物，记录库版本、哈希和支持能力；XInfer 校验兼容范围与构建指纹（§14.3） |
-| 第三方依赖 | 由 xcompute 维护来源与许可记录，公开发布前完成审查 |
+| 实现 | 仓内原生源码、通用算子族绑定和 catalog 条目覆盖受支持模型所需的算子；模型特定的打包、常量与算子顺序留在模型接入层 |
+| 绑定 | 经 TVM-FFI 加载 AOT 库：CUDA 张量算子使用 `xinfer_kernels.so`，RPU 预构建执行使用 `xinfer_rpu.so`；按明确的 PyTorch 集成需求增加 `torch.library` 适配（§14.2） |
+| 验证 | 主机契约与构建检查独立于设备源码编译、真机数值、重放和模型精度／性能门禁（§14.1、§17）；host-only 或 SDK stub 测试不能证明设备验收通过 |
+| 版本与发布 | 记录库身份、哈希和支持能力，验证后端特定的 ABI／构建元数据；RPU 还需匹配原生 catalog 与外部资产 manifest（§14.3） |
+| 第三方依赖 | 保留上游源码归属和适用的原许可证副本；厂商 SDK、编译器与生成的 RPU 资产仍为外部依赖。归属及条款见对应算子变更随附的 `THIRD_PARTY_NOTICES.md` |
+
+独立算子变更中的 `docs/rpu_ops.zh-CN.md` 说明 host-only 构建、运行时 SDK 构建和显式的 `.rc` 到 `.ref` 资产构建。提供源码并不附带 SDK 或生成资产，也不表示数值或性能验收通过。RPU 模型／运行时接入负责所选算子工厂注入和执行生命周期；仅有算子包不能运行模型。
 
 ### 18.3 扩展方式：插件入口
 
@@ -857,7 +873,7 @@ XInfer 不直接 import 外部扩展，而是在启动时按 Python entry point 
 
 | 入口组 | 用途 | 例子 |
 |---|---|---|
-| `xinfer.ops` | 注册算子实现 | xcompute 绑定，以及其他厂商算子包 |
+| `xinfer.ops` | 注册算子实现 | 树外算子包；内置 CUDA 和 Ascend 分类模块使用同一注册表 |
 | `xinfer.models` | 树外模型 | 私有或第三方模型 |
 | `xinfer.policies` | 调度策略 | 面向 SLO 的调度器 |
 | `xinfer.platforms` | 注册 Platform | 厂商 NPU 包；内置的 cuda、cpu 走同一机制 |
@@ -911,7 +927,7 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| M-1 评审与建仓 | 主仓库已创建，算子仓库确定为 xcompute；本文档评审及算子契约待完成；CPU CI 已接入 | 仓库安排已确定；本里程碑其余事项完成后记录评审与验收结论 |
+| M-1 评审与建仓 | 主仓库与 CPU CI 已接入，原生算子在仓内维护；本文档评审及算子契约待完成 | 仓库安排已确定；本里程碑其余事项完成后记录评审与验收结论 |
 | M0 数据面 | 平台、算子后端、模型层、Wall-OSS、单通道发射和基准测试 | Wall-OSS 通过精度门禁，并记录目标平台的时延与图发射开销。 |
 | M1 机队运行时 | 多通道发射、零等待组批、前端工作进程、slot 生命周期与配置解析 | 测量负载下的机队容量、组批精度和发射开销。 |
 | M2 量化与扩展 | NVFP4 与模型扩展 | 记录各模型及量化方法的数值结果。 |
@@ -933,7 +949,7 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 
 1. **对外名称冲突**：PyPI 上 `xinfer` 已被 dnth/xinfer（计算机视觉推理框架）占用，Xorbits 的 Xinference 名字也相近。仓库名仍为 XInfer，pip 包名在公开前确定。
 2. **模型权重**：对外分发 checkpoint 文件须单独取得授权。
-3. **PyTorch 算子适配范围与版本**：默认 TVM-FFI、按需增加 `torch.library` 的策略已确定（§0、§14.2）；与算子组确认首批需要适配的算子、实际支持的编译／导出路径及 PyTorch、TVM-FFI、xcompute 版本范围。
+3. **PyTorch 算子适配范围与版本**：默认 TVM-FFI、按需增加 `torch.library` 的策略已确定（§0、§14.2）；与算子组确认首批需要适配的算子、实际支持的编译／导出路径及 PyTorch、TVM-FFI、原生绑定兼容范围。外部兼容 provider 保留自己的版本要求。
 4. **许可证**：在 M3 前审批。
 5. **对外稳定面与支持等级**：API 版本号的起点与破坏性变更规则，Tier 2 的准入标准（§13.3）。
 6. **AMD GPU 的接入时机与型号**：是否进入 v1；型号决定可用的量化格式和 kernel 来源（§13.2）。

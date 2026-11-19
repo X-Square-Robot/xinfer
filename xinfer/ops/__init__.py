@@ -9,8 +9,6 @@ the ``xinfer.ops`` entry point group.
 
 import logging
 
-import torch
-
 from xinfer.ops import reference
 from xinfer.ops.reference import attn, flow, gemm, mxfp8, norm, nvfp4, rope
 from xinfer.ops.registry import (
@@ -335,9 +333,10 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
     Raises:
         RuntimeError: there are such operators and ``XINFER_OPS_STRICT`` is set.
     """
-    kind = torch.device(device).type
-    if kind not in ("cuda", "npu"):
+    kind = str(device).partition(":")[0]
+    if kind not in {"cuda", "npu"}:
         return []
+
     names = sorted({name for names in stage_ops.values() for name in names
                     if _is_slow_fallback(table.selection(name)) and name in FUSED_OPS})
     if names:
