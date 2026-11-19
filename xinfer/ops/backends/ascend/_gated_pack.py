@@ -1,4 +1,4 @@
-"""Launch the unchanged v22 R6B gated attention pack from the unified library."""
+"""Launch gated attention packing from the native library."""
 import torch
 
 from xinfer.ops.backends.ascend import _native

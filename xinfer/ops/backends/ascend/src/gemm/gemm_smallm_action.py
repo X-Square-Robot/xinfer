@@ -15,26 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Small-M action-stage Cube GEMMs reading the persistent KN weights directly.
+"""Output projections over head-major attention and persistent KN weights.
 
-The r4 o-projection route: the ACLNN FIA V5 attention writes its output BNSD
-[B, H, M, D] (strided out writes are rejected), and the wall_oss action loop
-used to pay a 4.0 us out-finish transpose per call so the o-projection Mm
-could read a packed [M, H*D] A. This kernel reads the BNSD-laid A directly:
-the k-th 128-wide column group of the logical [M, K] A is the contiguous
-[M, D] block A_bnsd[k // D, :, :], so one-head k-steps need no permutation
-copies at all. The K accumulation order (16 sequential D=128 Cube steps in
-one L0C accumulator) matches the ACLNN Mm bit-for-bit on the o-projection
-shape (probe 2026-11-11 r4: aclnn_delta 0.0, oracle_rel 1e-6).
-
-Tile geometry bn=64 / stages=3 measured fastest (5.46 us in-graph vs the
-7.61 us transpose+ACLNN composite; probe-smallm-sweep.json).
-
-qkv-batch r1: the same kernel at ROWS=32/64 (the B2/B4 request-batch
-o/down projections, A = [16, B*16, 128]). The per-row K order is unchanged
-(the same 16 sequential head steps), so the batch forms keep the ACLNN
-bitwise match, and the 64-row tile carries no M padding at all.
-"""
+Each 128-column K group is a contiguous head slice of the head-major input.
+Action kernels visit the 16 groups in order in one FP32 Cube accumulator;
+the 768-row prefill variant writes BF16 output directly."""
 
 import tilelang.ascend.language as T
 
@@ -72,18 +57,7 @@ M768_ROWS, M768_BM, M768_BN = 768, 256, 256
 
 
 def bnsd_o_proj_m768_bf16():
-    """OUT[768, 2048] BF16 = A_bnsd[16, 768, 128] @ W[2048, 2048]^T for the prefill.
-
-    r8: the prefill causal out is born BNSD [1, H, P, D] and the packed
-    o.reshape(768, -1) transpose copy plus the FP32->BF16 finish cast cost
-    ~17 us/call serially over 35 layers. This blocked kernel reads the BNSD A
-    directly (one [BM, D] L1 slab per head, the k-th 128-wide column group of
-    the logical [M, K] A is the contiguous [M, D] block A_bnsd[k // D]) and
-    rounds in the final store: bitwise vs the reshape+ACLNN+cast chain
-    (probe r8: aclnn_cast flips 0, fp32-route aclnn_max_abs 0.0; the K order
-    stays 16 sequential head-steps in one L0C accumulator per output element).
-    bm=bn=256/stages=2 measured fastest in the r8 sweep.
-    """
+    """Project [16,768,128] BF16 activations with [2048,2048] weights, accumulating in FP32 and storing BF16."""
     columns, reduction = 2048, HEADS * HEAD_DIM
     bm, bn = M768_BM, M768_BN
 

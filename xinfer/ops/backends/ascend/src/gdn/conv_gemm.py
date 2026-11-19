@@ -15,34 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""conv-gemm knife: depthwise 4-tap causal conv as a fused single-pass vector kernel.
+"""Four-tap depthwise causal convolution on the QKV portion of token-major rows.
 
-CONV-GEMM (MSPROF-SCAN-R4 roadmap #4). The production call replaced:
-
-    mixed = F.conv1d(qkv.transpose(1, 2), w[:, None, :], padding=3, groups=C)[..., :T]
-    x_t = mixed.transpose(1, 2).contiguous()     # token-major copy
-    F.silu(x_t, inplace=True)
-
-decomposes on aclnn into aclnnConvolution_{Slice,Transpose} satellites plus
-Conv2dWithFlag_Conv2DV2 (23.5 us mean, cube-busy cu91 / mac 0.07 -- the small-M
-form; R4 ledger pool 422.9 us/request over 18 GDN layers). A depthwise K=4 conv
-has no GEMM form (im2col would need a block-diagonal weight), but as a shifted
-4-tap FMA it is pure bandwidth: one pass reads the strided qkv rows
-(token-major, stride 8224, columns 0..6143), accumulates the taps in FP32 and
-writes the token-major BF16 result. That removes the slice, both transposes and
-the vendor conv in one kernel; silu stays on aclnnSilu because aclnnSilu's
-internal approximation is not bit-reproducible from vexp/vdiv (soupkill knife-B
-evidence, 3-5/2.75M residual elements).
-
-Numerics (probe2_pairwise.py, card 2, CANN 9.1.1): the vendor conv is bitwise
-equal to sequential ascending FP32 accumulation
-
-    acc = x[t-3]*w0; acc += x[t-2]*w1; acc += x[t-1]*w2; acc += x[t]*w3;  rne_bf16(acc)
-
-on every probed shape (P in {416,432,448,464} x 3 seeds, edges 1..8, dense sweep
-400..512) -- BF16 products are exact in FP32, so only the add order matters.
-The kernel keeps that exact order; missing taps at t<3 contribute exact zero.
-"""
+Input rows have stride 8224; the convolution consumes the first 6144 columns.
+It sums four taps in time order in FP32 and rounds the result once to BF16.
+The output is already token-major; the caller applies SiLU separately with ACLNN."""
 
 import tilelang.ascend.language as T
 

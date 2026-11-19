@@ -13,20 +13,20 @@ from xinfer.ops.backends.ascend import (
     cann_attention,
     cann_gated_delta_net,
     conv_gemm,
-    decodeattn_r4,
+    split_kv_decode,
     fia_fuse_route,
-    soup2,
+    square_cast,
 )
 
 
 @pytest.mark.parametrize(("new_pos", "mixed_output"), [(768, True), (767, True), (767, False)])
 def test_cache_attention_returns_packed_rows_from_decode_or_fia(monkeypatch, new_pos, mixed_output):
-    monkeypatch.setenv("XINFER_DECODEATTN_R4_ROW", "1")
-    monkeypatch.setattr(decodeattn_r4, "applies", lambda q, k, v, prefix, pos, mask, scale: pos == 768
+    monkeypatch.setenv("XINFER_ASCEND_SPLIT_KV_DECODE_ROW", "1")
+    monkeypatch.setattr(split_kv_decode, "applies", lambda q, k, v, prefix, pos, mask, scale: pos == 768
                         and mask is not None)
-    monkeypatch.setattr(decodeattn_r4, "_SCAN_VARIANT", "b")
-    monkeypatch.setattr(decodeattn_r4, "_SEEN", set())
-    monkeypatch.setattr(decodeattn_r4, "_entry", lambda *args: (None, None))
+    monkeypatch.setattr(split_kv_decode, "_SCAN_VARIANT", "tile_per_block")
+    monkeypatch.setattr(split_kv_decode, "_SEEN", set())
+    monkeypatch.setattr(split_kv_decode, "_entry", lambda *args: (None, None))
     monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: False,
                         current_stream=lambda device: SimpleNamespace(npu_stream=0)), raising=False)
     monkeypatch.setattr(cann_attention, "_check_qkv", lambda *args: None)
@@ -34,7 +34,7 @@ def test_cache_attention_returns_packed_rows_from_decode_or_fia(monkeypatch, new
 
     def launch(name, tensors, *args):
         launches.append((name, tensors))
-        if name == "decodeattn_r4_reduce_row":
+        if name == "split_kv_decode_reduce_token_major":
             tensors[1].copy_(q[0])
         return True
 
@@ -57,7 +57,7 @@ def test_cache_attention_returns_packed_rows_from_decode_or_fia(monkeypatch, new
     prefix = torch.tensor([new_pos], dtype=torch.int32)
     mask = torch.zeros(1, 1, 784, 2, dtype=torch.int32)
     result = unwrap(attn.prefix_kvcache_attention)(q, k, v, prefix, new_pos, flash_mask=mask)
-    names = ["decodeattn_r4_scan_b", "decodeattn_r4_reduce_row"] if new_pos == 768 else ["fia"]
+    names = ["split_kv_decode_scan_tile_per_block", "split_kv_decode_reduce_token_major"] if new_pos == 768 else ["fia"]
     assert [name for name, _ in launches] == names
     query, keys, values = launches[0][1][:3]
     torch.testing.assert_close(query.reshape(1, 16, 16, 128), q.transpose(1, 2), atol=0, rtol=0)
@@ -197,9 +197,9 @@ def test_nested_gdn_postprocessing_preserves_the_launcher_error(monkeypatch):
     def fail(*args):
         raise RuntimeError("qksq launch failed")
 
-    monkeypatch.setattr(soup2, "qksq", fail)
+    monkeypatch.setattr(square_cast, "qksq", fail)
     with pytest.raises(RuntimeError, match="qksq launch failed"):
-        cann_gated_delta_net._soup2_qksq(torch.zeros(1), 1, 2, 128)
+        cann_gated_delta_net._square_cast_qksq(torch.zeros(1), 1, 2, 128)
 
 
 def test_finish_failure_does_not_reclassify_the_entry_as_unavailable(monkeypatch):

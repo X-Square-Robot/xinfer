@@ -123,9 +123,9 @@ def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_orde
 
 def _qkv_rope_split_fallback(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
     out = _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
-    from xinfer.ops.backends.ascend.copykill_r2 import enabled
+    from xinfer.ops.backends.ascend.layout_reuse import enabled
 
-    if enabled("k3"):
+    if enabled("contiguous_qkv"):
         return out.view(x.shape[0], 3, num_heads, head_dim).permute(1, 0, 2, 3).contiguous().unbind(0)
     return out.view(x.shape[0], 3, num_heads, head_dim).unbind(1)
 

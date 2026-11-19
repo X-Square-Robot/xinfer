@@ -121,13 +121,7 @@ def generic(width=WIDTH):
 
 
 def generic_f32in(width=WIDTH):
-    """r3 (agent H): the K1-class fused cast+add+rms form of the generic plan.
-
-    ``x`` arrives as the FP32 mm output; the kernel rounds it to BF16 first
-    (RNE -- bit-identical to the chain's separate ``mm32.to(bf16)`` cast
-    kernel) and then runs the released add+rms math unchanged, so the chain
-    ``[cast kernel] + [add_rmsnorm]`` collapses into one launch.
-    """
+    """Round the FP32 accumulator to BF16 and run the H1024 cast/add/RMSNorm plan in the same kernel."""
     tile = 1024 if width == 1024 else TILE
 
     @T.prim_func

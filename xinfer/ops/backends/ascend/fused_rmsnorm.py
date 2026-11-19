@@ -1,16 +1,16 @@
 """Optional RMS normalization plans in the in-tree native library.
 
-``XINFER_RMSFUSE_R4`` is off by default. ``m16`` handles M16/H1024
+``XINFER_ASCEND_FUSED_RMSNORM`` is off by default. ``m16`` handles M16/H1024
 normalization, ``h2048w`` handles [1,P,2048] add-normalization with direct
 FP32 weights, and ``f32in`` exposes the FP32-accumulator finish helper.
 That helper rounds the product to BF16 before the M16 normalization and
 defers to an enabled small-M projection route. Launches use the current
 stream; weight conversions must be prepared before graph capture.
 """
+import os
 from xinfer.ops.backends.ascend import _native
 import array
 import ctypes
-import os
 from threading import Lock
 
 import torch
@@ -25,7 +25,7 @@ _FAMILIES = ("m16", "f32in", "h2048w")
 
 def _parse():
     global _ENABLED
-    raw = os.environ.get("XINFER_RMSFUSE_R4", "off").strip().lower()
+    raw = os.environ.get("XINFER_ASCEND_FUSED_RMSNORM", "off").strip().lower()
     if raw in ("off", "", "0"):
         _ENABLED = frozenset()
     elif raw in ("1", "all", "on"):
@@ -34,7 +34,7 @@ def _parse():
         wanted = {t.strip() for t in raw.split(",")}
         unknown = wanted - set(_FAMILIES)
         if unknown:
-            raise RuntimeError(f"XINFER_RMSFUSE_R4 unknown families: {sorted(unknown)}")
+            raise RuntimeError(f"XINFER_ASCEND_FUSED_RMSNORM unknown families: {sorted(unknown)}")
         _ENABLED = frozenset(wanted)
 
 
@@ -76,7 +76,7 @@ def _launch(name, tensors, scalars):
     status = call(*args, ctypes.c_void_p(stream))
     if status:
         raise RuntimeError(
-            "rmsfuse-r4 " + name + ": " + (err() or b"?").decode("utf-8", "replace")
+            "fused-rmsnorm " + name + ": " + (err() or b"?").decode("utf-8", "replace")
         )
 
 
@@ -101,7 +101,7 @@ def _stats_scratch(device):
 def add_rms_m16(x, residual, weight, eps):
     """[1,16,1024] BF16 x/residual + FP32 weight -> (sum, normed), both BF16.
 
-    Bitwise to the lib generic_h1024 plan on the same inputs (probe-r4)."""
+    Bitwise to the lib generic_h1024 plan on the same inputs."""
     w32 = _weight32(weight)
     rows, width = 16, 1024
     shape = residual.shape
@@ -109,7 +109,7 @@ def add_rms_m16(x, residual, weight, eps):
     r2 = residual.reshape(rows, width)
     sum_out = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
     norm_out = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
-    _launch("rf4_m16", [x2, r2, sum_out, w32, norm_out, _stats_scratch(x.device)],
+    _launch("rmsnorm_m16_h1024", [x2, r2, sum_out, w32, norm_out, _stats_scratch(x.device)],
             [rows, _eps_bits(eps), 0, 1, 1, 0])
     return sum_out.view(shape), norm_out.view(shape)
 
@@ -122,7 +122,7 @@ def rms_m16(x, weight, eps):
     x2 = x.reshape(rows, width)
     sum_out = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
     norm_out = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
-    _launch("rf4_m16", [x2, x2, sum_out, w32, norm_out, _stats_scratch(x.device)],
+    _launch("rmsnorm_m16_h1024", [x2, x2, sum_out, w32, norm_out, _stats_scratch(x.device)],
             [rows, _eps_bits(eps), 0, 0, 1, 0])
     return norm_out.view(shape)
 
@@ -139,7 +139,7 @@ def add_rms_m16_f32in(acc32, residual, weight, eps):
     acc2 = acc32.reshape(rows, width)
     sum_out = torch.empty((rows, width), dtype=torch.bfloat16, device=acc32.device)
     norm_out = torch.empty((rows, width), dtype=torch.bfloat16, device=acc32.device)
-    _launch("rf4_m16_f32in",
+    _launch("rmsnorm_m16_h1024_fp32_input",
             [acc2, r2, sum_out, w32, norm_out, _stats_scratch(acc32.device)],
             [rows, _eps_bits(eps), 0, 1, 1, 0])
     return sum_out.view(shape), norm_out.view(shape)
@@ -153,25 +153,25 @@ def add_rms_h2048w(x, residual, weight, eps):
     r2 = residual.reshape(rows, width)
     sum_out = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
     norm_out = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
-    _launch("rf4_ubv2048_f", [x2, r2, sum_out, w32, norm_out],
+    _launch("rmsnorm_unified_buffer_h2048_fp32_weight", [x2, r2, sum_out, w32, norm_out],
             [rows, 1, _eps_bits(eps)])
     return sum_out.view(x.shape), norm_out.view(x.shape)
 
 
-def gemm_add_rms_r4(x, weight, residual, norm_weight, epsilon, projection):
+def gemm_add_rmsnorm(x, weight, residual, norm_weight, epsilon, projection):
     """The fused gemm+add+rms entry for the action m16 sites.
 
     ``x`` is the attention output BNSD [16,16,128] (o-projection) or the GLU
     hidden [1,16,2048]/[16,2048] (down projection). Borrows the projection's
     FP32 accumulator, launches the f32in plan inside the borrow scope, and
     returns (sum, normed) BF16 -- or None when the route does not apply (the
-    caller falls back to the released chain). Defers to the smallm-r3
+    caller falls back to the released chain). Defers to the action-gemm-m16
     oproj/down kernels when those families are enabled."""
     try:
-        from xinfer.ops.backends.ascend import smallm_r3
-        if smallm_r3.enabled("oproj") and x.ndim == 3 and tuple(x.shape) == (16, 16, 128):
+        from xinfer.ops.backends.ascend import action_gemm_m16
+        if action_gemm_m16.enabled("oproj") and x.ndim == 3 and tuple(x.shape) == (16, 16, 128):
             return None
-        if smallm_r3.enabled("down") and x.ndim >= 2 and tuple(weight.shape) == (1024, 2048) \
+        if action_gemm_m16.enabled("down") and x.ndim >= 2 and tuple(weight.shape) == (1024, 2048) \
                 and tuple(x.shape[-2:]) == (16, 2048):
             return None
     except Exception:

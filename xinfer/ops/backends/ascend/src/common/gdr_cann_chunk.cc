@@ -1,30 +1,6 @@
-// The unified GDN vendor-chunk bridge over aclnnChunkGatedDeltaRule.
-//
-// R3 (2026-11-17) rewrite, two findings closed at once:
-//
-// 1. ABI: the C entry points take the scale as ``double`` (the FIA bridge
-//    convention; the glue's ctypes binding declares ``c_double``). The R1
-//    port declared ``float`` in the C signature while the binding still
-//    passed a c_double -- on AArch64 the callee then reinterpreted the low
-//    32 mantissa bits of the double bit pattern (3.01e23 for dk**-0.5) and
-//    the recurrence ran with a garbage scale (R3 scale A/B probe: outputs
-//    +-3.5e22 garbage vs +-0.01 type-correct; the R2 action-gate 1.98 was
-//    this garbage rescaled by the RMS tail). The scale is now received as
-//    double and narrowed exactly like the old FFI (static_cast<float>).
-//
-// 2. Execution form: per-call Prepare. The 20.62 stack's live path was the
-//    retired v22 bridge's FFI TensorView Launch, which prepared a fresh
-//    executor on every call, launched once and destroyed
-//    it. The R1 port cached a repeatable executor keyed on (shape, scale,
-//    buffer addresses) and kept its descriptors alive -- dead code in the
-//    v22 tree, numerically suspect here. This file now mirrors the old
-//    Launch call for call: describe the nine raw pointers, GetWorkspaceSize,
-//    aclSetAclOpExecutorRepeatable (explicit-disposal ownership, exactly as
-//    the old bridge did), one launch, destroy the executor, then the
-//    descriptors (the old Call destructor order -- destroying an executor
-//    whose descriptors were freed crashes inside ~KernelGraph). The eager
-//    ~100 us prepare cost is the price the 20.62 stack already paid; hot
-//    NPUGraph replay never re-enters this bridge.
+// C ABI for aclnnChunkGatedDeltaRule. ctypes passes scale as a double;
+// narrow it to float only at the ACLNN call. Prepare a fresh executor for
+// each submission and destroy it before releasing the tensor descriptors it uses.
 #include "ffi.h"
 
 #include <aclnn/acl_meta.h>

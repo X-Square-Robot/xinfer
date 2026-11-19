@@ -1,6 +1,6 @@
 """The v22 rmsnorm FFI's plain-form plan dispatch over the unified core library.
 
-The 38.82 stack's ``rms_norm_cast`` fell through its RMSFUSE m16 knife to the
+After the specialized action norm, the implementation falls back to the
 v22 library's ``rmsnorm`` FFI, whose ``Forward()`` routed the served plain
 norms onto the rms_consistent plans: the ViT patch norm ``[rows, 1280]``
 (BF16 or FP32 weight; the UB plan when the envelope holds, the generic plan
@@ -116,8 +116,7 @@ def plain_rms(x, weight, eps):
     weight_words = 1 if weight.dtype == torch.bfloat16 else 2
     out = torch.empty((rows, width), dtype=torch.bfloat16, device=x2.device)
 
-    # The h1024 fast plan: the v22 "r2 (agent H)" plain route -- batch row
-    # counts over an FP32 weight only (the v22 required w.bytes == 4).
+    # Only the supported row counts with FP32 weights take the H1024 plan.
     if width == 1024:
         if rows not in (16, 32, 64) or weight.dtype != torch.float32:
             return None

@@ -15,28 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""GQA-GLUE knives 1+3: BHSD partial rope (rotary_dim 64) with in-kernel
-angle duplication.
+"""Head-major partial rotary embedding for the first 64 channels of 256-wide heads.
 
-Two changes vs the in-service rope_half_d64 (v2.1), both value-preserving:
-
-1. BHSD addressing (knife 1): q/k are read and written head-major
-   ``[H, rows, 256]`` -- per-head contiguous staging blocks, pure index
-   permutation of the same values, so the qkv BHSD kernel's outputs feed
-   straight in and the FIA BNSD inputs / KV-cache slots read straight out.
-2. In-kernel angle duplication (knife 3): the wrapper's fresh ``cat(cos, cos)``
-   disappears; the kernel consumes the compact width-32 tables and duplicates
-   them to 64 lanes itself. The 2026-11-15 v3 attempt failed because
-   ``vmul`` was fed a vector_bool as an *operand* (asc_mul has no such
-   overload); here the bool vector is the *predicate* of a multiply by
-   vdup(1.0) -- exactly the ``vmul(w_v, s_v, hi_m)`` pattern the shipped v2.1
-   body already proves -- so active lanes keep exact values and masked lanes
-   are zero; the duplicate is the sum of the two half-masked products.
-
-The rotation semantics (u/w/z neighbor loads, per-product rounding, one RNE
-store round, exact bf16->f32->bf16 pass-through of channels 64..255) are
-verbatim from the shipped v2.1 kernel.
-"""
+Duplicate the compact 32-column angle tables inside the kernel and use separate
+rounded products before the BF16 store. The unrotated channels retain their
+input values. Head-major rows can alias the caller's cache slots."""
 
 import tilelang.ascend.language as T
 

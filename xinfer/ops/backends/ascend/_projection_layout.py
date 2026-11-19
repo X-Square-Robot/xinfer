@@ -4,7 +4,7 @@ import weakref
 
 import torch
 
-from xinfer.ops.backends.ascend import finishbf16, soupform, soupkill
+from xinfer.ops.backends.ascend import finishbf16, projection_norm_epilogue, fp32_accumulator_epilogue
 
 _rope_tables = {}
 
@@ -29,7 +29,7 @@ def _expanded_rope(cos, sin):
 def qkv_rope_split(x, weight, bias, cos, sin, num_heads, head_dim, projection):
     """Separate Q/K/V planes when one of the existing fused projections accepts the call."""
     # The existing fused routes consume the full rotate-half table and are enabled together.
-    if head_dim != 64 or not soupkill.enabled("vrope") or cos.dim() != 2:
+    if head_dim != 64 or not fp32_accumulator_epilogue.enabled("vrope") or cos.dim() != 2:
         return None
     cos2, sin2 = _expanded_rope(cos, sin)
     if x.dim() != 2 or cos2.shape[-1] != head_dim:
@@ -40,14 +40,14 @@ def qkv_rope_split(x, weight, bias, cos, sin, num_heads, head_dim, projection):
             return packed.unbind(0)
     if projection is None:
         return None
-    if soupform.enabled("vropepack"):
+    if projection_norm_epilogue.enabled("vropepack"):
         with projection.accumulator(x, weight) as acc:
-            packed = soupform.vision_qkv_rope_packed(acc, bias, cos2, sin2, num_heads, head_dim)
+            packed = projection_norm_epilogue.vision_qkv_rope_packed(acc, bias, cos2, sin2, num_heads, head_dim)
         if packed is not None:
             return packed.unbind(0)
     with projection.accumulator(x, weight) as acc:
         out = x.new_empty((x.shape[0], 3 * num_heads * head_dim), dtype=torch.bfloat16)
-        fused = soupkill.vision_qkv_rope(acc, bias, cos2, sin2, out, num_heads, head_dim)
+        fused = fp32_accumulator_epilogue.vision_qkv_rope(acc, bias, cos2, sin2, out, num_heads, head_dim)
     if fused is not None:
         return fused.view(x.shape[0], 3, num_heads, head_dim).unbind(1)
     return None
@@ -61,7 +61,7 @@ def gemm_split(x, weight, split_size, row_scale, projection):
         split = finishbf16.zbasplit_bf16(x, weight, row_scale, split_size)
         if split is not None:
             return split
-    if soupform.enabled("zbasplit") and projection is not None:
+    if projection_norm_epilogue.enabled("zbasplit") and projection is not None:
         with projection.accumulator(x, weight) as acc:
-            return soupform.zbasplit(acc, row_scale, split_size)
+            return projection_norm_epilogue.zbasplit(acc, row_scale, split_size)
     return None

@@ -15,35 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""smallm-r3: action-loop M16 GEMM chain kernels (Round-3 SMALLM-K).
+"""M16 GEMMs for the Wall-OSS action output, gated MLP and QKV projections.
 
-Four kernels for the wall_oss action loop (180 calls each per request), all
-BF16-in, N-partitioned to exactly 32 blocks (one wave on the 32-AIC 950DT),
-FP32 L0C accumulation:
-
-  smallm_r3_o_proj   A_bnsd[16,16,128] x W[1024,2048] -> OUT[16,1024] BF16.
-      Replaces the shipped 16-block smallm_bnsd_o_proj (e2e 6.885us, mte2
-      5.50us serialized on half the cores) + the follow-up FP32->BF16 cast
-      slot (1.85us). Single-shot full-K W stream; the packed A is preloaded
-      once (16 pipelined head copies) so the Cube sees the same 16x128-step
-      k order as the shipped kernel (FP32-accum order preserved).
-  smallm_r3_gateup_glu  x[16,1024] x W_int[4096,1024] -> silu(g)*u -> OUT
-      [16,2048] BF16. W_int is the one-time row-interleaved weight (even rows
-      gate, odd rows up). Fuses the aclnnMm (6.22us) and the
-      gemm_glu_fp32_finish_split_2048 slot (3.50us) into one launch; the
-      L0C->UB dual_copy N-split keeps each (g,u) pair inside one AIV half
-      (smallm_kn bias-kernel structure). Scalar witness silu
-      g/(1.0+exp(-g))*u and the integer-RNE store.
-  smallm_r3_down      x[16,2048] x W[1024,2048] -> OUT[16,1024] BF16.
-      Single-shot bn=32 (32 blocks x one 128KB W DMA each); the BF16 store
-      folds the cast round (RNE, the bnsd_m768 argument).
-  smallm_r3_qkv       x[16,1024] x W[2560,1024] -> OUT[16,2560] FP32.
-      Plain swap (bn=80 -> 32 blocks); keeps the FP32 accumulator contract
-      the m16 rope finish consumes.
-
-Dissection evidence: smallm-r3/results/bench-dissect.json,
-bench-fusion*.json, prof-dissect.json (wave-1/2, card 0, rot-16 graph p50).
-"""
+The kernels partition output channels across Cube blocks and accumulate
+BF16 inputs in FP32. The O projection reads head-major input, SwiGLU reads
+interleaved gate/up weights, and QKV exposes an FP32 accumulator to the
+subsequent bias/RoPE/cache finish."""
 
 import tilelang.ascend.language as T
 
@@ -159,7 +136,7 @@ def qkv():
 
 
 def build_programs():
-    yield "smallm_r3_o_proj", o_proj(32)
-    yield "smallm_r3_gateup_glu", gateup_glu(64, 128, 3)
-    yield "smallm_r3_down", down()
-    yield "smallm_r3_qkv", qkv()
+    yield "action_gemm_m16_o_proj", o_proj(32)
+    yield "action_gemm_m16_gateup_glu", gateup_glu(64, 128, 3)
+    yield "action_gemm_m16_down", down()
+    yield "action_gemm_m16_qkv", qkv()

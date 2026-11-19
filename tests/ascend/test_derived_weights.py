@@ -138,18 +138,18 @@ def test_inference_views_without_a_base_cannot_outlive_their_own_identity(monkey
 
 
 def test_smallm_gateup_pack_follows_weight_lifetime_and_version(monkeypatch):
-    from xinfer.ops.backends.ascend import smallm_r3
+    from xinfer.ops.backends.ascend import action_gemm_m16
 
     packs = []
-    monkeypatch.setattr(smallm_r3, "_launch", lambda name, tensors: packs.append(tensors[1]))
+    monkeypatch.setattr(action_gemm_m16, "_launch", lambda name, tensors: packs.append(tensors[1]))
     weight = torch.nn.Parameter(torch.arange(32, dtype=torch.bfloat16).reshape(8, 4), requires_grad=False)
     x = torch.zeros(16, 4, dtype=torch.bfloat16)
-    smallm_r3.gateup(x, weight)
-    smallm_r3.gateup(x, weight)
+    action_gemm_m16.gateup(x, weight)
+    action_gemm_m16.gateup(x, weight)
     assert packs[0] is packs[1]
     previous = packs[0].clone()
     weight.add_(2)
-    smallm_r3.gateup(x, weight)
+    action_gemm_m16.gateup(x, weight)
     assert torch.equal(packs[-1], previous + 2)
     owner, packed = weakref.ref(weight), weakref.ref(packs[-1])
     packs.clear()
@@ -185,13 +185,13 @@ def test_gdn_gate_preparation_follows_weight_lifetime_and_version(monkeypatch):
     assert all(owner() is None for owner in owners) and not _native._derived
 
 
-@pytest.mark.parametrize("helper", ["action", "bias", "rmsfuse", "simdepi"])
+@pytest.mark.parametrize("helper", ["action", "bias", "fused_rmsnorm", "buffered_add_rmsnorm"])
 def test_norm_and_bias_forms_follow_owner_lifetime_and_inplace_updates(helper):
-    from xinfer.ops.backends.ascend import cann_action, rmsfuse_r4, simdepi_r1
+    from xinfer.ops.backends.ascend import cann_action, fused_rmsnorm, buffered_add_rmsnorm
 
     action = cann_action.CannAction.__new__(cann_action.CannAction)
     convert = {"action": action._one_plus, "bias": cann_projection._bias_fp32,
-               "rmsfuse": rmsfuse_r4._weight32, "simdepi": simdepi_r1._weight32}[helper]
+               "fused_rmsnorm": fused_rmsnorm._weight32, "buffered_add_rmsnorm": buffered_add_rmsnorm._weight32}[helper]
     weight = torch.nn.Parameter(torch.arange(8, dtype=torch.bfloat16), requires_grad=False)
     first = convert(weight)
     assert convert(weight) is first
@@ -207,9 +207,9 @@ def test_norm_and_bias_forms_follow_owner_lifetime_and_inplace_updates(helper):
 
 
 def test_existing_fp32_norm_and_bias_forms_are_not_cached_as_their_own_owner():
-    from xinfer.ops.backends.ascend import rmsfuse_r4, simdepi_r1
+    from xinfer.ops.backends.ascend import fused_rmsnorm, buffered_add_rmsnorm
 
     weight = torch.ones(8)
-    for convert in (cann_projection._bias_fp32, rmsfuse_r4._weight32, simdepi_r1._weight32):
+    for convert in (cann_projection._bias_fp32, fused_rmsnorm._weight32, buffered_add_rmsnorm._weight32):
         assert convert(weight) is weight
     assert not _native._derived

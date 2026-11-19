@@ -26,7 +26,7 @@ _CARRIED = {}
 def _bits(value: float) -> int:
     """The float's IEEE-754 bit pattern, the AOT scalar ABI the kernels take.
 
-    The v22 convention (struct.pack("<f") -> unpack("<I"), as in the simdepi
+    The v22 convention (struct.pack("<f") -> unpack("<I"), as in the buffered_add_rmsnorm
     and gdn glues): the int64 scalar's low word carries the float32 pattern."""
     return struct.unpack("<I", struct.pack("<f", float(value)))[0]
 
@@ -149,7 +149,7 @@ def gemm_qkv_cache_bias_rope_m16(out, key, value, accumulator, bias, cosine, sin
     lib = _native.core_library()
     _require(lib is not None, "gemm_qkv_cache: no core library")
     # The .cc's Prepare contract (gemm_qkv_cache.cc): a packed 2-D [16, 2048] Q
-    # or the r3 BNSD form -- 3-D [16, 16, 128], the head-major [H, M, D] order
+    # or the BNSD form -- 3-D [16, 16, 128], the head-major [H, M, D] order
     # the kernel writes so the ACLNN FIA query needs no per-call transpose copy.
     _require(out.dtype == torch.bfloat16 and out.is_contiguous()
              and ((out.ndim == 2 and tuple(out.shape) == (16, 2048))
@@ -211,7 +211,7 @@ def action_qkv_gemm_norm_rope(output, input, weight, bias, q_weight, k_weight,
                               cosine, sine, rotary, epsilon):
     """The merged M16 cache-append entry (the v22 ``ActionQkvGemmNormRope``).
 
-    The walloss r5 form: an FP32 ``input`` marks the M16 cache-append route --
+    For Wall-OSS, an FP32 ``input`` marks the M16 cache-append route --
     the input slot carries the FP32 [16, 2560] CANN projection accumulator,
     ``q_weight``/``k_weight`` the head-major K/V caches, the ``rotary`` slot
     the cache start row (768 lies outside the NV rotary range) and ``weight``
@@ -232,8 +232,7 @@ def action_qkv_gemm_norm_rope(output, input, weight, bias, q_weight, k_weight,
 def gemm_qkv_vision_rope_finish(out, accumulator, bias, cosine, sine):
     """The wall_oss vision QKV finish: bias + rotate-half RoPE + one RNE.
 
-    One UB pass over the borrowed FP32 ``[2112, 3840]`` accumulator (the r5
-    probe measured the torch rope chain ~113 us against ~10.6 us here).
+    One UB pass over the borrowed FP32 ``[2112, 3840]`` accumulator.
     """
     lib = _native.core_library()
     _require(lib is not None, "gemm_qkv_vision_rope_finish: no core library")
@@ -281,7 +280,7 @@ def gemm_epilogue_glu(out, projected, has_bias_flag, half_width):
 
 
 # ---------------------------------------------------------------------------
-# AdaRMS action compositions (adanorm-r2 kernels; the .cc action envelopes)
+# AdaRMS action compositions (adaptive-rmsnorm kernels; the .cc action envelopes)
 # ---------------------------------------------------------------------------
 def _action_entries():
     return _native.core_library()
@@ -292,7 +291,7 @@ def gated_residual_adarmsnorm(out, gate, residual_out, residual, branch, branch_
                               epsilon=1e-6):
     """The fused gated-residual action norm on the [1, 16, 1024] family.
 
-    Port of the adarmsnorm.cc GatedResidual fast path: the adanorm-r2
+    Port of the adarmsnorm.cc GatedResidual fast path: the adaptive-rmsnorm
     ``action_gated`` kernel takes (residual, branch, branch_gate,
     residual_out, out, gate, modulation, modulation, eps_bits, stream) with
     optional pinned (modulation, modulation, counts) triples.
@@ -310,7 +309,7 @@ def gated_residual_adarmsnorm(out, gate, residual_out, residual, branch, branch_
                                      pinned_rows=row(pinned_rows, index), epsilon=epsilon)
         return
     lib = _action_entries()
-    _require(lib is not None, "adanorm_r2: the knife library is not loaded")
+    _require(lib is not None, "adaptive_rmsnorm: the knife library is not loaded")
     pinned = pinned_modulation is not None and pinned_rows is not None
     _require(out.shape == branch.shape and out.dtype == torch.bfloat16
              and out.is_contiguous() and branch.is_contiguous(),
@@ -357,7 +356,7 @@ def double_adarmsnorm_gated_residual_inplace(residual, branch, gate, previous_ga
                 pinned_post_modulation=row(pinned_post_modulation, index), pinned_rows=row(pinned_rows, index))
         return
     lib = _action_entries()
-    _require(lib is not None, "adanorm_r2: the knife library is not loaded")
+    _require(lib is not None, "adaptive_rmsnorm: the knife library is not loaded")
     _require(branch.dtype == torch.bfloat16 and branch.is_contiguous(),
              "the action kernel requires contiguous BF16 activations")
     stream = torch.npu.current_stream(branch.device).npu_stream
@@ -577,7 +576,7 @@ def denoise_output_euler(x, h, weight, *, dt, bias=None, prenorm="none", norm_we
 # kernel set (the msprof ledger of both final stacks shows the non-knife norm
 # sites running vendor compositions); the shims below therefore compose the
 # reference numerics in torch, so the binding's internal knife mounts
-# (soupunlock rmsfull, simdepi, rmsfuse, the d64 rope) serve their audited
+# (fused_norm_reduction rmsfull, buffered_add_rmsnorm, fused_rmsnorm, the d64 rope) serve their audited
 # envelopes while every general tail matches the reference composition the
 # @partial fallback would have produced.
 def _reference_rmsnorm(input, weight, epsilon, zero_centered):

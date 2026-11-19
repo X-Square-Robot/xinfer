@@ -42,8 +42,7 @@ def main():
     parser.add_argument(
         "--symbol-prefix",
         default="xinfer_aot_",
-        help="Exported launcher prefix (xinfer_aot_ for the unified branch; the "
-        "v22 anchor spelling reproduces the delivery byte for byte -- see the S2 anchor notes)",
+        help="Prefix for generated C ABI launchers (default: xinfer_aot_).",
     )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)

@@ -1,9 +1,9 @@
-"""SOUP2 mount (kernel launchers + the plain-finish Matmul route for the XINFER_SOUP2 class).
+"""SQUARE_CAST mount (kernel launchers + the plain-finish Matmul route for the XINFER_ASCEND_SQUARE_CAST class).
 
 Route points (all envelope-guarded with fail-safe fallback to the released chains):
 
 ``qksq``    — GDN prefill qk stats pre-pass in glue.cann_gated_delta_net
-              (mover2 branch): ONE kernel writes f32(RNE_bf16(qk*qk)) over the
+              (gdn_layout branch): ONE kernel writes f32(RNE_bf16(qk*qk)) over the
               strided qk window of x_t; the aclnn ReduceSum/Adds/Rsqrt that
               follow read bit-identical bits (replaces aclnnMul + the sum's
               implicit bf16->f32 cast kernel).
@@ -18,7 +18,7 @@ Route points (all envelope-guarded with fail-safe fallback to the released chain
 
 Bitwise contract: qksq/rawsq/finplain are bit-identical to the released chains.
 Every route keeps the consumers' operand contracts unchanged.
-Route counters land in $XINFER_SOUP2_STATS[-pidN].json at shutdown.
+Route counters land in $XINFER_ASCEND_SQUARE_CAST_STATS[-pidN].json at shutdown.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ _STATS = {f: [0, 0] for f in FAMILIES}
 def enabled(family: str) -> bool:
     global _ENABLED
     if _ENABLED is None:
-        raw = os.environ.get("XINFER_SOUP2", "off").strip().lower()
+        raw = os.environ.get("XINFER_ASCEND_SQUARE_CAST", "off").strip().lower()
         if raw in ("", "off", "0", "false", "no"):
             _ENABLED = frozenset()
         elif raw in ("1", "all", "on"):
@@ -51,7 +51,7 @@ def enabled(family: str) -> bool:
             wanted = {t.strip() for t in raw.split(",")}
             unknown = wanted - set(FAMILIES)
             if unknown:
-                raise RuntimeError(f"XINFER_SOUP2 unknown families: {sorted(unknown)}")
+                raise RuntimeError(f"XINFER_ASCEND_SQUARE_CAST unknown families: {sorted(unknown)}")
             _ENABLED = frozenset(wanted)
     return family in _ENABLED and family not in _BROKEN
 
@@ -99,7 +99,7 @@ def _routed(family):
 
 
 def dump_stats():
-    base = os.environ.get("XINFER_SOUP2_STATS")
+    base = os.environ.get("XINFER_ASCEND_SQUARE_CAST_STATS")
     if not base:
         return
     try:

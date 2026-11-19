@@ -234,10 +234,7 @@ class AddRmsnorm:
                 and residual.dtype == torch.bfloat16
                 and not zero_centered
             ):
-                # r3 (agent H): the K1 f32in fast plan -- the FP32 mm output
-                # feeds the kernel directly and the RNE round to BF16 happens
-                # inside it, bit-identical to casting first while saving the
-                # separate cast kernel launch.
+                # Pass the FP32 accumulator directly; the kernel rounds to BF16 before normalizing.
                 if residual.shape != input.shape:
                     raise ValueError(
                         f"add_rmsnorm residual shape {tuple(residual.shape)} "

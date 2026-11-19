@@ -1,13 +1,13 @@
 """Optional bias finishes from the in-tree native library.
 
-``XINFER_UBFINISH_R5=1`` enables per-width row-tiled entries; it is off by
+``XINFER_ASCEND_TILED_BIAS_EPILOGUE=1`` enables per-width row-tiled entries; it is off by
 default. They widen BF16 bias, add in FP32 and store with ROUND_R conversion.
 Launches use the current stream. Unsupported widths or row counts are
 handled by the caller's existing tail.
 """
+import os
 from xinfer.ops.backends.ascend import _native
 import ctypes
-import os
 from threading import Lock
 
 import torch
@@ -20,11 +20,11 @@ _LOCK = Lock()
 
 
 def enabled():
-    return os.environ.get("XINFER_UBFINISH_R5", "0") == "1"
+    return os.environ.get("XINFER_ASCEND_TILED_BIAS_EPILOGUE", "0") == "1"
 
 
 def _registry():
-    return {1280: ("ubfinish_r5_s8_c1280", 8), 2048: ("ubfinish_r5_s4_c2048", 4)}
+    return {1280: ("bias_add_cast_simd_rows8_c1280", 8), 2048: ("bias_add_cast_simd_rows4_c2048", 4)}
 
 
 def supported_cols():
@@ -59,7 +59,7 @@ def _entry(cols):
 def finish(out, acc, bias, rows, cols):
     """out[r,c] = rne(acc_f32[r,c] + bias_f32[c]); all tensors contiguous."""
     if not routes(rows, cols):
-        raise ValueError(f"ubfinish-r5: no route for {rows}x{cols}")
+        raise ValueError(f"tiled-bias-epilogue: no route for {rows}x{cols}")
     name = _registry()[cols][0]
     if _native.launch_kernel(name, (out, acc, bias), (rows,)):
         return
@@ -74,6 +74,5 @@ def finish(out, acc, bias, rows, cols):
     )
     if status:
         message = err()
-        raise RuntimeError(
-            "ubfinish-r5 " + name + ": " + (message.decode("utf-8", "replace") if message else "unknown failure")
-        )
+        detail = message.decode("utf-8", "replace") if message else "unknown failure"
+        raise RuntimeError(f"{name}: {detail}")

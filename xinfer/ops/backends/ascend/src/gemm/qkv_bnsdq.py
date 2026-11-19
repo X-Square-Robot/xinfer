@@ -15,26 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""R6B-BRIDGE B1: the 2B fused QKV tail writing Q head-major (BNSD) directly.
-
-Same job plan, same FP32 arithmetic, and the same K/V cache append as
-``gemm_qkv_2b_norm_gate_cache`` -- only the two store targets change:
-
-* Q stores land in a dedicated contiguous BNSD buffer
-  ``q_bnsd[h * (rows * 256) + row * 256 + j]`` instead of the token-major
-  ``packed[row * 4096 + h * 256 + j]`` slot;
-* the gate stores land in a dedicated contiguous ``gate[row * 2048 + c]``
-  buffer instead of ``packed[row * 4096 + 2048 + c]``.
-
-Byte safety (both semantic stories of the FIA mode-2 query read): the old
-bridge materialized ``query = q.transpose(1, 2).contiguous()`` whose byte at
-offset ``(h * rows + m) * 256 + d`` equals the value the released kernel
-stored at ``packed[m * 4096 + h * 256 + d]``.  This kernel computes the
-identical FP32 value for every (row, head, dim) job (the same stats/apply
-program) and stores it directly at ``(h * rows + m) * 256 + d``.  The FIA
-input bytes and the dense [B, H, M, D] descriptor are therefore identical in
-both chains, whatever order the operator applies internally.
-"""
+"""Finish the Wall-X 2B QKV projection for cache attention.
+Apply per-head RMS normalization and RoPE to Q/K, append K/V to the cache
+and write head-major Q and a separate packed gate for the gated attention store."""
 
 import tilelang.ascend.language as T
 

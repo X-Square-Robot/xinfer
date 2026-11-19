@@ -14,39 +14,6 @@ namespace xinfer::aot::attn_glue {
 using xinfer::aot::glue::TensorView;
 
 extern "C" {
-int32_t xinfer_aot_decodeattn_r4_reduce_call(void*, void*, void* stream);
-const char* xinfer_aot_decodeattn_r4_reduce_get_last_error();
-}
-
-void decodeattn_r4_reduce(TensorView P, TensorView OUT) {
-  xinfer::aot::glue::Launch("decodeattn_r4_reduce", xinfer_aot_decodeattn_r4_reduce_call,
-                            xinfer_aot_decodeattn_r4_reduce_get_last_error, P, OUT);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(decodeattn_r4_reduce, xinfer::aot::attn_glue::decodeattn_r4_reduce);
-
-extern "C" {
-int32_t xinfer_aot_decodeattn_r4_reduce_row_call(void*, void*, void* stream);
-const char* xinfer_aot_decodeattn_r4_reduce_row_get_last_error();
-}
-
-void decodeattn_r4_reduce_row(TensorView P, TensorView OUT) {
-  xinfer::aot::glue::Launch("decodeattn_r4_reduce_row", xinfer_aot_decodeattn_r4_reduce_row_call,
-                            xinfer_aot_decodeattn_r4_reduce_row_get_last_error, P, OUT);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(decodeattn_r4_reduce_row, xinfer::aot::attn_glue::decodeattn_r4_reduce_row);
-
-extern "C" {
-int32_t xinfer_aot_decodeattn_r4_scan_b_call(void*, void*, void*, void*, void*, void*, int64_t, int64_t, void* stream);
-const char* xinfer_aot_decodeattn_r4_scan_b_get_last_error();
-}
-
-void decodeattn_r4_scan_b(TensorView Q, TensorView K, TensorView V, TensorView FM, TensorView PL, TensorView P, int64_t new_pos, int64_t scale_bits) {
-  xinfer::aot::glue::Launch("decodeattn_r4_scan_b", xinfer_aot_decodeattn_r4_scan_b_call,
-                            xinfer_aot_decodeattn_r4_scan_b_get_last_error, Q, K, V, FM, PL, P, new_pos, scale_bits);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(decodeattn_r4_scan_b, xinfer::aot::attn_glue::decodeattn_r4_scan_b);
-
-extern "C" {
 int32_t xinfer_aot_fia_fuse_reduce_bnsd_l432_call(void*, void*, void* stream);
 const char* xinfer_aot_fia_fuse_reduce_bnsd_l432_get_last_error();
 }
@@ -188,5 +155,38 @@ void gated_attn_bnsd_pack_pow2(TensorView res, TensorView out, TensorView gate, 
                             xinfer_aot_gated_attn_bnsd_pack_pow2_get_last_error, res, out, gate, count, gspan, hd, rows, d, pitch, offset);
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gated_attn_bnsd_pack_pow2, xinfer::aot::attn_glue::gated_attn_bnsd_pack_pow2);
+
+extern "C" {
+int32_t xinfer_aot_split_kv_decode_reduce_head_major_call(void*, void*, void* stream);
+const char* xinfer_aot_split_kv_decode_reduce_head_major_get_last_error();
+}
+
+void split_kv_decode_reduce_head_major(TensorView P, TensorView OUT) {
+  xinfer::aot::glue::Launch("split_kv_decode_reduce_head_major", xinfer_aot_split_kv_decode_reduce_head_major_call,
+                            xinfer_aot_split_kv_decode_reduce_head_major_get_last_error, P, OUT);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(split_kv_decode_reduce_head_major, xinfer::aot::attn_glue::split_kv_decode_reduce_head_major);
+
+extern "C" {
+int32_t xinfer_aot_split_kv_decode_reduce_token_major_call(void*, void*, void* stream);
+const char* xinfer_aot_split_kv_decode_reduce_token_major_get_last_error();
+}
+
+void split_kv_decode_reduce_token_major(TensorView P, TensorView OUT) {
+  xinfer::aot::glue::Launch("split_kv_decode_reduce_token_major", xinfer_aot_split_kv_decode_reduce_token_major_call,
+                            xinfer_aot_split_kv_decode_reduce_token_major_get_last_error, P, OUT);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(split_kv_decode_reduce_token_major, xinfer::aot::attn_glue::split_kv_decode_reduce_token_major);
+
+extern "C" {
+int32_t xinfer_aot_split_kv_decode_scan_tile_per_block_call(void*, void*, void*, void*, void*, void*, int64_t, int64_t, void* stream);
+const char* xinfer_aot_split_kv_decode_scan_tile_per_block_get_last_error();
+}
+
+void split_kv_decode_scan_tile_per_block(TensorView Q, TensorView K, TensorView V, TensorView FM, TensorView PL, TensorView P, int64_t new_pos, int64_t scale_bits) {
+  xinfer::aot::glue::Launch("split_kv_decode_scan_tile_per_block", xinfer_aot_split_kv_decode_scan_tile_per_block_call,
+                            xinfer_aot_split_kv_decode_scan_tile_per_block_get_last_error, Q, K, V, FM, PL, P, new_pos, scale_bits);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(split_kv_decode_scan_tile_per_block, xinfer::aot::attn_glue::split_kv_decode_scan_tile_per_block);
 
 }  // namespace xinfer::aot::attn_glue

@@ -15,28 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""soupform: single-pass soup kills for the wall-x 2B final stack (SOUP-FORM).
+"""Elementwise epilogues for Wall-X 2B projections and normalization.
 
-All kernels keep the released torch chains' FP32 arithmetic and round with a
-single RNE; every route is pure elementwise mul/add/round/copy, so the outputs
-are bitwise-identical to the aclnn chains they replace (witness adjudicated):
-
-- normprep_c2048  : s = rne(f32(x)+f32(res)); sq = f32(s)^2
-                    replaces aclnnAdd(bf16) + Cast(s.float()) + aclnnPow(2)
-                    at the add_zero_centered_rms_norm prefill sites.
-- apply_rstd_c2048: y = rne((f32(x)*rstd) * (1+w)) -- elementwise only, the
-                    same association as the library's rmsnorm_apply_rstd.
-- zbasplit_c8224  : o = rne(acc * keep[row]); conv columns and the z/b/a tail
-                    written into two contiguous bf16 buffers (replaces
-                    aclnnMul + Cast + Slice + Slice at the qkv_zba sites).
-                    The 2080-wide tail is padded to 2112 in UB; the padded
-                    lanes never reach global memory (exact-length T.copy).
-- mulcast_c6144   : out = rne(silu_out * up_half) over the GLU accumulator
-                    (replaces aclnnMul + Cast).
-- vision_qkv_rope_v3p: the landed vrope v3 math with the store permuted to
-                    [3, rows, heads, dim] so the vision pack transpose
-                    disappears (same values, different addresses).
-"""
+Residual-norm preparation writes a BF16 sum and its FP32 square; apply
+multiplies by the reciprocal RMS and zero-centered weight. Z/B/A splitting
+scales each row and packs its two outputs, and the SwiGLU epilogue multiplies
+the activated gate by the up projection. Vision QKV/RoPE writes directly
+in contiguous [3, rows, heads, dim] order."""
 
 import tilelang.ascend.language as T
 
@@ -235,7 +220,7 @@ def mulcast(half=6144, rows_per_tile=1, cores=CORES):
 
 
 def vision_qkv_rope_packed(heads=16, dim=64, half=32, rows_per_tile=2, cores=CORES):
-    """The landed vrope v3 math; stores [3, rows, heads, dim] instead of [rows, 3, h, d]."""
+    """Apply vision QKV bias and RoPE, storing contiguous [3,rows,heads,dim] output."""
     n = 3 * heads * dim
     sec = heads * dim
     span = rows_per_tile * n
@@ -343,4 +328,4 @@ def build_programs():
     yield "apply_rstd_c2048", apply_rstd_c2048()
     yield "zbasplit_c8224", zbasplit()
     yield "mulcast_c6144", mulcast()
-    yield "vision_qkv_rope_v3p", vision_qkv_rope_packed()
+    yield "vision_qkv_rope_packed", vision_qkv_rope_packed()

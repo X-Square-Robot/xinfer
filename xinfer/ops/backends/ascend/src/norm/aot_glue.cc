@@ -58,6 +58,28 @@ void adarmsnorm_action_gated_bf16_f32_pinned(TensorView residual, TensorView bra
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(adarmsnorm_action_gated_bf16_f32_pinned, xinfer::aot::norm_glue::adarmsnorm_action_gated_bf16_f32_pinned);
 
 extern "C" {
+int32_t xinfer_aot_add_rmsnorm_h1280_double_buffer_fp32_weight_call(void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, void* stream);
+const char* xinfer_aot_add_rmsnorm_h1280_double_buffer_fp32_weight_get_last_error();
+}
+
+void add_rmsnorm_h1280_double_buffer_fp32_weight(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, int64_t rows, int64_t weight_words, int64_t epsilon_bits) {
+  xinfer::aot::glue::Launch("add_rmsnorm_h1280_double_buffer_fp32_weight", xinfer_aot_add_rmsnorm_h1280_double_buffer_fp32_weight_call,
+                            xinfer_aot_add_rmsnorm_h1280_double_buffer_fp32_weight_get_last_error, x, residual, summed, weight, output, rows, weight_words, epsilon_bits);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(add_rmsnorm_h1280_double_buffer_fp32_weight, xinfer::aot::norm_glue::add_rmsnorm_h1280_double_buffer_fp32_weight);
+
+extern "C" {
+int32_t xinfer_aot_add_rmsnorm_h2048_double_buffer_fp32_weight_call(void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, void* stream);
+const char* xinfer_aot_add_rmsnorm_h2048_double_buffer_fp32_weight_get_last_error();
+}
+
+void add_rmsnorm_h2048_double_buffer_fp32_weight(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, int64_t rows, int64_t weight_words, int64_t epsilon_bits) {
+  xinfer::aot::glue::Launch("add_rmsnorm_h2048_double_buffer_fp32_weight", xinfer_aot_add_rmsnorm_h2048_double_buffer_fp32_weight_call,
+                            xinfer_aot_add_rmsnorm_h2048_double_buffer_fp32_weight_get_last_error, x, residual, summed, weight, output, rows, weight_words, epsilon_bits);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(add_rmsnorm_h2048_double_buffer_fp32_weight, xinfer::aot::norm_glue::add_rmsnorm_h2048_double_buffer_fp32_weight);
+
+extern "C" {
 int32_t xinfer_aot_apply_rstd_c2048_call(void*, void*, void*, void*, int64_t, void* stream);
 const char* xinfer_aot_apply_rstd_c2048_get_last_error();
 }
@@ -100,39 +122,6 @@ void qkv_split_vec_bhsd_h256(TensorView packed, TensorView rq, TensorView rk, Te
                             xinfer_aot_qkv_split_vec_bhsd_h256_get_last_error, packed, rq, rk, qf, kf, q, k, v, gate, rows);
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(qkv_split_vec_bhsd_h256, xinfer::aot::norm_glue::qkv_split_vec_bhsd_h256);
-
-extern "C" {
-int32_t xinfer_aot_rf4_m16_call(void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, void* stream);
-const char* xinfer_aot_rf4_m16_get_last_error();
-}
-
-void rf4_m16(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, TensorView stats, int64_t rows, int64_t epsilon_bits, int64_t centered, int64_t add_residual, int64_t write_output, int64_t write_stats) {
-  xinfer::aot::glue::Launch("rf4_m16", xinfer_aot_rf4_m16_call,
-                            xinfer_aot_rf4_m16_get_last_error, x, residual, summed, weight, output, stats, rows, epsilon_bits, centered, add_residual, write_output, write_stats);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(rf4_m16, xinfer::aot::norm_glue::rf4_m16);
-
-extern "C" {
-int32_t xinfer_aot_rf4_m16_f32in_call(void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, void* stream);
-const char* xinfer_aot_rf4_m16_f32in_get_last_error();
-}
-
-void rf4_m16_f32in(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, TensorView stats, int64_t rows, int64_t epsilon_bits, int64_t centered, int64_t add_residual, int64_t write_output, int64_t write_stats) {
-  xinfer::aot::glue::Launch("rf4_m16_f32in", xinfer_aot_rf4_m16_f32in_call,
-                            xinfer_aot_rf4_m16_f32in_get_last_error, x, residual, summed, weight, output, stats, rows, epsilon_bits, centered, add_residual, write_output, write_stats);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(rf4_m16_f32in, xinfer::aot::norm_glue::rf4_m16_f32in);
-
-extern "C" {
-int32_t xinfer_aot_rf4_ubv2048_f_call(void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, void* stream);
-const char* xinfer_aot_rf4_ubv2048_f_get_last_error();
-}
-
-void rf4_ubv2048_f(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, int64_t rows, int64_t weight_words, int64_t epsilon_bits) {
-  xinfer::aot::glue::Launch("rf4_ubv2048_f", xinfer_aot_rf4_ubv2048_f_call,
-                            xinfer_aot_rf4_ubv2048_f_get_last_error, x, residual, summed, weight, output, rows, weight_words, epsilon_bits);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(rf4_ubv2048_f, xinfer::aot::norm_glue::rf4_ubv2048_f);
 
 extern "C" {
 int32_t xinfer_aot_rms_apply_rstd_h2048_call(void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, void* stream);
@@ -223,6 +212,39 @@ void rmsnorm_full_c2048(TensorView s, TensorView out, TensorView x, TensorView r
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_full_c2048, xinfer::aot::norm_glue::rmsnorm_full_c2048);
 
 extern "C" {
+int32_t xinfer_aot_rmsnorm_m16_h1024_call(void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, void* stream);
+const char* xinfer_aot_rmsnorm_m16_h1024_get_last_error();
+}
+
+void rmsnorm_m16_h1024(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, TensorView stats, int64_t rows, int64_t epsilon_bits, int64_t centered, int64_t add_residual, int64_t write_output, int64_t write_stats) {
+  xinfer::aot::glue::Launch("rmsnorm_m16_h1024", xinfer_aot_rmsnorm_m16_h1024_call,
+                            xinfer_aot_rmsnorm_m16_h1024_get_last_error, x, residual, summed, weight, output, stats, rows, epsilon_bits, centered, add_residual, write_output, write_stats);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_m16_h1024, xinfer::aot::norm_glue::rmsnorm_m16_h1024);
+
+extern "C" {
+int32_t xinfer_aot_rmsnorm_m16_h1024_fp32_input_call(void*, void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, void* stream);
+const char* xinfer_aot_rmsnorm_m16_h1024_fp32_input_get_last_error();
+}
+
+void rmsnorm_m16_h1024_fp32_input(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, TensorView stats, int64_t rows, int64_t epsilon_bits, int64_t centered, int64_t add_residual, int64_t write_output, int64_t write_stats) {
+  xinfer::aot::glue::Launch("rmsnorm_m16_h1024_fp32_input", xinfer_aot_rmsnorm_m16_h1024_fp32_input_call,
+                            xinfer_aot_rmsnorm_m16_h1024_fp32_input_get_last_error, x, residual, summed, weight, output, stats, rows, epsilon_bits, centered, add_residual, write_output, write_stats);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_m16_h1024_fp32_input, xinfer::aot::norm_glue::rmsnorm_m16_h1024_fp32_input);
+
+extern "C" {
+int32_t xinfer_aot_rmsnorm_unified_buffer_h2048_fp32_weight_call(void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, void* stream);
+const char* xinfer_aot_rmsnorm_unified_buffer_h2048_fp32_weight_get_last_error();
+}
+
+void rmsnorm_unified_buffer_h2048_fp32_weight(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, int64_t rows, int64_t weight_words, int64_t epsilon_bits) {
+  xinfer::aot::glue::Launch("rmsnorm_unified_buffer_h2048_fp32_weight", xinfer_aot_rmsnorm_unified_buffer_h2048_fp32_weight_call,
+                            xinfer_aot_rmsnorm_unified_buffer_h2048_fp32_weight_get_last_error, x, residual, summed, weight, output, rows, weight_words, epsilon_bits);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_unified_buffer_h2048_fp32_weight, xinfer::aot::norm_glue::rmsnorm_unified_buffer_h2048_fp32_weight);
+
+extern "C" {
 int32_t xinfer_aot_rope_half_d64_bhsd_call(void*, void*, void*, void*, void*, void*, int64_t, void* stream);
 const char* xinfer_aot_rope_half_d64_bhsd_get_last_error();
 }
@@ -234,37 +256,15 @@ void rope_half_d64_bhsd(TensorView q, TensorView k, TensorView cosine, TensorVie
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rope_half_d64_bhsd, xinfer::aot::norm_glue::rope_half_d64_bhsd);
 
 extern "C" {
-int32_t xinfer_aot_se1_ubv1280_buf2f_call(void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, void* stream);
-const char* xinfer_aot_se1_ubv1280_buf2f_get_last_error();
+int32_t xinfer_aot_vision_qkv_rope_packed_call(void*, void*, void*, void*, void*, int64_t, void* stream);
+const char* xinfer_aot_vision_qkv_rope_packed_get_last_error();
 }
 
-void se1_ubv1280_buf2f(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, int64_t rows, int64_t weight_words, int64_t epsilon_bits) {
-  xinfer::aot::glue::Launch("se1_ubv1280_buf2f", xinfer_aot_se1_ubv1280_buf2f_call,
-                            xinfer_aot_se1_ubv1280_buf2f_get_last_error, x, residual, summed, weight, output, rows, weight_words, epsilon_bits);
+void vision_qkv_rope_packed(TensorView out, TensorView acc, TensorView bias, TensorView cos, TensorView sin, int64_t rows) {
+  xinfer::aot::glue::Launch("vision_qkv_rope_packed", xinfer_aot_vision_qkv_rope_packed_call,
+                            xinfer_aot_vision_qkv_rope_packed_get_last_error, out, acc, bias, cos, sin, rows);
 }
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(se1_ubv1280_buf2f, xinfer::aot::norm_glue::se1_ubv1280_buf2f);
-
-extern "C" {
-int32_t xinfer_aot_se1_ubv2048_buf2f_call(void*, void*, void*, void*, void*, int64_t, int64_t, int64_t, void* stream);
-const char* xinfer_aot_se1_ubv2048_buf2f_get_last_error();
-}
-
-void se1_ubv2048_buf2f(TensorView x, TensorView residual, TensorView summed, TensorView weight, TensorView output, int64_t rows, int64_t weight_words, int64_t epsilon_bits) {
-  xinfer::aot::glue::Launch("se1_ubv2048_buf2f", xinfer_aot_se1_ubv2048_buf2f_call,
-                            xinfer_aot_se1_ubv2048_buf2f_get_last_error, x, residual, summed, weight, output, rows, weight_words, epsilon_bits);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(se1_ubv2048_buf2f, xinfer::aot::norm_glue::se1_ubv2048_buf2f);
-
-extern "C" {
-int32_t xinfer_aot_vision_qkv_rope_v3p_call(void*, void*, void*, void*, void*, int64_t, void* stream);
-const char* xinfer_aot_vision_qkv_rope_v3p_get_last_error();
-}
-
-void vision_qkv_rope_v3p(TensorView out, TensorView acc, TensorView bias, TensorView cos, TensorView sin, int64_t rows) {
-  xinfer::aot::glue::Launch("vision_qkv_rope_v3p", xinfer_aot_vision_qkv_rope_v3p_call,
-                            xinfer_aot_vision_qkv_rope_v3p_get_last_error, out, acc, bias, cos, sin, rows);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(vision_qkv_rope_v3p, xinfer::aot::norm_glue::vision_qkv_rope_v3p);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(vision_qkv_rope_packed, xinfer::aot::norm_glue::vision_qkv_rope_packed);
 
 extern "C" {
 int32_t xinfer_aot_zbasplit_c8224_call(void*, void*, void*, void*, int64_t, void* stream);

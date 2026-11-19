@@ -75,13 +75,13 @@ def test_fused_projection_execution_errors_do_not_fall_back(monkeypatch):
 
 
 def test_composite_projection_does_not_activate_previously_unselected_fusions(monkeypatch):
-    from xinfer.ops.backends.ascend import gemm, rmsfuse_r4
+    from xinfer.ops.backends.ascend import gemm, fused_rmsnorm
 
     def unselected(*args, **kwargs):
         pytest.fail("the composite operator activated an unselected fusion")
 
-    monkeypatch.setattr(rmsfuse_r4, "enabled", lambda family: True)
-    monkeypatch.setattr(rmsfuse_r4, "gemm_add_rms_r4", unselected)
+    monkeypatch.setattr(fused_rmsnorm, "enabled", lambda family: True)
+    monkeypatch.setattr(fused_rmsnorm, "gemm_add_rmsnorm", unselected)
     monkeypatch.setattr(gemm, "cann_projection", SimpleNamespace(
         _stable_contiguous=lambda weight: weight.contiguous(), gemm_add_rms_norm=unselected))
     monkeypatch.setattr(gemm, "norm_library", None)

@@ -51,13 +51,13 @@ def test_identity_norm_keeps_inplace_rows_and_shared_scalar_options(monkeypatch,
 
 
 def test_ascend_norm_binding_preserves_the_layer_threshold(monkeypatch):
-    from xinfer.ops.backends.ascend import norm, soupunlock
+    from xinfer.ops.backends.ascend import norm, fused_norm_reduction
 
-    monkeypatch.setattr(soupunlock, "enabled", lambda family: family == "rmsfull")
-    monkeypatch.setattr(soupunlock, "from_layer", lambda: 8)
+    monkeypatch.setattr(fused_norm_reduction, "enabled", lambda family: family == "rmsfull")
+    monkeypatch.setattr(fused_norm_reduction, "from_layer", lambda: 8)
     inputs = torch.ones(1, 3, 4), torch.ones(1, 3, 4), torch.zeros(4), 1e-6
     marker = torch.full((1, 3, 4), 7.0)
-    monkeypatch.setattr(soupunlock, "rmsnorm_full", lambda *args: (marker, marker))
+    monkeypatch.setattr(fused_norm_reduction, "rmsnorm_full", lambda *args: (marker, marker))
     lower = norm.add_zero_centered_rms_norm.bind(layer_index=7)
     upper = norm.add_zero_centered_rms_norm.bind(layer_index=8)
     assert lower is norm.add_zero_centered_rms_norm
@@ -67,6 +67,6 @@ def test_ascend_norm_binding_preserves_the_layer_threshold(monkeypatch):
     def fail(*args):
         raise RuntimeError("norm launch failed")
 
-    monkeypatch.setattr(soupunlock, "rmsnorm_full", fail)
+    monkeypatch.setattr(fused_norm_reduction, "rmsnorm_full", fail)
     with pytest.raises(RuntimeError, match="norm launch failed"):
         upper(*inputs)

@@ -441,8 +441,7 @@ def qkv_vision_rope_cube():
 
     The wall_oss vision QKV shape in ONE cube launch: [M, 1280] x NK weight [3840, 1280]
     (the launcher pads M=2112 to the 128-row tile grid and slices the tail rows away).
-    r11b retiling: N tiles of 240 (16 tiles, 272 blocks vs the r10 160-tiling's 408;
-    the bare wide gemm's own quantization is 255) with an M-split epilogue -- each
+    Each N tile spans 240 columns. In the M-split epilogue, each
     of the two AIVs finishes one 64-row half of the full 240-wide tile, so every
     +/-40 rotary partner stays inside its AIV row and every 80-wide head stays
     intact. The 240 tiling crosses qk_width=2560 mid-tile (2400-2640), so the QK/V

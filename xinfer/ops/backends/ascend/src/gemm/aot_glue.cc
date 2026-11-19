@@ -14,6 +14,50 @@ namespace xinfer::aot::gemm_glue {
 using xinfer::aot::glue::TensorView;
 
 extern "C" {
+int32_t xinfer_aot_action_gemm_m16_down_call(void*, void*, void*, void* stream);
+const char* xinfer_aot_action_gemm_m16_down_get_last_error();
+}
+
+void action_gemm_m16_down(TensorView X, TensorView W, TensorView OUT) {
+  xinfer::aot::glue::Launch("action_gemm_m16_down", xinfer_aot_action_gemm_m16_down_call,
+                            xinfer_aot_action_gemm_m16_down_get_last_error, X, W, OUT);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(action_gemm_m16_down, xinfer::aot::gemm_glue::action_gemm_m16_down);
+
+extern "C" {
+int32_t xinfer_aot_action_gemm_m16_gateup_glu_call(void*, void*, void*, void* stream);
+const char* xinfer_aot_action_gemm_m16_gateup_glu_get_last_error();
+}
+
+void action_gemm_m16_gateup_glu(TensorView X, TensorView W, TensorView OUT) {
+  xinfer::aot::glue::Launch("action_gemm_m16_gateup_glu", xinfer_aot_action_gemm_m16_gateup_glu_call,
+                            xinfer_aot_action_gemm_m16_gateup_glu_get_last_error, X, W, OUT);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(action_gemm_m16_gateup_glu, xinfer::aot::gemm_glue::action_gemm_m16_gateup_glu);
+
+extern "C" {
+int32_t xinfer_aot_action_gemm_m16_o_proj_call(void*, void*, void*, void* stream);
+const char* xinfer_aot_action_gemm_m16_o_proj_get_last_error();
+}
+
+void action_gemm_m16_o_proj(TensorView A, TensorView W, TensorView OUT) {
+  xinfer::aot::glue::Launch("action_gemm_m16_o_proj", xinfer_aot_action_gemm_m16_o_proj_call,
+                            xinfer_aot_action_gemm_m16_o_proj_get_last_error, A, W, OUT);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(action_gemm_m16_o_proj, xinfer::aot::gemm_glue::action_gemm_m16_o_proj);
+
+extern "C" {
+int32_t xinfer_aot_action_gemm_m16_qkv_call(void*, void*, void*, void* stream);
+const char* xinfer_aot_action_gemm_m16_qkv_get_last_error();
+}
+
+void action_gemm_m16_qkv(TensorView X, TensorView W, TensorView OUT) {
+  xinfer::aot::glue::Launch("action_gemm_m16_qkv", xinfer_aot_action_gemm_m16_qkv_call,
+                            xinfer_aot_action_gemm_m16_qkv_get_last_error, X, W, OUT);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(action_gemm_m16_qkv, xinfer::aot::gemm_glue::action_gemm_m16_qkv);
+
+extern "C" {
 int32_t xinfer_aot_bnsd_o_proj_m768_bf16_call(void*, void*, void*, void* stream);
 const char* xinfer_aot_bnsd_o_proj_m768_bf16_get_last_error();
 }
@@ -133,49 +177,5 @@ void smallm_bnsd_o_proj_m64(TensorView A, TensorView W, TensorView OUT) {
                             xinfer_aot_smallm_bnsd_o_proj_m64_get_last_error, A, W, OUT);
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(smallm_bnsd_o_proj_m64, xinfer::aot::gemm_glue::smallm_bnsd_o_proj_m64);
-
-extern "C" {
-int32_t xinfer_aot_smallm_r3_down_call(void*, void*, void*, void* stream);
-const char* xinfer_aot_smallm_r3_down_get_last_error();
-}
-
-void smallm_r3_down(TensorView X, TensorView W, TensorView OUT) {
-  xinfer::aot::glue::Launch("smallm_r3_down", xinfer_aot_smallm_r3_down_call,
-                            xinfer_aot_smallm_r3_down_get_last_error, X, W, OUT);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(smallm_r3_down, xinfer::aot::gemm_glue::smallm_r3_down);
-
-extern "C" {
-int32_t xinfer_aot_smallm_r3_gateup_glu_call(void*, void*, void*, void* stream);
-const char* xinfer_aot_smallm_r3_gateup_glu_get_last_error();
-}
-
-void smallm_r3_gateup_glu(TensorView X, TensorView W, TensorView OUT) {
-  xinfer::aot::glue::Launch("smallm_r3_gateup_glu", xinfer_aot_smallm_r3_gateup_glu_call,
-                            xinfer_aot_smallm_r3_gateup_glu_get_last_error, X, W, OUT);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(smallm_r3_gateup_glu, xinfer::aot::gemm_glue::smallm_r3_gateup_glu);
-
-extern "C" {
-int32_t xinfer_aot_smallm_r3_o_proj_call(void*, void*, void*, void* stream);
-const char* xinfer_aot_smallm_r3_o_proj_get_last_error();
-}
-
-void smallm_r3_o_proj(TensorView A, TensorView W, TensorView OUT) {
-  xinfer::aot::glue::Launch("smallm_r3_o_proj", xinfer_aot_smallm_r3_o_proj_call,
-                            xinfer_aot_smallm_r3_o_proj_get_last_error, A, W, OUT);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(smallm_r3_o_proj, xinfer::aot::gemm_glue::smallm_r3_o_proj);
-
-extern "C" {
-int32_t xinfer_aot_smallm_r3_qkv_call(void*, void*, void*, void* stream);
-const char* xinfer_aot_smallm_r3_qkv_get_last_error();
-}
-
-void smallm_r3_qkv(TensorView X, TensorView W, TensorView OUT) {
-  xinfer::aot::glue::Launch("smallm_r3_qkv", xinfer_aot_smallm_r3_qkv_call,
-                            xinfer_aot_smallm_r3_qkv_get_last_error, X, W, OUT);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(smallm_r3_qkv, xinfer::aot::gemm_glue::smallm_r3_qkv);
 
 }  // namespace xinfer::aot::gemm_glue

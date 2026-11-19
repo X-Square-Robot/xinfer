@@ -15,24 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""soup2: second-round soup kills for the wall-x 2B PUSH-FIAFIX stack (SOUP2-ASCENDC).
+"""Elementwise square-and-cast kernels for Gated DeltaNet statistics.
 
-Site map (MSPROF-SCAN-R5 chosen steady window, per request):
-- qksq_c6144 : GDN prefill qk stats pre-pass. The released chain is
-               Mul(qk, qk) [bf16, strided rows of x_t [1,T,6144]] followed by
-               the ReduceSum's implicit bf16->f32 cast. This kernel writes
-               f32(RNE_bf16(a*a)) in one pass -- bit-identical bits into the
-               untouched aclnn ReduceSum/Adds/Rsqrt, one launch instead of two
-               and one GM read instead of three.
-- rawsq_r128 : GDN gdrtailmix raw stats pre-pass. Cast(raw f32) + Square ->
-               one pass writing RNE_f32(a*a); aclnn Mean/Adds/Rsqrt read the
-               same bits (bitwise).
-
-All kernels are TileLang multi-block SIMD (dconv4/soupform form -- the only
-fast-and-stable vector-machine shape on this platform per ascendc-action /
-move-r2 hard laws). fp32 vector exp/div route through the tilelang codegen
-aliases (safe routines), never raw ccec intrinsics.
-"""
+The Q/K kernel squares strided BF16 values, rounds to BF16 and stores the
+widened values as FP32. The output-statistics kernel widens BF16 to FP32
+before squaring. The following reduction and reciprocal square root remain
+in the caller, preserving their original reduction order."""
 
 import tilelang.ascend.language as T
 

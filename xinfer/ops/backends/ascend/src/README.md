@@ -40,6 +40,9 @@ are needed. The TileLang compiler and standard Ascend SDK remain toolchain depen
 | `common` | CANN bridges and build information |
 
 The build links the entries listed in `CMakeLists.txt`. The backend adapters
-define the launch ABIs and supported layouts.
+define the launch ABIs and supported layouts. Kernel names describe their
+operation and, where needed, their specialization: `m16` means 16 rows,
+`h1024` a hidden width of 1024, and `rows8` an eight-row tile.
+FIA V5 names the version of the CANN API.
 See [kernel integration](../../../../../docs/kernels.md) for registration,
 graph lifetime and validation requirements.

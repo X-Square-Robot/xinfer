@@ -1,14 +1,8 @@
-"""R6B-BRIDGE B2 r2: pow2-specialized gating pack for the decode shape.
+"""Gated attention packing for M=16, H=8 and D=256.
 
-The r4 streaming kernel decomposes every element index with six runtime
-int64 divmods (row/head/batch/dim splits); at the decode shape every
-divisor is a power of two (H=8, M=16, D=256, HD=2048), so this variant
-bakes those constants and replaces the decomposition with shifts/masks.
-The per-element scalar arithmetic is unchanged -- the same FP32 sigmoid
-``1/(1+exp(-x))``, the same two RNE roundings, the same store order -- so
-the outputs stay bitwise with the r4 kernel and the torch tail on this
-envelope (probe requirement).  Envelope: B*M*H*D elements with M=16, H=8,
-D=256, any B; callers fall back to the r4 kernel otherwise.
+The power-of-two dimensions allow shifts and masks for index decomposition.
+The FP32 sigmoid, both round-to-nearest-even conversions and the store order
+match the generic packing kernel.
 """
 
 import tilelang.ascend.language as T

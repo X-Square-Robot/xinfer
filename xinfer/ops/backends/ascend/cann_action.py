@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from xinfer.ops.backends.ascend import _native
 from xinfer.ops.backends.ascend.core import CORE
 from xinfer.ops.backends.ascend._cann_action_scope import memo_action_metadata
-from xinfer.ops.backends.ascend import smallm_r3
+from xinfer.ops.backends.ascend import action_gemm_m16
 
 
 _QKV_2B_CACHE_FINISH = None
@@ -470,7 +470,7 @@ class CannAction:
                     (activation.shape[0], n),
                     (torch.float32,),
                 )
-                # r3: BNSD [H, M, D] -- the kernel writes the head-major layout
+                # BNSD [H, M, D] -- the kernel writes the head-major layout
                 # the ACLNN FIA query consumes, so the attention transpose is a view.
                 query = x.new_empty((num_heads, 16, head_dim))
                 self._qkv_bias_rope_m16(
@@ -531,38 +531,25 @@ class CannAction:
             eps,
             allow_gate=True,
         )
-        # smallm-r3 qkv blade (XINFER_SMALLM_R3=qkv, default off): the m16
+        # action-gemm-m16 qkv blade (XINFER_ASCEND_ACTION_GEMM_M16=qkv, default off): the m16
         # action QKV projection rides the bitwise Cube kernel; the route is
         # lock-free with no shared buffers (the WALLOSS-QKV capacity win).
-        if (smallm_r3.enabled("qkv")
+        if (action_gemm_m16.enabled("qkv")
                 and (m, n, x.shape[1]) == (16, 2560, 1024)
                 and x.dtype == weight.dtype == torch.bfloat16
                 and x.is_contiguous() and weight.is_contiguous()
                 and x.device.type == "npu"):
-            projected_ctx = contextlib.nullcontext(smallm_r3.qkv_fp32(x, weight))
+            projected_ctx = contextlib.nullcontext(action_gemm_m16.qkv_fp32(x, weight))
         else:
             projected_ctx = self._accumulator(x, weight)
         with projected_ctx as y:
             _check_tensor(y, "accumulator result", x.device, (m, n), (torch.float32,))
-            # 2b-qkv / R6B-BRIDGE B1 (env XINFER_R6B_BRIDGE=1, the v22 20.62
-            # stack's run flag): the wallx2b action QKV tail fused into one
-            # AOT kernel -- per-head RMS norm on the raw FP32 accumulator,
-            # the (1 + w) factors, the 64-dim partial rotary, the head-major
-            # K/V append, the Q half stored head-major (BNSD-contiguous) and
-            # the gate in its own dense buffer, both by the same job plan and
-            # FP32 arithmetic as the released packed kernel, only the store
-            # indices move. Returns (q_bnsd [1, H, M, D], gate [1, M, H*D]) --
-            # the head-major query is what the ACLNN FIA dense descriptor
-            # reads, so the action attention takes the FIA-FUSE pair without
-            # the token-major materialization. K/V caches and the gate half
-            # are bitwise with the chain; Q/K values carry an ulp-level rstd
-            # residue (CANN npu_rms_norm approximate rsqrt, ~7e-7 rel; probe:
-            # 1 BF16 flip in 65536 on a synthetic batch). Envelope misses (or
-            # the flag off) keep the released _write_qkv chain below.
+            # One AOT kernel applies per-head normalization and partial RoPE, appends K/V,
+            # and stores Q head-major alongside the packed gate.
             finish = _qkv_2b_cache_finish_pair()
             if (
                 finish is not None
-                and os.environ.get("XINFER_R6B_BRIDGE", "0") == "1"
+                and os.environ.get("XINFER_ASCEND_ACTION_QKV_NORM_ROPE_CACHE", "0") == "1"
                 and (m, n, x.shape[1], num_heads, num_kv_heads, head_dim)
                 == (16, 5120, 1024, 8, 2, 256)
                 and float(eps) == 1e-6

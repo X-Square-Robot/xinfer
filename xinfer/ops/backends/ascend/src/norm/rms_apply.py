@@ -15,15 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""rmsnorm-r3 (B2B) v2: vector-engine bit-aligned apply-only RMSNorm, H2048.
-
-Same contract as the v1 scalar plan (external per-row FP32 rstd, reference
-association (x*rstd)*(1+w), single RNE round) with the elementwise work on
-the CCE vector units (the v1 scalar SimtVF apply ran at ~0.5 TB/s and ate the
-launch savings; vector unpack/mul/pack per the released ubv plan). All vector
-ops are IEEE FP32 mul/add with the ROUND_R (RNE) BF16 pack, the same classes
-probe-r1 F/G proved bitwise vs the torch composition.
-"""
+"""Apply a supplied per-row FP32 reciprocal RMS to H2048 BF16 input.
+Compute (x * rstd) * (1 + weight) in FP32 vector lanes and round once to
+BF16 on store. The caller owns the statistics reduction."""
 
 import tilelang.ascend.language as T
 

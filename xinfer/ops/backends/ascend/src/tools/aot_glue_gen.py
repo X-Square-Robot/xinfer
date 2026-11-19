@@ -41,7 +41,7 @@ import argparse
 from pathlib import Path
 
 # The src family directory of every kernel of the family-library map (src/FAMILIES.md):
-# the library groups (core, smallm_r3, ...) mix modules; the glue faces live beside the
+# the library groups (core, action_gemm_m16, ...) mix modules; the glue faces live beside the
 # kernel sources, so the map goes kernel -> directory.
 _DIRECTORIES = {
     "gemm": (
@@ -49,24 +49,24 @@ _DIRECTORIES = {
         "smallm_bnsd_o_proj_m32", "smallm_bnsd_o_proj_m64", "gemm_qkv_cache_bias_rope_m16",
         "gemm_qkv_cache_bias_rope_prefill", "gemm_qkv_vision_rope_finish",
         "gemm_glu_fp32_finish_split_2048", "gemm_glu_fp32_finish_split_11008", "gemm_glu_fp32_finish_split_6144",
-        "smallm_r3_o_proj", "smallm_r3_gateup_glu", "smallm_r3_down", "smallm_r3_qkv"),
+        "action_gemm_m16_o_proj", "action_gemm_m16_gateup_glu", "action_gemm_m16_down", "action_gemm_m16_qkv"),
     "norm": (
         "rms_apply_rstd_h2048", "rms_consistent_ubv_h1280", "rms_consistent_generic_h1024_f32in",
         "rms_consistent_ub_h1280", "rms_consistent_generic_h1280", "rms_consistent_ub_h2048",
         "rms_consistent_generic_h1024", "adarmsnorm_action_double_bf16_f32",
         "adarmsnorm_action_gated_bf16_f32", "adarmsnorm_action_double_bf16_f32_pinned",
         "adarmsnorm_action_gated_bf16_f32_pinned", "rmsnorm_full_c2048", "normprep_c2048",
-        "apply_rstd_c2048", "zbasplit_c8224", "mulcast_c6144", "vision_qkv_rope_v3p",
-        "se1_ubv1280_buf2f", "se1_ubv2048_buf2f", "rf4_m16", "rf4_m16_f32in", "rf4_ubv2048_f",
+        "apply_rstd_c2048", "zbasplit_c8224", "mulcast_c6144", "vision_qkv_rope_packed",
+        "add_rmsnorm_h1280_double_buffer_fp32_weight", "add_rmsnorm_h2048_double_buffer_fp32_weight", "rmsnorm_m16_h1024", "rmsnorm_m16_h1024_fp32_input", "rmsnorm_unified_buffer_h2048_fp32_weight",
         "qkv_split_vec_bhsd_h256", "rope_half_d64_bhsd"),
     "attn": (
-        "gated_attn_bnsd_pack_pow2", "decodeattn_r4_scan_b", "decodeattn_r4_reduce", "decodeattn_r4_reduce_row",
+        "gated_attn_bnsd_pack_pow2", "split_kv_decode_scan_tile_per_block", "split_kv_decode_reduce_head_major", "split_kv_decode_reduce_token_major",
         *(f"fia_fuse_scan_l{length}" for length in (432, 448, 464, 480)),
         *(f"fia_fuse_reduce_l{length}" for length in (432, 448, 464, 480)),
         *(f"fia_fuse_reduce_bnsd_l{length}" for length in (432, 448, 464, 480))),
     "finish": (
-        "finish_br_c1024", "glu_split_bf16_c6144", "zbasplit_bf16_c8224",
-        "ubfinish_r5_s8_c1280", "ubfinish_r5_s4_c2048"),
+        "bias_residual_cast_c1024", "glu_split_bf16_c6144", "zbasplit_bf16_c8224",
+        "bias_add_cast_simd_rows8_c1280", "bias_add_cast_simd_rows4_c2048"),
     "gdn": ("gdrprep_bf16", "gdrapply_bf16", "gdrtailmix_bf16", "dconv4_c6144"),
     "denoise": ("denoise_input_embed", "denoise_fp32head_cube", "denoise_fp32head_prep"),
     "elem": ("qksq_c6144", "rawsq_r128"),

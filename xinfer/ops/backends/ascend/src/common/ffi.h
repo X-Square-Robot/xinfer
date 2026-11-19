@@ -1,6 +1,4 @@
-// Binding-only helpers for the unified static bridges (vendored from the v22
-// repo src/common/npu/ffi.h with the tvm_ffi TensorView machinery dropped:
-// the unified bridges are raw C-ABI and resolve the stream through torch_npu).
+// Utilities for raw Ascend C-ABI launchers. Submissions use the caller's active torch_npu stream.
 #pragma once
 
 #include <acl/acl.h>

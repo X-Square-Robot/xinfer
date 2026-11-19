@@ -15,16 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""GDN-VENDOR kernels: gates-chain fuse for the 2B GDN vendor path.
+"""Compute beta and the gate pre-activation from strided Gated DeltaNet Z/B/A rows.
 
-gdrprep_bf16: one pass over the strided zba rows [T, 2080] writing
-  beta[t,h] = RNE_bf16(1/(1+exp(-f32(zba[t, 2048+h]))))   (bitwise vs aclnn
-              SigmoidAiCore: probe_sig2 v0, n_diff=0 over all 65536 bf16)
-  gpre[t,h] = f32(zba[t, 2064+h]) + dt[h]                  (IEEE-exact)
-Softplus and the (-exp(A_log)) multiply stay on aclnn: SoftplusV2 has a
-log1p tail that vln(1+exp(x)) cannot reproduce bitwise (probe_sp2), and the
-g-amp advisory (R/gdn-k3-r2) forbids non-bitwise g inputs.
-"""
+Beta is the BF16-rounded FP32 sigmoid of its input. The gate pre-activation
+adds the per-head dt bias in FP32. The caller uses ACLNN softplus and
+multiplies by the negative exponential of A_log."""
 
 import tilelang.ascend.language as T
 
@@ -32,16 +27,7 @@ CORES = 64
 COMPILE_OPTIONS = ["-ffp-contract=off"]
 
 def gdrprep_bf16(hv=16, ldz=2080, cores=CORES):
-    """One pass over the strided zba rows: beta + the g-chain prefix.
-
-    beta[t, h] = RNE_bf16(1 / (1 + exp(-f32(zba[t, hv*128 + h]))))
-    gpre[t, h] = f32(zba[t, hv*128 + hv + h]) + dt[h]
-    dt is pre-duplicated into a 32-lane pad inside the kernel. The sigmoid
-    composition is bitwise against aclnn SigmoidAiCore over the whole bf16
-    domain (results/probe-tr-bitwise.json v0: n_diff=0/65536); the add/cast
-    ops are IEEE-exact. Softplus and the premul multiply stay on aclnn
-    (SoftplusV2's log1p tail is NOT bitwise reproducible with vln).
-    """
+    """Read beta logits and gate logits from strided Z/B/A rows; store BF16 sigmoid and FP32 gate plus dt bias."""
     boff = hv * 128
     aoff = boff + hv
 

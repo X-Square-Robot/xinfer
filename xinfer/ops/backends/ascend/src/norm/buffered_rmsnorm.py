@@ -15,31 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""VISION-RMS R5 kernel variants: ubv_h1280 inline-reduction rewrites.
+"""Vector residual-add RMS normalization with configurable staging and reduction.
 
-Baselines are imported VERBATIM from the walloss lib source (read-only
-import). Variants keep every arithmetic statement of the released ubv plan
-(same vadd/vcvt/vmul/vcpadd/vdupv/vsqrt/vdiv statements over identical
-operand values, same balanced 20-leaf tree association, same 6-step vcpadd
-chain) and change only scheduling / data staging:
-
-buf2    -- sum_ub/out_ub double buffering (buffer versions 1 -> 2): the MTE3
-           store of step N overlaps the vector work of step N+1. Zero
-           arithmetic touched.
-roll    -- the per-segment squares stay in vector registers and fold into the
-           SAME balanced tree as they are produced (the identical 19 vadds
-           over the identical operand values, fired as soon as both operands
-           exist); the sqlane_ub store + load round trip disappears. The
-           bf16 sum still goes through the PK_B32 store + UNPK_B16 reload
-           (that store feeds the summed output anyway), so every surviving
-           statement is textually the released one.
-sr_live -- pass D reuses the pass-A register sr{c} (identical value to the
-           UNPK reload) instead of re-reading sum_ub.
-stages  -- pipeline depth of the x/res staging (3 = triple buffers).
-
-add_residual=1, write_output=1, no stats, not centered -- exactly the
-inference add_rms_norm call the vision/merger rows make.
-"""
+Buffer count, rows per step and pipeline depth control staging. Rolling
+reduction keeps lane partials in registers and schedules additions in the
+same balanced-tree order. The residual sum is rounded to BF16 before it
+contributes to the FP32 statistics. FP32 weights can be loaded directly."""
 import tilelang.ascend.language as T  # noqa: E402
 
 from . import rms_consistent as _orig  # noqa: E402  (the vendored baseline)
@@ -116,7 +97,7 @@ def _tree_statements_text(names, level):
     return text + ("\n" + rest if rest else ""), final
 
 
-def ubv5(width=1280, rows_per_step=4, lanes=64, weight_mode="fold16",
+def buffered_ub_rmsnorm(width=1280, rows_per_step=4, lanes=64, weight_mode="fold16",
          buf2=False, roll=False, sr_live=False, stages=2, f32in=False):
     W, R, L = width, rows_per_step, lanes
     nseg = W // L
@@ -238,8 +219,7 @@ def ubv5(width=1280, rows_per_step=4, lanes=64, weight_mode="fold16",
                                     T.simd.vld(x_ub[o], dist="UNPK_B16"),
                                     "float32", part=0,
                                 )"""
-        # Textually the released per-row body (segment loop, sqlane staging,
-        # lane-vector loads, balanced tree, vcpadd chain, final loop).
+        # Stage lane-wise squares for the balanced row reduction.
         row_body = f"""                            for c in range(W // L):
                                 o = r * W + c * L
                                 {xv_load}
@@ -304,8 +284,7 @@ def ubv5(width=1280, rows_per_step=4, lanes=64, weight_mode="fold16",
     sum_v = 2 if buf2 else 1
     out_v = 2 if buf2 else 1
 
-    # The generated row lines carry the released 4-deeper indent; shift them
-    # onto this skeleton (the lib's own line[4:] strip, applied in reverse).
+    # The generated row body nests one level less deeply in this template.
     row_body = "\n".join(
         line[4:] if line.startswith("    ") else line for line in row_body.split("\n")
     )
@@ -360,7 +339,7 @@ def main(
 """
 
     namespace = {"T": T, "W": W, "R": R, "L": L, "CORES": CORES, "WM": weight_mode}
-    source_name = f"<ubv5-{width}-{R}-{weight_mode}-{'roll' if roll else 'tree'}>"
+    source_name = f"<buffered_ub_rmsnorm-{width}-{R}-{weight_mode}-{'roll' if roll else 'tree'}>"
     import linecache
     linecache.cache[source_name] = (
         len(template), None,
@@ -372,32 +351,32 @@ def main(
 
 def build_programs():
     # -- baseline: the verbatim lib program (same source the lib built from)
-    yield "rf5_ubv1280_base", _orig.ubv(1280, weight_mode="fold16")
+    yield "rmsnorm_vector_h1280_folded_weight", _orig.ubv(1280, weight_mode="fold16")
     # -- scheduling only: MTE3 double-buffered stores
-    yield "rf5_ubv1280_buf2", ubv5(buf2=True)
+    yield "rmsnorm_vector_h1280_double_buffer", buffered_ub_rmsnorm(buf2=True)
     # -- register-resident inline reduction (same adds, no sqlane round trip)
-    yield "rf5_ubv1280_roll", ubv5(roll=True)
-    yield "rf5_ubv1280_buf2roll", ubv5(buf2=True, roll=True)
+    yield "rmsnorm_vector_h1280_rolling_reduce", buffered_ub_rmsnorm(roll=True)
+    yield "rmsnorm_vector_h1280_double_buffer_rolling_reduce", buffered_ub_rmsnorm(buf2=True, roll=True)
     # -- pass D reuses the pass-A registers
-    yield "rf5_ubv1280_rollsr", ubv5(roll=True, sr_live=True)
-    yield "rf5_ubv1280_buf2rollsr", ubv5(buf2=True, roll=True, sr_live=True)
+    yield "rmsnorm_vector_h1280_rolling_reduce_keep_sum", buffered_ub_rmsnorm(roll=True, sr_live=True)
+    yield "rmsnorm_vector_h1280_double_buffer_rolling_reduce_keep_sum", buffered_ub_rmsnorm(buf2=True, roll=True, sr_live=True)
     # -- knobs on the leading structure
-    yield "rf5_ubv1280_buf2rollsr_r2", ubv5(buf2=True, roll=True, sr_live=True,
+    yield "rmsnorm_vector_h1280_double_buffer_rolling_reduce_keep_sum_rows2", buffered_ub_rmsnorm(buf2=True, roll=True, sr_live=True,
                                             rows_per_step=2)
-    yield "rf5_ubv1280_buf2rollsr_f", ubv5(buf2=True, roll=True, sr_live=True,
+    yield "rmsnorm_vector_h1280_double_buffer_rolling_reduce_keep_sum_fp32_weight", buffered_ub_rmsnorm(buf2=True, roll=True, sr_live=True,
                                            weight_mode="f32direct")
-    yield "rf5_ubv1280_buf2rollsr_s3", ubv5(buf2=True, roll=True, sr_live=True,
+    yield "rmsnorm_vector_h1280_double_buffer_rolling_reduce_keep_sum_stages3", buffered_ub_rmsnorm(buf2=True, roll=True, sr_live=True,
                                             stages=3)
-    # -- probe-r5 ladder 2: buf2 refinements (roll family retired: 2-3x slower)
-    yield "rf5_ubv1280_buf2f", ubv5(buf2=True, weight_mode="f32direct")
-    yield "rf5_ubv1280_buf2s3", ubv5(buf2=True, stages=3)
-    yield "rf5_ubv1280_buf2r8", ubv5(buf2=True, rows_per_step=8)
-    yield "rf5_ubv1280_buf2r8f", ubv5(buf2=True, rows_per_step=8,
+    # Double-buffered stores with direct weights, deeper staging or more rows per step.
+    yield "rmsnorm_vector_h1280_double_buffer_fp32_weight", buffered_ub_rmsnorm(buf2=True, weight_mode="f32direct")
+    yield "rmsnorm_vector_h1280_double_buffer_stages3", buffered_ub_rmsnorm(buf2=True, stages=3)
+    yield "rmsnorm_vector_h1280_double_buffer_rows8", buffered_ub_rmsnorm(buf2=True, rows_per_step=8)
+    yield "rmsnorm_vector_h1280_double_buffer_rows8_fp32_weight", buffered_ub_rmsnorm(buf2=True, rows_per_step=8,
                                       weight_mode="f32direct")
     # -- side pool: prefill h2048 f32in (the gemm FP32 accumulator feeds the
     #    plan directly; the RNE round to BF16 happens in-kernel via the
     #    PK-store + UNPK-reload round trip, bit-identical to the gemm_epilogue
     #    finish cast followed by the ubv plan -- the m16_f32in semantics)
-    yield "rf5_ubv2048_base", _orig.ubv(2048)
-    yield "rf5_ubv2048_f32in", ubv5(width=2048, weight_mode="f32direct",
+    yield "rmsnorm_vector_h2048_baseline", _orig.ubv(2048)
+    yield "rmsnorm_vector_h2048_fp32_input", buffered_ub_rmsnorm(width=2048, weight_mode="f32direct",
                                     buf2=True, f32in=True)

@@ -1,6 +1,6 @@
 """Gated DeltaNet layout and elementwise adapters for the in-tree native library.
 
-``XINFER_MOVER2`` is off by default and accepts these families:
+``XINFER_ASCEND_GDN_LAYOUT`` is off by default and accepts these families:
 - ``gdrapply``: write TND Q/K packs with one RNE and copy V after the existing
   convolution, SiLU and normalization statistics.
 - ``gdrgates``: compute beta and gate pre-activations from strided ZBA rows.
@@ -9,7 +9,7 @@
 
 Chunk inputs keep their layouts and dtypes. The gate route may differ in
 FP32 transcendental approximations; the layout/tail routes retain the same
-arithmetic. Optional route counts use ``XINFER_MOVER2_STATS``.
+arithmetic. Optional route counts use ``XINFER_ASCEND_GDN_LAYOUT_STATS``.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ _STATS = {"gdrapply": [0, 0], "gdrtailmix": [0, 0]}
 def enabled(family: str) -> bool:
     global _ENABLED
     if _ENABLED is None:
-        raw = os.environ.get("XINFER_MOVER2", "off").strip().lower()
+        raw = os.environ.get("XINFER_ASCEND_GDN_LAYOUT", "off").strip().lower()
         if raw in ("", "off", "0", "false", "no"):
             _ENABLED = frozenset()
         elif raw in ("1", "all", "on"):
@@ -44,7 +44,7 @@ def enabled(family: str) -> bool:
             wanted = {t.strip() for t in raw.split(",")}
             unknown = wanted - set(FAMILIES)
             if unknown:
-                raise RuntimeError(f"XINFER_MOVER2 unknown families: {sorted(unknown)}")
+                raise RuntimeError(f"XINFER_ASCEND_GDN_LAYOUT unknown families: {sorted(unknown)}")
             _ENABLED = frozenset(wanted)
     return family in _ENABLED and family not in _BROKEN
 
@@ -88,7 +88,7 @@ def _routed(family):
 
 
 def dump_stats():
-    base = os.environ.get("XINFER_MOVER2_STATS")
+    base = os.environ.get("XINFER_ASCEND_GDN_LAYOUT_STATS")
     if not base:
         return
     try:

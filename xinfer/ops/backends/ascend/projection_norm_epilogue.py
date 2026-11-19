@@ -1,6 +1,6 @@
 """Optional fused projection and normalization finishes in the native library.
 
-``XINFER_SOUPFORM`` is off by default and accepts ``normprep``, ``zbasplit``,
+``XINFER_ASCEND_PROJECTION_NORM_EPILOGUE`` is off by default and accepts ``normprep``, ``zbasplit``,
 ``glumulcast`` and ``vropepack``. These respectively prepare the residual
 sum/statistics, write contiguous convolution/ZBA outputs, apply SwiGLU to
 an FP32 accumulator, and write QKV/RoPE in [3,rows,heads,dim] layout.
@@ -13,11 +13,11 @@ All launchers are resolved through ``_native`` from the in-tree library.
 from __future__ import annotations
 
 import ctypes
-import os
 from threading import Lock
 
 import torch
 
+import os
 from xinfer.ops.backends.ascend import _native
 
 _FAMILIES = ("normprep", "zbasplit", "glumulcast", "vropepack")
@@ -29,7 +29,7 @@ _ENABLED = None
 
 def _parse() -> None:
     global _ENABLED
-    raw = os.environ.get("XINFER_SOUPFORM", "off").strip().lower()
+    raw = os.environ.get("XINFER_ASCEND_PROJECTION_NORM_EPILOGUE", "off").strip().lower()
     if raw in ("", "off", "0", "false", "no"):
         _ENABLED = frozenset()
     elif raw in ("1", "all", "on"):
@@ -39,7 +39,7 @@ def _parse() -> None:
         unknown = wanted - set(_FAMILIES)
         if unknown:
             raise RuntimeError(
-                f"XINFER_SOUPFORM unknown families: {sorted(unknown)}"
+                f"XINFER_ASCEND_PROJECTION_NORM_EPILOGUE unknown families: {sorted(unknown)}"
             )
         _ENABLED = frozenset(wanted)
 
@@ -181,7 +181,7 @@ def mulcast(silu_out, acc, half=6144):
 
 
 def vision_qkv_rope_packed(acc, bias, cos2, sin2, heads=16, dim=64):
-    """The vrope v3 math stored as packed [3, rows, heads, dim] BF16."""
+    """Apply vision RoPE and store packed [3, rows, heads, dim] BF16."""
     if not enabled("vropepack"):
         return None
     if not (heads == 16 and dim == 64 and _flat(acc) and acc.dtype == torch.float32
@@ -196,6 +196,6 @@ def vision_qkv_rope_packed(acc, bias, cos2, sin2, heads=16, dim=64):
         return None
     rows = acc.shape[0]
     out = acc.new_empty((3, rows, heads, dim), dtype=torch.bfloat16)
-    if not _launch("vision_qkv_rope_v3p", (out, acc, bias, cos2, sin2), (rows,)):
+    if not _launch("vision_qkv_rope_packed", (out, acc, bias, cos2, sin2), (rows,)):
         return None
     return out

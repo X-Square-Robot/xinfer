@@ -15,31 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""ubfinish-r5: UB-vectorized bias finish (T.copy DMA recipe).
+"""Tiled bias addition over a contiguous FP32 accumulator, with a BF16 result.
 
-Revives the libcopy-r3 knife-2 arithmetic (out = rne(acc_f32 + bias_f32),
-bitwise with the torch tail ``y + bias.float(); y.to(bf16)`` -- proven
-bitwise in r3 across 7 shapes x 3 trials) with the memory pattern of the
-production finish family:
-
-* v1 ``bias_finish_ub``: the finish_bf16_ub4096 mold (fixed CORES grid,
-  flat 1-D one-row tiles, Pipelined stages=2, int32 bases, scalar SimtVF
-  math with the integer-RNE store). Measured 0.9-1.2 TB/s eager on card 7
-  (probe-r5.json): bitwise but the 5-8 KB row copies leave MTE efficiency
-  and scalar compute on the table.
-* v2 ``bias_finish_rows``: the gemm_glu rowpass mold -- one large
-  multi-row contiguous span per core-step (rows x cols f32 is contiguous
-  row-major), the same scalar integer-RNE math, stages=2.
-* v3 ``bias_finish_simd``: the same rowpass mold with the production SIMD
-  idioms (vld / UNPK_B16 bias widen / vadd / vcvt ROUND_R + PK_B32 store,
-  the gemm_glu_fp32_finish.split_finish recipe). vcvt ROUND_R is documented
-  ties-to-even; bitwise vs the torch tail is decided by the witness probe
-  (random sweeps + crafted ties/subnormals/overflow), not assumed.
-
-Rows stays a runtime int64; the python wrapper routes only complete
-row-tile multiples and int32-eligible counts, everything else falls back
-to the torch tail.
-"""
+DMA stages the accumulator and BF16 bias in the Ascend unified buffer.
+The scalar and SIMD variants both widen the bias, add in FP32 and round
+to nearest even on the BF16 store. Multi-row tiles require the row count
+to be divisible by the selected tile height with offsets in int32 range."""
 
 import tilelang.ascend.language as T
 
@@ -49,8 +30,7 @@ CORES = 64
 THREADS = 256
 LANES = 64  # FP32 lanes per CCE vector register
 
-# Gate-stack shape probe (2026-11-13 19:46): bias-only gemm_epilogue
-# population is [2112,1280] (dominant) + [528,2048]. Column widths {1280, 2048}.
+# Supported column widths for vision and prefill bias epilogues.
 SHAPES = [1280, 2048]
 ROWS_PER_TILE = {1280: 8, 2048: 4}
 
@@ -121,12 +101,7 @@ def bias_finish_rows(cols, rows_per_tile, cores=CORES, threads=THREADS):
 
 
 def bias_finish_simd(cols, rows_per_tile, cores=CORES):
-    """Rowpass mold + production SIMD math (split_finish recipe).
-
-    Per 64-lane chunk: bf16 bias widened via UNPK_B16 + vcvt part=0 (exact),
-    one fp32 vadd (the torch tail add), one vcvt ROUND_R to bfloat16 with a
-    PK_B32 packed store. Bitwise adjudicated by the witness probe.
-    """
+    """Stage multiple rows per core tile, widen BF16 bias, add in FP32 and store with ROUND_R."""
 
     @T.prim_func
     def main(oh: T.handle, ah: T.handle, bh: T.handle, rows: T.int64):
@@ -172,12 +147,12 @@ def bias_finish_simd(cols, rows_per_tile, cores=CORES):
 
 def build_programs():
     for cols in SHAPES:
-        yield f"ubfinish_r5_c{cols}", bias_finish_ub(cols)
+        yield f"bias_add_cast_c{cols}", bias_finish_ub(cols)
         yield (
-            f"ubfinish_r5_r{ROWS_PER_TILE[cols]}_c{cols}",
+            f"bias_add_cast_rows{ROWS_PER_TILE[cols]}_c{cols}",
             bias_finish_rows(cols, ROWS_PER_TILE[cols]),
         )
         yield (
-            f"ubfinish_r5_s{ROWS_PER_TILE[cols]}_c{cols}",
+            f"bias_add_cast_simd_rows{ROWS_PER_TILE[cols]}_c{cols}",
             bias_finish_simd(cols, ROWS_PER_TILE[cols]),
         )

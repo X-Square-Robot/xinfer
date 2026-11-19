@@ -24,17 +24,21 @@ def _exported(recipe, name):
     raise AssertionError(f"{name} is missing from {recipe}")
 
 
+def _selected_families(module_name):
+    spec = importlib.util.spec_from_file_location(
+        f"_recipe_{module_name}", ROOT / "xinfer/ops/backends/ascend" / f"{module_name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return {family for family in module._FAMILIES if module.enabled(family)}
+
+
 @pytest.mark.parametrize(("module_name", "variable"), [
-    ("copykill_r2", "XINFER_COPYKILL_R2"), ("rmsfuse_r4", "XINFER_RMSFUSE_R4"),
+    ("layout_reuse", "XINFER_ASCEND_LAYOUT_REUSE"), ("fused_rmsnorm", "XINFER_ASCEND_FUSED_RMSNORM"),
 ])
 def test_explicit_recipe_families_match_the_measured_all_selector(monkeypatch, module_name, variable):
     def selected(value):
         monkeypatch.setenv(variable, value)
-        spec = importlib.util.spec_from_file_location(
-            f"_recipe_{module_name}", ROOT / "xinfer/ops/backends/ascend" / f"{module_name}.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return {family for family in module._FAMILIES if module.enabled(family)}
+        return _selected_families(module_name)
 
     explicit = _exported(ROOT / "examples/ascend/wall_oss.env", variable)
     assert explicit != "all"

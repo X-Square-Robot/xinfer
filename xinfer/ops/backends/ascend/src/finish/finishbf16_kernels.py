@@ -15,41 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""finish-bf16: single-pass BF16 finishes reading the aclnnMatmul BF16 store.
-
-FINISH-BF16 (GEMM-AUDIT R6 handoff). Every kernel is a verbatim port of the
-in-service FP32-accumulator finish of its family (soupkill r1 / soup-form /
-lib-glu-gelu recipe: T.copy DMA staging + CCE SIMD vector math + fixed
-64-core grid) with exactly one change: the accumulator operand is loaded as
-BF16 and widened with vcvt part=0 on load. The GEMM that feeds the finish
-switches from the aclnnMm FP32 accumulator to one aclnnMatmul BF16 store
-(FP32 accumulate, single RNE -- GEMM-AUDIT iso v2 proved the store bitwise
-vs the Mm+Cast pair on every family shape), so the finish's input is the
-same value the old chain would have rounded, rounded once earlier:
-
-- glu_split_bf16_c6144  : out = rne(silu(f32(g)) * f32(u)); g/u halves of a
-                          BF16 [rows, 12288] store. Port of soupkill r1
-                          glu_split (div form, no ftz), the same math the
-                          shipped split_6144 finish runs over the FP32
-                          accumulator.
-- zbasplit_bf16_c8224   : o1 = rne(f32(acc16[:, :6144]) * keep),
-                          o2 = rne(f32(acc16[:, 6144:]) * keep). keep is the
-                          exact 0/1 row_scale, so the output is bitwise the
-                          FP32 chain's (mul by 1 is exact, mul by 0 is 0).
-                          Port of soup-form zbasplit_c8224 (tail 2080 padded
-                          to 2112 in UB, exact-length store).
-- vision_qkv_rope_bf16_v3p: the soupkill v1/v3 rope math (separate
-                          vmul/vsub/vadd, no FMA contraction) over the BF16
-                          store, packed [3, rows, heads, dim] output like
-                          soup-form vropepack so the vision pack transpose
-                          disappears.
-- finish_br_bf16_c1024  : out = rne((f32(acc16) + f32(bias)) + f32(res)) --
-                          the two fp32 adds in the released order, one RNE.
-                          Port of soupkill r1 finish_bias_res(1024, 4).
-- gelu_bf16_c4096       : out = rne(gelu_tanh(f32(acc16) + f32(bias))) --
-                          div form, no clamp, no FMA. Port of the shipped
-                          gemm_gelu_fp32_finish_4096 finish.
-"""
+"""BF16 projection epilogues for SwiGLU, row-scaled QKV/ZBA splitting, vision
+QKV/RoPE, bias plus residual, and GELU. Inputs have already been rounded to
+BF16 by the preceding matmul. Each kernel widens its inputs to FP32 for
+the epilogue and rounds the result to BF16 on store."""
 
 import tilelang.ascend.language as T
 
@@ -163,14 +132,7 @@ def zbasplit_bf16(conv=6144, tail=2080, rows_per_tile=1, cores=CORES):
 
 
 def vision_qkv_rope_bf16_packed(heads=16, dim=64, half=32, rows_per_tile=2, cores=CORES):
-    """The landed soup-form v3p rope math over the BF16 store; packed [3, rows, heads, dim].
-
-    Verbatim port of the in-service vision_qkv_rope_v3p (the vci lane-index
-    masked single write per head -- first half x1*c - x2*s on lanes<32,
-    second half x2*c + x1*s on lanes>=32 -- with the 32-element GUARD
-    absorbing the +-half boundary reads). The only change: the accumulator
-    operand is BF16, widened with vcvt part=0 on load.
-    """
+    """Apply Q/K rotate-half RoPE after BF16 projection and pack Q/K/V as [3,rows,heads,dim]."""
     n = 3 * heads * dim
     sec = heads * dim
     span = rows_per_tile * n
@@ -286,7 +248,7 @@ def vision_qkv_rope_bf16_packed(heads=16, dim=64, half=32, rows_per_tile=2, core
 
 
 def finish_br_bf16(cols=1024, rows_per_tile=4, cores=CORES):
-    """out[m,cols] = rne((f32(acc16) + f32(bias)) + f32(res)); adds in the released order."""
+    """Widen the BF16 operands, add bias before residual and round the sum once to BF16."""
     span = rows_per_tile * cols
 
     @T.prim_func
@@ -399,10 +361,10 @@ def gelu_bf16(cols=4096, rows_per_tile=2, cores=CORES):
 
 def build_programs():
     yield "glu_split_bf16_c6144", glu_split_bf16()
-    yield "glu_split_bf16_r2", glu_split_bf16(rows_per_tile=2)
+    yield "glu_split_bf16_rows2", glu_split_bf16(rows_per_tile=2)
     yield "zbasplit_bf16_c8224", zbasplit_bf16()
-    yield "zbasplit_bf16_r2", zbasplit_bf16(rows_per_tile=2)
-    yield "vision_qkv_rope_bf16_v3p", vision_qkv_rope_bf16_packed()
+    yield "zbasplit_bf16_rows2", zbasplit_bf16(rows_per_tile=2)
+    yield "vision_qkv_rope_bf16_packed", vision_qkv_rope_bf16_packed()
     yield "finish_br_bf16_c1024", finish_br_bf16()
     yield "gelu_bf16_c4096", gelu_bf16()
-    yield "gelu_bf16_r4", gelu_bf16(rows_per_tile=4)
+    yield "gelu_bf16_rows4", gelu_bf16(rows_per_tile=4)

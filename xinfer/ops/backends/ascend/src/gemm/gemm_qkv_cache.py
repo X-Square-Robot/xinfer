@@ -72,12 +72,7 @@ def rotate_fp32_append():
 
 
 def bias_rotate_fp32_append_m16():
-    """Q16/KV2 D128: add BF16 bias in FP32, rotate Q/K, append head-major K/V.
-
-    Q is written directly in BNSD [H, M, D] order (r3): the values are the
-    same elements the [M, H*D] packing carried, at head-major addresses, so
-    the ACLNN FIA query needs no per-call transpose copy (the strided-query
-    descriptor route is rejected by ACLNN, error 561103, probe r2)."""
+    """Add BF16 bias in FP32, rotate Q/K, append head-major K/V and store Q as [16, M, 128]."""
 
     @T.prim_func
     def main(qh: T.handle, kh: T.handle, vh: T.handle, ah: T.handle, bh: T.handle,
@@ -178,18 +173,7 @@ def build_programs():
 
 
 def bias_rotate_fp32_append_prefill():
-    """Q16/KV2 D128 prefill: add BF16 bias in FP32, rotate Q/K, append K/V, write Q BNSD.
-
-    The r6 fused finish of the prefill qkv_rope_kvcache call (m 768, n 2560):
-    the m16 kernel's group structure (18 rotary pair groups + 4 V groups of 64
-    per row) over ub-staged 4-row tiles, one DMA burst per tile per tensor.
-    Q lands BNSD [16, rows, 128] (the r7 layout: the same elements the packed
-    [rows, 2048] write carried, at the head-major addresses the prefill FIA
-    query consumes, so the per-call transpose copy disappears -- the m16
-    kernel's r3 pattern; the head-major ub staging keeps one bulk store per
-    tile); K/V append head-major [2, capacity, 128] exactly as the torch
-    chain.
-    """
+    """Rotate Q/K over four-row tiles, write Q as [16,rows,128] and append K/V as [2,capacity,128]."""
 
     R = 4
     cores = 64

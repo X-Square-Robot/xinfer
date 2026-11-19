@@ -1,7 +1,4 @@
-// The unified ACLNN Mm bridge: the raw C-ABI pair over aclnnMm (BF16 or FP32
-// rows against an NK weight into an FP32 out), ported from the v22 bridge with
-// the TensorView halves and the in-library BNSD routes dropped (those AOT
-// kernels are served by the glue over their own libraries now).
+// C ABI for aclnnMm with BF16 or FP32 activations, NK weights and FP32 output.
 #include "ffi.h"
 
 #include <aclnn/acl_meta.h>

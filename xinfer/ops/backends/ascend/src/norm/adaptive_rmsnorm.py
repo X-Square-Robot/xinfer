@@ -15,37 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""ADANORM-R2: precision-band-unlocked pure-VEC reduction variant of the
-Wall-X 2B adarsnorm action kernels (R6D adafast double 4.9us / gated 3.3us).
+"""Vector adaptive RMS normalization for the Wall-X 2B action stream.
 
-Re-verification context (REPORT.md section 2): the R6D "floor" was priced
-under the OLD gate (kernel-level 0 flips + engine-level bitwise + action band
-0.0062 with 0.0011 margin), which froze the statistics reduction to the
-production SimtVF serial per-lane chain verbatim and forced the
-VEC<->SIMT<->VEC domain fences. Under the 2026-11-15/16 ruling (numerical
-equivalence band, action gate cap 0.03, no worse than vendor vs fp64 oracle)
-that constraint dissolves:
-
-- The elementwise phases (gated absorption add, norm apply, gate packing) are
-  kept VERBATIM from R6D v2, including every bf16 intermediate rounding point
-  (store-then-reload idiom) -- these are algorithmic semantics, not a
-  bit-alignment concession.
-- Each SIMT statistics phase is replaced by a CCE-vector reduction using the
-  proven rms_consistent `ubv` idiom: squares of the already-rounded bf16 row
-  staged as fp32 lane vectors inside the elementwise pass, a balanced
-  16-segment vadd tree, a 6-step vcpadd chain, vdupv broadcast, and a
-  correctly-rounded inv = 1 / vsqrt(mean + eps). Pairwise tree summation has
-  a strictly smaller worst-case error bound than the serial chain it replaces
-  and vsqrt+vdiv is correctly rounded, so the fp64-oracle distance of the
-  statistics cannot get worse than the vendor approximation class.
-- double keeps its two chained statistics but both now run inside the single
-  SimdVF region: the kernel drops from 6 cross-unit fences
-  (MTE->VEC->SIMT->VEC->SIMT->VEC->MTE) to 2 (MTE->VEC->MTE); gated from 4
-  to 2.
-
-Kernel names match the production AOT object symbols exactly, so the relink
-swaps the R6D adafast objects 1:1 inside the final combined library.
-"""
+Gated residual addition and BF16 rounding precede the norm. Compute FP32
+statistics, apply the step's scale and shift, and return the gate. Pinned
+RTC rows select the pinned modulation; double-norm variants retain the
+intermediate rounding boundary between the two norms."""
 
 import tilelang.ascend.language as T
 from gemm.silu_and_mul import _store_rne
@@ -461,11 +436,6 @@ def action_adarms_bf16_fp32_pinned(double):
 def build_programs():
     yield "adarmsnorm_action_gated_bf16_f32", action_fast(False)
     yield "adarmsnorm_action_double_bf16_f32", action_fast(True)
-    # The pinned (RTC) twin pair: the 2B RTC denoise pins its first
-    # pinned_rows[0] tokens to the pinned modulations; the generic
-    # per-row kernels degenerate on the 16-token action shape, so the
-    # fused layout keeps the selection in-kernel (the v22 combined
-    # library carried these under the same names; vendored from the
-    # lib-port-2b tree's src/normalization/npu/adarmsnorm.py).
+    # RTC selects the pinned modulation in-kernel for its first pinned_rows[0] tokens.
     yield "adarmsnorm_action_gated_bf16_f32_pinned", action_adarms_bf16_fp32_pinned(False)
     yield "adarmsnorm_action_double_bf16_f32_pinned", action_adarms_bf16_fp32_pinned(True)

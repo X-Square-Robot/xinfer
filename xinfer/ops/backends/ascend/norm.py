@@ -49,15 +49,10 @@ def _supported(x, residual, weight, eps):
           version=VERSION)
 @partial(reference_add_rms_norm, check=_supported)
 def add_rms_norm(x, residual, weight, eps):
-    # SIMD-EPILOGUE R1 fused-after route (default off): the released ubv plans with buf2/f32direct
-    # scheduling, launched back-to-back with the GEMM in the same stream (probe-se1: sum+norm bitwise,
-    # the family-O chain 36.78 -> 34.82 us). XINFER_SIMDEPI selects the families (v1280: the vision
-    # and merger [rows, 1280] rows, p2048: the prompt [1, P, 2048] rows) and XINFER_SIMDEPI_LIB the
-    # library; the module is absent without that delivery and these guards fall through to the entries
-    # below, so the composition is unchanged.
+    # These residual add and RMSNorm kernels use double-buffered stores and FP32 weights.
     try:
-        from xinfer.ops.backends.ascend import simdepi_r1
-        if (simdepi_r1.enabled("v1280")
+        from xinfer.ops.backends.ascend import buffered_add_rmsnorm
+        if (buffered_add_rmsnorm.enabled("v1280")
                 and x.dim() == 2 and x.shape[-1] == 1280
                 and x.dtype == residual.dtype == torch.bfloat16
                 and residual.shape == x.shape and residual.device == x.device
@@ -65,8 +60,8 @@ def add_rms_norm(x, residual, weight, eps):
                 and weight.dtype in (torch.float32, torch.bfloat16)
                 and weight.device == x.device
                 and tuple(weight.shape) == (1280,) and 0 < eps <= torch.finfo(torch.float32).max):
-            return simdepi_r1.add_rms_v1280(x, residual, weight, eps)
-        if (simdepi_r1.enabled("p2048")
+            return buffered_add_rmsnorm.add_rms_v1280(x, residual, weight, eps)
+        if (buffered_add_rmsnorm.enabled("p2048")
                 and x.dim() == 3 and x.shape[0] == 1 and x.shape[-1] == 2048
                 and x.shape[1] % 4 == 0
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -75,23 +70,21 @@ def add_rms_norm(x, residual, weight, eps):
                 and weight.dtype in (torch.float32, torch.bfloat16)
                 and weight.device == x.device
                 and tuple(weight.shape) == (2048,) and 0 < eps <= torch.finfo(torch.float32).max):
-            return simdepi_r1.add_rms_p2048(x, residual, weight, eps)
+            return buffered_add_rmsnorm.add_rms_p2048(x, residual, weight, eps)
     except (ImportError, OSError):
         pass
-    # RMSFUSE-r4 RF1 (the [1, 16, 1024] action norm and the wide [1, T, 2048] prompt norm) rides the
-    # delivered package's AOT kernels; the module is absent without that delivery and these guards
-    # fall through to the entries below, so the composition is unchanged.
+    # Use the shape-specific fused add-RMSNorm kernels for action and prompt rows.
     try:
-        from xinfer.ops.backends.ascend import rmsfuse_r4
-        if (rmsfuse_r4.enabled("m16")
+        from xinfer.ops.backends.ascend import fused_rmsnorm
+        if (fused_rmsnorm.enabled("m16")
                 and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
                 and x.dtype == residual.dtype == torch.bfloat16
                 and residual.shape == x.shape and residual.device == x.device
                 and x.is_contiguous() and residual.is_contiguous()
                 and weight.dtype == torch.float32 and weight.device == x.device
                 and tuple(weight.shape) == (1024,) and 0 < eps <= torch.finfo(torch.float32).max):
-            return rmsfuse_r4.add_rms_m16(x, residual, weight, eps)
-        if (rmsfuse_r4.enabled("h2048w")
+            return fused_rmsnorm.add_rms_m16(x, residual, weight, eps)
+        if (fused_rmsnorm.enabled("h2048w")
                 and x.dim() == 3 and x.shape[0] == 1 and x.shape[-1] == 2048
                 and x.shape[1] % 4 == 0
                 and x.dtype == residual.dtype == torch.bfloat16
@@ -99,7 +92,7 @@ def add_rms_norm(x, residual, weight, eps):
                 and x.is_contiguous() and residual.is_contiguous()
                 and weight.dtype == torch.float32 and weight.device == x.device
                 and tuple(weight.shape) == (2048,) and 0 < eps <= torch.finfo(torch.float32).max):
-            return rmsfuse_r4.add_rms_h2048w(x, residual, weight, eps)
+            return fused_rmsnorm.add_rms_h2048w(x, residual, weight, eps)
     except (ImportError, OSError):
         pass
     if canonical_norm is not None:
@@ -133,21 +126,17 @@ def _plain_supported(x, weight, eps):
           version=VERSION)
 @partial(reference_rms_norm, check=_plain_supported)
 def rms_norm(x, weight, eps):
-    # Wall-OSS's vision, prompt and action input norms. R5: the plain-norm mounts of the 38.82 stack's
-    # ``rms_norm_cast`` -- its RMSFUSE-r4 RF1 m16 knife for the [1, 16, 1024] action input norms, then the
-    # v22 rmsnorm FFI's rms_consistent plans (the core library's launchers) for the [rows, 1280] ViT patch
-    # norm and the [rows, 2048] prefill input norm. An envelope miss (or a build without the kernels) keeps
-    # the reference composition below, exactly as a v22 build without those kernels would.
+    # The 16-row action norm and the vision and prefill norms have distinct native shapes.
     try:
-        from xinfer.ops.backends.ascend import rmsfuse_r4
+        from xinfer.ops.backends.ascend import fused_rmsnorm
 
-        if (rmsfuse_r4.enabled("m16")
+        if (fused_rmsnorm.enabled("m16")
                 and tuple(getattr(x, "shape", ())) == (1, 16, 1024)
                 and x.dtype == torch.bfloat16 and x.is_contiguous()
                 and weight.dtype == torch.float32 and weight.device == x.device
                 and tuple(weight.shape) == (1024,)
                 and 0 < eps <= torch.finfo(torch.float32).max):
-            return rmsfuse_r4.rms_m16(x, weight, eps)
+            return fused_rmsnorm.rms_m16(x, weight, eps)
     except (ImportError, OSError):
         pass
     try:
@@ -183,10 +172,10 @@ def _layer_norm_supported(x, weight, bias, eps):
           version=VERSION)
 @partial(reference_layer_norm_cast, check=_layer_norm_supported)
 def layer_norm_cast(x, weight, bias, eps):
-    from xinfer.ops.backends.ascend import soupunlock
+    from xinfer.ops.backends.ascend import fused_norm_reduction
 
-    if soupunlock.enabled("visionln"):
-        result = soupunlock.layernorm_c1024(x, weight, bias, eps)
+    if fused_norm_reduction.enabled("visionln"):
+        result = fused_norm_reduction.layernorm_c1024(x, weight, bias, eps)
         if result is not None:
             return result
     if not callable(_layernorm_inplace):
@@ -224,32 +213,28 @@ def add_zero_centered_rms_norm(x, residual, weight, eps):
     if _add_rms is None:
         return reference_add_zero_centered_rms_norm(x, residual, weight, eps)
     # (residual, input) order, as the entry documents, and the tuple is (sum, normalized).
-    # SOUP-FORM normprep: one pass computes s = rne(res+x) and sq = f32(s)^2,
-    # the aclnn statistics chain runs over the identical sq values, and the
-    # apply is the elementwise (s*rstd)*(1+w) with a single RNE. Opt-in through
-    # ``XINFER_SOUPFORM=normprep`` (the soupform mount, default off);
-    # Flag, symbol and envelope misses keep the entry chain below; launch failures propagate.
+    # Round the residual sum before squaring, then apply the zero-centered scale.
     try:
-        from xinfer.ops.backends.ascend import soupform
+        from xinfer.ops.backends.ascend import projection_norm_epilogue
     except (ImportError, OSError):
         pass
     else:
-        if soupform.enabled("normprep"):
-            fused = soupform.normprep_norm(x, residual, weight, eps)
+        if projection_norm_epilogue.enabled("normprep"):
+            fused = projection_norm_epilogue.normprep_norm(x, residual, weight, eps)
             if fused is not None:
                 return fused
     return _add_rms(residual, x, weight, float(eps), True, True)
 
 
 def _bind_add_zero_centered_rms_norm(*, layer_index):
-    from xinfer.ops.backends.ascend import soupunlock
+    from xinfer.ops.backends.ascend import fused_norm_reduction
 
-    if not soupunlock.enabled("rmsfull") or layer_index < soupunlock.from_layer():
+    if not fused_norm_reduction.enabled("rmsfull") or layer_index < fused_norm_reduction.from_layer():
         return add_zero_centered_rms_norm
 
     @wraps(add_zero_centered_rms_norm)
     def fused(x, residual, weight, eps):
-        result = soupunlock.rmsnorm_full(x, residual, weight, eps)
+        result = fused_norm_reduction.rmsnorm_full(x, residual, weight, eps)
         return add_zero_centered_rms_norm(x, residual, weight, eps) if result is None else result
 
     return fused

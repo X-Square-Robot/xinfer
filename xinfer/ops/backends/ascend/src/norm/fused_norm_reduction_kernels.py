@@ -15,36 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""soupunlock: precision-band unlocked fused reduction kernels (SOUP-UNLOCK).
+"""Fused row reductions for the 2048-wide residual RMSNorm and 1024-wide vision LayerNorm.
 
-The 2026-11-15/16 user ruling lifts the bitwise lock on reduction-shaped
-pools: aclnn Mean/Rsqrt bit patterns no longer have to be reproduced. The new
-gate is a numerical-equivalence band -- each kernel must be no worse than the
-vendor implementation it replaces when both are measured against an fp64
-oracle (deterministic fp32 tree reductions qualify; witness adjudicated).
-
-v2 (the delivered form): the statistics run on the VECTOR engine -- a 64-lane
-fp32 accumulator across the row chunks, spilled once to UB, then one tiny
-32-thread warp tree for the horizontal sum. (v1's per-lane serial SIMT pass
-was ~10x off the traffic floor.) A v5 single-block variant with the
-ADANORM-R2 vcpadd chain + mem_bar("VST_VLD") form was tried and measured:
-identical engine busy (6.3us/site) and marginally worse LN band rows -- kept
-in logs/witness-v5.log as the audit record; v2 stands.
-
-- rmsnorm_full_c2048: the whole add_zero_centered_rms_norm site in ONE pass:
-  s = rne(f32(x)+f32(res)); stats = deterministic fp32 tree over f32(s)^2;
-  rstd = rsqrt(mean+eps) refined by two Newton steps; normed =
-  rne((f32(s)*rstd)*(1+w)). Replaces normprep + aclnnMean + aclnnAdds +
-  aclnnRsqrt + apply_rstd (5 launches, ~19.5us busy/site at rows~448) with
-  one launch reading x/res once and writing s/normed once.
-- layernorm_c1024: fused vision LayerNorm (two-pass mean/var, rsqrt+Newton,
-  affine, one RNE to bf16). Replaces aclnnLayerNormV4 (negative result: 9.0us
-  vs the vendor's 5.8us traffic floor -- NOT in the default arm).
-
-Arithmetic kept in FP32 with the same rounding points as the released chains;
-only the reduction ORDER differs (deterministic vector-accumulate + warp tree
-vs the vendor's internal order).
-"""
+RMSNorm rounds the residual sum to BF16, accumulates its squares in FP32,
+refines the reciprocal square root and applies the zero-centered weight.
+LayerNorm computes the mean, variance and affine output in FP32 before BF16
+rounding. The vector reductions have a fixed tree; its ordering can differ
+from the vendor reductions."""
 
 import tilelang.ascend.language as T
 
@@ -54,12 +31,7 @@ WARP = 32
 
 
 def _rsqrt_f32(t):
-    """rsqrt(t) refined to ~fp32 precision: hardware seed + two Newton steps.
-
-    Each step squares the relative error, so two steps bring even a coarse
-    vector seed to the correctly-rounded rsqrt of the fp32 input (probe:
-    composite rstd relerr 9.1e-8 vs aclnn 1.18e-7 against the fp64 oracle).
-    """
+    """Refine the hardware reciprocal-square-root estimate with two FP32 Newton steps."""
     half_t = T.float32(0.5) * t
     y = T.rsqrt(t)
     y = y * (T.float32(1.5) - half_t * y * y)
@@ -151,13 +123,7 @@ def rmsnorm_full_c2048(cols=2048, cores=CORES):
 
 
 def layernorm_c1024(cols=1024, cores=CORES):
-    """out = rne(((f32(x)-mean)*rstd)*w + b); two-pass mean/var, fp32 stats.
-
-    v2 (the delivered form): vector-accumulated reductions + one tiny warp
-    tree per statistic. At the production shapes this measures 9.0us/site
-    vs aclnnLayerNormV4's 5.8us (vendor at the traffic floor) -- kept in the
-    library for the record, NOT in the default arm.
-    """
+    """Two-pass FP32 mean/variance, reciprocal square root and affine transform with one final BF16 rounding."""
 
     @T.prim_func
     def main(oh: T.handle, xh: T.handle, wh: T.handle, bh: T.handle,

@@ -1,14 +1,14 @@
 """Optional add-RMSNorm plans with buffered stores and direct FP32 weights.
 
-``XINFER_SIMDEPI`` is off by default. ``v1280`` serves [rows,1280] BF16
+``XINFER_ASCEND_BUFFERED_ADD_RMSNORM`` is off by default. ``v1280`` serves [rows,1280] BF16
 vision/merger inputs; ``p2048`` serves [1,P,2048] BF16 prefill inputs.
 The arithmetic is unchanged from the corresponding normalization plans.
 The in-tree launchers use the current stream; FP32 weight representations
 are cached before graph capture.
 """
+import os
 import array
 import ctypes
-import os
 from threading import Lock
 
 import torch
@@ -21,12 +21,15 @@ _ENTRIES = {}
 _LOCK = Lock()
 
 _FAMILIES = ("v1280", "p2048")
-_KERNELS = {"v1280": "se1_ubv1280_buf2f", "p2048": "se1_ubv2048_buf2f"}
+_KERNELS = {
+    "v1280": "add_rmsnorm_h1280_double_buffer_fp32_weight",
+    "p2048": "add_rmsnorm_h2048_double_buffer_fp32_weight",
+}
 
 
 def _parse():
     global _ENABLED
-    raw = os.environ.get("XINFER_SIMDEPI", "off").strip().lower()
+    raw = os.environ.get("XINFER_ASCEND_BUFFERED_ADD_RMSNORM", "off").strip().lower()
     if raw in ("off", "", "0"):
         _ENABLED = frozenset()
     elif raw in ("1", "all", "on"):
@@ -35,7 +38,7 @@ def _parse():
         wanted = {t.strip() for t in raw.split(",")}
         unknown = wanted - set(_FAMILIES)
         if unknown:
-            raise RuntimeError(f"XINFER_SIMDEPI unknown families: {sorted(unknown)}")
+            raise RuntimeError(f"XINFER_ASCEND_BUFFERED_ADD_RMSNORM unknown families: {sorted(unknown)}")
         _ENABLED = frozenset(wanted)
 
 
@@ -84,7 +87,7 @@ def _launch(name, tensors, scalars):
     status = call(*args, ctypes.c_void_p(stream))
     if status:
         raise RuntimeError(
-            "simdepi-r1 " + name + ": " + (err() or b"?").decode("utf-8", "replace")
+            "buffered-add-rmsnorm " + name + ": " + (err() or b"?").decode("utf-8", "replace")
         )
 
 
@@ -100,14 +103,14 @@ def _add_rms(name, x, residual, weight, eps):
 def add_rms_v1280(x, residual, weight, eps):
     """[rows,1280] BF16 vision/merger add rows -> (sum, normed), both BF16.
 
-    Bitwise to the released ubv_h1280 plan on the same inputs (probe-se1)."""
+    Bitwise to the released ubv_h1280 plan on the same inputs."""
     return _add_rms(_KERNELS["v1280"], x, residual, weight, eps)
 
 
 def add_rms_p2048(x, residual, weight, eps):
     """[1,P,2048] BF16 prefill add rows -> (sum, normed), both BF16 [1,P,2048].
 
-    Bitwise to the released ubv_h2048 plan on the same inputs (probe-se1)."""
+    Bitwise to the released ubv_h2048 plan on the same inputs."""
     x2 = x[0]
     r2 = residual[0]
     sum_out, norm_out = _add_rms(_KERNELS["p2048"], x2, r2, weight, eps)

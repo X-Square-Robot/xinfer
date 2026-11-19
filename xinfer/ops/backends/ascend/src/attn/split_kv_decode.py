@@ -15,41 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""decodeattn-r4: specialized small-M cache-attention for the wall-oss decode
-family (B1 H16 KV2 M16 D128 L784; fia-r3: 180 calls x 12.6us FIA per request,
-fixed overhead dominated).
+"""Split-KV cache attention for Wall-OSS (B1, H16, KV2, M16, D128, KV length 784).
 
-Two TileLang kernels over the splitk-v3 idioms
-(walloss/src/src/attention/npu/attention_splitk_decode.py) specialized to
-static shapes. Structural fixes vs the shipped generic splitkv (ms-class on
-this family): the lts/ute flash mask is folded into the SIMD softmax pass as
-per-lane constants (one 128-lane scalar setup per block-chunk instead of a
-per-row-per-lane scalar pass), partials move as whole-tile T.copy block
-stores instead of scalar walks, and the reduce is a vectorized vaxpy merge.
+The scan consumes dense head-major Q/K/V. It splits 784 keys into seven
+128-key tiles, sliding the last back to the end of the cache and masking any
+overlap. A key is visible only if it belongs to the prefix or new-key window
+and its LTS/UTE bounds include the query row. Each partial carries the FP32
+output accumulator, row maximum and softmax sum for the reducer.
 
-Layout contract (the production bridge shapes, zero extra copies):
-  Q  [256, 128] bf16, row = head*16 + query (H-major [H, M, D] memory; the
-     production caller hands a strided [1, M, H, D] view over it, whose
-     transpose(1,2) is exactly this contiguous buffer)
-  K  [1568, 128] bf16, row = kvhead*784 + position (cache [KV, L, D] major)
-  V  same as K
-  FM [784, 2] int32: lts, ute per position (flash_mask [1,1,L,2])
-  PL [1] int32: prefix_len (device data)
-  P  [28, 65, 128] fp32 partials: pair(kv, tile) x chunk; rows 0..63 = o
-     [64, 128] (sid*32 rows per sub-core), row 64 cols 0..63 = m, 64..127 = l
-  OUT [256, 128] bf16, row = head*16 + query (BNSD [H, M, D], the o_proj A)
-
-Mask semantics = the bridge make_drop_mask:
-  visible(pos, m) = ((pos < prefix) or (pos >= new_pos and pos < new_pos+16))
-                    and (m < lts[pos]) and (m >= ute[pos])
-The scan grid is (kvhead, tile, chunk): 28 blocks = 2 kv x 2 Q-tiles x 7
-128-key chunks (the last chunk slides to [L-128, L); a coverage bound keeps
-chunk windows disjoint, splitk-v3 rule). Each block loads its K/V tile once
-and its 64-row Q tile once: a wide A-tile of 4 heads x 16 queries, so K/V
-bytes move exactly once per (kv, tile) pair - no mgroups re-read
-amplification (ascendc-decode r5 lesson). Variant A (14 blocks, tile looped
-inside) is kept for the bandwidth comparison.
-"""
+The per-query-tile schedule launches one block per (KV head, Q tile, KV chunk);
+the other schedule loops over Q tiles within a block. The two reducers write
+the same attention values in either head-major or token-major order."""
 
 import functools
 
@@ -110,7 +86,7 @@ def scan(tile_per_block: bool):
             tile_fixed = rest // CHUNKS
             chunk = rest - tile_fixed * CHUNKS
             prefix = T.cast(PL[0], "int64")
-            # Chunk window (splitk-v3 slide rule for KEYS % KEY_TILE != 0):
+            # Assign disjoint key windows even when KEYS is not a multiple of KEY_TILE:
             # chunks 0..5 own [c*128, min((c+1)*128, KEYS-128)), the last
             # chunk slides to [KEYS-128, KEYS).
             base_row = T.alloc_var("int64", init=chunk * KEY_TILE)
@@ -282,14 +258,7 @@ def reduce():
 
 
 def reduce_row():
-    """Token-major twin of reduce(): same 16-block math, OUT is [M, H, D].
-
-    Layout tax knife K1: the o-projection A is consumed as [M, H*D] rows, so
-    the shipped head-major store makes the consumer read 16 strided 256B
-    segments per row. Writing OUT[m, h, d] here keeps every arithmetic
-    statement of reduce() byte-identical (same weights, same vaxpy fold, same
-    RNE pack); only the destination address of the final GM store changes.
-    """
+    """Use the same softmax merge as reduce(), with token-major [M,H,D] output for projection."""
 
     @T.prim_func
     def main(ph: T.handle, oh: T.handle):
@@ -352,7 +321,7 @@ def reduce_row():
 
 
 def build_programs():
-    yield "decodeattn_r4_scan_a", scan(False)
-    yield "decodeattn_r4_scan_b", scan(True)
-    yield "decodeattn_r4_reduce", reduce()
-    yield "decodeattn_r4_reduce_row", reduce_row()
+    yield "split_kv_decode_scan_loop_tiles", scan(False)
+    yield "split_kv_decode_scan_tile_per_block", scan(True)
+    yield "split_kv_decode_reduce_head_major", reduce()
+    yield "split_kv_decode_reduce_token_major", reduce_row()

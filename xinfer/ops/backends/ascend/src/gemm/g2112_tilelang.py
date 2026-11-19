@@ -15,22 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""g2112-r3 flag-isolated TileLang Cube routes for the 2112 family + prefill QKV.
-
-Default off (every XINFER_G2112_* flag unset keeps the released production
-routes). The delivery library is untouched: kernels compile lazily at first
-warm-up through the CANN 9.3.0 bisheng toolchain (TILELANG_CACHE_DIR holds
-the campaign cache) and launch onto Torch's current NPU stream via the
-tilelang torch-exchange install; each route warms once per stream before
-graph capture (the bnsd/mx8 discipline).
-
-Numerics (op precheck, card 1, 2026-11-13): K is walked in sequential
-128-wide steps inside one L0C FP32 accumulator, so the FP32 kernels are
-BITWISE vs the production cann_mm_fp32 buffer (A/B/D: 0 diff cells) and the
-BF16 down kernel is BITWISE vs the FP32+cast chain (C: 0 diff cells). The
-GLU knife keeps the production finish's per-element op order: BF16 biases
-added at FP32, silu g/(1+exp(-g)) in FP32, one RNE round at the store.
-"""
+"""Blocked Cube projections and vector SwiGLU for the 2112-row vision workload
+and selected prefill QKV shapes. FP32 accumulation visits K in sequential
+128-wide tiles; the epilogue controls where bias, SiLU and BF16 rounding occur.
+The first eager use compiles and warms each selected route before graph capture."""
 
 import os
 from contextlib import contextmanager
@@ -40,14 +28,14 @@ import torch
 KSTEP = 128
 
 # (bm, bn, stages) per route -- the proto sweep winners (proto-g2112.json,
-# proto_samu results); (64, 384) divides both 2112 rows and 3456 cols.
+# proto_silu_mul results); (64, 384) divides both 2112 rows and 3456 cols.
 GLU_CFG = (192, 128, 2)
 VITQKV_CFG = (192, 256, 2)
 DOWN_CFG = (192, 256, 2)
 PREFQKV_CFG = (256, 256, 2)
-SAMU_CFG = (64, 384)
+SILU_MUL_TILE = (64, 384)
 
-_FLAG_NAMES = ("GLU", "VITQKV", "DOWN", "PREFQKV", "TORCH_A", "TORCH_C")
+_FLAG_NAMES = ("GLU", "VITQKV", "DOWN", "PREFQKV", "TORCH_GLU", "TORCH_DOWN")
 G2112_FLAGS = {name: os.environ.get(f"XINFER_G2112_{name}", "") not in ("", "0", "off")
                for name in _FLAG_NAMES}
 
@@ -149,12 +137,12 @@ def _glu_fused(pad_m, n2, k, bm, bn, stages):
 
 
 
-SAMU_SIMD = os.environ.get("XINFER_SAMU_SIMD", "") not in ("", "0", "off")
+SIMD_SILU_MUL = os.environ.get("XINFER_ASCEND_SIMD_SILU_MUL", "") not in ("", "0", "off")
 CORES = 64
 LANES = 64
 
 
-def _samu_simd(rows, cols, bm=2):
+def _silu_mul_simd(rows, cols, bm=2):
     """GAP-WOSS-NONGE: rowpass CCE-vector silu*mul (production op order).
 
     One contiguous bm x 2*cols GM->UB span, UNPK_B16 widen of gate and up,
@@ -325,7 +313,7 @@ def down_route(x, weight):
     return out if pad == m else out[:m]
 
 
-def _samu(rows, cols, bm, bi):
+def _silu_mul(rows, cols, bm, bi):
     import tilelang.ascend.language as T
 
     @T.prim_func
@@ -351,29 +339,24 @@ def _samu(rows, cols, bm, bi):
     return main
 
 
-def samu_route(gate_up):
-    """[M, 2I] BF16 -> [M, I] BF16: silu(g)*u in FP32, one RNE store.
-
-    Completes the A knife (aclnn addmm folds the bias for free; the lib
-    activ_and_mul measured 443.7 us on [2112, 6912] -- unusable; the plain
-    torch tail 175.7 us -- a regression). 43.0 us at (64, 384).
-    """
+def silu_mul_route(gate_up):
+    """Map [M, 2I] BF16 to [M, I] BF16 by computing SiLU(gate) * up in FP32 with one BF16 store."""
     rows, twon = gate_up.shape
     cols = twon // 2
-    bm, bi = SAMU_CFG
+    bm, bi = SILU_MUL_TILE
     if rows % bm or cols % bi:
         raise RuntimeError(f"samu route requires {bm}|rows and {bi}|cols, got {rows}x{cols}")
-    if SAMU_SIMD and (rows, cols) == (2112, 3456) and gate_up.is_contiguous():
-        key = ("samu_simd", rows, cols)
+    if SIMD_SILU_MUL and (rows, cols) == (2112, 3456) and gate_up.is_contiguous():
+        key = ("simd_silu_mul", rows, cols)
         stream = _K.gate(key, gate_up.device)
-        kernel = _K.kernel(key, lambda: _samu_simd(rows, cols))
+        kernel = _K.kernel(key, lambda: _silu_mul_simd(rows, cols))
         out = gate_up.new_empty((rows, cols), dtype=torch.bfloat16)
         kernel(gate_up.view(-1), out.view(-1))
         _K.mark(key, stream)
         return out
     key = ("samu", rows, cols, bm, bi)
     stream = _K.gate(key, gate_up.device)
-    kernel = _K.kernel(key, lambda: _samu(rows, cols, bm, bi))
+    kernel = _K.kernel(key, lambda: _silu_mul(rows, cols, bm, bi))
     out = gate_up.new_empty((rows, cols), dtype=torch.bfloat16)
     kernel(gate_up, out)
     _K.mark(key, stream)

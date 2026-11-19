@@ -80,42 +80,42 @@ def _gdnv_enabled(family: str) -> bool:
         return False
 
 
-def _mover2_enabled(family: str) -> bool:
-    """MOVE-R2 route gate (XINFER_MOVER2, default off; see glue.move_r2)."""
+def _gdn_layout_enabled(family: str) -> bool:
+    """GDN-LAYOUT route gate (XINFER_ASCEND_GDN_LAYOUT, default off; see glue.gdn_layout)."""
     try:
-        from xinfer.ops.backends.ascend import move_r2
+        from xinfer.ops.backends.ascend import gdn_layout
 
-        return move_r2.enabled(family)
+        return gdn_layout.enabled(family)
     except Exception:  # noqa: BLE001 - any miss keeps the released chain
         return False
 
 
-def _soup2_enabled(family):
-    """SOUP2 route gate (XINFER_SOUP2, default off; see glue.soup2)."""
+def _square_cast_enabled(family):
+    """SQUARE_CAST route gate (XINFER_ASCEND_SQUARE_CAST, default off; see glue.square_cast)."""
     try:
-        from xinfer.ops.backends.ascend import soup2
+        from xinfer.ops.backends.ascend import square_cast
 
-        return soup2.enabled(family)
+        return square_cast.enabled(family)
     except Exception:  # noqa: BLE001 - any miss keeps the released chain
         return False
 
 
-def _soup2_qksq(x_t, tokens, two_hk, dk):
+def _square_cast_qksq(x_t, tokens, two_hk, dk):
     try:
-        from xinfer.ops.backends.ascend import soup2
+        from xinfer.ops.backends.ascend import square_cast
     except (ImportError, OSError):
         return None
     else:
-        return soup2.qksq(x_t, tokens, two_hk, dk)
+        return square_cast.qksq(x_t, tokens, two_hk, dk)
 
 
-def _soup2_rawsq(out, tokens, hv, dv):
+def _square_cast_rawsq(out, tokens, hv, dv):
     try:
-        from xinfer.ops.backends.ascend import soup2
+        from xinfer.ops.backends.ascend import square_cast
     except (ImportError, OSError):
         return None
     else:
-        return soup2.rawsq(out, tokens, hv, dv)
+        return square_cast.rawsq(out, tokens, hv, dv)
 
 
 class CannGatedDeltaNet:
@@ -245,24 +245,24 @@ class CannGatedDeltaNet:
                 x_t = conv_mixed_tokenmajor(qkv, conv_weight)
             except (ImportError, OSError):
                 x_t = None
-        # mover2 gdrapply blade (XINFER_MOVER2=gdrapply, default off): with the
+        # gdn_layout gdrapply blade (XINFER_ASCEND_GDN_LAYOUT=gdrapply, default off): with the
         # token-major rows already in hand (dconv4 direct write or the full-width
         # copy below), ONE kernel writes the TND q/k packs (x * rstd, the chain's
         # single RNE) and the v copy -- replacing the width slice + the n Mul_Cast
         # + 2x mul-by-one + AsStrided(v). The SiLU and the aclnn stats
         # (square/sum/rsqrt on identical inputs) stay; any miss or launcher
         # failure falls back to the released segment bit for bit.
-        mover2_apply = (
+        gdn_layout_apply = (
             hk == hv
             and tokens % 8 == 0
             and tokens >= 8
-            and _mover2_enabled("gdrapply")
+            and _gdn_layout_enabled("gdrapply")
         )
-        if mover2_apply:
+        if gdn_layout_apply:
             try:
-                from xinfer.ops.backends.ascend.move_r2 import gdrapply as _gdrapply
+                from xinfer.ops.backends.ascend.gdn_layout import gdrapply as _gdrapply
             except (ImportError, OSError):
-                mover2_apply = False
+                gdn_layout_apply = False
                 x_t = None
             else:
                 if x_t is None:
@@ -281,13 +281,13 @@ class CannGatedDeltaNet:
                     # pre-SiLU rows; the kernel reads the same [T, C] window
                     F.silu(x_t, inplace=True)
                     rows = x_t[0]
-                # SOUP2 qksq pre-pass (opt-in, XINFER_SOUP2=qksq): ONE kernel
+                # SQUARE_CAST qksq pre-pass (opt-in, XINFER_ASCEND_SQUARE_CAST=qksq): ONE kernel
                 # writes f32(RNE_bf16(qk*qk)) over the strided qk window; the
                 # aclnn ReduceSum/Adds/Rsqrt below then read bit-identical
                 # bits (the mul + the sum's implicit cast disappear).
                 _sq = None
-                if x_t is not None and _soup2_enabled("qksq"):
-                    _sq = _soup2_qksq(x_t, tokens, 2 * hk, dk)
+                if x_t is not None and _square_cast_enabled("qksq"):
+                    _sq = _square_cast_qksq(x_t, tokens, 2 * hk, dk)
                 if _sq is not None:
                     rs = torch.rsqrt(_sq.sum(dim=-1, keepdim=True) + 1e-6)
                 else:
@@ -295,7 +295,7 @@ class CannGatedDeltaNet:
                     with torch.autocast("npu", dtype=qkv.dtype):
                         rs = torch.rsqrt((qk * qk).sum(dim=-1, keepdim=True) + 1e-6)
                 q, k, v = _gdrapply(rows, rs.view(tokens, 2 * hk), tokens, hk, dk)
-        if not mover2_apply:
+        if not gdn_layout_apply:
             if x_t is None:
                 mixed = F.conv1d(
                     qkv.transpose(1, 2),
@@ -393,7 +393,7 @@ class CannGatedDeltaNet:
                     zba, norm_weight, out.view(tokens, hv * dv), fused, tokens, hv, eps, stream
                 ):
                     return fused.reshape(1, tokens, hv * dv)
-            # mover2 gdrtailmix blade (XINFER_MOVER2=gdrtailmix, default off):
+            # gdn_layout gdrtailmix blade (XINFER_ASCEND_GDN_LAYOUT=gdrtailmix, default off):
             # the aclnn gate chain and the aclnn stats stay; ONE kernel then
             # does the tail's exact three RNE roundings (nbf / wn / gate),
             # replacing the 6-op elementwise chain. Any miss or launcher
@@ -404,19 +404,19 @@ class CannGatedDeltaNet:
                 and hv == 16
                 and zba.stride(-1) == 1
                 and norm_weight.is_contiguous()
-                and _mover2_enabled("gdrtailmix")
+                and _gdn_layout_enabled("gdrtailmix")
             ):
                 try:
-                    from xinfer.ops.backends.ascend.move_r2 import gdrtailmix as _gdrtailmix
+                    from xinfer.ops.backends.ascend.gdn_layout import gdrtailmix as _gdrtailmix
                 except (ImportError, OSError):
                     pass
                 else:
                     gate = z.view(tokens, hv, dv).float()
                     F.silu(gate, inplace=True)
-                    # SOUP2 rawsq pre-pass (opt-in, XINFER_SOUP2=rawsq): ONE
+                    # SQUARE_CAST rawsq pre-pass (opt-in, XINFER_ASCEND_SQUARE_CAST=rawsq): ONE
                     # kernel writes RNE_f32(raw**2); the aclnn Mean/Adds/Rsqrt
                     # read bit-identical bits (cast + square disappear).
-                    _sq2 = _soup2_rawsq(out, tokens, hv, dv) if _soup2_enabled("rawsq") else None
+                    _sq2 = _square_cast_rawsq(out, tokens, hv, dv) if _square_cast_enabled("rawsq") else None
                     if _sq2 is not None:
                         rstd = torch.rsqrt(_sq2.mean(dim=-1, keepdim=True) + eps)
                     else:

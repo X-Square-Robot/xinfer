@@ -15,17 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""GQA-GLUE knife 1: BHSD direct-production qkv split + norm apply.
-
-Same math as the in-service qkv_split_vec_h256 (``((x32 * factor) * rstd)``,
-individually rounded multiplies, one RNE BF16 round -- bitwise-equal values),
-with the q/k/v outputs written head-major BHSD ``[H, rows, 256]`` so the five
-strided transposes of the prefill GQA chain (2 KV-cache writes + 3 FIA BNSD
-input materializations) disappear: pure index permutation, values identical
-by construction. The gate output stays token-major ``[rows, 2048]`` (its
-consumer is elementwise in packed order). Outputs are caller-allocated so the
-wrapper can hand KV-cache slots straight to the kernel.
-"""
+"""Split prefill QKV, apply Q/K normalization and emit head-major Q/K/V.
+Apply the zero-centered factor before the supplied reciprocal standard
+deviation in FP32 and round once to BF16. The gate remains token-major.
+Caller-supplied output buffers allow K/V to be written into cache slots."""
 
 import tilelang.ascend.language as T
 

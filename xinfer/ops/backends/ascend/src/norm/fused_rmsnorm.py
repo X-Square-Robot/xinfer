@@ -15,12 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""RMSFUSE-R4 kernel variants.
-
-Baselines come from the vendored ``rms_consistent`` module (verbatim from the
-walloss lib source); variants re-parameterize only scheduling (rows_per_step /
-weight staging mode) or data path (UB staging), never the arithmetic statements.
-"""
+"""RMSNorm kernels for M16 action and wider prefill rows. Variants change
+row scheduling, input dtype and weight staging while retaining the associated
+BF16 rounding and FP32 reduction order of their parent plans."""
 import tilelang.ascend.language as T  # noqa: E402
 
 from .rms_consistent import generic, ubv  # the vendored baseline module
@@ -114,21 +111,17 @@ def m16(width=1024):
 
 def build_programs():
     # -- baselines: verbatim lib programs (same source the lib binary built from)
-    yield "rf4_g1024_base", generic(1024)
-    yield "rf4_ubv1280_base", ubv(1280, weight_mode="fold16")
-    yield "rf4_ubv2048_base", ubv(2048)
-    # -- lean m16 plan (RF1)
-    yield "rf4_m16", m16(1024)
-    # -- scheduling-only retunes of the vector plans (RF2)
-    yield "rf4_ubv1280_f", ubv(1280, weight_mode="f32direct")
-    yield "rf4_ubv2048_f", ubv(2048, weight_mode="f32direct")
-    yield "rf4_m16_f32in", m16_f32in(1024)
+    yield "rmsnorm_generic_h1024_baseline", generic(1024)
+    yield "rmsnorm_unified_buffer_h1280_folded_weight", ubv(1280, weight_mode="fold16")
+    yield "rmsnorm_unified_buffer_h2048_baseline", ubv(2048)
+    yield "rmsnorm_m16_h1024", m16(1024)
+    yield "rmsnorm_unified_buffer_h1280_fp32_weight", ubv(1280, weight_mode="f32direct")
+    yield "rmsnorm_unified_buffer_h2048_fp32_weight", ubv(2048, weight_mode="f32direct")
+    yield "rmsnorm_m16_h1024_fp32_input", m16_f32in(1024)
 
 
 def m16_f32in(width=1024):
-    """RF3: the FP32 accumulator feeds the kernel directly; the RNE round to
-    BF16 happens inside it (value = f32(bf16(acc32))), bit-identical to the
-    released chain (gemm_epilogue _finish cast followed by the m16 plan)."""
+    """Round the FP32 GEMM accumulator to BF16 before the residual-add RMSNorm."""
     tile = 1024
 
     @T.prim_func
@@ -209,5 +202,3 @@ def m16_f32in(width=1024):
                         T.copy(out_ub[:width], output[base : base + width])
 
     return main
-
-

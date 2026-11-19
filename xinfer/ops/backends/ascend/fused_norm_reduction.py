@@ -1,14 +1,14 @@
 """Optional fused reductions for prefill normalization and vision LayerNorm.
 
-``XINFER_SOUPUNLOCK`` defaults to ``rmsfull`` from layer 8. ``off`` disables
+``XINFER_ASCEND_FUSED_NORM_REDUCTION`` defaults to ``rmsfull`` from layer 8. ``off`` disables
 it; ``on`` enables both ``rmsfull`` and ``visionln``. The existing
-``XINFER_SOUPUNLOCK_FROM_LAYER`` selects the first RMS layer.
+``XINFER_ASCEND_FUSED_NORM_REDUCTION_FROM_LAYER`` selects the first RMS layer.
 
 ``rmsfull`` combines the residual sum, deterministic FP32 tree statistics
 and zero-centered RMS apply. ``visionln`` uses a two-pass LayerNorm for
 1024-wide BF16 inputs. These are tolerance-level reduction implementations;
 the in-tree library retains the original operation order and envelopes.
-Unsupported calls return None. ``XINFER_SOUPUNLOCK_STATS`` records optional
+Unsupported calls return None. ``XINFER_ASCEND_FUSED_NORM_REDUCTION_STATS`` records optional
 per-process route counts.
 """
 
@@ -33,7 +33,7 @@ _STATS = {"routed": 0, "fell_back": 0, "rows": 0}
 
 def _parse() -> None:
     global _ENABLED
-    raw = os.environ.get("XINFER_SOUPUNLOCK", "rmsfull").strip().lower()
+    raw = os.environ.get("XINFER_ASCEND_FUSED_NORM_REDUCTION", "rmsfull").strip().lower()
     if raw in ("", "off", "0", "false", "no"):
         _ENABLED = frozenset()
     elif raw in ("1", "all", "on"):
@@ -42,7 +42,7 @@ def _parse() -> None:
         wanted = {t.strip() for t in raw.split(",")}
         unknown = wanted - set(_FAMILIES)
         if unknown:
-            raise RuntimeError(f"XINFER_SOUPUNLOCK unknown families: {sorted(unknown)}")
+            raise RuntimeError(f"XINFER_ASCEND_FUSED_NORM_REDUCTION unknown families: {sorted(unknown)}")
         _ENABLED = frozenset(wanted)
 
 
@@ -55,13 +55,13 @@ def enabled(family: str) -> bool:
 def from_layer() -> int:
     """Deterministic site gate: rmsfull arms only at layer indices >= this."""
     try:
-        return max(0, int(os.environ.get("XINFER_SOUPUNLOCK_FROM_LAYER", "8")))
+        return max(0, int(os.environ.get("XINFER_ASCEND_FUSED_NORM_REDUCTION_FROM_LAYER", "8")))
     except ValueError:
         return 0
 
 
 def _flush_stats(final: bool = False) -> None:
-    base = os.environ.get("XINFER_SOUPUNLOCK_STATS")
+    base = os.environ.get("XINFER_ASCEND_FUSED_NORM_REDUCTION_STATS")
     if not base:
         return
     try:
@@ -139,7 +139,7 @@ def _rows(x) -> int:
 def rmsnorm_full(x, residual, weight, eps):
     """(s, normed) of add_zero_centered_rms_norm in one fused launch.
 
-    Envelope mirrors soupform normprep (flat BF16 [.., 2048], FP32 weight,
+    Envelope mirrors projection_norm_epilogue normprep (flat BF16 [.., 2048], FP32 weight,
     any positive rows -- rows_per_tile is 1 here, so no %4 constraint).
     """
     if not enabled("rmsfull"):

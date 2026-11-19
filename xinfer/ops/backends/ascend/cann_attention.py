@@ -11,15 +11,15 @@ import torch
 from xinfer.ops.backends.ascend import _native
 from xinfer.ops.backends.ascend.core import CORE
 from xinfer.ops.backends.ascend._cann_action_scope import action_scope, memo_action_metadata
-try:  # decodeattn-r4: opt-in decode-family kernel pair (XINFER_DECODEATTN_R4)
-    from xinfer.ops.backends.ascend import decodeattn_r4 as _decodeattn_r4
+try:  # split-kv-decode: opt-in decode-family kernel pair (XINFER_ASCEND_SPLIT_KV_DECODE)
+    from xinfer.ops.backends.ascend import split_kv_decode as _split_kv_decode
 except Exception:  # pragma: no cover - the route stays off without the lib
-    _decodeattn_r4 = None
-try:  # copykill-r2 integration flags (XINFER_COPYKILL_R2, default off)
-    from xinfer.ops.backends.ascend.copykill_r2 import enabled as _copykill_enabled
+    _split_kv_decode = None
+try:  # layout-reuse integration flags (XINFER_ASCEND_LAYOUT_REUSE, default off)
+    from xinfer.ops.backends.ascend.layout_reuse import enabled as _layout_reuse_enabled
 except Exception:  # pragma: no cover - optional mount
 
-    def _copykill_enabled(_family):
+    def _layout_reuse_enabled(_family):
         return False
 
 _MAX_I32 = 2**31 - 1
@@ -141,10 +141,10 @@ class CannAttention:
             _check_tensor(flash_mask, q, "flash_mask", (batch, 1, length, 2), torch.int32)
         scale = _scale(scale, dim)
         if (
-            _decodeattn_r4 is not None
-            and _decodeattn_r4.applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
+            _split_kv_decode is not None
+            and _split_kv_decode.applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
         ):
-            return _decodeattn_r4.prefix_kvcache_attention(
+            return _split_kv_decode.prefix_kvcache_attention(
                 q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale, return_bnsd
             )
         key = self._key("cache", q, k_cache, scale)
@@ -180,7 +180,7 @@ class CannAttention:
 
             query = q.transpose(1, 2)
             if not query.is_contiguous():
-                if _copykill_enabled("k7"):
+                if _layout_reuse_enabled("reuse_query_buffer"):
                     def qbuf():
                         return torch.empty((batch, heads, rows, dim), dtype=q.dtype, device=q.device)
                     qbuf_v = self._warmed(("qbuf", *key), qbuf)
@@ -211,12 +211,7 @@ class CannAttention:
         key = self._key("causal", q, k, scale)
         query, keys, values = (t.transpose(1, 2).contiguous() for t in (q, k, v))
         with self._lock:
-            # r7: FIA's native sparse causal modes are rejected by the CANN
-            # 9.1.1 runtime for this GQA BNSD config (every sparseMode 1-4 /
-            # pre-next window combination sizes 561002; standalone sweep
-            # r7-probe/sparse_sweep.cc) -- the dense boolean mask stays. The
-            # FFI entry keeps the sparse_mode parameter for the runtime that
-            # gains support.
+            # CANN 9.1.1 rejected sparse causal modes for this GQA shape. Keep the dense causal mask.
             drop_mask = self._warmed(
                 ("mask", *key),
                 lambda: torch.ones((batch, 1, length, length), dtype=torch.bool, device=q.device).triu(1),

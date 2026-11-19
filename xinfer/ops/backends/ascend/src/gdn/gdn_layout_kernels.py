@@ -15,35 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""MOVE-R2 kernels (final): elementwise pack/tail fuses, dconv4-class TileLang.
+"""Gated DeltaNet Q/K/V packing and gated output normalization.
 
-Engine history (documented negatives):
-- TileLang SimtVF-scalar (v1): correct, 461/254us (strided global scalar loads).
-- TileLang fragment+reducer (v2): correct, 230/107us (codegen overhead).
-- AscendC ccec (v3): in-kernel fp32 Exp/Div kills the vector pipe; the
-  dav-3510 multi-block vector-op hazard (ascendc-action r1: blocks 1+ produce
-  garbage on Cast/Mul/Add; single-block only) rules out per-token AIV blocks.
-Final architecture: the REDUCTIONS (qk square sums / raw mean+rsqrt) and the
-transcendentals (silu, the beta/g gates) stay on aclnn (bitwise-identical
-inputs); these kernels fuse the pure elementwise remainders. Only mul/cast
-on aclnn-identical inputs => bitwise-expected vs the released chains.
-
-gdrapply_bf16: q/k TND packs + v copy from the SiLU'd token-major x_t and
-  the aclnn rstd [T, 32] fp32:
-    q[t,h,d]  = RNE_bf16(f32(x[t, h*128+d])      * rstd[t, h])
-    k[t,h,d]  = RNE_bf16(f32(x[t, 2048+h*128+d]) * rstd[t, 16+h])
-    v[t,h,d]  = x[t, 4096+h*128+d]
-  replaces Slice + the n Mul_Cast + 2x mul-by-one packs + AsStrided(v).
-
-gdrtailmix_bf16: the raw-side elementwise tail from the aclnn rstd [T, 16]
-  fp32, gate fp32 (the silu chain output) and w bf16:
-    nbf = RNE_bf16(f32(raw) * rstd); wn = RNE_bf16(f32(w) * f32(nbf));
-    out = RNE_bf16(f32(wn) * gate)
-  replaces raw-cast + Mul + Cast + w-Mul + gate-Mul + Cast (6 aclnn ops).
-
-Idioms copied verbatim from soup-form (apply_rstd_c2048 vmuls/vcvt/vsts)
-and conv-gemm (dconv4 row-wise guarded tile copies).
-"""
+The input transform applies the supplied inverse norms to Q/K and copies V
+to contiguous head rows. The output transform applies the row inverse RMS,
+weight and gate with the original BF16 rounding points. Reductions and
+transcendental functions remain outside these kernels."""
 
 import tilelang.ascend.language as T
 

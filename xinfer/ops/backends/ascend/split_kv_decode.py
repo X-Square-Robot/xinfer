@@ -1,14 +1,14 @@
 """Optional small-M cache-attention scan/reduce pair in the native library.
 
-``XINFER_DECODEATTN_R4`` is off by default. The supported Wall-OSS call is
+``XINFER_ASCEND_SPLIT_KV_DECODE`` is off by default. The supported Wall-OSS call is
 B1/H16/KV2/M16/D128/L784 with new_pos=768. Prefix length, the new-key
 window and flash-mask LTS/UTE bounds retain their existing semantics.
 This route is tolerance-level relative to FIA, not bitwise equivalent.
 Launches resolve the current stream for graph capture.
 """
+import os
 from xinfer.ops.backends.ascend import _native
 import ctypes
-import os
 import struct
 from threading import Lock
 
@@ -25,7 +25,7 @@ _P_SHAPE = (28, 65, 128)
 
 
 def _row_enabled():
-    """LAYOUT-OPROJ K1: token-major output (XINFER_DECODEATTN_R4_ROW=1).
+    """Write token-major output (XINFER_ASCEND_SPLIT_KV_DECODE_ROW=1).
 
     When on, the reduce twin stores OUT[m, h, d] and the route returns a
     contiguous [1, M, H*D] buffer (zero-copy view) instead of BNSD. The
@@ -36,11 +36,11 @@ def _row_enabled():
 
 def _parse():
     global _ENABLED, _SCAN_VARIANT
-    raw = os.environ.get("XINFER_DECODEATTN_R4", "off").strip().lower()
+    raw = os.environ.get("XINFER_ASCEND_SPLIT_KV_DECODE", "off").strip().lower()
     _ENABLED = raw not in ("off", "", "0")
-    _SCAN_VARIANT = os.environ.get("XINFER_DECODEATTN_R4_SCAN", "b").strip().lower()
-    if _SCAN_VARIANT not in ("a", "b"):
-        raise RuntimeError("XINFER_DECODEATTN_R4_SCAN must be a or b")
+    _SCAN_VARIANT = os.environ.get("XINFER_ASCEND_SPLIT_KV_DECODE_SCAN", "tile_per_block").strip().lower()
+    if _SCAN_VARIANT not in ("loop_tiles", "tile_per_block"):
+        raise RuntimeError("XINFER_ASCEND_SPLIT_KV_DECODE_SCAN must be loop_tiles or tile_per_block")
 
 
 def enabled():
@@ -68,8 +68,8 @@ def _entry(name, n_ptr, scalar_types):
     return pair
 
 
-_ROW_ENV = "XINFER_DECODEATTN_R4_ROW"
-_DEBUG_PATH = os.environ.get("XINFER_DECODEATTN_R4_DEBUG")
+_ROW_ENV = "XINFER_ASCEND_SPLIT_KV_DECODE_ROW"
+_DEBUG_PATH = os.environ.get("XINFER_ASCEND_SPLIT_KV_DECODE_DEBUG")
 
 
 def _debug(reason, q, k_cache, flash_mask, new_pos, scale):
@@ -138,13 +138,13 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mas
         # the engine warms every route eagerly before capture; a first sight
         # during capture means the warmup discipline was broken
         if ("warm",) not in _SEEN:
-            raise RuntimeError("warm up the decodeattn-r4 route before graph capture")
+            raise RuntimeError("warm up the split-kv-decode route before graph capture")
     variant = _SCAN_VARIANT
-    scan_name = f"decodeattn_r4_scan_{variant}"
+    scan_name = f"split_kv_decode_scan_{variant}"
     call, err = _entry(scan_name, 6, (ctypes.c_int64, ctypes.c_int64))
     row = not return_bnsd and _row_enabled()
     reduce_call, reduce_err = _entry(
-        "decodeattn_r4_reduce_row" if row else "decodeattn_r4_reduce", 2, ())
+        "split_kv_decode_reduce_token_major" if row else "split_kv_decode_reduce_head_major", 2, ())
     stream = torch.npu.current_stream(q.device).npu_stream
     pbuf = torch.empty(_P_SHAPE, dtype=torch.float32, device=q.device)
     out = torch.empty((_M, _H, _D) if row else (_H, _M, _D), dtype=q.dtype, device=q.device)
@@ -169,8 +169,8 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mas
             ctypes.c_void_p(stream),
         )
         if status:
-            raise RuntimeError("decodeattn-r4 scan: " + (err() or b"?").decode("utf-8", "replace"))
-    reduce_name = "decodeattn_r4_reduce_row" if row else "decodeattn_r4_reduce"
+            raise RuntimeError("split-kv-decode scan: " + (err() or b"?").decode("utf-8", "replace"))
+    reduce_name = "split_kv_decode_reduce_token_major" if row else "split_kv_decode_reduce_head_major"
     if not _native.launch_kernel(reduce_name, (pbuf, out)):
         status = reduce_call(
             ctypes.c_void_p(pbuf.data_ptr()),
@@ -178,7 +178,7 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, flash_mas
             ctypes.c_void_p(stream),
         )
         if status:
-            raise RuntimeError("decodeattn-r4 reduce: " + (reduce_err() or b"?").decode("utf-8", "replace"))
+            raise RuntimeError("split-kv-decode reduce: " + (reduce_err() or b"?").decode("utf-8", "replace"))
     _SEEN.add(("warm",))
     _debug("HIT", q, k_cache, flash_mask, new_pos, scale)
     if row:

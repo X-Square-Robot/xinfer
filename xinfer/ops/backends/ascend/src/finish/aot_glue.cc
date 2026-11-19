@@ -14,15 +14,37 @@ namespace xinfer::aot::finish_glue {
 using xinfer::aot::glue::TensorView;
 
 extern "C" {
-int32_t xinfer_aot_finish_br_c1024_call(void*, void*, void*, void*, int64_t, void* stream);
-const char* xinfer_aot_finish_br_c1024_get_last_error();
+int32_t xinfer_aot_bias_add_cast_simd_rows4_c2048_call(void*, void*, void*, int64_t, void* stream);
+const char* xinfer_aot_bias_add_cast_simd_rows4_c2048_get_last_error();
 }
 
-void finish_br_c1024(TensorView out, TensorView acc, TensorView bias, TensorView res, int64_t rows) {
-  xinfer::aot::glue::Launch("finish_br_c1024", xinfer_aot_finish_br_c1024_call,
-                            xinfer_aot_finish_br_c1024_get_last_error, out, acc, bias, res, rows);
+void bias_add_cast_simd_rows4_c2048(TensorView out, TensorView acc, TensorView bias, int64_t rows) {
+  xinfer::aot::glue::Launch("bias_add_cast_simd_rows4_c2048", xinfer_aot_bias_add_cast_simd_rows4_c2048_call,
+                            xinfer_aot_bias_add_cast_simd_rows4_c2048_get_last_error, out, acc, bias, rows);
 }
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(finish_br_c1024, xinfer::aot::finish_glue::finish_br_c1024);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bias_add_cast_simd_rows4_c2048, xinfer::aot::finish_glue::bias_add_cast_simd_rows4_c2048);
+
+extern "C" {
+int32_t xinfer_aot_bias_add_cast_simd_rows8_c1280_call(void*, void*, void*, int64_t, void* stream);
+const char* xinfer_aot_bias_add_cast_simd_rows8_c1280_get_last_error();
+}
+
+void bias_add_cast_simd_rows8_c1280(TensorView out, TensorView acc, TensorView bias, int64_t rows) {
+  xinfer::aot::glue::Launch("bias_add_cast_simd_rows8_c1280", xinfer_aot_bias_add_cast_simd_rows8_c1280_call,
+                            xinfer_aot_bias_add_cast_simd_rows8_c1280_get_last_error, out, acc, bias, rows);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bias_add_cast_simd_rows8_c1280, xinfer::aot::finish_glue::bias_add_cast_simd_rows8_c1280);
+
+extern "C" {
+int32_t xinfer_aot_bias_residual_cast_c1024_call(void*, void*, void*, void*, int64_t, void* stream);
+const char* xinfer_aot_bias_residual_cast_c1024_get_last_error();
+}
+
+void bias_residual_cast_c1024(TensorView out, TensorView acc, TensorView bias, TensorView res, int64_t rows) {
+  xinfer::aot::glue::Launch("bias_residual_cast_c1024", xinfer_aot_bias_residual_cast_c1024_call,
+                            xinfer_aot_bias_residual_cast_c1024_get_last_error, out, acc, bias, res, rows);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bias_residual_cast_c1024, xinfer::aot::finish_glue::bias_residual_cast_c1024);
 
 extern "C" {
 int32_t xinfer_aot_glu_split_bf16_c6144_call(void*, void*, int64_t, void* stream);
@@ -34,28 +56,6 @@ void glu_split_bf16_c6144(TensorView out, TensorView acc, int64_t rows) {
                             xinfer_aot_glu_split_bf16_c6144_get_last_error, out, acc, rows);
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(glu_split_bf16_c6144, xinfer::aot::finish_glue::glu_split_bf16_c6144);
-
-extern "C" {
-int32_t xinfer_aot_ubfinish_r5_s4_c2048_call(void*, void*, void*, int64_t, void* stream);
-const char* xinfer_aot_ubfinish_r5_s4_c2048_get_last_error();
-}
-
-void ubfinish_r5_s4_c2048(TensorView out, TensorView acc, TensorView bias, int64_t rows) {
-  xinfer::aot::glue::Launch("ubfinish_r5_s4_c2048", xinfer_aot_ubfinish_r5_s4_c2048_call,
-                            xinfer_aot_ubfinish_r5_s4_c2048_get_last_error, out, acc, bias, rows);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(ubfinish_r5_s4_c2048, xinfer::aot::finish_glue::ubfinish_r5_s4_c2048);
-
-extern "C" {
-int32_t xinfer_aot_ubfinish_r5_s8_c1280_call(void*, void*, void*, int64_t, void* stream);
-const char* xinfer_aot_ubfinish_r5_s8_c1280_get_last_error();
-}
-
-void ubfinish_r5_s8_c1280(TensorView out, TensorView acc, TensorView bias, int64_t rows) {
-  xinfer::aot::glue::Launch("ubfinish_r5_s8_c1280", xinfer_aot_ubfinish_r5_s8_c1280_call,
-                            xinfer_aot_ubfinish_r5_s8_c1280_get_last_error, out, acc, bias, rows);
-}
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(ubfinish_r5_s8_c1280, xinfer::aot::finish_glue::ubfinish_r5_s8_c1280);
 
 extern "C" {
 int32_t xinfer_aot_zbasplit_bf16_c8224_call(void*, void*, void*, void*, int64_t, void* stream);

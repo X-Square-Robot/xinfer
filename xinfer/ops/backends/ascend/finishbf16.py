@@ -164,7 +164,7 @@ def vrope_bf16(x, weight, bias, cos2, sin2, heads=16, dim=64):
     rows = x.shape[0]
     acc16 = _bf16_store(x, weight)
     out = x.new_empty((3, rows, heads, dim), dtype=torch.bfloat16)
-    _launch("vision_qkv_rope_bf16_v3p", (out, acc16, bias, cos2, sin2), (rows,))
+    _launch("vision_qkv_rope_bf16_packed", (out, acc16, bias, cos2, sin2), (rows,))
     _STATS["vrope"] += 1
     return out
 

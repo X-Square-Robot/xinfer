@@ -15,32 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Vector FP32 SwiGLU finish for the deferred Ascend GLU projection.
+"""SwiGLU over the FP32 accumulator of a paired or split gate/up projection.
 
-The ACLNN Mm projection of ``GemmGluFp32`` leaves a flat row-major FP32
-``[rows, 2*columns]`` accumulator (paired interleaved or split gate/up rows).
-The finish stages one span per tile through shared memory with pipelined
-copies and applies the activation on the CCE vector units:
-
-* ``vexp_1ulp_ftz_false`` + the raw hardware ``vdiv``: an adversarial witness
-  probe (278,770 values: the 1+2^-8 BF16 tie, an exhaustive near-tie sweep
-  within 4 FP32 ulps of BF16 rounding midpoints, the FP32 subnormal region,
-  saturation/specials, and random FP32 sweeps) showed this pair is
-  bit-identical to the scalar production path ``g / (1.0f + expf(-g))``.
-  The *software* ``vdiv_0ulp_ftz_true`` wrapper is the one that differs by
-  one FP32 ulp from the C division -- it must NOT be used here.
-* ``vcvt ROUND_R`` + a ``PK_B32`` packed store replaces the integer RNE
-  helper (verified exact at the tie witness; 2-3 boundary flips per 3.5M
-  random elements, within the FP64 oracle bound).
-* Split spans whose width is not a multiple of 64 lanes (3424 -> 1712) pad
-  the shared buffers to the next 64-lane multiple; padded lanes never leave
-  shared memory.
-
-Buffers are matched flat (the multicast GeGLU finish precedent): the paired
-gate/up interleave is 2-periodic, so the accumulator span of an output tile
-``[base, base+seg)`` is the contiguous flat range ``[2*base, 2*base+2*seg)``
-loaded with ``vld2 DINTLV_B32``.
-"""
+Use the non-flushing vector exponential and hardware division for the SiLU,
+then round the product once to BF16. Paired input interleaves gate and up
+values at stride two; split input stores contiguous halves. Split spans pad
+the unified buffer to a 64-lane boundary without writing padded lanes to output."""
 
 import tilelang.ascend.language as T
 
@@ -57,8 +37,7 @@ def _segment(columns):
     # naive ceildiv shortcut mis-sizes 11008 (1834 does not divide the row),
     # so take the real largest divisor <= 2048 with 32B-aligned FP32 spans
     # (11008 -> 1376, an exact 8-slab split of the row); when no 8-aligned
-    # divisor exists fall back to the plain largest true divisor (union of the
-    # absorb2 divisor guarantee and the glu-r1 alignment requirement).
+    # divisor exists, use the largest exact divisor.
     seg = min(2048, columns)
     while seg > 0 and (columns % seg or seg % 8):
         seg -= 8
@@ -194,18 +173,7 @@ def split_finish(columns):
 
 
 def rowpass_finish(columns):
-    """Rope-mold whole-row FP32 SwiGLU finish (glu-r1).
-
-    The staged column kernels above top out at the ~2.2TB/s staged-copy
-    ceiling (35.2 us measured on the vision [2112, 6912] accumulator), while
-    the shipped vision-rope finish (gemm_qkv_vision_rope_finish, one whole
-    GM->UB row tile per core-step, scalar SimtVF math) sustains ~4.6TB/s
-    effective on the same kind of borrowed FP32 accumulator. This is that
-    mold for the engine GLU widths: per-core row tiles with contiguous
-    multi-KB DMA bursts, the witness-exact scalar ``g / (1.0f + expf(-g)) * u``
-    SimtVF expression (the production row_finish math) and the integer-RNE
-    BF16 store, with the optional BF16 bias folded into the same pass.
-    """
+    """Compute SwiGLU from whole-row tiles with optional BF16 bias and an integer round-to-nearest-even BF16 store."""
     # One staged pass stays <= ~96KB of UB: 2*tile FP32 loads + tile BF16 store.
     tile = columns
     while columns % tile or tile * 10 > 98304:
@@ -272,14 +240,10 @@ def rowpass_finish(columns):
 
 
 def build_programs():
-    # Union: 11008 (wall_oss N22016 prefill GLU half-width, staged seg 1376)
-    # and 9216 (2610 N18432 prefill) join the split set; the kernel template
-    # is N-generic (absorb2 9216 + glu-r1 11008 receipts).
     for columns in (2048, 3424, 3456, 6144, 11008, 9216):
         yield f"gemm_glu_fp32_finish_split_{columns}", split_finish(columns)
     for columns in (2048, 6144):
         yield f"gemm_glu_fp32_finish_paired_{columns}", paired_finish(columns)
-    # glu-r1: the rope-mold row finishes for the two engine widths -- vision
-    # 3456 (whole-row tiles) and prefill 11008 (half-row tiles).
+    # Vision uses whole-row tiles at 3456 columns; prefill uses half-row tiles at 11008.
     for columns in (3456, 11008):
         yield f"gemm_glu_fp32_rowpass_finish_{columns}", rowpass_finish(columns)

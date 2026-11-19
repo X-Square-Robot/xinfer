@@ -1,13 +1,13 @@
 """Optional small-M action projections in the in-tree native library.
 
-``XINFER_SMALLM_R3`` is off by default. Select ``oproj``, ``gateup``,
+``XINFER_ASCEND_ACTION_GEMM_M16`` is off by default. Select ``oproj``, ``gateup``,
 ``down`` or ``qkv`` with a comma list, or enable all with ``1/all/on``.
 Launches resolve the current stream per call. Packed weights must be
 prepared before graph capture.
 """
+import os
 from xinfer.ops.backends.ascend import _native
 import ctypes
-import os
 from threading import Lock
 
 import torch
@@ -22,7 +22,7 @@ _FAMILIES = ("oproj", "gateup", "down", "qkv")
 
 def _parse():
     global _ENABLED
-    raw = os.environ.get("XINFER_SMALLM_R3", "off").strip().lower()
+    raw = os.environ.get("XINFER_ASCEND_ACTION_GEMM_M16", "off").strip().lower()
     if raw in ("off", "", "0"):
         _ENABLED = frozenset()
     elif raw in ("1", "all", "on"):
@@ -31,7 +31,7 @@ def _parse():
         wanted = {t.strip() for t in raw.split(",")}
         unknown = wanted - set(_FAMILIES)
         if unknown:
-            raise RuntimeError(f"XINFER_SMALLM_R3 unknown families: {sorted(unknown)}")
+            raise RuntimeError(f"XINFER_ASCEND_ACTION_GEMM_M16 unknown families: {sorted(unknown)}")
         _ENABLED = frozenset(wanted)
 
 
@@ -70,42 +70,42 @@ def _launch(name, tensors):
     )
     if status:
         raise RuntimeError(
-            f"smallm-r3 {name}: " + (err() or b"?").decode("utf-8", "replace")
+            f"action-gemm-m16 {name}: " + (err() or b"?").decode("utf-8", "replace")
         )
 
 
 def o_proj(a_bnsd, weight):
     """[16,16,128] BNSD x [1024,2048] -> BF16 [16,1024] (store-round RNE)."""
     out = a_bnsd.new_empty((16, 1024), dtype=torch.bfloat16)
-    _launch("smallm_r3_o_proj", (a_bnsd, weight, out))
+    _launch("action_gemm_m16_o_proj", (a_bnsd, weight, out))
     return out
 
 
 def o_proj_row(x, weight):
-    """[16,2048] row-major x [1024,2048] -> BF16 [16,1024] (LAYOUT-OPROJ K1).
+    """[16,2048] row-major x [1024,2048] -> BF16 [16,1024].
 
     The o-projection and the down projection are the same GEMM (M=16, K=2048,
-    N=1024, W [N,K]); this launches the released smallm_r3_down body, so the
+    N=1024, W [N,K]); this launches the released action_gemm_m16_down body, so the
     k order (h*128+d ascending) and the RNE store round are the ones the
     bitwise o_proj chain already validated. Only the A load changes: one
     contiguous 64KB DMA instead of 16 strided 4KB head copies.
     """
     out = x.new_empty((16, 1024), dtype=torch.bfloat16)
-    _launch("smallm_r3_down", (x, weight, out))
+    _launch("action_gemm_m16_down", (x, weight, out))
     return out
 
 
 def down(x, weight):
     """[16,2048] x [1024,2048] -> BF16 [16,1024]."""
     out = x.new_empty((16, 1024), dtype=torch.bfloat16)
-    _launch("smallm_r3_down", (x, weight, out))
+    _launch("action_gemm_m16_down", (x, weight, out))
     return out
 
 
 def qkv_fp32(x, weight):
     """[16,1024] x [2560,1024] -> FP32 [16,2560] (accumulator contract)."""
     out = x.new_empty((16, 2560), dtype=torch.float32)
-    _launch("smallm_r3_qkv", (x, weight, out))
+    _launch("action_gemm_m16_qkv", (x, weight, out))
     return out
 
 
@@ -118,7 +118,7 @@ def gateup(x, weight):
         interleaved[1::2] = weight[half:]
         return interleaved.contiguous()
 
-    packed = _native.derived("smallm-r3 gateup", weight, pack)
+    packed = _native.derived("action-gemm-m16 gateup", weight, pack)
     out = x.new_empty((16, 2048), dtype=torch.bfloat16)
-    _launch("smallm_r3_gateup_glu", (x, packed, out))
+    _launch("action_gemm_m16_gateup_glu", (x, packed, out))
     return out

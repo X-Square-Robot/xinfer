@@ -15,45 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""fia-fuse: specialized split-K scan+reduce cache attention for the wall-x 2B
-decode family (B1 H8 KV2 M16 D256, L in {432,448,464,480}; final stack:
-60 calls x (FusedInferAttentionScore 12.2us + gated_attn_bnsd_pack_pow2 5.0us)
-per request, fixed overhead dominated, cu62/v0.04/m0.04 unsaturated).
+"""Split-K cache attention with a gated output for Wall-X 2B (B1, H8, KV2, M16, D256).
 
-Port of the wall-oss decodeattn_r4 kernel pair (TileLang AOT, proven 4.8x on
-the oss decode family) to the 2B geometry, with two 2B-specific fusions:
+Each scan block loads a 64-key chunk and a 32-row query tile. For cache lengths
+432, 448, 464 and 480, the last tile slides back to the last full chunk; the
+visibility predicate excludes keys already covered by an earlier tile. A key
+must also belong to the prefix or new-key window and meet its LTS/UTE bounds.
 
-  * the wide A-tile is 32 rows (2 heads x 16 queries) so the scan grid
-    2 kv x 2 tiles x ceil(L/64) chunks = 28/32 blocks fills the device
-    (D=256 halves the per-block K/V tile the oss 128-wide layout allowed;
-    KEY_TILE=64 keeps k_l1+v_l1+q_l1 = 80KB inside the 128KB L1);
-  * the reduce block (head, 128-column half) merges the split-K partials,
-    rounds the merged attention to BF16 (the FIA output rounding), applies
-    the gate tail with the exact gated_attn_bnsd_pack_pow2 scalar arithmetic
-    (FP32 sigmoid 1/(1+exp(-x)), two manual-RNE BF16 roundings, scalar
-    T.exp), and stores the packed [M, H*D] rows the o_proj GEMM reads --
-    the separate pack launch disappears.
-
-Layout contract (production bridge shapes, zero extra copies):
-  Q  [128, 256] bf16 row = head*16 + query (the BNSD buffer the 2B QKV
-     kernel writes directly; q arrives contiguous [1, 8, 16, 256])
-  K  [2*L, 256] bf16 row = kvhead*L + position (cache [KV, L, D] major)
-  V  same as K
-  FM [L, 2] int32: lts, ute per position (flash_mask [1,1,L,2])
-  PL [1] int32: prefix_len (device data)
-  P  [4*CHUNKS, 33, 256] fp32 partials: (kv, tile, chunk) pairs; rows 0..31
-     = o (32 rows x 256), row 32 cols 0..31 = m, cols 32..63 = l
-  OUT [16, 2048] bf16 row = query, col = head*256 + dim (packed M-major)
-  GATE flat bf16, element (m, j) at m*pitch + j (row-pitch strided rows)
-
-Mask semantics = the bridge make_drop_mask exactly:
-  visible(pos, m) = ((pos < prefix) or (pos >= new_pos and pos < new_pos+16))
-                    and (m < lts[pos]) and (m >= ute[pos])
-The scan grid is (kvhead, tile, chunk); each block loads its K/V chunk and
-its 32-row Q tile once: K/V bytes move exactly once per (kv, tile) pair -
-no mgroups re-read amplification (ascendc-decode r5 lesson), and the
-splitk-v3 slide rule keeps the chunk windows disjoint for every L family.
-"""
+The reducer combines FP32 softmax partials, rounds attention to BF16, applies the
+FP32 sigmoid gate with the same BF16 rounding boundaries as gated_attn_bnsd_pack_pow2,
+and stores contiguous token-major output. A separate reducer can write head-major
+attention for callers that apply the gate later."""
 
 import functools
 
@@ -123,7 +95,7 @@ def scan(keys: int):
             tile = rest // chunks
             chunk = rest - tile * chunks
             prefix = T.cast(PL[0], "int64")
-            # splitk-v3 slide rule: chunks 0..C-2 own [c*T, min((c+1)*T, L-T)),
+            # The last window slides back to avoid a partial tile: chunks 0..C-2 own [c*T, min((c+1)*T, L-T)),
             # the last chunk slides to [L-T, L); the windows stay disjoint.
             base_row = T.alloc_var("int64", init=chunk * KEY_TILE)
             coverage = T.alloc_var("int64", init=keys)
@@ -268,8 +240,7 @@ def reduce_packed(keys: int):
 
 
 def reduce_bnsd(keys: int):
-    """8 blocks = head; merged attention -> BF16 BNSD [H*M, D] (backup route
-    that keeps the released pack launch)."""
+    """Merge softmax partials into BF16 head-major attention, leaving the gate to the caller."""
     chunks = _chunks(keys)
 
     @T.prim_func

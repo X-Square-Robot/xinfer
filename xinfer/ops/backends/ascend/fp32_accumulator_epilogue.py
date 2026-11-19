@@ -1,6 +1,6 @@
-"""soupkill-r1 mount: single-pass BF16 finishes over the FP32 ACLNN accumulator.
+"""fp32-accumulator-epilogue mount: single-pass BF16 finishes over the FP32 ACLNN accumulator.
 
-Flag ``XINFER_SOUPKILL`` (default off): ``1``/``all``/a comma list of the
+Flag ``XINFER_ASCEND_FP32_ACCUMULATOR_EPILOGUE`` (default off): ``1``/``all``/a comma list of the
 families ``finish`` (bias+residual finish), ``vrope`` (vision QKV + RoPE
 finish), ``glu`` (prompt SwiGLU split finish through the library's own
 ``gemm_glu_fp32_finish_split_6144`` entry), ``gelu`` (vision fc1
@@ -13,10 +13,10 @@ so the caller keeps the released torch chain.
 """
 
 from __future__ import annotations
+import os
 from xinfer.ops.backends.ascend import _native
 
 import ctypes
-import os
 
 import torch
 
@@ -29,7 +29,7 @@ _ENABLED = None
 
 def _parse() -> None:
     global _ENABLED
-    raw = os.environ.get("XINFER_SOUPKILL", "off").strip().lower()
+    raw = os.environ.get("XINFER_ASCEND_FP32_ACCUMULATOR_EPILOGUE", "off").strip().lower()
     if raw in ("", "off", "0", "false", "no"):
         _ENABLED = frozenset()
     elif raw in ("1", "all", "on"):
@@ -38,7 +38,7 @@ def _parse() -> None:
         wanted = {t.strip() for t in raw.split(",")}
         unknown = wanted - set(_FAMILIES)
         if unknown:
-            raise RuntimeError(f"XINFER_SOUPKILL unknown families: {sorted(unknown)}")
+            raise RuntimeError(f"XINFER_ASCEND_FP32_ACCUMULATOR_EPILOGUE unknown families: {sorted(unknown)}")
         _ENABLED = frozenset(wanted)
 
 
@@ -69,7 +69,7 @@ def _xc_library():
             if _XC_LIB is None:
                 _XC_LIB = _native.core_library()
                 if _XC_LIB is None:
-                    raise OSError("soupkill glu: the unified core library is not loaded")
+                    raise OSError("fp32_accumulator_epilogue glu: the unified core library is not loaded")
     return _XC_LIB
 
 
@@ -146,7 +146,7 @@ def finish_bias_res(acc, bias, residual, out):
             and out.shape == acc.shape and acc.shape[1] == 1024 and bias.shape[0] == 1024
             and acc.shape[0] % 4 == 0 and acc.shape[0] > 0):
         return None
-    _launch("finish_br_c1024", (out, acc, bias, residual), (acc.shape[0],))
+    _launch("bias_residual_cast_c1024", (out, acc, bias, residual), (acc.shape[0],))
     return out
 
 
@@ -165,7 +165,7 @@ def vision_qkv_rope(acc, bias, cos2, sin2, out, heads=16, dim=64):
             and out.numel() == acc.shape[0] * 3 * heads * dim
             and acc.shape[0] % 2 == 0 and acc.shape[0] > 0):
         return None
-    _launch("vision_qkv_rope_v3", (out, acc, bias, cos2, sin2), (acc.shape[0],))
+    _launch("vision_qkv_rope_token_major", (out, acc, bias, cos2, sin2), (acc.shape[0],))
     return out
 
 
@@ -200,5 +200,5 @@ def gelu_finish(acc, bias, out, cols=4096):
             and _flat(out) and out.dtype == torch.bfloat16
             and out.shape == acc.shape):
         return None
-    _launch("gelu_g1", (out, acc, bias), (acc.shape[0],))
+    _launch("bias_gelu_tanh_cast_c4096", (out, acc, bias), (acc.shape[0],))
     return out

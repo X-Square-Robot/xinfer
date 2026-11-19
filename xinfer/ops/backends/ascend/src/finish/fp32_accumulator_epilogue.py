@@ -15,22 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""soupkill-r1: single-pass BF16 finishes over the FP32 ACLNN accumulator.
+"""Single-pass BF16 epilogues for FP32 projection accumulators.
 
-Each kernel replaces a multi-kernel torch tail with one pass (UB-FINISH r5
-recipe: T.copy DMA staging + CCE SIMD vector math + fixed 64-core grid; the
-vector unit stays off the scalar SimtVF path).
-
-* ``finish_br_c{cols}``: ``out = rne(acc + widen(bias) + widen(res))``. The
-  two fp32 adds happen in the same order and rounding as ``_finish``'s torch
-  chain (bias first, then residual), with one final RNE.
-* ``vision_qkv_rope``: ``out = rne(rope_half(acc + widen(bias)))`` for the 2B
-  ViT QKV layout ``[rows, 3, 16, 64]`` with ``rotary_dim = head_dim = 64``.
-  Per head ``[a*c - b*s | b*c + a*s]`` uses separate vmul/vsub/vadd (no FMA
-  contraction, matching the torch chain's per-op fp32 rounding); the V
-  section is copied through with the same single RNE.
-* ``glu_split_c{half}``: ``out = rne(silu(acc[:, :half]) * acc[:, half:])``.
-"""
+The bias/residual finish widens the operands, adds bias before residual and
+rounds once to BF16. The vision QKV finish applies rotate-half RoPE to Q/K
+with separate FP32 multiplies and adds; V passes through after bias. The
+SwiGLU finish multiplies SiLU(gate) by the up projection before rounding."""
 
 import tilelang.ascend.language as T
 
@@ -244,6 +234,6 @@ def glu_split(half, rows_per_tile=1, cores=CORES):
 
 
 def build_programs():
-    yield "finish_br_c1024", finish_bias_res(1024, 4)
+    yield "bias_residual_cast_c1024", finish_bias_res(1024, 4)
     yield "vision_qkv_rope", vision_qkv_rope()
     yield "glu_split_c6144", glu_split(6144, 1)

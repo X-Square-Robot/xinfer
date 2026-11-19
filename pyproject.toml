@@ -79,7 +79,7 @@ markers = [
 [tool.ruff]
 line-length = 120
 target-version = "py310"
-# Vendored device kernels and generators retain their original source bytes.
+# Keep the device generators and vendored native sources outside package linting.
 extend-exclude = ["xinfer/ops/backends/ascend/src"]
 
 [tool.ruff.lint]

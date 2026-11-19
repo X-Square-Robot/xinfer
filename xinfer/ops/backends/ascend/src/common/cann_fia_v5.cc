@@ -1,7 +1,4 @@
-// The unified FIA V5 bridge: the raw C-ABI launchers (BNSD masked and packed
-// TND vision compositions over aclnnFusedInferAttentionScoreV5), ported from
-// the v22 bridge with the TensorView halves dropped (the glue binds raw
-// pointers; see glue/_cann_primitives.py and _provider.BRIDGE).
+// C ABI for aclnnFusedInferAttentionScoreV5 with BNSD inputs or packed TND vision inputs.
 #include "ffi.h"
 
 #include <aclnn/acl_meta.h>

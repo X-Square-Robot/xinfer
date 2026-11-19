@@ -13,11 +13,11 @@ import torch
 import torch.nn.functional as F
 from xinfer.ops.backends.ascend.core import CORE, _has_glu_finish
 from xinfer.ops.backends.ascend.rmsnorm import add_rmsnorm as _add_rmsnorm
-try:  # r6a-m16epi A1 (XINFER_SMALLM_R3=gateup, default off)
-    from xinfer.ops.backends.ascend import smallm_r3
+try:
+    from xinfer.ops.backends.ascend import action_gemm_m16
 except Exception:  # pragma: no cover - optional mount
-    smallm_r3 = None
-try:  # glu-epilogue K-B (XINFER_GLUEPI=prefillglu, default off)
+    action_gemm_m16 = None
+try:
     from xinfer.ops.backends.ascend import glu_epi
 except Exception:  # pragma: no cover - optional mount
     glu_epi = None
@@ -25,18 +25,18 @@ try:  # finish-bf16 (XINFER_FINISHBF16, default off)
     from xinfer.ops.backends.ascend import finishbf16
 except Exception:  # pragma: no cover - optional mount
     finishbf16 = None
-try:  # copykill-r2 integration flags (XINFER_COPYKILL_R2, default off)
-    from xinfer.ops.backends.ascend.copykill_r2 import enabled as _copykill_enabled
+try:  # layout-reuse integration flags (XINFER_ASCEND_LAYOUT_REUSE, default off)
+    from xinfer.ops.backends.ascend.layout_reuse import enabled as _layout_reuse_enabled
 except Exception:  # pragma: no cover - optional mount
-    def _copykill_enabled(_family):
+    def _layout_reuse_enabled(_family):
         return False
-try:  # INT-WOSS g2112-r3 flag-isolated routes (XINFER_G2112_*, default off)
+try:
     from xinfer.ops.backends.ascend.src.gemm.g2112_tilelang import (
-        G2112_FLAGS, glu_route, mm_fp32_route, down_route, accumulator_route, samu_route,
+        G2112_FLAGS, glu_route, mm_fp32_route, down_route, accumulator_route, silu_mul_route,
     )
 except Exception:  # pragma: no cover - optional mount
-    G2112_FLAGS = {name: False for name in ("GLU", "VITQKV", "DOWN", "PREFQKV", "TORCH_A", "TORCH_C")}
-    glu_route = mm_fp32_route = down_route = accumulator_route = samu_route = None
+    G2112_FLAGS = {name: False for name in ("GLU", "VITQKV", "DOWN", "PREFQKV", "TORCH_GLU", "TORCH_DOWN")}
+    glu_route = mm_fp32_route = down_route = accumulator_route = silu_mul_route = None
 
 _ACTIVATIONS = {
     "silu": F.silu,
@@ -52,7 +52,7 @@ def _bias_fp32(bias):
     return _native.derived("projection FP32 bias", bias, bias.float)
 
 
-# mx8-r3: opt-in routes for the wall-oss prefill down projection family.
+# Opt-in routes for the wall-oss prefill down projection family.
 _MX8_DOWN_MODE = os.environ.get("XINFER_MX8_DOWN_MODE", "off")
 if _MX8_DOWN_MODE == "off":
     # splitk outranks prepack when both are exported (the final-consolidate
@@ -64,22 +64,23 @@ if _MX8_DOWN_MODE == "off":
         _MX8_DOWN_MODE = "prepack"
 _MX8_DOWN_SPLITK = 4
 
-_GAP_UBF_READY = None
+_TILED_BIAS_ROUTES = None
 
 
-def _gap_ubf_routes(m, n):
-    """GAP-WOSS-NONGE k2: compiled+tileable check for libubfinish_r5."""
-    global _GAP_UBF_READY
-    if _GAP_UBF_READY is None:
+def _tiled_bias_routes(m, n):
+    """Whether the native bias epilogue supports this row tile and width."""
+    global _TILED_BIAS_ROUTES
+    if _TILED_BIAS_ROUTES is None:
         try:
-            from xinfer.ops.backends.ascend import ubfinish_r5
+            from xinfer.ops.backends.ascend import tiled_bias_epilogue
 
-            _GAP_UBF_READY = ubfinish_r5.routes if ubfinish_r5.enabled() else (lambda rows, cols: False)
+            _TILED_BIAS_ROUTES = (tiled_bias_epilogue.routes if tiled_bias_epilogue.enabled()
+                                 else (lambda rows, cols: False))
         except Exception:  # noqa: BLE001 - any miss keeps the released chain
-            _GAP_UBF_READY = lambda rows, cols: False
-    return _GAP_UBF_READY(m, n)
+            _TILED_BIAS_ROUTES = lambda rows, cols: False
+    return _TILED_BIAS_ROUTES(m, n)
 
-# gemm-audit K1 (XINFER_GEMM_BF16DIRECT=on, default off): see the route below.
+# Direct BF16 output (XINFER_GEMM_BF16DIRECT=on, default off): see the route below.
 _BF16DIRECT_ON = os.environ.get("XINFER_GEMM_BF16DIRECT", "") == "on"
 _BF16DIRECT_STATS = os.environ.get("XINFER_GEMM_BF16DIRECT_STATS")
 _BF16DIRECT_COUNT = {"routed": 0}
@@ -119,23 +120,23 @@ def _geometry(x, weight):
     return m, n, k
 
 
-# SOUP2 finplain: the plain-finish prefill GEMM envelope. Every (k, n) below
+# SQUARE_CAST finplain: the plain-finish prefill GEMM envelope. Every (k, n) below
 # is probed bitwise (matmul-bf16 vs Mm-fp32+cast, zero flips across the
-# production M values 16..868; SOUP2 probe2 receipt). The m16 pair stays in
-# the original arm so the released behavior is unchanged when SOUP2 is off.
-_SOUP2_FINPLAIN_SHAPES = {(2048, 2048), (2048, 5120), (1024, 1536), (1024, 4096), (2048, 1024)}
+# production M values 16..868; SQUARE_CAST probe2 receipt). The m16 pair stays in
+# the original arm so the released behavior is unchanged when SQUARE_CAST is off.
+_PLAIN_GEMM_SHAPES = {(2048, 2048), (2048, 5120), (1024, 1536), (1024, 4096), (2048, 1024)}
 
 
-def _soup2_family_ok(family):
+def _square_cast_family_ok(family):
     try:
-        from xinfer.ops.backends.ascend import soup2
+        from xinfer.ops.backends.ascend import square_cast
 
-        return soup2.enabled(family)
+        return square_cast.enabled(family)
     except Exception:  # noqa: BLE001 - any miss keeps the released chain
         return False
 
 
-_soup2_finplain_ok = lambda: _soup2_family_ok("finplain")
+_plain_gemm_enabled = lambda: _square_cast_family_ok("finplain")
 
 
 def _check_tensor(tensor, name, device, shape, dtypes):
@@ -144,11 +145,7 @@ def _check_tensor(tensor, name, device, shape, dtypes):
 
 
 def _finish(y, bias, activation, residual, residual_gate, row_class, row_scale):
-    # SOUPKILL knife A (opt-in, XINFER_SOUPKILL=finish): the plain bias+residual
-    # finish of a 1024-wide FP32 accumulator is one SIMD pass over the
-    # accumulator -- same two FP32 adds in the same order, one final RNE. Any
-    # envelope miss, or a deployment without the knife library, returns None and
-    # the released chain below runs unchanged.
+    # Fuse both FP32 additions for a 1024-wide bias/residual finish and round once to BF16.
     if (
         bias is not None
         and residual is not None
@@ -160,23 +157,22 @@ def _finish(y, bias, activation, residual, residual_gate, row_class, row_scale):
         and y.dim() == 2
         and y.shape[1] == 1024
     ):
-        from xinfer.ops.backends.ascend import soupkill
+        from xinfer.ops.backends.ascend import fp32_accumulator_epilogue
 
-        fused = soupkill.finish_bias_res(
+        fused = fp32_accumulator_epilogue.finish_bias_res(
             y, bias, residual, y.new_empty(tuple(y.shape), dtype=torch.bfloat16)
         )
         if fused is not None:
             return fused
-    # INT-WOSS COPYKILL-r2 K5: single-kernel biased BF16 round. Off keeps the
-    # walloss two-kernel chain byte-for-byte; K4 independently controls memo.
-    if (_copykill_enabled("k5") and bias is not None and activation is None
+    # Round the accumulator and bias together; bias caching is independently selectable.
+    if (_layout_reuse_enabled("fuse_bias_cast") and bias is not None and activation is None
             and residual is None and residual_gate is None and row_scale is None
             and y.is_contiguous()):
         out = torch.empty(y.shape, dtype=torch.bfloat16, device=y.device)
         torch.add(y, _bias_fp32(bias), out=out)
         return out
     if bias is not None:
-        y = y + (_bias_fp32(bias) if _copykill_enabled("k4") else bias.float())
+        y = y + (_bias_fp32(bias) if _layout_reuse_enabled("cache_fp32_bias") else bias.float())
     if row_scale is not None:
         y = y * row_scale[:, None]
     if activation is not None:
@@ -253,23 +249,13 @@ class CannProjection:
                     "nor the in-library ACLNN Mm core"
                 )
             self._query, self._launch = pair
-        # r3: the fused FP32 SwiGLU finish (gemm_glu_fp32_finish_split_2048 via
-        # the gemm_epilogue_glu FFI entry) for the action-stage [M, 4096] split
-        # halves; the four-op torch epilogue stays for every other shape.
-        # glu-r1: the prefill [768, 22016] fused finish rides the existing
-        # gemm_epilogue_glu entry; the vision [2112, 6912] bias-folded chain
-        # rides gemm_glu_fp32_npu (its own shared ACLNN Mm + bias-staged
-        # split_3456 finish). Both are reused FFI names -- the surface is
-        # unchanged.
+        # The action and prefill SwiGLU finishes read the FP32 accumulator directly.
+        # The vision finish also consumes the BF16 bias.
         self._glu_split_fp32_finish = getattr(CORE, "gemm_epilogue_glu", None)
         self._glu_fp32_deferred = getattr(CORE, "gemm_glu_fp32_npu", None)
-        # r5: the wall_oss vision QKV fused finish (one UB pass over the
-        # borrowed FP32 accumulator; the torch rope chain measured ~113 us on
-        # the [2112, 3840] rows, the kernel ~10.6 us, probe-r5).
+        # Apply bias and rotary embedding in one pass over the vision projection accumulator.
         self._vision_rope_finish = getattr(CORE, "gemm_qkv_vision_rope_finish", None)
-        # r10: the fused vision QKV Cube (gemm + bias + rotate-half RoPE + one RNE in
-        # one launch; the FP32 accumulator never round-trips GM). Internal mount via
-        # the lib's AOT launcher symbols -- no new FFI export.
+        # The fused Cube kernel keeps the projection accumulator on chip through RoPE.
         self._vision_rope_cube = _aot_ctypes_entry("gemm_qkv_vision_rope_cube")
         self._vision_cube_warmed = False
         self._buffers = {}
@@ -281,7 +267,7 @@ class CannProjection:
         return _native.derived("cann_contiguous", weight, weight.contiguous)
 
     def _mx8_down(self, x, weight):
-        """mx8-r3 flag routes for the [M, 11008] x [2048, 11008] down projection.
+        """Optional routes for the [M, 11008] x [2048, 11008] down projection.
 
         Off by default (XINFER_MX8_DOWN_MODE=off keeps the released shared
         FP32-accumulator chain). Prepack: one-time [K, N] copy per storage
@@ -330,7 +316,7 @@ class CannProjection:
 
     def accumulator(self, x, weight):
         """Borrow FP32 `[M,N]` inside a context, scheduling every consumer before exit."""
-        # INT-WOSS G2112-r3 PREFQKV, default off.
+        # PREFQKV, default off.
         if x.ndim == 2 and weight.ndim == 2:
             m, k = x.shape
             if (G2112_FLAGS["PREFQKV"] and (m, k) == (768, 2048)
@@ -342,7 +328,7 @@ class CannProjection:
         return self._project(x, weight, _geometry(x, weight))
 
     def gemm_add_rms_norm(self, x, weight, residual, norm_weight, epsilon):
-        """r3 (agent H): bias-free projection + the f32in add+rms fast plan.
+        """Bias-free projection followed by add-RMSNorm on the FP32 accumulator.
 
         The FP32 accumulator feeds the kernel directly; the RNE round to BF16
         happens inside it -- bit-identical to the released chain
@@ -364,8 +350,8 @@ class CannProjection:
                 y = y.reshape(residual.shape)
             return _add_rmsnorm(residual, y, norm_weight, epsilon, inference=True)
 
-    def copykill_f32in_available(self):
-        """INT-WOSS COPYKILL-r2 K2 capability: the core library's f32in AOT pair.
+    def fp32_input_norm_available(self):
+        """Whether the core library contains the FP32-input RMSNorm kernel.
 
         The v22 delivery's probe resolved the pair from its combined library;
         the unified core carries the same kernel (rms_consistent_generic_h1024_f32in,
@@ -408,8 +394,8 @@ class CannProjection:
         row_scale=None,
     ):
         """Project `[M,K]` by NK weights, apply the FP32 epilogue, and return BF16."""
-        # INT-WOSS G2112-r3 TORCH_C/DOWN, disjoint from MX8/SMALLM shapes.
-        if ((G2112_FLAGS["DOWN"] or G2112_FLAGS["TORCH_C"])
+        # TORCH_DOWN/DOWN, disjoint from MX8/SMALLM shapes.
+        if ((G2112_FLAGS["DOWN"] or G2112_FLAGS["TORCH_DOWN"])
                 and bias is None and activation is None and residual is None
                 and residual_gate is None and row_class is None and row_scale is None
                 and x.ndim == 2 and weight.ndim == 2
@@ -419,7 +405,7 @@ class CannProjection:
             if G2112_FLAGS["DOWN"]:
                 return down_route(x, weight)
             return torch.mm(x, weight.t())
-        # mx8-r3: flag-isolated routes for the prefill e0 down projection
+        # Optional routes for the prefill e0 down projection
         # ([M, 11008] x [2048, 11008], trivial epilogue only). Default off.
         if (
             _MX8_DOWN_MODE != "off"
@@ -448,29 +434,23 @@ class CannProjection:
             and (
                 (tuple(x.shape) == (16, 2048) and tuple(weight.shape) == (1024, 2048))
                 or (
-                    _soup2_finplain_ok()
+                    _plain_gemm_enabled()
                     and 1 <= x.shape[0] <= 8192
-                    and (x.shape[1], weight.shape[0]) in _SOUP2_FINPLAIN_SHAPES
+                    and (x.shape[1], weight.shape[0]) in _PLAIN_GEMM_SHAPES
                 )
             )
         ):
-            # EPILOGUE-R2 blade A (XINFER_SMALLM_R3=down, default off): the
-            # m16 down/o_proj [16,2048]x[1024,2048] plain store rides the
-            # bitwise smallm_r3_down Cube kernel (smallm-r3 receipt: 0 flips
-            # vs the aclnn chain on this exact shape). Flag off keeps the
-            # released torch.matmul verbatim. CAPACITY-PREVIEW: the explicit
-            # m16 guard keeps the blade inside its audited envelope now that
-            # the widened branch also admits the SOUP2 finplain shapes.
+            # Use the small-M action down projection for the supported unmodified epilogue.
             if (
-                smallm_r3 is not None and smallm_r3.enabled("down")
+                action_gemm_m16 is not None and action_gemm_m16.enabled("down")
                 and tuple(x.shape) == (16, 2048) and tuple(weight.shape) == (1024, 2048)
             ):
-                return smallm_r3.down(x, self._stable_contiguous(weight))
+                return action_gemm_m16.down(x, self._stable_contiguous(weight))
             if tuple(x.shape) == (16, 2048) and tuple(weight.shape) == (1024, 2048):
                 return torch.matmul(x, self._stable_contiguous(weight).t())
-            from xinfer.ops.backends.ascend import soup2
+            from xinfer.ops.backends.ascend import square_cast
 
-            return soup2.finplain(x, self._stable_contiguous(weight).t())
+            return square_cast.finplain(x, self._stable_contiguous(weight).t())
         if (
             _BF16DIRECT_ON
             and bias is None and activation is None and residual is None
@@ -482,7 +462,7 @@ class CannProjection:
             and tuple(x.shape) == (464, 2048)
             and tuple(weight.shape) in ((2048, 2048), (5120, 2048))
         ):
-            # gemm-audit K1: trivial-epilogue prefill shapes route to one
+            # trivial-epilogue prefill shapes route to one
             # aclnnMatmul BF16 store (FP32 accumulate, single RNE, bitwise vs
             # the Mm FP32 accumulator + Cast pair on both audited shapes; iso
             # v2 card 5: -2.7/-5.3 us per call, hot==rot4).
@@ -546,10 +526,10 @@ class CannProjection:
         elif row_class is not None:
             raise ValueError("row_class requires residual_gate")
 
-        # smallm-r3: opt-in action down-projection kernel ([16,2048]x
+        # action-gemm-m16: opt-in action down-projection kernel ([16,2048]x
         # [1024,2048], trivial epilogue): 32-block single-shot W stream, the
         # BF16 store folds the cast round (bitwise on the twin reference).
-        if (smallm_r3 is not None and smallm_r3.enabled("down")
+        if (action_gemm_m16 is not None and action_gemm_m16.enabled("down")
                 and bias is None and activation is None and residual is None
                 and residual_gate is None and row_class is None and row_scale is None
                 and x.ndim == 2 and weight.ndim == 2
@@ -558,14 +538,14 @@ class CannProjection:
                 and x.dtype == weight.dtype == torch.bfloat16
                 and x.is_contiguous() and weight.is_contiguous()
                 and x.device.type == "npu" and weight.device == x.device):
-            return smallm_r3.down(x, weight)
-        # layout-oproj K1: the decode attention hands back its output
+            return action_gemm_m16.down(x, weight)
+        # The decode attention hands back its output
         # token-major [16, 2048], so the o-projection now sees the same
         # contiguous A as the down site (same GEMM body, same k order, same
         # RNE store round -> bitwise). Kept after the released down branch:
         # the two sites are shape-identical, so in the combined arm the down
         # branch still owns both and this only serves arms with down off.
-        if (smallm_r3 is not None and smallm_r3.enabled("oproj")
+        if (action_gemm_m16 is not None and action_gemm_m16.enabled("oproj")
                 and bias is None and activation is None and residual is None
                 and residual_gate is None and row_class is None and row_scale is None
                 and x.ndim == 2 and weight.ndim == 2
@@ -574,12 +554,10 @@ class CannProjection:
                 and x.dtype == weight.dtype == torch.bfloat16
                 and x.is_contiguous() and weight.is_contiguous()
                 and x.device.type == "npu" and weight.device == x.device):
-            return smallm_r3.o_proj_row(x, weight)
-        # GAP-WOSS-NONGE k2: ubfinish-r5 rowpass-SIMD bias finish (witnessed
-        # bitwise vs the torch tail; graph 6.65us vs the 2-kernel chain
-        # 10.30us on [2112,1280]). Opt-in; unregistered shapes fall through.
+            return action_gemm_m16.o_proj_row(x, weight)
+        # The row-tiled SIMD kernel adds bias in FP32 before the BF16 store.
         if (
-            os.environ.get("XINFER_UBFINISH_R5") == "1"
+            os.environ.get("XINFER_ASCEND_TILED_BIAS_EPILOGUE") == "1"
             and bias is not None
             and activation is None
             and residual is None
@@ -588,9 +566,9 @@ class CannProjection:
             and row_scale is None
             and bias.dtype == torch.bfloat16
             and bias.is_contiguous()
-            and _gap_ubf_routes(m, n)
+            and _tiled_bias_routes(m, n)
         ):
-            from xinfer.ops.backends.ascend import ubfinish_r5 as _ub5
+            from xinfer.ops.backends.ascend import tiled_bias_epilogue as _ub5
 
             with self._project(x, weight, shape) as output:
                 out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
@@ -611,8 +589,8 @@ class CannProjection:
         if bias is not None:
             _check_tensor(bias, "bias", x.device, (n2,), _FLOAT_DTYPES)
         n = n2 // 2
-        # INT-WOSS G2112-r3 TORCH_A/GLU, default off.
-        if ((G2112_FLAGS["GLU"] or G2112_FLAGS["TORCH_A"])
+        # TORCH_GLU/GLU, default off.
+        if ((G2112_FLAGS["GLU"] or G2112_FLAGS["TORCH_GLU"])
                 and bias is not None and n2 == 6912 and shape[0] == 2112
                 and bias.dtype == torch.bfloat16 and bias.is_contiguous()
                 and x.dtype == weight.dtype == torch.bfloat16
@@ -620,10 +598,10 @@ class CannProjection:
                 and x.device.type == "npu" and weight.device == x.device):
             if G2112_FLAGS["GLU"]:
                 return glu_route(x, weight, bias)
-            return samu_route(torch.addmm(bias, x, weight.t()))
+            return silu_mul_route(torch.addmm(bias, x, weight.t()))
         if (bias is not None and n2 == 6912 and bias.dtype == torch.bfloat16
                 and bias.is_contiguous() and callable(self._glu_fp32_deferred)):
-            # glu-r1: the vision shape [2112, 1280] x [6912, 1280] rides the
+            # The vision shape [2112, 1280] x [6912, 1280] rides the
             # gemm_glu_fp32_npu entry end to end: the same shared ACLNN Mm
             # projects into the entry's FP32 accumulator and the split_3456
             # finish folds the BF16 bias into its single staged pass. The old
@@ -633,9 +611,8 @@ class CannProjection:
             ws = self._glu_deferred_workspace(x, weight, shape)
             self._glu_fp32_deferred(out, ws, x, weight, bias, False, False)
             return out
-        # r6a-m16epi blade A1 (XINFER_SMALLM_R3=gateup, default off): fused
-        # action gate_up Cube+GLU single-shot kernel.
-        if (smallm_r3 is not None and smallm_r3.enabled("gateup")
+        # Fuse the action gate/up projection and its SwiGLU finish for 16 rows.
+        if (action_gemm_m16 is not None and action_gemm_m16.enabled("gateup")
                 and bias is None
                 and x.ndim == 2 and weight.ndim == 2
                 and tuple(x.shape) == (16, 1024)
@@ -643,7 +620,7 @@ class CannProjection:
                 and x.dtype == weight.dtype == torch.bfloat16
                 and x.is_contiguous() and weight.is_contiguous()
                 and x.device.type == "npu" and weight.device == x.device):
-            return smallm_r3.gateup(x, weight)
+            return action_gemm_m16.gateup(x, weight)
         if (
             finishbf16 is not None and finishbf16.enabled("gateup")
             and bias is None and n2 == 12288
@@ -655,11 +632,11 @@ class CannProjection:
         ):
             # FINISH-BF16 gateup: one aclnnMatmul BF16 store feeds the
             # bf16-reading split_6144 finish; the borrowed FP32 accumulator
-            # and its 2x-wide read disappear (GEMM-AUDIT R6 gateup row).
+            # and its 2x-wide read disappear.
             return finishbf16.glu_split_bf16(x, weight)
         with self._project(x, weight, shape) as output:
             if bias is None and n2 == 4096 and callable(self._glu_split_fp32_finish) and _has_glu_finish(n):
-                # r3: the action shape [M, 1024] x [4096, 1024] finishes through
+                # The action shape [M, 1024] x [4096, 1024] finishes through
                 # the fused split_2048 kernel (one silu*up + BF16 round) instead
                 # of the silu-slice + swish + mul + cast torch chain; enqueued
                 # inside the projection lock like every other consumer of the
@@ -669,7 +646,7 @@ class CannProjection:
                 return out
             if (bias is not None and n2 == 6912 and bias.dtype == torch.bfloat16
                     and bias.is_contiguous() and callable(self._glu_split_fp32_finish) and _has_glu_finish(n)):
-                # r4: the vision shape [rows, 1280] x [6848, 1280]. The BF16 bias
+                # The vision shape [rows, 1280] x [6848, 1280]. The BF16 bias
                 # is pre-added into the borrowed FP32 accumulator -- elementwise
                 # the torch chain's y = output + bias.float() -- and the fused
                 # split_3456 finish (has_bias=0) does silu*up + one BF16 round in
@@ -679,7 +656,7 @@ class CannProjection:
                 self._glu_split_fp32_finish(out, output, 0, n)
                 return out
             if bias is None and n2 == 22016 and callable(self._glu_split_fp32_finish) and _has_glu_finish(n):
-                # glu-r1: the prefill shape [768, 2048] x [22016, 2048]: one
+                # The prefill shape [768, 2048] x [22016, 2048]: one
                 # fused split_11008 pass over the borrowed FP32 accumulator
                 # replaces the three-op torch tail (silu + mul + cast).
                 out = x.new_empty((shape[0], n), dtype=torch.bfloat16)
@@ -697,7 +674,7 @@ class CannProjection:
                 glu_epi.split_6144_finish(out, output, shape[0])
                 return out
             y = output if bias is None else output + bias.float()
-            # SOUP-FORM glumulcast: keep aclnnSilu on the gate half (the bits
+            # Keep aclnnSilu on the gate half (the bits
             # are the reference), fold the strided mul + BF16 round into one
             # pass over the borrowed accumulator. Parked: the kernel lost its
             # race with the aclnn chain at the call sites (45.9 vs 38.4 us per
@@ -705,13 +682,13 @@ class CannProjection:
             # for the record and for the envelope audit.
             if bias is None:
                 try:
-                    from xinfer.ops.backends.ascend import soupform
+                    from xinfer.ops.backends.ascend import projection_norm_epilogue
                 except (ImportError, OSError):
                     pass
                 else:
-                    if soupform.enabled("glumulcast"):
+                    if projection_norm_epilogue.enabled("glumulcast"):
                         gate = F.silu(y[:, :n])
-                        fused = soupform.mulcast(gate, y, n)
+                        fused = projection_norm_epilogue.mulcast(gate, y, n)
                         if fused is not None:
                             return fused
             return (F.silu(y[:, :n]) * y[:, n:]).to(torch.bfloat16)
@@ -759,22 +736,14 @@ class CannProjection:
                 and x.dtype == weight.dtype == torch.bfloat16 and x.device == weight.device
                 and callable(self._vision_rope_cube)
                 and os.environ.get("XINFER_VISION_ROPE_CUBE") == "1"):
-            # r10: the fused Cube route. Numerics landed BITWISE vs the ACLNN Mm +
-            # gemm_qkv_vision_rope_finish pair (probe-rope-r10: max_abs 0.0, mismatch
-            # 0.0), but its first tiling (bm=128 x bn=160, 408 blocks, the SimtVF rope
-            # on both AIVs) measured 176.15 us vs the pair 104.45 -- a 72% regression,
-            # so the route stays opt-in (XINFER_VISION_ROPE_CUBE=1) until the gemm
-            # tile lane re-tils it (bn=240 with an M-split epilogue keeps the +/-40
-            # partner in-tile too); the kernel and the ctypes mount are in the lib.
+            # This opt-in Cube route fuses the projection, bias and rotate-half RoPE.
             return self._vision_rope_cube_call(x, weight, bias, cos, sin)
         with self._project(x, weight, shape) as output:
             if (m == 2112 and n == 3840 and num_heads == 16 and head_dim == 80
                     and half == 40 and bias.dtype == torch.bfloat16
                     and bias.is_contiguous() and cos.is_contiguous() and sin.is_contiguous()
                     and callable(self._vision_rope_finish)):
-                # r5: the fused vision finish (gemm_qkv_vision_rope_finish) --
-                # one pass: bias add + standard-order rotate-half RoPE on the
-                # Q/K heads + one BF16 round, oracle-anchored (probe-r5).
+                # Fuse the vision bias and rotate-half RoPE before rounding once to BF16.
                 out = x.new_empty((m, n), dtype=torch.bfloat16)
                 self._vision_rope_finish(out, output, bias, cos, sin)
                 return out
