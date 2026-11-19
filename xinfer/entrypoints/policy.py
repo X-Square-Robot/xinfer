@@ -12,11 +12,12 @@ are decoded and resized on the device by default where the platform supports it
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import suppress
 from typing import Any
 
 from xinfer import ops
-from xinfer.config import ExplicitSettings, apply_image_preprocess_device, resolve
-from xinfer.engine.core import Engine
+from xinfer.config import ExplicitSettings, apply_image_preprocess_device
+from xinfer.entrypoints import _factory as _engine_factory
 from xinfer.engine.cudagraph import CUDAGraphConfig
 from xinfer.models.interface import PreparedRequest, connect
 from xinfer.models.registry import get_model_class
@@ -74,8 +75,9 @@ class Policy:
                 device, ``"cpu"`` in the calling thread, or ``None`` for the platform's default (``"gpu"`` on a
                 device with an available image backend, see ``xinfer.config.apply_image_preprocess_device``).
                 A top-level model option, as in ``xinfer serve --model-options``, not a ``processing`` field.
-            **model_options: passed to ``from_checkpoint``. A string ``quantization`` (default ``"bf16"``)
-                also selects the tuned table. ``processing``, if given, is a dict.
+            **model_options: passed to ``from_checkpoint``; the model chooses its default precision.
+                Its effective ``quantization`` attribute, when provided, selects the tuned table;
+                otherwise the explicit option or ``"bf16"`` is used. ``processing``, if given, is a dict.
 
         Raises:
             ConfigError: CUDA graphs requested on a platform without capture; ``image_preprocess_device`` set in
@@ -100,14 +102,46 @@ class Policy:
         ops.warn_slow_fallbacks(model, self.op_table, self.capabilities.stage_ops, self.platform.device)
         self.io_schema = self.model.io_schema()
         self._prepare = connect(self.model.input_processor())
-        self._finish = self.model.output_processor()
-        quantization = model_options.get("quantization", "bf16")
-        self.resolved = resolve(self.model, self.platform, model_name=model,
-                                quantization=quantization if isinstance(quantization, str) else None,
-                                explicit=ExplicitSettings(cudagraphs=None if cudagraphs is None else bool(cudagraphs),
-                                                          stream_priorities=stream_priorities or {}))
-        policy = cudagraphs if isinstance(cudagraphs, CUDAGraphConfig) else None
-        self.engine = Engine(self.model, self.platform, self.resolved.engine_config(policy))
+        try:
+            self._finish = self.model.output_processor()
+            quantization = getattr(self.model, "quantization", model_options.get("quantization", "bf16"))
+            self.resolved = _engine_factory.resolve_config(
+                self.model, self.platform, model_name=model,
+                quantization=quantization if isinstance(quantization, str) else None,
+                explicit=ExplicitSettings(cudagraphs=None if cudagraphs is None else bool(cudagraphs),
+                                          stream_priorities=stream_priorities or {}))
+            graph_policy = cudagraphs if isinstance(cudagraphs, CUDAGraphConfig) else None
+            self.engine = _engine_factory.create_engine(self.platform, self.model,
+                                                        self.resolved.engine_config(graph_policy))
+        except BaseException:
+            with suppress(BaseException):
+                self._close_processor()
+            raise
+
+    def _close_processor(self):
+        close = getattr(self._prepare, "close", None)
+        if close is not None:
+            close()
+
+    def close(self) -> None:
+        """Drain the engine and close the input processor."""
+        try:
+            self.engine.shutdown()
+        except BaseException:
+            with suppress(BaseException):
+                self._close_processor()
+            raise
+        self._close_processor()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, error, traceback):
+        if exc_type is None:
+            self.close()
+        else:
+            with suppress(BaseException):
+                self.close()
 
     def prepare(self, observation: Mapping[str, Any]) -> PreparedRequest:
         """Run the model's InputProcessor on one observation (CPU, calling thread).

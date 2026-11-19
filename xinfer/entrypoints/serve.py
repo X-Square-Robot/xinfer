@@ -212,6 +212,11 @@ def main(argv=None) -> None:
 
     torch.set_num_threads(1)
     platform = resolve_platform(args.device)
+    if platform.capabilities.execution_model != "cuda-lanes":
+        raise SystemExit(f"xinfer serve currently requires execution_model='cuda-lanes'; "
+                         f"{platform.name} ({platform.device}) advertises "
+                         f"{platform.capabilities.execution_model!r}. Use the in-process Policy or "
+                         "that vendor's dedicated entry point.")
     # The views are decoded and resized in the frontends unless the model options say "gpu" (bitwise as the
     # reference services).
     model_options = apply_image_preprocess_device(json.loads(args.model_options), platform, default="cpu")

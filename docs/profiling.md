@@ -186,6 +186,9 @@ without CUDA activity stops the command with that message.
 
 ## Load profile (`xinfer-profile load`)
 
+This command requires the lane engine's admission and stage spans. The explicit-completion RPU profile is
+unsupported; use its in-process `Policy` interface for inference.
+
 ```bash
 xinfer-profile load --model wall_oss --checkpoint /path/to/checkpoint --requests observation.msgpack \
   --robots 8 --out artifacts/wall-oss-load

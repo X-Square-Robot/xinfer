@@ -50,6 +50,9 @@ class Lane:
             ValueError: priority is not an integer, is nonzero on an unsupported platform,
                 or the runtime cannot verify or honor the requested value without clamping.
         """
+        if platform.capabilities.execution_model != "cuda-lanes":
+            raise ValueError("lane dispatch requires execution_model='cuda-lanes'; "
+                             f"got {platform.capabilities.execution_model!r}")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise ValueError(f"stream priority for {stage} must be an integer, got {priority!r}")
         if priority != 0 and not platform.capabilities.stream_priorities:

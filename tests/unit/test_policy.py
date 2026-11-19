@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 from xinfer.config import ConfigError, apply_image_preprocess_device
-from xinfer.platforms.cpu import cpu_platform as _cpu_platform
+from xinfer.platforms.cpu import cpu_platform
 
 
 def _platform(device_images):
-    platform = _cpu_platform()
+    platform = cpu_platform()
     return replace(platform, name="test", capabilities=replace(platform.capabilities, device_images=device_images))
 
 
@@ -56,7 +56,7 @@ def test_the_option_is_not_a_processing_field():
 
 
 def test_the_cpu_platform_has_no_device_images():
-    assert not _cpu_platform().capabilities.device_images
+    assert not cpu_platform().capabilities.device_images
 
 
 @pytest.fixture
@@ -76,7 +76,7 @@ def policy(monkeypatch):
 
     monkeypatch.setattr(policy_module, "get_model_class", lambda name: SimpleNamespace(from_checkpoint=load))
     monkeypatch.setattr(policy_module.ops.registry, "load_plugins", lambda: None)
-    monkeypatch.setattr(policy_module, "Engine", lambda model, platform, config: None)
+    monkeypatch.setattr(policy_module._engine_factory, "create_engine", lambda platform, model, config: None)
 
     def make(device_images=True, **options):
         monkeypatch.setattr(policy_module, "resolve_platform", lambda device: _platform(device_images))

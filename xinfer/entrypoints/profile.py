@@ -132,6 +132,10 @@ def _in_process(args) -> tuple[list[dict], dict, dict]:
     from xinfer.platforms import resolve_platform
 
     platform = resolve_platform(args.device)
+    if platform.capabilities.execution_model != "cuda-lanes":
+        raise SystemExit("xinfer-profile load requires execution_model='cuda-lanes' for admission and stage spans; "
+                         f"{platform.name} ({platform.device}) advertises "
+                         f"{platform.capabilities.execution_model!r}")
     options = apply_image_preprocess_device(json.loads(args.model_options), platform, default="cpu")
     ops.registry.load_plugins()
     table = ops.registry.build_table(platform)

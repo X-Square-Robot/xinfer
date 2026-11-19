@@ -115,6 +115,7 @@ Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 
 | NVIDIA GPUs · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
 | NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
+| Rhino RPU (R1) | `rpu` | Rhino Launch SDK AOT · [Profile](docs/models/wallx2b_rpu.md) |
 | CPU | `cpu` | Reference implementations and tests |
 
 Each accelerator runs its own Engine and weights.
