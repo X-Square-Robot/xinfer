@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 from xinfer.ops.backends.ascend import _native
 from xinfer.ops.backends.ascend.core import CORE
-from xinfer.ops.backends.ascend._cann_action_scope import memo_action_metadata
 from xinfer.ops.backends.ascend import action_gemm_m16
 
 
@@ -247,15 +246,8 @@ class CannAction:
             q_prefix = q[..., :width].clone(memory_format=torch.contiguous_format)
             k_prefix = k[..., :width].clone(memory_format=torch.contiguous_format)
 
-            def expand_tables():
-                return (
-                    torch.cat((cos, cos), dim=-1).unsqueeze(1),
-                    torch.cat((sin, sin), dim=-1).unsqueeze(1),
-                )
-
-            cos_full, sin_full = memo_action_metadata(
-                ("rope_tables", id(self)), (cos, sin), expand_tables
-            )
+            cos_full = torch.cat((cos, cos), dim=-1).unsqueeze(1)
+            sin_full = torch.cat((sin, sin), dim=-1).unsqueeze(1)
             q_rot, k_rot = self._rotary(
                 q_prefix, k_prefix, cos_full, sin_full, layout="TND", rotary_mode="half"
             )

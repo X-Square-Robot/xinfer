@@ -21,8 +21,6 @@ Differences to the reference:
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -110,15 +108,6 @@ class OptimizedAction(nn.Module):
             sin: FP32 ``[H, rotary_dim / 2]`` compact sines.
             out: Output ``[1, H, D]`` FP32.
         """
-        # The cache-attention metadata scope of the 2B action bridge: one open scope per forward
-        # lets every flow step's ``gated_kvcache_attention`` call share the dense drop mask the
-        # bridge builds from the live flash mask, instead of each call rebuilding it. The torch
-        # composition exposes no scope and keeps the getattr default (a null context).
-        scope = getattr(self.ops.gated_kvcache_attention, "action_scope", nullcontext)
-        with scope():
-            return self._forward_inner(x, prompt_kv, cos, sin, out)
-
-    def _forward_inner(self, x, prompt_kv, cos, sin, out):
         c, ops, m = self.config, self.ops, self.config.model
         heads, kv_heads, d, eps = m.num_attention_heads, m.num_key_value_heads, m.head_dim, m.rms_norm_eps
         noise, dof = x["noise"].to(torch.float32), x["dof_mask"].to(torch.float32)

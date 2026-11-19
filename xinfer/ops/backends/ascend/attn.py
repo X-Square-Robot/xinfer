@@ -122,12 +122,6 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_
     return out.reshape(q.shape[0], q.shape[1], -1)
 
 
-# The cache-attention metadata scope rides the prefix attention: models open it around their action loop so the
-# dense drop mask is built once per forward from the live flash mask instead of once per call.
-_action_scope = getattr(attention, "action_scope", None) if attention is not None else None
-if callable(_action_scope):
-    prefix_kvcache_attention.action_scope = _action_scope
-
 # ---------------------------------------------------------------- Wall-X 2B attention family
 # One packed-segment entry serves both 2B attention operators: ``causal`` picks the mask and ``out_gate`` folds the
 # output gate into the same kernel, which is exactly how the reference composes them.
@@ -307,13 +301,6 @@ def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, f
     torch.mul(out, torch.sigmoid(gate).view(batch, rows, heads, dim).transpose(1, 2),
               out=packed.view(batch, rows, heads, dim).transpose(1, 2))
     return packed
-
-
-# The same metadata scope the prefix entry carries: the Wall-X 2B action loop drives this operator
-# once per layer per flow step and opens the scope around the whole forward, so all of the loop's
-# calls share the one dense drop mask instead of each rebuilding it.
-if callable(_action_scope):
-    gated_kvcache_attention.action_scope = _action_scope
 
 
 def _sigmoid_gate(out, gate):

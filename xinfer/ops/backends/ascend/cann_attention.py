@@ -10,7 +10,6 @@ from threading import Lock
 import torch
 from xinfer.ops.backends.ascend import _native
 from xinfer.ops.backends.ascend.core import CORE
-from xinfer.ops.backends.ascend._cann_action_scope import action_scope, memo_action_metadata
 try:  # split-kv-decode: opt-in decode-family kernel pair (XINFER_ASCEND_SPLIT_KV_DECODE)
     from xinfer.ops.backends.ascend import split_kv_decode as _split_kv_decode
 except Exception:  # pragma: no cover - the route stays off without the lib
@@ -66,8 +65,6 @@ class CannAttention:
     that will be captured. Keep this instance alive while its graphs or
     submissions are live. Returned tensors have their own storage.
     """
-
-    action_scope = staticmethod(action_scope)
 
     def __init__(self):
         self._bnsd_query = getattr(CORE, "cann_fia_v5_probe_workspace_size", None)
@@ -168,8 +165,7 @@ class CannAttention:
         # Native workspace belongs to this stream. Serialize host submission
         # when two callers share it.
         with self._lock:
-            drop_mask = memo_action_metadata(("drop_mask", id(self), key, new_pos),
-                                             (prefix_len, flash_mask), make_drop_mask)
+            drop_mask = make_drop_mask()
             # Feed ACLNN's BNSD layout without per-call copies where the
             # operator takes it: the wall-style caches arrive as permuted
             # (B, L, KV, D) views of contiguous (B, KV, L, D) buffers, so the

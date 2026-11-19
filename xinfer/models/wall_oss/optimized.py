@@ -18,8 +18,6 @@ which selects the small-M kernel. Differences to the reference:
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import torch
 from torch import nn
 
@@ -247,32 +245,29 @@ class OptimizedAction(nn.Module):
             dof_mask, padding = dof, x_in["padding_action"].to(torch.float32) - x
         pinned_rows = delay.to(torch.int32) if rtc else None
         last = len(self.layers) - 1
-        # Let the selected attention reuse metadata derived from this request's live mask.
-        scope = getattr(ops.prefix_kvcache_attention, "action_scope", nullcontext)
         prefetch_weights, qkv_rope_kvcache = ops.prefetch_weights, ops.qkv_rope_kvcache
         gemm_epilogue, gemm_glu_epilogue = ops.gemm_epilogue, ops.gemm_glu_epilogue
         add_rms_norm = ops.add_rms_norm
-        with scope():
-            for step in range(steps):
-                tau = torch.where(pinned, torch.ones_like(times[step]), times[step])
-                h = self.action_head.embed(x, tau, dof).to(DTYPE)
-                normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
-                for i, layer in enumerate(self.layers):
-                    # this layer's later weights and the next layer's QKV, read while the QKV and attention run
-                    following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
-                    prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
-                    keys, values, k_arg, v_arg = cache_views[i]
-                    q = qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin,
-                                         keys, values, p, heads, kv_heads, d)
-                    o = ops.prefix_kvcache_attention(q.view(1, horizon, heads, d), k_arg, v_arg, start, p,
-                                                     flash_mask=flash_mask)
-                    h, normed = add_rms_norm(gemm_epilogue(o[0], layer.o_t.t())[None], h, layer.post_norm, eps)
-                    hidden = gemm_glu_epilogue(normed[0], layer.gate_up)
-                    following = self.final_norm if i == last else self.layers[i + 1].input_norm
-                    h, normed = add_rms_norm(gemm_epilogue(hidden, layer.down_t.t())[None], h, following, eps)
-                x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
-                                            pinned_rows, prefix)
-            ops.join_prefetch()
+        for step in range(steps):
+            tau = torch.where(pinned, torch.ones_like(times[step]), times[step])
+            h = self.action_head.embed(x, tau, dof).to(DTYPE)
+            normed = ops.rms_norm(h, self.layers[0].input_norm, eps)
+            for i, layer in enumerate(self.layers):
+                # this layer's later weights and the next layer's QKV, read while the QKV and attention run
+                following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
+                prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
+                keys, values, k_arg, v_arg = cache_views[i]
+                q = qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin,
+                                     keys, values, p, heads, kv_heads, d)
+                o = ops.prefix_kvcache_attention(q.view(1, horizon, heads, d), k_arg, v_arg, start, p,
+                                                 flash_mask=flash_mask)
+                h, normed = add_rms_norm(gemm_epilogue(o[0], layer.o_t.t())[None], h, layer.post_norm, eps)
+                hidden = gemm_glu_epilogue(normed[0], layer.gate_up)
+                following = self.final_norm if i == last else self.layers[i + 1].input_norm
+                h, normed = add_rms_norm(gemm_epilogue(hidden, layer.down_t.t())[None], h, following, eps)
+            x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
+                                        pinned_rows, prefix)
+        ops.join_prefetch()
         out.copy_(x)
 
 
