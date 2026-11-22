@@ -39,6 +39,27 @@ def test_cli_parses_signed_stream_priorities():
     assert _per_stage(args.stream_priorities) == {"a": 0, "b": -1}
 
 
+@pytest.mark.parametrize(("model_id", "loader"), [
+    ("wall-oss-1.0-nano", "xinfer.models.wall_oss_1_0_nano.model.WallOSS10Nano.from_checkpoint"),
+    ("wall-oss-0.5", "xinfer.models.wall_oss_0_5.model.WallOSS05.from_checkpoint"),
+])
+def test_released_model_ids_work_in_service_and_policy(model_id, loader, monkeypatch, tmp_path):
+    import json
+
+    from echo_model import EchoModel
+    from xinfer import Policy
+    from xinfer.entrypoints.serve import main
+
+    # Keep the real registry and both entry points; only the checkpoint loader uses the CPU echo model.
+    monkeypatch.setattr(loader, EchoModel.from_checkpoint)
+    resolved = tmp_path / "resolved.json"
+    main(["--model", model_id, "--checkpoint", "unused", "--device", "cpu",
+          "--dry-run", "--resolved-config", str(resolved)])
+    assert json.loads(resolved.read_text())["model"] == model_id
+    with Policy(model_id, "unused", device="cpu") as policy:
+        np.testing.assert_array_equal(policy.infer({"x": [1.0, 2.0]})["y"], [3.0, 5.0])
+
+
 def _dry_run(model_options):
     env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(ROOT), str(HERE)]))
     return subprocess.run([sys.executable, "-m", "xinfer.entrypoints.serve", "--model", "echo_model:EchoModel",

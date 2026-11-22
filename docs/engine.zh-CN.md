@@ -34,7 +34,7 @@ completion thread:
 
 1. **链式分发（dispatch）。** 请求的上游阶段一经*分发*，请求就进入该阶段的队列；通道（lane）在 GPU 上等待上游的事件。通道空闲时，请求无需主机往返即可跑完所有阶段，这就是单请求路径。有负载时队列被填满，各阶段形成流水线。
 2. **零等待组批。** 一次分发取队列中已有的兼容请求，不超过该阶段的上限，选用允许的最大批大小，且从不填充空行。兼容指该阶段读取的每个输入形状相同（批维除外）且主机端取值相同。阶段最多按模型在 `Capabilities.batch_sizes` 中声明的最大批大小组批；模型只为组批结果能通过其精度门禁的阶段声明大于 1 的批大小。每个阶段的第一次分发单独运行，因为要借此得知该阶段读取哪些输入。
-   - **不同长度。** 若交接张量的 `TensorSpec` 声明了 `seq_axis`（Wall-OSS：prompt 的 K/V），同批请求之间该张量的长度可以不同。组批时每一行左填充到最长者的长度，阶段会收到 `<name>_lengths`（`int32 [B]`，B1 时也有）。见 `xinfer/engine/batching.py`。在 CUDA 上，长度从锁页（pinned）内存异步上传：通道可能已经在等待上游事件，阻塞式上传会卡住发起提交的线程。
+   - **不同长度。** 若交接张量的 `TensorSpec` 声明了 `seq_axis`（WALL-OSS-0.5：prompt 的 K/V），同批请求之间该张量的长度可以不同。组批时每一行左填充到最长者的长度，阶段会收到 `<name>_lengths`（`int32 [B]`，B1 时也有）。见 `xinfer/engine/batching.py`。在 CUDA 上，长度从锁页（pinned）内存异步上传：通道可能已经在等待上游事件，阻塞式上传会卡住发起提交的线程。
    - **延迟合并。** 输入在阶段读取时才合并。阶段不读取的输入，或无法共享的输入（形状或主机端取值不同），不会合并进批。
    - **计数器。** `stats["dispatch_<stage>_b<N>"]` 按批大小统计分发次数，`stats["padded_dispatch_<stage>"]` 统计对不同长度做过填充的批数。
 3. **下游优先。** 引擎线程每一轮先在有空闲槽位时准入等待中的请求，再从最后一个阶段到第一个阶段依次分发，使下游工作先于上游阶段新增的工作发出。
@@ -55,13 +55,13 @@ completion thread:
 
 nvImageCodec 在解码器自己的 stream 上用 nvJPEG 的硬件解码器解码整批，它运行在 GPU 的 JPEG 引擎上（NVJPG，RTX 5090 和 Jetson Thor 都有）：熵解码和 IDCT 在那里执行，再由一个 CUDA kernel 像 libjpeg-turbo 一样做色度上采样并转成 RGB，因此解码出的视图与 CPU 路径相差不超过 1 级。解码出的图像属于 nvImageCodec 的内存。解码器在自己的 stream 上把它们拷进张量，并让线程的 stream 等待这次拷贝；它保留这些图像，直到拷贝之后记录的事件完成，再解码到这些图像里复用，所以一次调用既不分配新图像，也不等待 GPU。在 RTX 5090 上（nvImageCodec 0.10），一个请求的相机视图占用该线程 0.4–0.7 ms。解码器只用一个 CPU 线程：nvImageCodec 默认按可见核数起线程，等待时自旋，在有 CPU 配额的容器里压测时拖慢了前端和引擎。一个设备图像线程就够了，解码器也只从这个线程调用。JPEG 字节留在主机内存，nvImageCodec 从那里读取码流。
 
-CUDA 设备是否支持设备图像，通过创建解码器来检查，不做解码。若在这时（平台解析时）解码，该进程之后的每次 CUDA graph 回放都会变慢：在 RTX 5090 上，回放中 kernel 之间的间隙从 0.5 µs 以下变为 0.5–1 µs，Wall-X 2B 每个请求约多 0.6 ms，Wall-OSS 每个请求最多多 1 ms，不论请求是否带 JPEG。不在这时解码，单请求耗时与 XInfer 之前所用的 torchvision 解码器相同。
+CUDA 设备是否支持设备图像，通过创建解码器来检查，不做解码。若在这时（平台解析时）解码，该进程之后的每次 CUDA graph 回放都会变慢：在 RTX 5090 上，回放中 kernel 之间的间隙从 0.5 µs 以下变为 0.5–1 µs，WALL-OSS-1.0-Nano 每个请求约多 0.6 ms，WALL-OSS-0.5 每个请求最多多 1 ms，不论请求是否带 JPEG。不在这时解码，单请求耗时与 XInfer 之前所用的 torchvision 解码器相同。
 
 ## 预热
 
-`Engine.warmup(requests)`（`Policy.warmup`、`xinfer-serve --warmup`）先应用模型专用的 `warmup_requests`（如有），再通过模型的 `pad` 钩子展开 `model.shape_buckets()`：同类请求可能落入的每个形状桶（shape bucket）各一个变体（在该请求的指令下，状态文本可能产生的每个 prompt 宽度：Wall-OSS 默认按 16 token 分桶）。它单独运行每个变体，从而在第一个通道上以批大小 1 捕获其 graph；每个通道保留这些捕获的输入。随后 `capture_batch_sizes`（`xinfer/engine/cudagraph.py`）在该阶段的每个通道上、以每个允许的批大小运行这些输入，合并方式与服务时组批相同，因此服务时能找到这些形状所需的 graph。最大的输入先运行，因为增大通道的静态缓冲区会丢弃使用旧缓冲区的 graph。长度不等的混合批会填充到其中最长的成员，因此为每个长度预热即可覆盖各种混合。所以每类请求各一个就够了（Wall-OSS：一个 flow 请求和一个 RTC 请求；每条指令各一组）；模型不会推导出的形状（其他指令、相机布局或 RTC 行数）仍需各自的预热请求，否则会在首次使用时捕获并复用。预热会记录所选的桶宽度、耗时、每个阶段保留的 graph、它们的捕获耗时以及之后预留的显存。
+`Engine.warmup(requests)`（`Policy.warmup`、`xinfer-serve --warmup`）先应用模型专用的 `warmup_requests`（如有），再通过模型的 `pad` 钩子展开 `model.shape_buckets()`：同类请求可能落入的每个形状桶（shape bucket）各一个变体（在该请求的指令下，状态文本可能产生的每个 prompt 宽度：WALL-OSS-0.5 默认按 16 token 分桶）。它单独运行每个变体，从而在第一个通道上以批大小 1 捕获其 graph；每个通道保留这些捕获的输入。随后 `capture_batch_sizes`（`xinfer/engine/cudagraph.py`）在该阶段的每个通道上、以每个允许的批大小运行这些输入，合并方式与服务时组批相同，因此服务时能找到这些形状所需的 graph。最大的输入先运行，因为增大通道的静态缓冲区会丢弃使用旧缓冲区的 graph。长度不等的混合批会填充到其中最长的成员，因此为每个长度预热即可覆盖各种混合。所以每类请求各一个就够了（WALL-OSS-0.5：一个 flow 请求和一个 RTC 请求；每条指令各一组）；模型不会推导出的形状（其他指令、相机布局或 RTC 行数）仍需各自的预热请求，否则会在首次使用时捕获并复用。预热会记录所选的桶宽度、耗时、每个阶段保留的 graph、它们的捕获耗时以及之后预留的显存。
 
-每个通道最多保留 `CUDAGraphConfig.max_graphs`（64）个 graph。action 阶段的通道保留的最多：每条指令下，Wall-OSS 每个通道需要 3–4 个 prompt 桶 × flow/RTC × 4 种批大小 = 24–32 个 graph。
+每个通道最多保留 `CUDAGraphConfig.max_graphs`（64）个 graph。action 阶段的通道保留的最多：每条指令下，WALL-OSS-0.5 每个通道需要 3–4 个 prompt 桶 × flow/RTC × 4 种批大小 = 24–32 个 graph。
 
 `Engine.warmup` 返回每个预热请求的输出（取自其第一个变体），`xinfer-serve` 把它们交给前端，用于前端自己的预热（[serving.md](serving.zh-CN.md)）。
 
@@ -83,8 +83,8 @@ CUDA 设备是否支持设备图像，通过创建解码器来检查，不做解
 
 ## 保证与测试
 
-- `test_wall_oss_parity.py::test_action_batches_match_single_requests` 对不同 prompt 长度和 RTC 延迟比较 B2–B8 组批与单请求动作，检查两者的差异是否在舍入范围内。
-- 批大小为 1 时，请求的结果与并发无关：`tests/models/test_wall_oss_parity.py` 在每阶段 2 个通道、启用 graph 的情况下运行 21 个并发请求，并与相同请求单独运行的结果逐位比较。
+- `test_wall_oss_0_5_parity.py::test_action_batches_match_single_requests` 对不同 prompt 长度和 RTC 延迟比较 B2–B8 组批与单请求动作，检查两者的差异是否在舍入范围内。
+- 批大小为 1 时，请求的结果与并发无关：`tests/models/test_wall_oss_0_5_parity.py` 在每阶段 2 个通道、启用 graph 的情况下运行 21 个并发请求，并与相同请求单独运行的结果逐位比较。
 - `tests/unit/test_engine.py` 覆盖并发提交、组批与按行拆分、兼容性键、准入上限与背压、取消以及逐请求失败。
 - `tests/unit/test_cudagraph.py::test_result_freed_during_a_capture` 在通道正在捕获时于另一个线程释放一个结果。
 - `tests/unit/test_host_copy.py` 用一个 GPU 闸门挡住失败分发的部分拷贝，并检查在此期间其通道和槽位不会被复用。

@@ -64,7 +64,7 @@ def _nvimgcodec_decoder(index: int):
 
     One CPU thread: by default nvImageCodec starts one per visible core, and they spin while they wait; in a container
     with a CPU quota that slows the frontends and the engine under load. Nothing is decoded here: a decode at platform
-    resolution left every later CUDA graph replay of the process slower (on an RTX 5090, up to 1 ms per Wall-OSS
+    resolution left every later CUDA graph replay of the process slower (on an RTX 5090, up to 1 ms per WALL-OSS-0.5
     request).
     """
     try:

@@ -284,9 +284,9 @@ def test_gemm_family_norms_quantize_the_bf16_norm():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_gemm_family_forms_match_the_references_at_wallx2b_shapes():
-    """The CUDA operators (the kernels with MXFP8 operands) against the references at Wall-X 2B's shapes: ViT rows
-    1568 (hidden 1024, 16 heads of 64, MLP 4096) and a prompt of 640 (hidden 2048, MLP 6144, DeltaNet 8224)."""
+def test_cuda_gemm_family_forms_match_the_references_at_wall_oss_1_0_nano_shapes():
+    """Compare CUDA MXFP8 kernels with references at WALL-OSS-1.0-Nano shapes:
+    1568 ViT rows (hidden 1024, 16 heads of 64, MLP 4096) and 640 prompt rows (hidden 2048, MLP 6144, DeltaNet 8224)."""
     table = ops.registry.build_table(resolve_platform("cuda"))
     if table.selection("mxfp8_gemm_epilogue").library != "kernels":
         pytest.skip("needs the CUDA kernel library (docs/kernels.md)")

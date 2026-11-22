@@ -1672,7 +1672,7 @@ extern "C" int mcast_bf16_sm110_gate_up(const bf16* xn, const bf16* w, bf16* h, 
   om.m[1] = om.m[0];
   om.m[2] = om.m[0];
   // SiLU: weights evict_first in the cluster kernel (each weight block is read once there), so h stays in L2 for the
-  // down projection that reads it next: Wall-OSS prefill (M 768, I 11008) gate/up + down -9% per layer on Thor. The
+  // down projection that reads it next: WALL-OSS-0.5 prefill (M 768, I 11008) gate/up + down -9% per layer on Thor. The
   // GELU-tanh path keeps its default.
   if (act == MCAST_ACT_SILU) return dispatch<EPI_SWIGLU>("p6", xn, w, M, 2 * I, 2048, p, om, stream, 3, 512, 1, 4, 0, 1);
   return dispatch<EPI_GEGLU>("p6", xn, w, M, 2 * I, 2048, p, om, stream, 3, 512, 1, 4);

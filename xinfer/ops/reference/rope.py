@@ -68,7 +68,7 @@ def rotary_embedding_rounded(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tens
     return apply_rotary(x, cos, sin)
 
 
-# ---------------------------------------------------------------- Wall-X 2B fused operators
+# ---------------------------------------------------------------- WALL-OSS-1.0-Nano fused operators
 
 def _merge_order(h: int, w: int, merge: int, device) -> tuple[torch.Tensor, torch.Tensor]:
     """Patch rows and columns of an ``h × w`` grid in merge-block order."""

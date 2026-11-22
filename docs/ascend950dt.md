@@ -8,7 +8,7 @@ Install matching PyTorch and TorchNPU and source CANN before importing TorchNPU.
 `--device npu:0` or `Policy(device="npu:0")`. With `ASCEND_RT_VISIBLE_DEVICES`, the index is relative to the
 visible set. The platform's backend name is `ascend`; its torch device is `npu:N`.
 
-Wall-OSS uses the existing checkpoint and request formats. The service processes images on the CPU by default.
+WALL-OSS-0.5 uses the existing checkpoint and request formats. The service processes images on the CPU by default.
 With PyACL DVPP V2 available, select device images using the top-level model option
 `--model-options '{"image_preprocess_device":"gpu"}'`, or `Policy(image_preprocess_device="gpu")`.
 `Policy` defaults to device images when supported. Do not put this option inside `processing`.
@@ -86,9 +86,9 @@ xcompute package/library release. Bind it through the existing shared loader, re
 operator checks, lane smoke, precision and latency benchmarks. New operator semantics or signatures require a
 separate operator-contract change.
 
-### Wall-OSS operator list
+### WALL-OSS-0.5 operator list
 
-Every operator Wall-OSS calls, except the no-op `prefetch_weights` and `join_prefetch`, selects `ascend:xcompute`
+Every operator WALL-OSS-0.5 calls, except the no-op `prefetch_weights` and `join_prefetch`, selects `ascend:xcompute`
 with the default wiring: eleven operator bindings and two operators that call them in turn, and a
 per-layout dispatch audit of a full request pass confirmed every call layout admitted (no operator ran on a torch
 reference). These are not eleven independent custom kernels: the table records the actual routes and compute
@@ -121,17 +121,17 @@ reference operations. An exported alternative entry does not establish that the 
 
 `prefetch_weights` and `join_prefetch` (action) do nothing on the NPU (their references). An xcompute export named `qkv_rope_epilogue` must take the operator's `qk_order` keyword; the standard order serves both values.
 
-Wall-OSS action uses ordinary RMSNorm, biased QKV and unmodulated GLU.
+WALL-OSS-0.5 action uses ordinary RMSNorm, biased QKV and unmodulated GLU.
 Switching binaries requires rerunning [precision](precision.md) and
-[performance](performance.md#ascend-950dt) checks with the same requests and image path.
+[performance](benchmark.md#performance-table) checks with the same requests and image path.
 
-### Wall-X 2B operator list
+### WALL-OSS-1.0-Nano operator list
 
-Wall-X 2B declares twenty-one distinct operators across its three stages, and with the default wiring every one
+WALL-OSS-1.0-Nano declares twenty-one distinct operators across its three stages, and with the default wiring every one
 of them selects `ascend:xcompute`: a per-layout dispatch audit of a full request pass confirmed all twenty-one
 with every call layout admitted, so no operator runs on a torch reference. None of these bindings is a
 hand-written kernel in this repository. The table below lists eighteen of the twenty-one because the other
-three — `gemm_epilogue`, `gemm_glu_epilogue` and `qkv_rope_epilogue` — are the same entries the Wall-OSS table
+three — `gemm_epilogue`, `gemm_glu_epilogue` and `qkv_rope_epilogue` — are the same entries the WALL-OSS-0.5 table
 above already describes, so repeating their routes would duplicate the routes rather than the operators.
 
 | Operator | Stage | Entry | Notes |
@@ -162,12 +162,12 @@ an explicit pin.
 
 The four attention operators also have a graph-safe torch composition (`backends/ascend/_torch_attn.py`), so a
 layout outside the entries' white list still runs under capture instead of falling back to SDPA, which cannot be
-captured. Both halves follow the same rule as Wall-OSS: the selectors are checked before the call, and a layout
+captured. Both halves follow the same rule as WALL-OSS-0.5: the selectors are checked before the call, and a layout
 the entries reject stays on the partial-support path rather than surfacing as a runtime error.
 
 ### CANN official operators (opt-in)
 
-`xinfer/ops/backends/ascend/official.py` and `xinfer/ops/backends/ascend/cann.py` serve Wall-X 2B operators
+`xinfer/ops/backends/ascend/official.py` and `xinfer/ops/backends/ascend/cann.py` serve WALL-OSS-1.0-Nano operators
 from TorchNPU's own CANN entries rather than from xcompute. Both modules register below the xcompute entries in
 priority, so **none of them is selected by default**: a deployment runs the xcompute entries, and reaches these
 only by naming one explicitly.
@@ -185,12 +185,11 @@ only by naming one explicitly.
 Select one with the pin, for example:
 
 ```bash
-xinfer-serve --model wallx2b --checkpoint /path --device npu:0 \
+xinfer-serve --model wall-oss-1.0-nano --checkpoint /path --device npu:0 \
     --op-backends gemm_epilogue=ascend:npu_linear
 ```
 
-The [performance table](performance.md) reports the default xcompute wiring; these pins are the alternative for
-deployments that prefer the official operators.
+These pins select the official operators for deployments that use them.
 
 ## Graphs
 

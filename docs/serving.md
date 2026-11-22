@@ -54,8 +54,9 @@ the device-image thread in [Device images](engine.md#device-images).
 
 ## Protocol
 
-- On connect the server sends the model's metadata frame. For Wall-OSS:
-  `{"batch_enabled": true, "model": "wall-x", "action_horizon": 16, "action_dim": 26, "rtc_ee_chunk_dim": 14, "env": "x2robot"}`.
+- On connect the server sends the model's metadata frame. For WALL-OSS-0.5:
+  `{"batch_enabled": true, "model": "wall-oss-0.5", "action_horizon": 16, "action_dim": 26, "rtc_ee_chunk_dim": 14, "env": "x2robot"}`.
+- For WALL-OSS-1.0-Nano, the connection metadata reports `"model": "wall-oss-1.0-nano"` and `"model_family": "qwen3_5"`.
 - Each request is one msgpack message, with arrays in the msgpack-numpy layout. A connection's requests are answered one at a time, by its own input processor: a model with per-connection state keeps it for the connection's lifetime. The response carries the model's fields plus `status` (`"ok"`) and `server_timing`:
   - `infer_ms`: request decoded → response encoded;
   - `prepare_ms`, `engine_ms`, `output_ms`;
@@ -77,17 +78,17 @@ the device-image thread in [Device images](engine.md#device-images).
 ## Run
 
 ```bash
-python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkpoint \
+python -m xinfer.entrypoints.serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint \
   --port 33985 --warmup flow.msgpack rtc.msgpack \
   --model-options '{"quantization": "bf16", "processing": {"instruction_override": null}}'
 ```
 
 | Option | Meaning |
 |---|---|
-| `--model-options` | JSON passed to `from_checkpoint` and `build_processors` (Wall-OSS: `processing` = `ProcessingConfig` fields) |
+| `--model-options` | JSON passed to `from_checkpoint` and `build_processors` (WALL-OSS-0.5: `processing` = `ProcessingConfig` fields) |
 | `--frontends`, `--frontend-workers`, `--shm-buffers`, `--shm-buffer-mib` | frontend processes (default 2), processing threads each (default 4) and shared-memory buffers each; buffer size |
 | `--lanes`, `--max-batch`, `--max-running-requests`, `--max-queued-requests`, `--per-robot-inflight` | engine settings ([engine.md](engine.md)); checked, never rewritten |
-| `--enforce-eager` | run every stage eagerly, without CUDA graphs (default: CUDA graphs where the platform supports capture); `--warmup` request files (JSON or msgpack, each one request or a list): their graphs, at every shape bucket the model derives from them (one flow and one RTC request cover Wall-OSS), are captured on every lane and allowed batch size, and every frontend runs them through the model's processors, before serving |
+| `--enforce-eager` | run every stage eagerly, without CUDA graphs (default: CUDA graphs where the platform supports capture); `--warmup` request files (JSON or msgpack, each one request or a list): their graphs, at every shape bucket the model derives from them (one flow and one RTC request cover WALL-OSS-0.5), are captured on every lane and allowed batch size, and every frontend runs them through the model's processors, before serving |
 | `--tuned` | tuned-table selection: `auto`, `none` or a path |
 | `--resolved-config`, `--dry-run` | write the resolved settings with their sources; print them and exit |
 | `--profile-dir` | record the engine's spans and write each request's engine segments to this directory at shutdown; for profiling runs (`xinfer-profile load --serve`, [profiling](profiling.md#through-xinfer-serve---serve)), the records grow with the requests |

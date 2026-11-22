@@ -121,7 +121,7 @@ bound = roofline(op_cost(name, args, kwargs, outputs), PEAKS["NVIDIA GeForce RTX
 ## 算子剖析（`xinfer-profile ops`）
 
 ```bash
-xinfer-profile ops --model wall_oss --checkpoint /path/to/checkpoint \
+xinfer-profile ops --model wall-oss-0.5 --checkpoint /path/to/checkpoint \
   --requests requests.msgpack --requests-per-run 2 --out profile
 ```
 
@@ -150,8 +150,8 @@ xinfer-profile ops --model wall_oss --checkpoint /path/to/checkpoint \
 此命令需要通道引擎的准入和阶段 span，不支持使用显式完成的 RPU 配置；RPU 推理使用进程内 `Policy` 接口。
 
 ```bash
-xinfer-profile load --model wall_oss --checkpoint /path/to/checkpoint --requests observation.msgpack \
-  --robots 8 --out artifacts/wall-oss-load
+xinfer-profile load --model wall-oss-0.5 --checkpoint /path/to/checkpoint --requests observation.msgpack \
+  --robots 8 --out artifacts/wall-oss-0.5-load
 ```
 
 多台机器人共用引擎时，请求的时间花在引擎的哪里：这是一次只跑一个请求的 `xinfer-profile ops` 看不到的。

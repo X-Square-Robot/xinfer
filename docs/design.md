@@ -9,7 +9,7 @@ Existing code and records this design draws on:
 - earlier internal serving prototypes of these models and their measurements;
 - current main source of vLLM and SGLang.
 
-The [performance table](performance.md) lists measurement conditions for Wall-OSS and Wall-X 2B and links to their validation results.
+The [performance table](performance.md) lists WALL-OSS-1.0-Nano results and measurement conditions.
 
 ---
 
@@ -22,7 +22,7 @@ The [performance table](performance.md) lists measurement conditions for Wall-OS
 | Kernels | Maintain native operator sources and build definitions in `xinfer/ops/backends/<backend>/src`, with Python bindings in the backend package; build shared libraries ahead of time (AOT). External compatibility providers may remain where a backend still needs them (§18.2) |
 | Operator binding | Native libraries use TVM-FFI; all backends use the same operator registry and build-time selection. RPU registers prepared-operation signatures. `torch.library` adapters reuse the implementation where concrete PyTorch compile or export needs arise (§14.2) |
 | Deployment scenario | Each accelerator runs a model instance serving one or more robots. |
-| Bundled models | Wall-OSS and Wall-X 2B |
+| Bundled models | WALL-OSS-0.5 and WALL-OSS-1.0-Nano |
 | First hardware | RTX 5090 (sm120), Jetson Thor (sm110) |
 | GPU process layout | Default `colocated`: one Engine per GPU, with Vision / Prefill / Action in one process; v1 implements only this layout, `split` is not implemented for now |
 | Stage and deployment boundary | Logical stages are separate from the process mapping; StageGraph declares computation and dependencies, and the runtime decides which process a stage runs in (§9.3) |
@@ -43,19 +43,19 @@ The native RPU operator package described in §14 and §18.2 is an operator-laye
 | §4 Device boundary | Partially implemented | Some device primitives use `platforms/devices.py`; the shared engine still calls `torch.cuda` directly and branches on `Platform.is_cuda`. Engine dispatch uses `capabilities.execution_model`; all backends use the operator registry. CUDA profiling and frontend shared-memory registration use `Platform.is_cuda`. `test_layering.py` only checks that `platforms/interface.py` and `models/interface.py` do not import torch |
 | §5 Cancellation and per-request errors | Partially implemented | Cancelled requests that are not yet dispatched are dropped; dispatched ones run to completion and their results are discarded. An error during stage execution, during the upload at admission or while taking a batch fails only the affected requests and releases their slots. If the engine thread or the completion thread stops, `xinfer-serve` exits with status 1; recognizing sticky device errors (`Platform.classify_error`) and DRAINING are not implemented |
 | §6.3 Three scheduling rules | Implemented | A request enters the downstream queue as soon as its upstream is dispatched, and the downstream lane waits for the event on the GPU; zero-wait batching; the completion thread waits only for the final event (`xinfer/engine/core.py`) |
-| §6.4 Batched precision | Implemented | The Wall-OSS reference action stage supports B1, B2, B4 and B8. The optimized composition, vision and prefill run at B1. |
+| §6.4 Batched precision | Implemented | The WALL-OSS-0.5 reference action stage supports B1, B2, B4 and B8. The optimized composition, vision and prefill run at B1. |
 | §7.1 Admission | Partially implemented | `submit` returns a Future, which on rejection holds an `AdmitError` (`queue_full`, `per_robot_limit`, `stopped`); `admission_timeout` is not implemented |
 | §7.2–§7.4 Stage queues, batching, dispatch | Implemented | FIFO; the runtime derives the compatibility key from the inputs a stage actually reads; handoff tensors with different sequence lengths are left-padded and batched; batches are joined with torch concatenation, not through Platform copy primitives |
 | §7.5 Policy plugins | Not implemented | FIFO is built into the engine |
 | §8.1 Slot state machine | Partially implemented | `SlotPool` only counts admissions and checks generations (FREE / ACTIVE / RELEASING); handoff tensors are held by the request, and each stage makes its own copy |
 | §8.2 Memory planner | Not implemented | |
-| §8.3 Graph management | Partially implemented | Each lane owns its graph pool and static buffers. Wall-OSS uses 16-token prompt buckets by default. Warmup enumerates the reachable widths and allowed batch sizes for each lane. |
+| §8.3 Graph management | Partially implemented | Each lane owns its graph pool and static buffers. WALL-OSS-0.5 uses 16-token prompt buckets by default. Warmup enumerates the reachable widths and allowed batch sizes for each lane. |
 | §9.1 Engine threads | Partially implemented | Three threads: the engine thread, the completion thread and the device-image thread (decodes and resizes, on its own stream, the views of requests with `DeviceImage` inputs); OMP / MKL / NUMBA thread counts default to 1; freezing GC after warmup is not implemented |
 | §9.2 Frontend processes | Implemented | 2 processes by default, SO_REUSEPORT, 4 processing threads per process; shared memory plus pipe notification (not ZMQ); does not initialize CUDA, but imports torch. In-process calls are provided by `Policy` |
 | §10 Configuration resolution | Partially implemented | Explicit value > tuning table > model / platform rules > default, with the source of each item printed at startup (docs/configuration.md); no tuning tables ship with the package yet; `xinfer tune`, memory-planner input to derivation, and `Platform.derive` / `validate` are not implemented |
 | §11 Model integration | Implemented | Models declare stages, handoff tensors, capabilities, input and output processing, and shape buckets. The frontend imports the model class's `build_processors`; the engine calls the model's `pad` hook for warmup. |
-| §11.4 Bundled models | Implemented | Wall-OSS supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the internal precision gate. Wall-X 2B uses a Qwen3.5 backbone and supports RTC on the desktop dual-arm robot. |
-| §12 Quantization | Partially implemented | The framework supports per-group `QuantConfig`. Wall-OSS runs in BF16. MXFP8 and NVFP4 have PyTorch reference operators. See [quantization](quantization.md). |
+| §11.4 Bundled models | Implemented | WALL-OSS-0.5 supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the internal precision gate. WALL-OSS-1.0-Nano uses a Qwen3.5 backbone and supports RTC on the desktop dual-arm robot. |
+| §12 Quantization | Partially implemented | The framework supports per-group `QuantConfig`. WALL-OSS-0.5 runs in BF16. MXFP8 and NVFP4 have PyTorch reference operators. See [quantization](quantization.md). |
 | §13 Platform | Partially implemented | Only device capability descriptions and CUDA / CPU resolution (`xinfer/platforms/`); streams, events, copy primitives, `register_host` (`frontend/shm.py` currently calls `cudaHostRegister` directly), `classify_error`, `derive` / `validate` and plugin activation are not implemented; Thor (sm110) is unverified |
 | §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; CUDA uses the in-tree native library and flash-attn, while Ascend retains an external xcompute compatibility provider alongside its other providers (§14.2); `xinfer.ops.conformance` is not implemented |
 | §15 Protocol and frontend | Partially implemented | WebSocket + msgpack, compatible with the x2robot client; `xinfer.Policy` in-process API; Client SDK and compatibility adapters not implemented |
@@ -86,7 +86,7 @@ So VLA serving cannot simply reuse the token-level scheduling and paged KV of vL
 
 | Goal | Acceptance criterion | Existing reference |
 |---|---|---|
-| Thor single request | Wall-OSS on Thor, same input | No higher than the earlier Thor port of the model |
+| Thor single request | WALL-OSS-0.5 on Thor, same input | No higher than the earlier Thor port of the model |
 | Highest per-GPU capacity | 5090, uniform input, client P50 < 150 ms, three runs | Same-condition capacity of the earlier internal serving runtime (baseline numbers to be rechecked under §20 M1) |
 | Same results alone and under full load | The same input run alone and under full load | Both pass the model's precision gate; bitwise-equal outputs where the stages' operators are deterministic (§6.4) |
 | Easy to add new models | When the backbone and action-head building blocks exist | Write only the model file and weight mapping, no runtime changes |
@@ -110,7 +110,7 @@ So VLA serving cannot simply reuse the token-level scheduling and paged KV of vL
 | Stage | A piece of computation declared by the model, for example `vision`, `prefill`, `action`. A unit in code |
 | StageGraph | The DAG of computation stages declared by the model, without process placement. The first models follow the logical chain vision → prefill → action; each model declares its own stages and handoffs |
 | Lane | One concurrent execution slot of a stage: one stream + one set of static workspaces + one graph pool |
-| Shape bucket | A discrete shape a stage input can take, for example Wall-OSS's prompt width in multiples of 16 |
+| Shape bucket | A discrete shape a stage input can take, for example WALL-OSS-0.5's prompt width in multiples of 16 |
 | Slot | Per-request handoff storage for cross-stage tensors (such as the prefix KV), with a generation |
 | Handoff | The set of tensors passed between stages, declared by a HandoffSpec |
 | Chained dispatch | When an upstream stage is dispatched, its downstream stage is dispatched with it, linked by GPU events (§6) |
@@ -194,7 +194,7 @@ Two principles:
 
 The startup order is: build the model (operators are selected here) → `config.resolve` reads the built model's `capabilities()` and the platform capabilities → create the Engine. So what the built model supports, such as its batch sizes, reaches the engine through the model interface, and the engine depends on neither ops nor config; the Frontend's shared memory and the Engine are connected by `entrypoints/serve.py`, so the engine does not depend on frontend.
 
-**RPU package boundaries.** `models/wallx2b/rpu/` owns model configuration, weights, request processing and resident stage plans. `engine/rpu/engine.py` owns request admission, submission, completion, reset and shutdown through the model's RPU hooks. The platform package owns device resources: `platforms/rpu/platform.py` describes capabilities, `resources.py` owns buffers and operations, `execution.py` owns ordered executions, and `context.py` owns context lifecycle. `platforms/rpu/plan.py` defines the RPU request contract consumed by the backend model and engine; the shared model interface stays independent of vendor execution types. `config/rpu.py` supplies RPU request and lane defaults while the generic resolver keeps frontend and shared-memory settings. The entry-point factory injects the native backend factory and `rpu.bind_ops(model.ops)` operation factory into the platform context. `context.prepare` calls the selected OpTable implementation, which prepares the native operation; neither the platform nor the engine imports ops. Ordered batch execution and completion waits remain separate from operator selection.
+**RPU package boundaries.** `models/wall_oss_1_0_nano/rpu/` owns model configuration, weights, request processing and resident stage plans. `engine/rpu/engine.py` owns request admission, submission, completion, reset and shutdown through the model's RPU hooks. The platform package owns device resources: `platforms/rpu/platform.py` describes capabilities, `resources.py` owns buffers and operations, `execution.py` owns ordered executions, and `context.py` owns context lifecycle. `platforms/rpu/plan.py` defines the RPU request contract consumed by the backend model and engine; the shared model interface stays independent of vendor execution types. `config/rpu.py` supplies RPU request and lane defaults while the generic resolver keeps frontend and shared-memory settings. The entry-point factory injects the native backend factory and `rpu.bind_ops(model.ops)` operation factory into the platform context. `context.prepare` calls the selected OpTable implementation, which prepares the native operation; neither the platform nor the engine imports ops. Ordered batch execution and completion waits remain separate from operator selection.
 
 `test_layering.py` checks the package dependency directions in the table above, and that `platforms/interface.py` and `models/interface.py` do not import torch. The device boundary below is a target; it is only partly implemented and is not checked as a complete contract.
 
@@ -259,7 +259,7 @@ The first two concern "how stages are linked" and the last two "at what granular
 ### 6.4 Correctness contract: running alone and under full load
 
 - **Same kernels.** Both paths use the same set of stage graphs. Operators need not be deterministic (§14.1): results under full load must pass the model's precision gate as results run alone do, and where every operator of a stage is deterministic the two are bitwise equal.
-- A model declares a stage's supported batch sizes after checking the batched results against its precision gate. Batching may change rounding. Wall-OSS supports action batching in the reference composition and uses B1 in the optimized composition.
+- A model declares a stage's supported batch sizes after checking the batched results against its precision gate. Batching may change rounding. WALL-OSS-0.5 supports action batching in the reference composition and uses B1 in the optimized composition.
 - **Scope.** Bitwise equality holds only within one platform and one set of operator implementations, not across chips; alignment across platforms and with the reference implementation uses tolerances, and each platform keeps its own golden outputs.
 
 ### 6.5 Risks to quantify in M0 / M1
@@ -408,15 +408,15 @@ The v1 GPU process layout is fixed to `colocated`; neither the tuning table nor 
 ### 10.3 Example and audit
 
 ```bash
-xinfer serve --model wall_oss --checkpoint CKPT                     # defaults
-xinfer serve --model wall_oss --checkpoint CKPT --lanes vision=1    # override one item explicitly
+xinfer serve --model wall-oss-0.5 --checkpoint CKPT                     # defaults
+xinfer serve --model wall-oss-0.5 --checkpoint CKPT --lanes vision=1    # override one item explicitly
 ```
 
 At startup the resolved values are printed and saved to disk, each with its source:
 
 ```text
 max_running_requests  32         default
-lanes.vision          2          tuned:wall_oss/sm120-mxfp8@<commit>
+lanes.vision          2          tuned:wall-oss-0.5/sm120-mxfp8@<commit>
 batch_sizes.vision    [1]        model:declares B1 only
 batch_sizes.action    [1,2,4,8]  model:declared sizes
 cudagraphs            True       platform:supports graph capture
@@ -445,7 +445,7 @@ frontend_workers      4          default, frontends × workers ≤ cpus/2 = 12
 | `WeightMapping` | Mapping from checkpoint keys to parameters | Loading |
 
 ```python
-class WallOSS(VLAModel):
+class WallOSS05(VLAModel):
     stage_graph = StageGraph(
         Stage("vision",  "encode_images"),
         Stage("prefill", "prefill", depends_on="vision"),
@@ -466,15 +466,15 @@ class WallOSS(VLAModel):
     def denoise(self, b: StageBatch) -> None: ...         # all N steps in one go, writes b.out["actions"]
 ```
 
-**Registration is lazy.** A model registers with a name plus two "module:Class" strings: one points to processing (IOSchema, Input/OutputProcessor) and one to the model.
+**Registration is lazy.** Register a model ID and the import path of its model class. The registry imports the class when a caller selects the model.
 
 ```python
-register_model("wall_oss",
-               processing="xinfer.models.wall_oss.processing:WallOSSInputProcessor",
-               model="xinfer.models.wall_oss.model:WallOSS")
+from xinfer.models.registry import register_model
+
+register_model("wall-oss-0.5", "xinfer.models.wall_oss_0_5.model:WallOSS05")
 ```
 
-The Frontend imports only processing, never model code; only the Engine imports the model. An import failure in one model does not affect other models. Out-of-tree models register in the same form through the `xinfer.models` entry point.
+Out-of-tree models can also expose their model class through the `xinfer.models` entry point.
 
 ### 11.2 Stage function constraints
 
@@ -497,15 +497,15 @@ The Frontend imports only processing, never model code; only the Engine imports 
 
 ### 11.4 Bundled models
 
-Wall-OSS uses a Qwen2.5-VL vision tower, a prefill expert and a flow-matching action expert. See the [Wall-OSS design](models/wall_oss_design.md) for tensor layouts, execution stages and numerical configurations.
+WALL-OSS-0.5 uses a Qwen2.5-VL vision tower, a prefill expert and a flow-matching action expert. See the [WALL-OSS-0.5 design](models/wall_oss_0_5_design.md) for tensor layouts, execution stages and numerical configurations.
 
-Wall-X 2B pairs a Qwen3.5 vision encoder and hybrid language backbone with a flow-matching action expert. For the checkpoint layout, desktop dual-arm protocol and serving command, see the [Wall-X 2B guide](models/wallx2b.md).
+WALL-OSS-1.0-Nano pairs a Qwen3.5 vision encoder and hybrid language backbone with a flow-matching action expert. For the checkpoint layout, desktop dual-arm protocol and serving command, see the [WALL-OSS-1.0-Nano guide](models/wall_oss_1_0_nano.md).
 
 ---
 
 ## 12. Quantization
 
-- **`QuantConfig`** sets the method for each module group. Wall-OSS currently supports BF16 only. See [quantization methods](quantization.md).
+- **`QuantConfig`** sets the method for each module group. WALL-OSS-0.5 currently supports BF16 only. See [quantization methods](quantization.md).
 - **`QuantMethod` interface**:
   - `create_weights`;
   - `process_weights_after_loading`: conversion, packing and swizzling, which must finish before the weights are frozen;
@@ -650,11 +650,11 @@ RPU uses the same `OpRegistry` and `build_table` as CPU, CUDA and Ascend. Its `p
 
 Both columns belong in the XInfer repository. External SDKs, compilers, model weights and generated RPU `.ref` assets keep their separate distribution and licensing boundaries.
 
-Tool: `xinfer profile ops --model wall_oss` reports each operator's time and theoretical lower bound for a model, so the operator team can set priorities.
+Tool: `xinfer profile ops --model wall-oss-0.5` reports each operator's time and theoretical lower bound for a model, so the operator team can set priorities.
 
 Vendor backends may use the same in-tree layout or a separately maintained package through the `xinfer.ops` and `xinfer.platforms` entry points (§18.3). Prepared backends declare their callable signatures and execution contracts through the same registry.
 
-### 14.4 Wall-OSS operator list
+### 14.4 WALL-OSS-0.5 operator list
 
 - GEMM: BF16, MXFP8; plus fused quantization (RMSNorm + quant, SiLU-mul + quant).
 - Attention:
@@ -711,7 +711,7 @@ These tools decide whether others can reproduce "how many robots per GPU", and t
 
 ## 18. Repository and development process
 
-- XInfer maintains native operator sources, bindings and build definitions in the same repository as the framework, under the contracts and validation requirements in §14. Existing external providers remain explicit compatibility dependencies. External publication requires license and contribution-process approval.
+- XInfer maintains native operator sources, bindings and build definitions in the same repository as the framework, under the contracts and validation requirements in §14. Existing external providers remain explicit compatibility dependencies. The source code is licensed under the [Apache License 2.0](../LICENSE). External publication requires contribution-process approval.
 - **Conventions**:
   - MR descriptions must state the problem, changes, validation and limitations;
   - raw experiment data stays out of Git;
@@ -778,7 +778,7 @@ XInfer/
 │   │   │                           # IOSchema, InputProcessor, OutputProcessor
 │   │   ├── registry.py             # lazy registration (name → module:Class string) and discovery, including plugin entry points
 │   │   ├── processing.py           # input processing shared by models: concurrent views, segment tokenizer
-│   │   ├── wall_oss/
+│   │   ├── wall_oss_0_5/
 │   │   │   ├── config.py           # structural parameters from the checkpoint config
 │   │   │   ├── model.py            # stage graph and the three stage functions (assembled from layers)
 │   │   │   ├── processing.py       # IOSchema, Input/OutputProcessor
@@ -831,8 +831,8 @@ XInfer/
 │   │   ├── tune.py                 # xinfer tune: sweeps and generates tuning tables
 │   │   └── eval.py                 # xinfer eval: alignment, open-loop error, quantization gate
 │   └── tuned/                      # tuning tables, shipped with the package
-│       ├── wall_oss/sm120-mxfp8.json   # values + commit + date + measurement conditions
-│       └── wall_oss/sm110-mxfp8.json
+│       ├── wall-oss-0.5/sm120-mxfp8.json   # values + commit + date + measurement conditions
+│       └── wall-oss-0.5/sm110-mxfp8.json
 ├── client/                         # separate small package xinfer-client, no torch dependency
 │   ├── pyproject.toml
 │   └── xinfer_client/
@@ -897,7 +897,7 @@ M0–M3 all use `colocated` as the GPU execution layout and include no split exe
 
 | Milestone | Mainly in |
 |---|---|
-| M0 | `platforms/`, `ops/`, `models/layers/`, `models/wall_oss`, engine stages and slots, policy and benchmark entry points |
+| M0 | `platforms/`, `ops/`, `models/layers/`, `models/wall_oss_0_5`, engine stages and slots, policy and benchmark entry points |
 | M1 | `frontend/` (multi-process), all of `engine/scheduler/`, `memory/planner.py`, `config/resolve.py`, `benchmarks/fleet.py`, `tune.py`, `tuned/`, `client/` |
 | M2 | `models/layers/quantization/nvfp4.py`, precision gates and building blocks for model extensions |
 | M3 | Compatibility adapters, Router, docs, Docker images, GitHub release |
@@ -931,10 +931,10 @@ What is carried over are the logical stages and the batching and ownership rules
 | Milestone | Content | Acceptance |
 |---|---|---|
 | M-1 Review and repository setup | Main repository and CPU CI set up; native operators maintained in-tree; review of this document and of the operator contracts pending | Repository arrangement decided; review and acceptance conclusions recorded once the other items of this milestone are done |
-| M0 Data plane | Platform, operator backends, layers, Wall-OSS, single-lane dispatch and benchmarks | Wall-OSS meets its precision gate and records latency and graph dispatch costs on the target platform. |
+| M0 Data plane | Platform, operator backends, layers, WALL-OSS-0.5, single-lane dispatch and benchmarks | WALL-OSS-0.5 meets its precision gate and records latency and graph dispatch costs on the target platform. |
 | M1 Fleet runtime | Multi-lane dispatch, zero-wait batching, frontend workers, slot lifecycle and configuration resolution | Measure fleet capacity, batched precision and dispatch overhead under load. |
 | M2 Quantization and extension | NVFP4 and model extensions | Record numerical results for each model and quantization method. |
-| M3 Release | Docs, Client SDK, compatibility adapters, Router; license approval; GitHub release | External users can reproduce single-request latency and per-GPU capacity by following the docs |
+| M3 Release | Docs, Client SDK, compatibility adapters, Router; GitHub release | External users can reproduce single-request latency and per-GPU capacity by following the docs |
 
 ---
 
@@ -953,7 +953,6 @@ What is carried over are the logical stages and the batching and ownership rules
 1. **External name conflict**: `xinfer` on PyPI is taken by dnth/xinfer (a computer-vision inference framework), and Xorbits' Xinference has a similar name. The repository stays XInfer; the pip package name is decided before going public.
 2. **Model weights**: external distribution of checkpoint files requires separate approval.
 3. **Scope and versions of PyTorch operator adapters**: the strategy of TVM-FFI by default with `torch.library` added as needed is settled (§0, §14.2); confirm with the operator team which operators need adapters first, which compile/export paths are actually supported, and the PyTorch, TVM-FFI and native binding compatibility ranges. External compatibility providers retain their own version requirements.
-4. **License**: to be approved before M3.
-5. **External stable surface and support tiers**: the starting API version number and the rules for breaking changes, and the admission criteria for Tier 2 (§13.3).
-6. **Timing and GPU models for AMD GPUs**: whether they enter v1; the GPU model determines the available quantization formats and kernel sources (§13.2).
+4. **External stable surface and support tiers**: the starting API version number and the rules for breaking changes, and the admission criteria for Tier 2 (§13.3).
+5. **Timing and GPU models for AMD GPUs**: whether they enter v1; the GPU model determines the available quantization formats and kernel sources (§13.2).
 

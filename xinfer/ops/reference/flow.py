@@ -44,7 +44,7 @@ def flow_velocity_euler(x: torch.Tensor, h: torch.Tensor, weight: torch.Tensor, 
     return out
 
 
-# ---------------------------------------------------------------- Wall-X 2B fused operators
+# ---------------------------------------------------------------- WALL-OSS-1.0-Nano fused operators
 
 def flow_input_embed(x: torch.Tensor, weight: torch.Tensor, head_index: torch.Tensor | None = None,
                      extra: torch.Tensor | None = None, input_mask: torch.Tensor | None = None,

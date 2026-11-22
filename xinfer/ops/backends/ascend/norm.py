@@ -1,7 +1,7 @@
 """Ascend normalization operators for the two model families.
 
-Wall-OSS needs ``add_rms_norm`` and ``rms_norm`` (the vision, prompt and action streams' input norms); Wall-X 2B
-also needs the zero-centered VoT norms, the ViT's layer norm and the AdaRMS family (``modulated_rms_norm``,
+WALL-OSS-0.5 needs ``add_rms_norm`` and ``rms_norm`` for the vision, prompt, and action streams.
+WALL-OSS-1.0-Nano also needs zero-centered VoT norms, ViT layer norm, and the AdaRMS family (``modulated_rms_norm``,
 ``gated_residual_modulated_rms_norm``, ``identity_layer_norms_``). Each registration names one OpSpec and delegates
 to the xcompute entry that implements that semantics; entries reject unsupported layouts with ``ValueError`` (or
 fail the ``check`` predicate) and the reference runs instead.
@@ -49,7 +49,7 @@ def add_rms_norm(x, residual, weight, eps):
     return xc.add_rmsnorm(residual, x, weight.contiguous(), float(eps), inference=True)
 
 
-# ---------------------------------------------------------------- Wall-X 2B normalization family
+# ---------------------------------------------------------------- WALL-OSS-1.0-Nano normalization family
 # The xcompute entries below are classes with a stateful call, or functions that overwrite their first tensors.
 _rmsnorm = getattr(xc, "Rmsnorm", None) if xc is not None else None
 _add_rmsnorm = getattr(xc, "AddRmsnorm", None) if xc is not None else None
@@ -72,7 +72,7 @@ def _plain_supported(x, weight, eps):
           version=VERSION)
 @partial(reference_rms_norm, check=_plain_supported)
 def rms_norm(x, weight, eps):
-    # Wall-OSS's vision, prompt and action input norms; the entry's inference path with the plain (not
+    # WALL-OSS-0.5's vision, prompt and action input norms; the entry's inference path with the plain (not
     # zero-centered) weight, as the CUDA backend registers it.
     return _rms(x, weight, float(eps), True, False)
 

@@ -1,6 +1,6 @@
 """The ViT and prompt stream of the Wall-X Qwen3.5 models on the CUDA backend's kernels (``numerics="optimized"``).
 
-The Wall-X 2B stages use one operator per fusion from ``xinfer/ops/reference/``.
+The WALL-OSS-1.0-Nano stages use one operator per fusion from ``xinfer/ops/reference/``.
 The backend selects the kernel for each shape. GEMM weights are ``[N, K]``. Differences to the
 reference composition (``numerics="reference"``, the wall-x model under autocast):
 

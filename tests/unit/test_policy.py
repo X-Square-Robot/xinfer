@@ -100,8 +100,8 @@ def test_policy_takes_the_switch_only_at_the_top_level(policy):
         policy(device_images=False, image_preprocess_device="gpu")
 
 
-def test_wall_oss_processor_takes_the_device_path():
-    from xinfer.models.wall_oss.processing import processing_config
+def test_wall_oss_0_5_processor_takes_the_device_path():
+    from xinfer.models.wall_oss_0_5.processing import processing_config
 
     assert processing_config({"image_preprocess_device": "gpu"}).image_preprocess_device == "gpu"
 

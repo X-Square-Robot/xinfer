@@ -120,7 +120,7 @@ class MRope:
     width bands (Qwen2.5-VL ``mrope_section``).
 
     Args:
-        section: Band sizes, summing to ``D/2`` (Wall-OSS: 16, 24, 24).
+        section: Band sizes, summing to ``D/2`` (WALL-OSS-0.5: 16, 24, 24).
 
     Attributes:
         section: The band sizes as a list.

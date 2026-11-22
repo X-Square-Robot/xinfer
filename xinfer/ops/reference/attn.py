@@ -418,7 +418,7 @@ def _chunk_gated_delta_rule(q, k, v, g, beta, chunk_size):
     return out.reshape(b, h, -1, dv)[:, :, :length].transpose(1, 2).contiguous()
 
 
-# ---------------------------------------------------------------- Wall-X 2B fused operators
+# ---------------------------------------------------------------- WALL-OSS-1.0-Nano fused operators
 
 def gate_output(o: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """``bf16(bf16(o) · bf16(sigmoid(gate)))``: the attention output times its gate, as two BF16 operations."""

@@ -10,7 +10,7 @@
 因此每项设置都是适用于任何负载的固定选择或上限。它在启动时解析一次，并连同其来源一起报告。优先级从高到低：
 
 1. **显式（explicit）**：运维人员设置的命令行参数或函数参数。它会对照平台和模型进行检查，但从不被改写。冲突即报错：模型未声明的批大小、在不支持捕获的平台上启用 CUDA graph（仅限 API），或未知的阶段。
-2. **调优表（tuned table）**：针对（模型、架构、量化）组合的实测值，来自 `xinfer/tuned/<model>/<arch>-<quantization>.json` 或 `--tuned <path>`。每张表记录提交、日期、方法和证据；来源显示为 `tuned:<table>@<commit>`。表可以设置 `lanes`。目前没有随附任何表：只有当实测值与默认值不同时才添加表。
+2. **调优表（tuned table）**：针对（模型、架构、量化）组合的实测值，来自 `xinfer/tuned/<model>/<arch>-<quantization>.json` 或 `--tuned <path>`。内置模型按标准小写 ID 查找调优表目录，传入官方大小写的模型名称时也使用同一目录。显式指定表路径时直接加载该文件。每张表记录提交、日期、方法和证据；来源显示为 `tuned:<table>@<commit>`。表可以设置 `lanes`。目前没有随附任何表：只有当实测值与默认值不同时才添加表。
 3. **模型 / 平台规则**：模型声明的内容（批大小）和平台支持的能力（graph 捕获、CPU 配额）；来源为 `model:<rule>` 和 `platform:<rule>`。
 4. **默认（default）**：固定值。
 
@@ -24,7 +24,7 @@
 | `max_running_requests` | 32 | 在途的已准入请求数。这是一个上限：槽位不预分配内存，且每个机器人只有一个请求时，只有 32 台机器人才会达到它 |
 | `max_queued_requests` | 256 | 已提交、等待准入的请求数 |
 | `lanes.<stage>` | 调优值，否则为 2 | 一个通道是一条带有自己 graph 池的 stream；第二个通道让两个请求可以同时运行该阶段 |
-| `stream_priorities.<stage>` | 最终阶段（Wall-OSS：`action`）：将 −1 限制在支持范围内；范围未知、不支持或其他阶段时为 0 | 该阶段各通道的加速器 stream 优先级，越小越高（`--stream-priorities action=0`、`Policy(stream_priorities={...})`） |
+| `stream_priorities.<stage>` | 最终阶段（WALL-OSS-0.5：`action`）：将 −1 限制在支持范围内；范围未知、不支持或其他阶段时为 0 | 该阶段各通道的加速器 stream 优先级，越小越高（`--stream-priorities action=0`、`Policy(stream_priorities={...})`） |
 | `batch_sizes.<stage>` | 模型声明的所有大小 | 允许更大的批大小从不会延迟请求，因为批只由已排队的请求组成；模型只为组批结果能通过其精度门禁的阶段声明大于 1 的批大小 |
 | `cudagraphs` | 平台支持捕获时开启 | |
 | `frontends` | 2，最多为容器配额 CPU 数的一半 | 每个前端会在引擎进程中增加一个桥接线程 |
@@ -36,32 +36,32 @@ stream 优先级是对就绪加速器工作的调度提示，不会绕过事件�
 创建通道。创建通道时还会验证声明支持优先级的运行时是否准确采用请求值。CUDA 支持时继续使用最终阶段
 默认值 −1；范围为 0–7 的运行时保持该默认值为 0。
 
-下述 MXFP8 数据是早期 Wall-OSS 配置的历史测量；当前 [Wall-OSS 组合](models/wall_oss.zh-CN.md)支持 BF16。
+下述 MXFP8 数据是早期 WALL-OSS-0.5 配置的历史测量；当前 [WALL-OSS-0.5 组合](models/wall_oss_0_5.zh-CN.md)支持 BF16。
 
 为什么取这些值：
-- **通道数 2。** 在 Wall-OSS MXFP8（RTX 5090）上，两个 action 通道的容量为 7 台，一个通道为 5 台（action 阶段组批）；不组批时 2/2/2 优于 1/1/1（饱和时 31.2 对 27.2 req/s）；三个及以上通道未测量。
+- **通道数 2。** 在 WALL-OSS-0.5 MXFP8（RTX 5090）上，两个 action 通道的容量为 7 台，一个通道为 5 台（action 阶段组批）；不组批时 2/2/2 优于 1/1/1（饱和时 31.2 对 27.2 req/s）；三个及以上通道未测量。
 - **两个前端。** 对 x2robot dummy 客户端的请求（一路 720×1280 原始视图和两路 640×480 JPEG 视图；三路原始视图时为 1.7 ms），Wall-X 输入处理每个请求耗时 7.1 ms，因此 8 台机器人以 5.6 Hz 发送时，一个前端约有三分之一的时间处于忙碌。下面的对比是在输入处理每个请求耗时 22.2 ms 时测得的，当时 8 台机器人下一个进程约 100 % 的时间处于忙碌。低负载时更多前端没有帮助：4 台机器人时（2026-11-01，action 阶段组批之前；各跑一次），服务端 P50 / P99 在 1 个前端时为 94.8 / 123.8 ms，2 个时为 95.9 / 133.0 ms，4 个时为 119.9 / 144.0 ms。启用 action 组批后，4 台机器人在 1 个和 2 个前端下端到端时延相同（汇总 P50 分别为 85–87 和 86–88 ms）；1 个前端时请求排队等待输入处理（P50 28 ms 对 21 ms），2 个前端时则改为在引擎中等待。
 - **每个前端 4 个处理线程。** 图像解码和 resize 会释放 GIL，因此一个进程可以同时准备多个请求。
 - **最终阶段优先。** 优先级相同时，最终阶段的就绪工作要排在后续请求的 vision 和 prefill kernel 之后。在 RTX 5090 上（仓库压测口径，同一代码树上的成对实例），action 优先级 −1 对比 0：
-  - Wall-OSS MXFP8，8 台机器人：服务端汇总 P50 为 120.9 / 123.4 对 137.1 / 142.4 ms，P99 为 167.5 / 162.3 对 182.2 / 203.4 ms；
-  - 1 台和 4 台机器人（Wall-OSS MXFP8）时没有可测量的差异。
+  - WALL-OSS-0.5 MXFP8，8 台机器人：服务端汇总 P50 为 120.9 / 123.4 对 137.1 / 142.4 ms，P99 为 167.5 / 162.3 对 182.2 / 203.4 ms；
+  - 1 台和 4 台机器人（WALL-OSS-0.5 MXFP8）时没有可测量的差异。
 
   达到或超过饱和时，它可能带来代价：
-  - Wall-OSS BF16，5 台机器人（过载）：中位数低 42 ms、吞吐高 15 %，但 P99 高 24–37 ms；
-  - Wall-OSS MXFP8，10 台机器人（过载）：中位数低 13 ms、P95 更低、吞吐高 10 %，但 150 ms 以内的请求更少（2–11 % 对 28–32 %）。
+  - WALL-OSS-0.5 BF16，5 台机器人（过载）：中位数低 42 ms、吞吐高 15 %，但 P99 高 24–37 ms；
+  - WALL-OSS-0.5 MXFP8，10 台机器人（过载）：中位数低 13 ms、P95 更低、吞吐高 10 %，但 150 ms 以内的请求更少（2–11 % 对 28–32 %）。
 
   `--stream-priorities action=0` 可恢复相同优先级。
 
 ## Prompt 形状桶
 
-Wall-OSS 使用 `xinfer/models/interface.py` 中的 `BucketSpec`。启动报告中的 `shape_buckets.prompt` 显示生效的策略。默认值为 `processing.prompt_bucket=16`。
+WALL-OSS-0.5 使用 `xinfer/models/interface.py` 中的 `BucketSpec`。启动报告中的 `shape_buckets.prompt` 显示生效的策略。默认值为 `processing.prompt_bucket=16`。
 
 | 模型选项 | 实际策略 |
 |---|---|
 | 正数 `prompt_bucket` | 向上取整到该粒度，上限为模型的 prompt 长度上限 |
 | `prompt_bucket=0` | 精确的有效长度，不做桶填充 |
 
-Wall-OSS 在 action 注意力中对填充位置使用掩码。改变 prompt 宽度可能导致浮点舍入差异。
+WALL-OSS-0.5 在 action 注意力中对填充位置使用掩码。改变 prompt 宽度可能导致浮点舍入差异。
 
 引擎在 `xinfer/engine/cudagraph.py` 中展开 `meta["prompt_len_range"]` 并调用模型的 `pad` 钩子，按从大到小的顺序预热可达宽度。日志报告各宽度和每个阶段的 graph 数量。精确长度策略只预热所提供的 prompt 宽度，其他长度按配置的预热后 graph 未命中策略处理。
 
@@ -81,23 +81,23 @@ Wall-OSS 在 action 注意力中对填充位置使用掩码。改变 prompt 宽�
 
 `"gpu"` 需要 CUDA 设备和 NVIDIA 的 nvImageCodec（`pip install -e '.[gpu-image]'`，即 CUDA 13 版的 `nvidia-nvimgcodec-cu13`）；没有时 `Policy` 默认 `"cpu"`，显式指定 `"gpu"` 会在启动时抛出 `ConfigError`。解码器为第一个请求创建，使用 `--warmup` 时即为一个预热请求。视图形状不变，因此两种模式下的 CUDA graph 相同。
 
-Wall-OSS（默认 BF16 组合）在 RTX 5090 上启用 CUDA graph，使用 `benchmarks/request_latency.py` 运行 50 次的单请求 P50（ms；nvImageCodec 0.10，xcompute `7336b0d`）：
+WALL-OSS-0.5（默认 BF16 组合）在 RTX 5090 上启用 CUDA graph，使用 `benchmarks/request_latency.py` 运行 50 次的单请求 P50（ms；nvImageCodec 0.10，xcompute `7336b0d`）：
 
 | 模型、请求 | `"cpu"`：总计（准备 / 引擎） | `"gpu"`：总计（准备 / 引擎） |
 |---|---|---|
-| Wall-OSS，x2robot dummy 客户端（一路 1280×720 原始前视图，两路 640×480 噪声 JPEG 腕部视图） | 51.9 (7.3 / 44.4) | 49.1 (3.2 / 45.8) |
-| Wall-OSS，三路机器人相机 JPEG 视图（1280×720 和 640×480） | 50.9 (6.2 / 44.6) | 47.7 (2.0 / 45.5) |
+| WALL-OSS-0.5，x2robot dummy 客户端（一路 1280×720 原始前视图，两路 640×480 噪声 JPEG 腕部视图） | 51.9 (7.3 / 44.4) | 49.1 (3.2 / 45.8) |
+| WALL-OSS-0.5，三路机器人相机 JPEG 视图（1280×720 和 640×480） | 50.9 (6.2 / 44.6) | 47.7 (2.0 / 45.5) |
 
-前端改为把解码和缩放交给引擎进程的设备图像线程，在该线程的 stream 上每个请求约耗时 1 ms（[引擎](engine.zh-CN.md#设备图像)）。以 4 台机器人运行 Wall-OSS 时（单卡容量，[性能表](performance.zh-CN.md)口径，8 轮），各轮服务端 P50 / P95 的中位数在 GPU 预处理下为 94 / 104 ms，CPU 预处理下为 119 / 133 ms；同一配置的各轮之间相差几十毫秒（取决于各轮的起始相位）。两种模式都通过了内部精度门禁（[精度](precision.zh-CN.md#内部验证)）。
+前端改为把解码和缩放交给引擎进程的设备图像线程，在该线程的 stream 上每个请求约耗时 1 ms（[引擎](engine.zh-CN.md#设备图像)）。以 4 台机器人运行 WALL-OSS-0.5 时（单卡容量，[基准测试口径](benchmark.zh-CN.md#性能表)，8 轮），各轮服务端 P50 / P95 的中位数在 GPU 预处理下为 94 / 104 ms，CPU 预处理下为 119 / 133 ms；同一配置的各轮之间相差几十毫秒（取决于各轮的起始相位）。两种模式都通过了内部精度门禁（[精度](precision.zh-CN.md#内部验证)）。
 
 尚未纳入解析：
 - 内存规划器（design §8.2）；
 - `xinfer tune`（调优表需根据基准测试结果手工编写）；
 - 进程内前端（design §9.2）。
 
-## 示例：RTX 5090 上的 Wall-OSS
+## 示例：RTX 5090 上的 WALL-OSS-0.5
 
-`xinfer-serve --model wall_oss ... --dry-run`（optimized 组合）：
+`xinfer-serve --model wall-oss-0.5 ... --dry-run`（optimized 组合）：
 
 ```text
 shape_buckets.prompt          {"granularity": 16, "max_length": null, "sizes": []} model:bucket policy
@@ -123,4 +123,4 @@ shm_buffers                   16         default:one per running request
 
 ## 默认设置下的实测结果
 
-各模型在这些设置下的单卡容量见[性能](performance.zh-CN.md)。
+WALL-OSS-1.0-Nano 的单卡容量实测见[性能](performance.zh-CN.md)。

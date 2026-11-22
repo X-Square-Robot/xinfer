@@ -24,7 +24,7 @@ def test_load_rejects_rpu_before_plugin_or_asset_loading(tmp_path, monkeypatch, 
     monkeypatch.setattr(protocol, "read_requests", forbidden)
 
     with pytest.raises(SystemExit, match="xinfer-profile load.*execution_model='cuda-lanes'"):
-        profile.main(["load", "--model", "wallx2b", "--checkpoint", str(checkpoint),
+        profile.main(["load", "--model", "wall-oss-1.0-nano", "--checkpoint", str(checkpoint),
                       "--requests", str(requests), "--device", device, "--out", str(tmp_path / "out")])
 
     assert not calls

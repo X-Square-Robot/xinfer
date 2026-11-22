@@ -9,7 +9,7 @@
 - 这些模型此前的内部服务原型及其测量；
 - vLLM、SGLang 当前 main 源码。
 
-[性能表](performance.zh-CN.md)列出 Wall-OSS 和 Wall-X 2B 的测量条件，并链接到各自的验证结果。
+[性能表](performance.zh-CN.md)列出 WALL-OSS-1.0-Nano 的结果和测量条件。
 
 ---
 
@@ -22,7 +22,7 @@
 | kernel | 原生算子源码和构建定义维护在 `xinfer/ops/backends/<backend>/src`，Python 绑定在后端包内，提前构建共享库（AOT）；后端仍有需要时保留外部兼容 provider（§18.2） |
 | 算子绑定 | 原生库使用 TVM-FFI；所有后端使用同一算子注册表和构建期选择。RPU 注册预构建算子签名；有明确的 PyTorch 编译、导出需求时，`torch.library` 适配复用已有实现（§14.2） |
 | 部署场景 | 每个加速器运行一个模型实例，为一台或多台机器人提供服务。 |
-| 内置模型 | Wall-OSS、Wall-X 2B |
+| 内置模型 | WALL-OSS-0.5、WALL-OSS-1.0-Nano |
 | 首批硬件 | RTX 5090（sm120）、Jetson Thor（sm110） |
 | GPU 进程布局 | 默认 `colocated`：每 GPU 一个 Engine，Vision / Prefill / Action 同进程；v1 只实现这一布局，`split` 暂不实现 |
 | 阶段与部署边界 | 逻辑阶段与进程映射分离；StageGraph 声明计算与依赖，阶段的进程归属由运行时负责（§9.3） |
@@ -43,19 +43,19 @@
 | §4 设备边界 | 部分实现 | 部分设备原语经 `platforms/devices.py` 调用；共享引擎仍直接调用 `torch.cuda`，并按 `Platform.is_cuda` 分支。引擎分派读取 `capabilities.execution_model`，所有后端使用算子注册表；CUDA profiling 与 frontend 共享内存注册使用 `Platform.is_cuda`。`test_layering.py` 只检查 `platforms/interface.py`、`models/interface.py` 不 import torch |
 | §5 取消与单请求错误 | 部分实现 | 未发射的取消请求直接丢弃，已发射的跑完后丢弃结果；阶段执行、接纳时的上传或取批时出错，只让相应的请求失败，并释放其 slot。引擎线程或完成线程停止时 `xinfer-serve` 以状态 1 退出；设备粘滞错误的识别（`Platform.classify_error`）与 DRAINING 未实现 |
 | §6.3 三条调度规则 | 已实现 | 上游发射后请求即进入下游队列，下游 lane 在 GPU 上等待事件；零等待组批；完成线程只等最终事件（`xinfer/engine/core.py`） |
-| §6.4 组批精度 | 已实现 | Wall-OSS 参考组合允许 action 阶段使用 B1、B2、B4 和 B8。优化组合、vision 和 prefill 只使用 B1。 |
+| §6.4 组批精度 | 已实现 | WALL-OSS-0.5 参考组合允许 action 阶段使用 B1、B2、B4 和 B8。优化组合、vision 和 prefill 只使用 B1。 |
 | §7.1 接纳 | 部分实现 | `submit` 返回 Future，拒绝时为 `AdmitError`（`queue_full`、`per_robot_limit`、`stopped`）；`admission_timeout` 未实现 |
 | §7.2–§7.4 阶段队列、组批、发射 | 已实现 | FIFO；兼容键由运行时按阶段实际读取的输入推导；序列长度不同的交接张量左填充后组批；合批用 torch 拼接，不经 Platform 拷贝原语 |
 | §7.5 策略插件 | 未实现 | FIFO 写在引擎内 |
 | §8.1 slot 状态机 | 部分实现 | `SlotPool` 只做接纳计数和代数检查（FREE / ACTIVE / RELEASING）；交接张量由请求持有，每个阶段复制一份 |
 | §8.2 显存规划器 | 未实现 | |
-| §8.3 图管理 | 部分实现 | 每条通道有自己的图池和静态缓冲。Wall-OSS 默认按 16 token 对 prompt 分桶，预热覆盖每条通道可达的宽度与允许的批大小。 |
+| §8.3 图管理 | 部分实现 | 每条通道有自己的图池和静态缓冲。WALL-OSS-0.5 默认按 16 token 对 prompt 分桶，预热覆盖每条通道可达的宽度与允许的批大小。 |
 | §9.1 Engine 线程 | 部分实现 | engine thread、completion thread 与 device-image thread（在自己的 stream 上解码、resize 带 `DeviceImage` 输入的请求的视图）三个线程；OMP / MKL / NUMBA 线程数默认 1；预热后冻结 GC 未实现 |
 | §9.2 Frontend 进程 | 已实现 | 默认 2 个进程，SO_REUSEPORT，每个进程 4 个处理线程；共享内存加 pipe 通知（不是 ZMQ）；不初始化 CUDA，但 import torch。进程内调用由 `Policy` 提供 |
 | §10 配置解析 | 部分实现 | 显式值 > 调优表 > 模型 / 平台规则 > 默认值，启动时打印每项来源（docs/configuration.md）；目前没有随包发布的调优表；`xinfer tune`、显存规划器参与推导、`Platform.derive` / `validate` 未实现 |
 | §11 模型接入 | 已实现 | 模型声明阶段、交接张量、能力、输入输出处理和形状桶。前端通过模型类的 `build_processors` 构建处理器，引擎预热时调用模型的 `pad` 钩子。 |
-| §11.4 内置模型 | 已实现 | Wall-OSS 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过内部精度门禁。 Wall-X 2B 使用 Qwen3.5 骨干，支持桌面双臂 RTC。 |
-| §12 量化 | 部分实现 | 框架支持按模块组配置 `QuantConfig`。Wall-OSS 使用 BF16。MXFP8 和 NVFP4 具有 PyTorch 参考实现，详见[量化](quantization.zh-CN.md)。 |
+| §11.4 内置模型 | 已实现 | WALL-OSS-0.5 提供参考和优化两种 BF16 组合，RTX 5090 上的优化组合通过内部精度门禁。 WALL-OSS-1.0-Nano 使用 Qwen3.5 骨干，支持桌面双臂 RTC。 |
+| §12 量化 | 部分实现 | 框架支持按模块组配置 `QuantConfig`。WALL-OSS-0.5 使用 BF16。MXFP8 和 NVFP4 具有 PyTorch 参考实现，详见[量化](quantization.zh-CN.md)。 |
 | §13 Platform | 部分实现 | 只有设备能力描述和 CUDA / CPU 解析（`xinfer/platforms/`）；stream、event、拷贝原语、`register_host`（现由 `frontend/shm.py` 直接调用 `cudaHostRegister`）、`classify_error`、`derive` / `validate` 和插件激活未实现；Thor（sm110）未验证 |
 | §14 算子 | 部分实现 | `OpSpec` 与契约、注册表、构建期选择和选择表已实现；CUDA 使用仓内原生库和 flash-attn，Ascend 在其他 provider 之外仍保留外部 xcompute 兼容 provider（§14.2）；`xinfer.ops.conformance` 未实现 |
 | §15 协议与前端 | 部分实现 | WebSocket + msgpack，兼容 x2robot 客户端；`xinfer.Policy` 进程内 API；Client SDK 与兼容适配未实现 |
@@ -86,7 +86,7 @@
 
 | 目标 | 验收口径 | 现有参考 |
 |---|---|---|
-| Thor 单请求 | Thor 上 Wall-OSS，同输入 | 不高于该模型此前的 Thor 移植 |
+| Thor 单请求 | Thor 上 WALL-OSS-0.5，同输入 | 不高于该模型此前的 Thor 移植 |
 | 单卡容量最高 | 5090，统一输入，客户端 P50 < 150 ms，三遍 | 此前内部服务运行时的同口径容量（基线数字需按 §20 M1 复核） |
 | 单请求与满载结果一致 | 同一输入单独运行和满载运行 | 两者都通过该模型的精度门禁；阶段算子都是确定性时输出逐位相同（§6.4） |
 | 接入新模型容易 | 骨干和动作头已有构件时 | 只写模型文件和权重映射，不改运行时 |
@@ -110,7 +110,7 @@
 | Stage（阶段） | 模型声明的一段计算，例如 `vision`、`prefill`、`action`。代码单位 |
 | StageGraph | 模型声明的计算阶段 DAG，不声明进程归属。首批模型按 vision → prefill → action 的逻辑链组织，具体阶段与交接由各模型声明 |
 | Lane | 某阶段的一个并发执行槽：一条 stream + 一组静态工作区 + 一个图池 |
-| 形状桶（bucket） | 阶段输入可取的离散形状，例如 Wall-OSS 的 prompt 宽度取 16 的倍数 |
+| 形状桶（bucket） | 阶段输入可取的离散形状，例如 WALL-OSS-0.5 的 prompt 宽度取 16 的倍数 |
 | Slot | 按请求分配的交接存储，存放跨阶段张量（如前缀 KV），带 generation |
 | Handoff | 阶段之间交接的张量集合，由 HandoffSpec 声明 |
 | 链式发射 | 上游阶段发射时，把下游阶段一起发射，靠 GPU 事件衔接（§6） |
@@ -191,7 +191,7 @@
 
 启动顺序是：构建模型（算子在此时选定）→ `config.resolve` 读取已构建模型的 `capabilities()` 与平台能力 → 创建 Engine。所以已构建模型支持的能力（例如批大小）经模型接口交给 engine，engine 不依赖 ops，也不依赖 config；Frontend 的共享内存与 Engine 之间由 `entrypoints/serve.py` 衔接，engine 不依赖 frontend。
 
-**RPU 包的职责边界。** `models/wallx2b/rpu/` 负责模型配置、权重、请求处理和常驻阶段计划。`engine/rpu/engine.py` 通过模型的 RPU 钩子负责请求准入、提交、完成、重置和关闭。平台包负责设备资源：`platforms/rpu/platform.py` 描述能力，`resources.py` 管理缓冲区和操作，`execution.py` 管理有序执行，`context.py` 管理上下文生命周期。`platforms/rpu/plan.py` 定义后端模型和引擎共同使用的 RPU 请求契约；共享模型接口不依赖厂商执行类型。`config/rpu.py` 提供 RPU 请求和通道默认值，通用解析器继续负责 frontend 和共享内存设置。入口工厂向平台上下文注入原生后端工厂和 `rpu.bind_ops(model.ops)` 算子工厂。`context.prepare` 调用 OpTable 选中的实现，再准备原生操作；平台与引擎都不导入 ops。有序批执行和完成等待独立于算子选择。
+**RPU 包的职责边界。** `models/wall_oss_1_0_nano/rpu/` 负责模型配置、权重、请求处理和常驻阶段计划。`engine/rpu/engine.py` 通过模型的 RPU 钩子负责请求准入、提交、完成、重置和关闭。平台包负责设备资源：`platforms/rpu/platform.py` 描述能力，`resources.py` 管理缓冲区和操作，`execution.py` 管理有序执行，`context.py` 管理上下文生命周期。`platforms/rpu/plan.py` 定义后端模型和引擎共同使用的 RPU 请求契约；共享模型接口不依赖厂商执行类型。`config/rpu.py` 提供 RPU 请求和通道默认值，通用解析器继续负责 frontend 和共享内存设置。入口工厂向平台上下文注入原生后端工厂和 `rpu.bind_ops(model.ops)` 算子工厂。`context.prepare` 调用 OpTable 选中的实现，再准备原生操作；平台与引擎都不导入 ops。有序批执行和完成等待独立于算子选择。
 
 `test_layering.py` 检查上表中包之间的依赖方向，以及 `platforms/interface.py`、`models/interface.py` 不 import torch。下面的设备边界是目标，目前只部分实现，也未作为完整契约检查。
 
@@ -256,7 +256,7 @@ Engine Scheduler: 接纳（分配请求 slot）→ H2D（uint8 图像、token、
 ### 6.4 正确性契约：单独运行与满载运行
 
 - **同一套 kernel。** 两条路径使用同一批阶段图。算子不要求确定性（§14.1）：满载下的结果要像单独运行的结果一样通过该模型的精度门禁；某个阶段的算子都是确定性时，两者逐位相同。
-- 模型通过精度门禁后，才为该阶段声明大于 1 的批大小。组批可能改变浮点舍入。Wall-OSS 参考组合支持 action 组批，优化组合保持 B1。
+- 模型通过精度门禁后，才为该阶段声明大于 1 的批大小。组批可能改变浮点舍入。WALL-OSS-0.5 参考组合支持 action 组批，优化组合保持 B1。
 - **适用范围。** 逐位相同只在同一平台和同一组算子实现内成立，不跨芯片；跨平台与参考实现的对齐用容差，每个平台保存自己的 golden。
 
 ### 6.5 M0 / M1 需要量化的风险
@@ -405,15 +405,15 @@ v1 的 GPU 进程布局固定为 `colocated`，不由调优表或负载状态切
 ### 10.3 示例与审计
 
 ```bash
-xinfer serve --model wall_oss --checkpoint CKPT                     # 默认值
-xinfer serve --model wall_oss --checkpoint CKPT --lanes vision=1    # 显式覆盖单项
+xinfer serve --model wall-oss-0.5 --checkpoint CKPT                     # 默认值
+xinfer serve --model wall-oss-0.5 --checkpoint CKPT --lanes vision=1    # 显式覆盖单项
 ```
 
 启动时打印并落盘解析结果，每一项都标出来源：
 
 ```text
 max_running_requests  32         default
-lanes.vision          2          tuned:wall_oss/sm120-mxfp8@<commit>
+lanes.vision          2          tuned:wall-oss-0.5/sm120-mxfp8@<commit>
 batch_sizes.vision    [1]        model:declares B1 only
 batch_sizes.action    [1,2,4,8]  model:declared sizes
 cudagraphs            True       platform:supports graph capture
@@ -442,7 +442,7 @@ frontend_workers      4          default, frontends × workers ≤ cpus/2 = 12
 | `WeightMapping` | checkpoint 键到参数的映射 | 加载 |
 
 ```python
-class WallOSS(VLAModel):
+class WallOSS05(VLAModel):
     stage_graph = StageGraph(
         Stage("vision",  "encode_images"),
         Stage("prefill", "prefill", depends_on="vision"),
@@ -463,15 +463,15 @@ class WallOSS(VLAModel):
     def denoise(self, b: StageBatch) -> None: ...         # 整段 N 步，写 b.out["actions"]
 ```
 
-**注册是惰性的。** 模型以名字加两个"模块:类"字符串注册：一个指向 processing（IOSchema、Input/OutputProcessor），一个指向 model。
+**模型按需加载。** 注册时提供模型 ID 和模型类的导入路径。调用方选中该模型后，注册表才会导入对应的类。
 
 ```python
-register_model("wall_oss",
-               processing="xinfer.models.wall_oss.processing:WallOSSInputProcessor",
-               model="xinfer.models.wall_oss.model:WallOSS")
+from xinfer.models.registry import register_model
+
+register_model("wall-oss-0.5", "xinfer.models.wall_oss_0_5.model:WallOSS05")
 ```
 
-Frontend 只导入 processing，不导入模型代码；Engine 才导入 model。一个模型的导入失败不影响其他模型。树外模型经 `xinfer.models` 入口用同样的形式注册。
+仓库外的模型也可以通过 `xinfer.models` 入口注册模型类。
 
 ### 11.2 阶段函数约束
 
@@ -494,15 +494,15 @@ Frontend 只导入 processing，不导入模型代码；Engine 才导入 model�
 
 ### 11.4 内置模型
 
-Wall-OSS 使用 Qwen2.5-VL 视觉塔、prefill 专家和流匹配动作专家。张量布局、执行阶段和数值配置见 [Wall-OSS 设计](models/wall_oss_design.zh-CN.md)。
+WALL-OSS-0.5 使用 Qwen2.5-VL 视觉塔、prefill 专家和流匹配动作专家。张量布局、执行阶段和数值配置见 [WALL-OSS-0.5 设计](models/wall_oss_0_5_design.zh-CN.md)。
 
-Wall-X 2B 将 Qwen3.5 视觉编码器、混合注意力语言骨干与流匹配动作专家组合在一起。兼容 checkpoint 所需文件、桌面双臂协议和服务命令见 [Wall-X 2B 指南](models/wallx2b.zh-CN.md)。
+WALL-OSS-1.0-Nano 将 Qwen3.5 视觉编码器、混合注意力语言骨干与流匹配动作专家组合在一起。兼容 checkpoint 所需文件、桌面双臂协议和服务命令见 [WALL-OSS-1.0-Nano 指南](models/wall_oss_1_0_nano.zh-CN.md)。
 
 ---
 
 ## 12. 量化
 
-- **`QuantConfig`** 配置各模块组使用的方法。Wall-OSS 当前只支持 BF16。参见[量化方法](quantization.zh-CN.md)。
+- **`QuantConfig`** 配置各模块组使用的方法。WALL-OSS-0.5 当前只支持 BF16。参见[量化方法](quantization.zh-CN.md)。
 - **`QuantMethod` 接口**：
   - `create_weights`；
   - `process_weights_after_loading`：转换、打包、swizzle，必须在权重冻结之前完成；
@@ -647,11 +647,11 @@ RPU 与 CPU、CUDA、Ascend 使用同一 `OpRegistry` 和 `build_table`。其 `p
 
 两列内容均维护在 XInfer 仓库。外部 SDK、编译器、模型权重和生成的 RPU `.ref` 资产保留各自的分发与许可边界。
 
-工具：`xinfer profile ops --model wall_oss` 按模型输出每个算子的耗时与理论下限，供算子组排定优先级。
+工具：`xinfer profile ops --model wall-oss-0.5` 按模型输出每个算子的耗时与理论下限，供算子组排定优先级。
 
 厂商后端可以采用相同的仓内布局，也可以通过 `xinfer.ops`、`xinfer.platforms` 入口作为独立包维护（§18.3）。预构建执行后端经同一注册表声明调用签名和执行契约。
 
-### 14.4 Wall-OSS 算子清单
+### 14.4 WALL-OSS-0.5 算子清单
 
 - GEMM：BF16、MXFP8；以及融合量化（RMSNorm + quant、SiLU-mul + quant）。
 - 注意力：
@@ -708,7 +708,7 @@ RPU 与 CPU、CUDA、Ascend 使用同一 `OpRegistry` 和 `build_table`。其 `p
 
 ## 18. 仓库与开发流程
 
-- XInfer 在框架仓库内维护原生算子的源码、绑定和构建定义，遵守 §14 的契约与验证要求；现有外部 provider 保留为显式兼容依赖。对外发布仍须完成许可与贡献流程审批。
+- XInfer 在框架仓库内维护原生算子的源码、绑定和构建定义，遵守 §14 的契约与验证要求；现有外部 provider 保留为显式兼容依赖。源代码采用 [Apache License 2.0](../LICENSE)。对外发布须完成贡献流程审批。
 - **规范**：
   - MR 描述必须写明问题、改动、验证和限制；
   - 实验原始数据不进 Git；
@@ -775,7 +775,7 @@ XInfer/
 │   │   │                           # IOSchema、InputProcessor、OutputProcessor
 │   │   ├── registry.py             # 惰性注册（名字 → 模块:类 字符串）与发现，含插件入口
 │   │   ├── processing.py           # 各模型输入处理共用：视图并发、分段 tokenizer
-│   │   ├── wall_oss/
+│   │   ├── wall_oss_0_5/
 │   │   │   ├── config.py           # 从 checkpoint 配置得出结构参数
 │   │   │   ├── model.py            # 阶段图与三个阶段函数（组装 layers）
 │   │   │   ├── processing.py       # IOSchema、Input/OutputProcessor
@@ -828,8 +828,8 @@ XInfer/
 │   │   ├── tune.py                 # xinfer tune：扫描并生成调优表
 │   │   └── eval.py                 # xinfer eval：对齐、开环误差、量化门禁
 │   └── tuned/                      # 调优表，随包发布
-│       ├── wall_oss/sm120-mxfp8.json   # 取值 + 提交 + 日期 + 测量口径
-│       └── wall_oss/sm110-mxfp8.json
+│       ├── wall-oss-0.5/sm120-mxfp8.json   # 取值 + 提交 + 日期 + 测量口径
+│       └── wall-oss-0.5/sm110-mxfp8.json
 ├── client/                         # 独立小包 xinfer-client，不依赖 torch
 │   ├── pyproject.toml
 │   └── xinfer_client/
@@ -894,7 +894,7 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 
 | 里程碑 | 主要落在 |
 |---|---|
-| M0 | `platforms/`、`ops/`、`models/layers/`、`models/wall_oss`、引擎阶段与 slot、Policy 和基准测试入口 |
+| M0 | `platforms/`、`ops/`、`models/layers/`、`models/wall_oss_0_5`、引擎阶段与 slot、Policy 和基准测试入口 |
 | M1 | `frontend/`（多进程）、`engine/scheduler/` 全部、`memory/planner.py`、`config/resolve.py`、`benchmarks/fleet.py`、`tune.py`、`tuned/`、`client/` |
 | M2 | `models/layers/quantization/nvfp4.py`、精度门禁和扩展模型所用的构件 |
 | M3 | 兼容适配、Router、文档、Docker 镜像、GitHub 发布 |
@@ -928,10 +928,10 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | M-1 评审与建仓 | 主仓库与 CPU CI 已接入，原生算子在仓内维护；本文档评审及算子契约待完成 | 仓库安排已确定；本里程碑其余事项完成后记录评审与验收结论 |
-| M0 数据面 | 平台、算子后端、模型层、Wall-OSS、单通道发射和基准测试 | Wall-OSS 通过精度门禁，并记录目标平台的时延与图发射开销。 |
+| M0 数据面 | 平台、算子后端、模型层、WALL-OSS-0.5、单通道发射和基准测试 | WALL-OSS-0.5 通过精度门禁，并记录目标平台的时延与图发射开销。 |
 | M1 机队运行时 | 多通道发射、零等待组批、前端工作进程、slot 生命周期与配置解析 | 测量负载下的机队容量、组批精度和发射开销。 |
 | M2 量化与扩展 | NVFP4 与模型扩展 | 记录各模型及量化方法的数值结果。 |
-| M3 发布 | 文档、Client SDK、兼容适配、Router；许可审批；GitHub 发布 | 外部用户按文档能复现单请求延迟与单卡容量 |
+| M3 发布 | 文档、Client SDK、兼容适配、Router；GitHub 发布 | 外部用户按文档能复现单请求延迟与单卡容量 |
 
 ---
 
@@ -950,7 +950,6 @@ M0–M3 均以 `colocated` 为 GPU 执行布局，不包含 split 执行后端�
 1. **对外名称冲突**：PyPI 上 `xinfer` 已被 dnth/xinfer（计算机视觉推理框架）占用，Xorbits 的 Xinference 名字也相近。仓库名仍为 XInfer，pip 包名在公开前确定。
 2. **模型权重**：对外分发 checkpoint 文件须单独取得授权。
 3. **PyTorch 算子适配范围与版本**：默认 TVM-FFI、按需增加 `torch.library` 的策略已确定（§0、§14.2）；与算子组确认首批需要适配的算子、实际支持的编译／导出路径及 PyTorch、TVM-FFI、原生绑定兼容范围。外部兼容 provider 保留自己的版本要求。
-4. **许可证**：在 M3 前审批。
-5. **对外稳定面与支持等级**：API 版本号的起点与破坏性变更规则，Tier 2 的准入标准（§13.3）。
-6. **AMD GPU 的接入时机与型号**：是否进入 v1；型号决定可用的量化格式和 kernel 来源（§13.2）。
+4. **对外稳定面与支持等级**：API 版本号的起点与破坏性变更规则，Tier 2 的准入标准（§13.3）。
+5. **AMD GPU 的接入时机与型号**：是否进入 v1；型号决定可用的量化格式和 kernel 来源（§13.2）。
 

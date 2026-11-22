@@ -99,7 +99,7 @@ _qk_norm = getattr(xc, "QkNorm", None) if xc is not None else None
 
 # ``qkv_rope_kvcache`` takes the unified projection entry first: the same ``qkv_proj_rope`` call with its
 # ``kv_cache`` epilogue that the end-to-end precision gate validated. The CANN action bridge also serves the
-# operator, but its composition fails that gate for Wall-OSS (every other operator family passes), so it stays the
+# operator, but its composition fails that gate for WALL-OSS-0.5 (every other operator family passes), so it stays the
 # fallback for builds without the entry.
 @register("qkv_rope_kvcache", backend="ascend",
           requires=xc if callable(_fused_projection) or callable(native_cache) else None,

@@ -122,7 +122,7 @@ def add_rms_norm(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
     return s, rms_norm(s, weight, eps)
 
 
-# ---------------------------------------------------------------- Wall-X 2B fused operators
+# ---------------------------------------------------------------- WALL-OSS-1.0-Nano fused operators
 
 def _zero_centered(x32: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """FP32 ``x · rsqrt(mean(x²) + eps) · (1 + w)``."""

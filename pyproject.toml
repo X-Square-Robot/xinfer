@@ -16,8 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Tokenization, image processing, and pose conversion for Wall-OSS and Wall-X 2B.
-# Wall-X 2B on RPU shares the same stack (its CPU input pipeline needs transformers 5.2.0 and torchvision).
+# Tokenization, image processing, and pose conversion for WALL-OSS-0.5 and WALL-OSS-1.0-Nano.
+# WALL-OSS-1.0-Nano on RPU shares the same stack (its CPU input pipeline needs transformers 5.2.0 and torchvision).
 models = [
     "tokenizers>=0.19",
     "opencv-python-headless>=4.10",

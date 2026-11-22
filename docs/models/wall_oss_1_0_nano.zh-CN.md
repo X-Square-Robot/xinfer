@@ -1,0 +1,64 @@
+# WALL-OSS-1.0-Nano
+
+[English](wall_oss_1_0_nano.md) | 简体中文
+
+在 CUDA GPU 或昇腾 950DT NPU 上使用模型 ID `wall-oss-1.0-nano` 加载 BF16 WALL-OSS-1.0-Nano checkpoint。后者所需的算子清单与环境配置见[昇腾指南](../ascend950dt.zh-CN.md)，下文的命令以 `--device cuda` 为例。模型接收三路相机图像、桌面双臂机器人的状态和任务指令，每次预测双臂接下来 16 步的动作。实时分块（RTC）可固定上一轮预测中的部分动作，使相邻两轮预测在时间上重叠。
+
+RTX 5090 上的延迟、单卡服务容量和开环精度见[验证结果](wall_oss_1_0_nano_validation.zh-CN.md)。
+
+在 CUDA 上使用低精度推理时，在下方的服务命令中加入 `--model-options '{"quantization":"mxfp8"}'`（或 `"nvfp4"`），或者向 `Policy` 传入 `quantization="mxfp8"`（或 `"nvfp4"`）。引擎读取同一份 checkpoint，在加载时量化视觉块和提示词投影层。动作阶段继续使用 BF16 计算组合。各阶段的选项、算子要求和验证方式见[模型设计](wall_oss_1_0_nano_design.zh-CN.md)（[MXFP8](wall_oss_1_0_nano_design.zh-CN.md#mxfp8)、[NVFP4](wall_oss_1_0_nano_design.zh-CN.md#nvfp4)）。
+
+## Checkpoint 要求
+
+请自行准备兼容的 checkpoint 目录。仓库提供推理代码。下列文件应来自同一次训练导出：
+
+| 文件 | 加载器读取的内容 |
+|---|---|
+| `model.safetensors`、`config.json` | Qwen3.5 视觉、语言和动作组件的权重与对应维度。 |
+| `config.yml` | `qwen3_5` 模型类型、任务的动作与状态布局，以及嵌入 `data.dataset_config_effective` 的 Dataset V2 配置。 |
+| `tokenizer.json`、`tokenizer_config.json`、`preprocessor_config.json` | checkpoint 配套的 tokenizer、附加 token 和图像处理器设置。 |
+| `normalizer_action.pth`、`normalizer_propri.pth` | 与该 checkpoint 的动作与机器人状态匹配的归一化统计量。 |
+
+可在 checkpoint 目录中加入 `xinfer.json`，内容为 `{"model_id":"wall-oss-1.0-nano"}`。加载时，XInfer 会核对这个 ID 与选用的模型；两者不一致会报错。此文件独立于原始训练配置。没有该文件的兼容 checkpoint 仍按原有格式加载。
+
+## 运行
+
+安装与 CUDA 环境匹配的 PyTorch，然后在仓库根目录执行下列命令。将一条符合下文格式的观测保存为 `flow.msgpack`。服务需要接收 RTC 请求时，另准备一条 `rtc.msgpack` 用于预热。每个文件包含一条请求。示例中的服务完成预热后在 33985 端口监听。
+
+```bash
+python -m pip install -e '.[models,serve]'
+xinfer-serve --model wall-oss-1.0-nano --checkpoint /path/to/wall-oss-1.0-nano-checkpoint \
+  --device cuda --warmup flow.msgpack rtc.msgpack --port 33985
+```
+
+默认的优化 BF16 组合在 CUDA kernel 库已编译时使用它。编译方法和实际选择的算子后端见 [kernel 指南](../kernels.zh-CN.md)。如需使用参考组合并让视觉阶段使用 FlashAttention 2，安装兼容的 FlashAttention 2 构建，并在服务命令中追加 `--model-options '{"numerics":"reference"}' --reference-ops --op-backends varlen_attention=flash_attn`。
+
+同一条 flow 观测也可以直接在进程内运行。示例选择 CPU 图像预处理，与服务默认设置一致。
+
+```python
+from pathlib import Path
+
+from xinfer import Policy
+from xinfer.frontend.protocol import unpackb
+
+observation = unpackb(Path("flow.msgpack").read_bytes())
+policy = Policy("wall-oss-1.0-nano", "/path/to/wall-oss-1.0-nano-checkpoint", device="cuda",
+                image_preprocess_device="cpu")
+try:
+    policy.warmup([observation])
+    response = policy.infer(observation)
+    print(response["action_pred"].shape)
+finally:
+    policy.engine.shutdown()
+```
+
+## 请求与响应
+
+| 请求字段 | 桌面双臂格式 |
+|---|---|
+| `views` | 包含 `camera_front`、`camera_left` 和 `camera_right` 的映射。每路图像可以是 JPEG 字节、base64 编码的 JPEG 字符串或 HWC 格式的 `uint8` RGB 数组。 |
+| `state` | `follow1_pos` 对应左臂，`follow2_pos` 对应右臂。两者均为 `[x, y, z, roll, pitch, yaw, gripper]`，位置单位为米，角度单位为弧度。 |
+| `instruction` | 任务指令字符串。 |
+| RTC 字段 | 设置 `use_rtc=true`，提供整数 `s_model`（已执行步数）和 `inference_delay`。将上一动作块已执行的行移出并在末尾补齐后，作为 `prev_action_chunk` 传入。形状为 `[16, 14]`；若首行为锚定位姿，则为 `[17, 14]`。 |
+
+响应中的 `follow1_pos` 和 `follow2_pos` 分别包含左右臂 16 步的绝对位姿。`action_pred` 将两者拼接为形状 `[16, 14]` 的数组。`predict_action_norm` 是形状为 `[1, 16, 26]` 的归一化模型输出。

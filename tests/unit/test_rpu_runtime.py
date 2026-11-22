@@ -275,12 +275,12 @@ def test_invalid_stage_layout_preserves_plan_cleanup_and_validation_error(contex
 
 
 @pytest.mark.parametrize("failure_stage", ["action", "vision"])
-def test_wallx2b_binding_failure_waits_for_reset_before_rebuilding(context, failure_stage):
+def test_wall_oss_1_0_nano_binding_failure_waits_for_reset_before_rebuilding(context, failure_stage):
     from collections import Counter
     from types import SimpleNamespace
-    from xinfer.models.wallx2b.rpu.model import WallX2B
+    from xinfer.models.wall_oss_1_0_nano.rpu.model import WallOSS10NanoRPU
 
-    model = WallX2B()
+    model = WallOSS10NanoRPU()
     model.context = context
     model._initial_resources = frozenset(context._resources)
     weight = context.prepare_weight(np.ones(2, np.float16), layout="row_major")

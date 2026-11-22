@@ -4,7 +4,7 @@ Read [docs/design.md](docs/design.md),
 including its implementation-status section, before proposing implementation
 changes.
 
-The GitHub distribution ships Wall-OSS and Wall-X 2B. When syncing from upstream, import reviewed changes for the framework and these models.
+The GitHub distribution ships WALL-OSS-0.5 and WALL-OSS-1.0-Nano. When syncing from upstream, import reviewed changes for the framework and these models.
 
 ## Scope and architecture
 
@@ -124,5 +124,4 @@ paths or machine names, files over 1 MiB (unless listed in the script), and
 issue or merge-request numbers in Python code.
 
 Do not commit credentials or machine-specific private configuration. Preserve
-source provenance when porting code. Licensing and external publication remain
-pending and must be resolved before public release.
+source provenance and applicable license notices when porting code.

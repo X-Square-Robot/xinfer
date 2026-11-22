@@ -57,7 +57,7 @@ stage waits and executions to it as `RequestStats`
    precision gate. The first dispatch of each stage runs alone because it
    learns which inputs the stage reads.
    - **Different lengths.** A handoff tensor whose `TensorSpec` declares a
-     `seq_axis` (Wall-OSS: the prompt K/V) may differ in length between batched
+     `seq_axis` (WALL-OSS-0.5: the prompt K/V) may differ in length between batched
      requests. The batch left-pads every row to the longest, and the stage
      receives `<name>_lengths` (`int32 [B]`, also at B1). See
      `xinfer/engine/batching.py`. On CUDA the lengths are uploaded
@@ -144,8 +144,8 @@ where nvImageCodec reads the bitstream.
 Whether a CUDA device has device images is checked by creating the decoder,
 without decoding. A decode at that point, at platform resolution, left every
 later CUDA graph replay of the process slower: on an RTX 5090 the gaps between
-their kernels grew from under 0.5 µs to 0.5–1 µs, about 0.6 ms per Wall-X 2B
-request and up to 1 ms per Wall-OSS request, with or without JPEGs. Without it,
+their kernels grew from under 0.5 µs to 0.5–1 µs, about 0.6 ms per WALL-OSS-1.0-Nano
+request and up to 1 ms per WALL-OSS-0.5 request, with or without JPEGs. Without it,
 single requests take as long as with torchvision's decoder, which XInfer used
 before.
 
@@ -155,7 +155,7 @@ before.
 applies any model-specific `warmup_requests`, then
 expands `model.shape_buckets()` through the model's `pad` hook: one variant per
 shape bucket that requests like it can take (every prompt width the state
-text can give with the request's instruction, in 16-token buckets by default for Wall-OSS). It runs each
+text can give with the request's instruction, in 16-token buckets by default for WALL-OSS-0.5). It runs each
 variant alone, which captures its graphs at batch size 1 on the first lane;
 each lane keeps the inputs of those captures. `capture_batch_sizes`
 (`xinfer/engine/cudagraph.py`) then runs them on every lane of their stage at
@@ -163,7 +163,7 @@ every allowed batch size, merged as serving merges a batch, so serving finds
 the graphs it needs for these shapes. Largest inputs go first, since growing a
 lane's static buffer drops the graphs that use the old one. A batch of mixed
 ragged lengths is padded to its longest member, so warming each length covers
-the mixes. One request of each kind (Wall-OSS: a flow and an RTC request; one
+the mixes. One request of each kind (WALL-OSS-0.5: a flow and an RTC request; one
 per instruction) is therefore enough; shapes the model does not derive
 (another instruction, camera layout or RTC row count) still need their own
 warmup request, and are otherwise captured on first use and reused. The warmup logs its selected bucket widths,
@@ -171,7 +171,7 @@ its time, the graphs kept per stage,
 their capture time and the device memory reserved afterwards.
 
 Each lane keeps at most `CUDAGraphConfig.max_graphs` (64) graphs. The action
-lanes hold the most: per instruction, Wall-OSS needs 3–4 prompt buckets ×
+lanes hold the most: per instruction, WALL-OSS-0.5 needs 3–4 prompt buckets ×
 flow/RTC × 4 batch sizes = 24–32 graphs per lane.
 
 `Engine.warmup` returns each warmup request's outputs (from its first
@@ -201,9 +201,9 @@ platform rules and fixed defaults that do not depend on the load
 
 ## Guarantees and tests
 
-- `test_wall_oss_parity.py::test_action_batches_match_single_requests` compares action batches B2–B8 against requests run alone across different prompt lengths and RTC delays. The outputs agree within rounding.
+- `test_wall_oss_0_5_parity.py::test_action_batches_match_single_requests` compares action batches B2–B8 against requests run alone across different prompt lengths and RTC delays. The outputs agree within rounding.
 - Results of a request are independent of concurrency when batch size is 1:
-  `tests/models/test_wall_oss_parity.py` runs 21 concurrent requests on 2 lanes
+  `tests/models/test_wall_oss_0_5_parity.py` runs 21 concurrent requests on 2 lanes
   per stage with graphs and compares them bitwise with the same requests run
   alone.
 - `tests/unit/test_engine.py` covers concurrent submission, batching and row

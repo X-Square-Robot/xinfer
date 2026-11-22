@@ -2,7 +2,7 @@
 
 [English](kernels.md) | 简体中文
 
-Wall-OSS 和 Wall-X 2B 的默认组合在 CUDA 上使用融合算子。它们的 kernel 在本仓库中（`xinfer/ops/backends/cuda/src`），编译成一个库 `xinfer_kernels.so`。没有编译这个库时，XInfer 用 PyTorch 参考实现运行同样的组合。安装可选的 `flash-attn` 包可启用视觉和 prompt 注意力的优化实现。
+WALL-OSS-0.5 和 WALL-OSS-1.0-Nano 的默认组合在 CUDA 上使用融合算子。它们的 kernel 在本仓库中（`xinfer/ops/backends/cuda/src`），编译成一个库 `xinfer_kernels.so`。没有编译这个库时，XInfer 用 PyTorch 参考实现运行同样的组合。安装可选的 `flash-attn` 包可启用视觉和 prompt 注意力的优化实现。
 
 内置的 `cuda` 后端模块（`xinfer/ops/backends/cuda/`）调用 kernel 库和 flash-attn，与 `xinfer.ops` 入口点中的扩展以同样方式加载（[注册](design.zh-CN.md#142-后端注册与选择)）。库加载失败时，相应算子运行 torch 参考实现，并由一条告警列出变慢的算子；设置 `XINFER_OPS_STRICT=1` 时这条告警变成错误。例如，设置 `XINFER_FLASH_ATTN=0` 会在加载时跳过 flash-attn。
 
@@ -10,7 +10,7 @@ Wall-OSS 和 Wall-X 2B 的默认组合在 CUDA 上使用融合算子。它们的
 
 kernel 库针对一种 GPU 架构编译，只在这种架构上注册算子。本仓库有 SM120（RTX 50 系列）和 SM110（Jetson Thor）的 kernel。
 
-GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`、`gemm_sm110.py`）：在 RTX 5090 上是实测不慢于 cuBLASLt 路径的行数区间；在 Jetson AGX Thor 上是连续三个或更多扫描点都快至少 5% 的行数区间，即测得[性能表](performance.zh-CN.md)数据时所用 xcompute 构建的选路，本库在参考请求上的输出与该构建逐位相同。在 SM110 上本库覆盖 Wall-OSS 和 Wall-X 2B 的 BF16 计算组合。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
+GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`、`gemm_sm110.py`）：在 RTX 5090 上是实测不慢于 cuBLASLt 路径的行数区间；在 Jetson AGX Thor 上是连续三个或更多扫描点都快至少 5% 的行数区间，与参考 SM110 算子构建的选路一致，本库在参考请求上的输出与该构建逐位相同。在 SM110 上本库覆盖 WALL-OSS-0.5 和 WALL-OSS-1.0-Nano 的 BF16 计算组合。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
 
 ## 编译
 
@@ -28,7 +28,7 @@ cmake --build build/kernels -j
 ## 运行
 
 ```bash
-xinfer-serve --model wall_oss --checkpoint /path/to/checkpoint --device cuda \
+xinfer-serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --device cuda \
   --warmup observation.msgpack --port 33985
 ```
 
@@ -48,10 +48,10 @@ xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue':
 - 没有安装 `apache-tvm-ffi` 包；
 - 库是为另一种 GPU 架构编译的。
 
-此时 `Policy` 和 `xinfer-serve` 在 GPU 上加载 Wall-OSS 时会记录一条警告：
+此时 `Policy` 和 `xinfer-serve` 在 GPU 上加载 WALL-OSS-0.5 时会记录一条警告：
 
 ```
-wall_oss: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Build the
+wall-oss-0.5: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Build the
 CUDA kernel library for this GPU: docs/kernels.md
 ```
 

@@ -2,7 +2,7 @@
 
 English | [简体中文](kernels.zh-CN.md)
 
-The default compositions for Wall-OSS and Wall-X 2B use fused operators on CUDA. Their kernels are in this repository (`xinfer/ops/backends/cuda/src`) and build into one library, `xinfer_kernels.so`. XInfer runs the same compositions on PyTorch reference implementations when the library is not built. Install the optional `flash-attn` package for vision and prompt attention.
+The default compositions for WALL-OSS-0.5 and WALL-OSS-1.0-Nano use fused operators on CUDA. Their kernels are in this repository (`xinfer/ops/backends/cuda/src`) and build into one library, `xinfer_kernels.so`. XInfer runs the same compositions on PyTorch reference implementations when the library is not built. Install the optional `flash-attn` package for vision and prompt attention.
 
 The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the kernel library and flash-attn and load the same way as extensions in the `xinfer.ops` entry point group ([registration](design.md#142-backend-registration-and-selection)). Operators whose library does not load run on their torch references, and a warning lists the slow ones; `XINFER_OPS_STRICT=1` makes that warning an error. For example, set `XINFER_FLASH_ATTN=0` to skip flash-attn at load time.
 
@@ -10,7 +10,7 @@ The built-in `cuda` backend modules (`xinfer/ops/backends/cuda/`) call the kerne
 
 The kernel library is built for one GPU architecture and registers its operators on that architecture only. This repository has kernels for SM120 (RTX 50 series) and SM110 (Jetson Thor).
 
-A GEMM runs on a kernel written for its architecture when the call is one that kernel was tuned on, and otherwise on cuBLASLt with the epilogue as a separate kernel. Each kernel lists the shapes it takes next to the code that launches it (`xinfer/ops/backends/cuda/gemm_sm120.py`, `gemm_sm110.py`): on an RTX 5090 the ranges of rows over which it was measured not slower than the cuBLASLt path; on a Jetson AGX Thor the ranges over which it was measured at least 5% faster at three or more consecutive scan points, the selection of the xcompute build of the [performance table](performance.md), whose outputs the library gives bit for bit on the reference requests. On SM110 the library covers the BF16 compositions of Wall-OSS and Wall-X 2B. The attention and flow kernels list their shapes the same way (`attn.py`, `flow.py`), and the calls outside them run on the torch reference.
+A GEMM runs on a kernel written for its architecture when the call is one that kernel was tuned on, and otherwise on cuBLASLt with the epilogue as a separate kernel. Each kernel lists the shapes it takes next to the code that launches it (`xinfer/ops/backends/cuda/gemm_sm120.py`, `gemm_sm110.py`): on an RTX 5090 the ranges of rows over which it was measured not slower than the cuBLASLt path; on a Jetson AGX Thor the ranges over which it was measured at least 5% faster at three or more consecutive scan points, matching the reference SM110 kernel build's selection and its bitwise outputs on the reference requests. On SM110 the library covers the BF16 compositions of WALL-OSS-0.5 and WALL-OSS-1.0-Nano. The attention and flow kernels list their shapes the same way (`attn.py`, `flow.py`), and the calls outside them run on the torch reference.
 
 ## Build
 
@@ -28,7 +28,7 @@ This writes `xinfer/ops/backends/cuda/xinfer_kernels.so`. The target architectur
 ## Run
 
 ```bash
-xinfer-serve --model wall_oss --checkpoint /path/to/checkpoint --device cuda \
+xinfer-serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --device cuda \
   --warmup observation.msgpack --port 33985
 ```
 
@@ -48,10 +48,10 @@ xinfer.serve INFO model loaded in 7.2s on cuda-sm120; ops {..., 'gemm_epilogue':
 - the `apache-tvm-ffi` package is not installed;
 - the library was built for another GPU architecture.
 
-`Policy` and `xinfer-serve` then log a warning when they load Wall-OSS on a GPU:
+`Policy` and `xinfer-serve` then log a warning when they load WALL-OSS-0.5 on a GPU:
 
 ```
-wall_oss: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Build the
+wall-oss-0.5: 7 operators have no fast kernel loaded and fall back to slow torch code (add_rms_norm, ...). Build the
 CUDA kernel library for this GPU: docs/kernels.md
 ```
 

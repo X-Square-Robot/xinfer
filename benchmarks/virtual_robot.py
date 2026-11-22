@@ -1,4 +1,4 @@
-"""Virtual desktop robot: the action queue and RTC fields of the x2robot client, and synthetic Wall-OSS observations.
+"""Virtual desktop robot with the x2robot client action queue, RTC fields, and synthetic WALL-OSS-0.5 observations.
 
 The client's rules with the settings of the repository's load convention: a 200 Hz consumer, six control points
 per model step (linear interpolation), the next request six model steps after the previous chunk's request
@@ -37,7 +37,7 @@ class Observations:
 
     Generate the camera views once per robot so JPEG encoding does not delay each request. Each
     arm's pose is a random xyz position within 0.5 m of the origin, roll/pitch/yaw within pi and a gripper value
-    within 0..1, new for every request. Wall-OSS writes the state into its prompt as text, so random poses vary the
+    within 0..1, new for every request. WALL-OSS-0.5 writes the state into its prompt as text, so random poses vary the
     prompt length as real robots do.
     """
 

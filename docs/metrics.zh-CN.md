@@ -59,7 +59,7 @@ GPU 利用率、显存、时钟和功耗由 NVIDIA DCGM exporter 提供，不由
 [examples/monitoring](../examples/monitoring) 中有 Prometheus 抓取配置、Grafana 的预配置和看板，以及同时运行两者的 Docker Compose 文件：
 
 ```bash
-python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkpoint --port 33985
+python -m xinfer.entrypoints.serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --port 33985
 cd examples/monitoring
 docker compose up -d
 ```

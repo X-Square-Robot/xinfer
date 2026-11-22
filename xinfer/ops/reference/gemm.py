@@ -244,7 +244,7 @@ def qkv_rope_kvcache(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor |
                                  head_dim, 0.0)
 
 
-# ---------------------------------------------------------------- Wall-X 2B fused operators
+# ---------------------------------------------------------------- WALL-OSS-1.0-Nano fused operators
 
 def _zero_centered_heads(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """FP32 ``x · (1 + w) · rsqrt(mean(x²) + eps)`` per head, rounded once."""

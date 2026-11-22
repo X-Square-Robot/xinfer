@@ -14,7 +14,7 @@ resolved once at startup and reported with its source. Precedence, highest
 first:
 
 1. **explicit**: a flag or argument the operator set. It is checked against the platform and the model and never rewritten. A conflict is an error: a batch size the model does not declare, CUDA graphs on a platform without capture (API only), or an unknown stage.
-2. **tuned table**: measured values for (model, architecture, quantization), from `xinfer/tuned/<model>/<arch>-<quantization>.json` or `--tuned <path>`. Each table records the commit, date, method and evidence; the source reads `tuned:<table>@<commit>`. Tables can set `lanes`. No table ships at present: a table is added only when a measured value differs from the default.
+2. **tuned table**: measured values for (model, architecture, quantization), from `xinfer/tuned/<model>/<arch>-<quantization>.json` or `--tuned <path>`. For built-in models, lookup uses the canonical lowercase ID as the directory name, including when the model name is supplied in its official capitalization. An explicit table path loads that file directly. Each table records the commit, date, method and evidence; the source reads `tuned:<table>@<commit>`. Tables can set `lanes`. No table ships at present: a table is added only when a measured value differs from the default.
 3. **model / platform rules**: what the model declares (batch sizes) and what the platform supports (graph capture, CPU quota); sources `model:<rule>` and `platform:<rule>`.
 4. **default**: a fixed value.
 
@@ -28,7 +28,7 @@ Code: `xinfer/config/` (`resolve.py`, `tuned.py`).
 | `max_running_requests` | 32 | admitted requests in flight. An upper bound: slots hold no preallocated memory, and with one request per robot it is reached only by 32 robots |
 | `max_queued_requests` | 256 | submitted requests waiting for admission |
 | `lanes.<stage>` | tuned value, else 2 | a lane is a stream with its own graph pool; a second lane lets two requests run the stage at once |
-| `stream_priorities.<stage>` | final stage (Wall-OSS: `action`): −1 bounded by the supported range; 0 when unknown or unsupported, and for other stages | accelerator stream priority of the stage's lanes, lower is higher (`--stream-priorities action=0`, `Policy(stream_priorities={...})`) |
+| `stream_priorities.<stage>` | final stage (WALL-OSS-0.5: `action`): −1 bounded by the supported range; 0 when unknown or unsupported, and for other stages | accelerator stream priority of the stage's lanes, lower is higher (`--stream-priorities action=0`, `Policy(stream_priorities={...})`) |
 | `batch_sizes.<stage>` | every size the model declares | a larger allowed size never delays a request, because batches form only from queued requests; a model declares sizes above 1 only for a stage whose batched results pass its precision gate |
 | `cudagraphs` | on where the platform supports capture | |
 | `frontends` | 2, at most half the CPUs of the container quota | each frontend adds a bridge thread in the engine process |
@@ -41,25 +41,25 @@ values on a platform without stream priorities are errors. `--dry-run` checks th
 creating lanes. Lane creation also verifies that a runtime advertising priorities honors the exact requested
 value. CUDA keeps the final-stage default −1 when supported; a runtime with range 0–7 keeps it at 0.
 
-The MXFP8 measurements below are historical results from an earlier Wall-OSS configuration. The current [Wall-OSS composition](models/wall_oss.md) supports BF16.
+The MXFP8 measurements below are historical results from an earlier WALL-OSS-0.5 configuration. The current [WALL-OSS-0.5 composition](models/wall_oss_0_5.md) supports BF16.
 
 Why these values:
-- **Lanes 2.** On Wall-OSS MXFP8 (RTX 5090), two action lanes gave 7 robots of capacity against 5 with one (batched action stage), and 2/2/2 beat 1/1/1 without batching (31.2 vs 27.2 req/s saturated); three or more lanes were not measured.
+- **Lanes 2.** On WALL-OSS-0.5 MXFP8 (RTX 5090), two action lanes gave 7 robots of capacity against 5 with one (batched action stage), and 2/2/2 beat 1/1/1 without batching (31.2 vs 27.2 req/s saturated); three or more lanes were not measured.
 - **Two frontends.** Wall-X input processing takes 7.1 ms per request from the x2robot dummy client (one raw 720×1280 view and two 640×480 JPEG views; 1.7 ms with three raw views), so 8 robots at 5.6 Hz keep one frontend busy about a third of the time. The comparisons below were measured when it took 22.2 ms per request, with one process busy about 100 % of the time at 8 robots. More did not help at low load: at 4 robots (2026-11-01, before action-stage batching; one run each) the server P50 / P99 was 94.8 / 123.8 ms with 1 frontend, 95.9 / 133.0 ms with 2 and 119.9 / 144.0 ms with 4. With action batching, 4 robots had the same end-to-end latency with 1 and 2 frontends (pooled P50 85–87 and 86–88 ms); with one frontend requests queued for input processing (P50 28 ms against 21 ms), with two they waited in the engine instead.
 - **Four processing workers per frontend.** Image decode and resize release the GIL, so one process prepares several requests at once.
 - **Final stage first.** With equal priorities, ready work of the final stage waits behind vision and prefill kernels of later requests. On an RTX 5090 (repository load convention, paired instances on one tree), action priority −1 against 0:
-  - Wall-OSS MXFP8, 8 robots: pooled server P50 120.9 / 123.4 against 137.1 / 142.4 ms, P99 167.5 / 162.3 against 182.2 / 203.4 ms;
-  - no measurable difference at 1 and 4 robots (Wall-OSS MXFP8).
+  - WALL-OSS-0.5 MXFP8, 8 robots: pooled server P50 120.9 / 123.4 against 137.1 / 142.4 ms, P99 167.5 / 162.3 against 182.2 / 203.4 ms;
+  - no measurable difference at 1 and 4 robots (WALL-OSS-0.5 MXFP8).
 
   At or beyond saturation it can cost:
-  - Wall-OSS BF16, 5 robots (overloaded): a 42 ms lower median and 15 % more throughput, but a 24–37 ms higher P99;
-  - Wall-OSS MXFP8, 10 robots (overloaded): a 13 ms lower median, a lower P95 and 10 % more throughput, but fewer requests under 150 ms (2–11 % against 28–32 %).
+  - WALL-OSS-0.5 BF16, 5 robots (overloaded): a 42 ms lower median and 15 % more throughput, but a 24–37 ms higher P99;
+  - WALL-OSS-0.5 MXFP8, 10 robots (overloaded): a 13 ms lower median, a lower P95 and 10 % more throughput, but fewer requests under 150 ms (2–11 % against 28–32 %).
 
   `--stream-priorities action=0` restores equal priorities.
 
 ## Prompt shape buckets
 
-Wall-OSS uses `BucketSpec` in `xinfer/models/interface.py`. The startup report shows its effective policy in
+WALL-OSS-0.5 uses `BucketSpec` in `xinfer/models/interface.py`. The startup report shows its effective policy in
 `shape_buckets.prompt`. The default is `processing.prompt_bucket=16`.
 
 | Model option | Effective policy |
@@ -67,7 +67,7 @@ Wall-OSS uses `BucketSpec` in `xinfer/models/interface.py`. The startup report s
 | Positive `prompt_bucket` | Round up to that granularity, capped at the model's prompt limit |
 | `prompt_bucket=0` | Exact valid length, without bucket padding |
 
-Wall-OSS masks padded positions during action attention. Changing the prompt width can change floating-point rounding.
+WALL-OSS-0.5 masks padded positions during action attention. Changing the prompt width can change floating-point rounding.
 
 The engine expands `meta["prompt_len_range"]` in `xinfer/engine/cudagraph.py`
 and calls the model's `pad` hook. It warms the reachable widths from largest to smallest. Logs report the widths and per-stage graph counts.
@@ -98,23 +98,23 @@ The entry point resolves it (`xinfer.config.apply_image_preprocess_device`) and 
 startup. The decoder is created for the first request, a warmup
 request under `--warmup`. The views keep their shapes, so the CUDA graphs are the same in both modes.
 
-Single-request P50 for Wall-OSS (the default BF16 composition) on RTX 5090 with CUDA graphs, measured with `benchmarks/request_latency.py` over 50 runs (ms; nvImageCodec 0.10, xcompute `7336b0d`):
+Single-request P50 for WALL-OSS-0.5 (the default BF16 composition) on RTX 5090 with CUDA graphs, measured with `benchmarks/request_latency.py` over 50 runs (ms; nvImageCodec 0.10, xcompute `7336b0d`):
 
 | Model, requests | `"cpu"`: total (prepare / engine) | `"gpu"`: total (prepare / engine) |
 |---|---|---|
-| Wall-OSS, x2robot dummy client (raw 1280×720 front view, two 640×480 noise JPEG wrist views) | 51.9 (7.3 / 44.4) | 49.1 (3.2 / 45.8) |
-| Wall-OSS, three robot camera JPEG views (1280×720 and 640×480) | 50.9 (6.2 / 44.6) | 47.7 (2.0 / 45.5) |
+| WALL-OSS-0.5, x2robot dummy client (raw 1280×720 front view, two 640×480 noise JPEG wrist views) | 51.9 (7.3 / 44.4) | 49.1 (3.2 / 45.8) |
+| WALL-OSS-0.5, three robot camera JPEG views (1280×720 and 640×480) | 50.9 (6.2 / 44.6) | 47.7 (2.0 / 45.5) |
 
-On the GPU path, the device-image thread spends about 1 ms per request on decoding and resizing on its own stream ([engine](engine.md#device-images)). With Wall-OSS at 4 robots (its single-GPU capacity, the [performance table](performance.md)'s protocol, 8 rounds), the median round server P50 / P95 was 94 / 104 ms with GPU preprocessing and 119 / 133 ms with CPU preprocessing; the rounds of one configuration differ by tens of milliseconds (their start phases). Both modes passed the internal precision gate ([precision](precision.md#internal-validation)).
+On the GPU path, the device-image thread spends about 1 ms per request on decoding and resizing on its own stream ([engine](engine.md#device-images)). With WALL-OSS-0.5 at 4 robots (its single-GPU capacity, the [benchmark protocol](benchmark.md#performance-table), 8 rounds), the median round server P50 / P95 was 94 / 104 ms with GPU preprocessing and 119 / 133 ms with CPU preprocessing; the rounds of one configuration differ by tens of milliseconds (their start phases). Both modes passed the internal precision gate ([precision](precision.md#internal-validation)).
 
 Not resolved yet:
 - the memory planner (design §8.2);
 - `xinfer tune` (tuned tables would be written by hand from benchmark runs);
 - in-process frontends (design §9.2).
 
-## Example: Wall-OSS on RTX 5090
+## Example: WALL-OSS-0.5 on RTX 5090
 
-`xinfer-serve --model wall_oss ... --dry-run` (the optimized composition):
+`xinfer-serve --model wall-oss-0.5 ... --dry-run` (the optimized composition):
 
 ```text
 shape_buckets.prompt          {"granularity": 16, "max_length": null, "sizes": []} model:bucket policy
@@ -141,4 +141,4 @@ The reference composition (`--model-options '{"numerics": "reference"}'`) declar
 
 ## Measured with the defaults
 
-Single-GPU capacity with these settings, for every model: [performance](performance.md).
+See [performance](performance.md) for WALL-OSS-1.0-Nano capacity measurements.

@@ -37,7 +37,8 @@ robot ◀──WebSocket── frontend: release the buffer → OutputProcessor 
 
 ## 协议
 
-- 建立连接时，服务端发送模型的元数据帧。Wall-OSS 的为：`{"batch_enabled": true, "model": "wall-x", "action_horizon": 16, "action_dim": 26, "rtc_ee_chunk_dim": 14, "env": "x2robot"}`。
+- 建立连接时，服务端发送模型的元数据帧。WALL-OSS-0.5 的为：`{"batch_enabled": true, "model": "wall-oss-0.5", "action_horizon": 16, "action_dim": 26, "rtc_ee_chunk_dim": 14, "env": "x2robot"}`。
+- WALL-OSS-1.0-Nano 的连接元数据包含 `"model": "wall-oss-1.0-nano"` 和 `"model_family": "qwen3_5"`。
 - 每个请求是一条 msgpack 消息，数组采用 msgpack-numpy 布局。同一连接的请求逐个应答，由该连接自己的输入处理器处理：有按连接状态的模型在连接存续期间保留这些状态。响应包含模型的字段，以及 `status`（`"ok"`）和 `server_timing`：
   - `infer_ms`：从请求解码完成到响应编码完成；
   - `prepare_ms`、`engine_ms`、`output_ms`；
@@ -59,17 +60,17 @@ robot ◀──WebSocket── frontend: release the buffer → OutputProcessor 
 ## 运行
 
 ```bash
-python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkpoint \
+python -m xinfer.entrypoints.serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint \
   --port 33985 --warmup flow.msgpack rtc.msgpack \
   --model-options '{"quantization": "bf16", "processing": {"instruction_override": null}}'
 ```
 
 | 选项 | 含义 |
 |---|---|
-| `--model-options` | 传给 `from_checkpoint` 和 `build_processors` 的 JSON（Wall-OSS：`processing` = `ProcessingConfig` 的字段） |
+| `--model-options` | 传给 `from_checkpoint` 和 `build_processors` 的 JSON（WALL-OSS-0.5：`processing` = `ProcessingConfig` 的字段） |
 | `--frontends`, `--frontend-workers`, `--shm-buffers`, `--shm-buffer-mib` | 前端进程数（默认 2）、每个前端的处理线程数（默认 4）和每个前端的共享内存缓冲区数；缓冲区大小 |
 | `--lanes`, `--max-batch`, `--max-running-requests`, `--max-queued-requests`, `--per-robot-inflight` | 引擎设置（[engine.md](engine.zh-CN.md)）；会经过检查，从不改写 |
-| `--enforce-eager` | 以 eager 模式运行所有阶段，不使用 CUDA graph（默认：平台支持捕获时使用 CUDA graph）；`--warmup` 请求文件（JSON 或 msgpack，每个文件一个请求或一个列表）：在开始服务之前，按模型从中推导出的每个形状桶（一个 flow 请求和一个 RTC 请求即可覆盖 Wall-OSS），在每个通道和每个允许的批大小上捕获它们的 graph，并由每个前端让它们经过模型的处理器 |
+| `--enforce-eager` | 以 eager 模式运行所有阶段，不使用 CUDA graph（默认：平台支持捕获时使用 CUDA graph）；`--warmup` 请求文件（JSON 或 msgpack，每个文件一个请求或一个列表）：在开始服务之前，按模型从中推导出的每个形状桶（一个 flow 请求和一个 RTC 请求即可覆盖 WALL-OSS-0.5），在每个通道和每个允许的批大小上捕获它们的 graph，并由每个前端让它们经过模型的处理器 |
 | `--tuned` | 调优表选择：`auto`、`none` 或路径 |
 | `--resolved-config`, `--dry-run` | 写出解析后的设置及其来源；打印这些设置后退出 |
 | `--profile-dir` | 记录引擎的 span，停止时把每个请求的引擎分段写到该目录；用于剖析运行（`xinfer-profile load --serve`，[剖析](profiling.zh-CN.md#经过-xinfer-serve--serve)），记录随请求数增长 |

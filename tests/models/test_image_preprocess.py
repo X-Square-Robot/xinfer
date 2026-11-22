@@ -1,6 +1,7 @@
 """``processing.image_preprocess_device="gpu"`` on the served models (GPU, nvImageCodec, external assets).
 
-The Wall-OSS parity assets are configured by ``XINFER_WALL_OSS_CHECKPOINT`` and ``XINFER_WALL_OSS_REFERENCE``.
+The WALL-OSS-0.5 parity assets are configured by ``XINFER_WALL_OSS_0_5_CHECKPOINT``
+and ``XINFER_WALL_OSS_0_5_REFERENCE``.
 The recorded dummy-client wrist views are encoded as JPEG and the front view stays a raw frame.
 
 The device path's views stay within a stated pixel tolerance of the CPU path's, and serving with the option
@@ -20,16 +21,17 @@ pytestmark = [pytest.mark.gpu, pytest.mark.assets,
               pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
 
 # Mean and largest per-channel |GPU − CPU| of the uint8 views. nvImageCodec decodes within one level of
-# libjpeg-turbo, and the Wall-OSS views are resized without antialiasing like a raw frame, so both differ by at most
+# libjpeg-turbo, and the WALL-OSS-0.5 views are resized without antialiasing like a raw frame, so both differ by at most
 # one level (uniform-noise JPEGs: 0.0007 / 1).
 NOISE_JPEG = (0.05, 2)
 FRAME = (0.01, 1)
 
 
-def _wall_oss_requests():
+def _wall_oss_0_5_requests():
     import cv2
 
-    requests = list(pickle.load(open(Path(os.environ["XINFER_WALL_OSS_REFERENCE"]) / "requests.pkl", "rb")).values())
+    requests_path = Path(os.environ["XINFER_WALL_OSS_0_5_REFERENCE"]) / "requests.pkl"
+    requests = list(pickle.load(open(requests_path, "rb")).values())
     out = []
     for observation in requests[:6]:
         views = dict(observation["views"])
@@ -43,22 +45,22 @@ def _wall_oss_requests():
 
 @pytest.fixture(scope="module")
 def served():
-    """A Wall-OSS policy and its CPU-path processor for the same recorded requests."""
+    """A WALL-OSS-0.5 policy and its CPU-path processor for the same recorded requests."""
     from xinfer.platforms import resolve_platform
 
     if not resolve_platform("cuda").capabilities.device_images:
         pytest.skip("needs nvImageCodec")
-    checkpoint = os.environ.get("XINFER_WALL_OSS_CHECKPOINT")
-    if not checkpoint or not os.environ.get("XINFER_WALL_OSS_REFERENCE"):
-        pytest.skip("Wall-OSS assets not configured")
+    checkpoint = os.environ.get("XINFER_WALL_OSS_0_5_CHECKPOINT")
+    if not checkpoint or not os.environ.get("XINFER_WALL_OSS_0_5_REFERENCE"):
+        pytest.skip("WALL-OSS-0.5 assets not configured")
     from xinfer import Policy
     from xinfer.engine.cudagraph import CUDAGraphConfig
     from xinfer.models.registry import get_model_class
 
-    policy = Policy("wall_oss", checkpoint, cudagraphs=CUDAGraphConfig(on_miss_after_warmup="error"),
+    policy = Policy("wall-oss-0.5", checkpoint, cudagraphs=CUDAGraphConfig(on_miss_after_warmup="error"),
                     image_preprocess_device="gpu")
-    cpu_prepare = get_model_class("wall_oss").build_processors(checkpoint)[0]
-    yield policy, cpu_prepare, _wall_oss_requests()
+    cpu_prepare = get_model_class("wall-oss-0.5").build_processors(checkpoint)[0]
+    yield policy, cpu_prepare, _wall_oss_0_5_requests()
     policy.engine.shutdown()
 
 

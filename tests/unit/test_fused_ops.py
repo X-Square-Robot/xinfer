@@ -1,4 +1,4 @@
-"""Fused Wall-OSS and Wall-X 2B operators against unfused torch (CPU) and the CUDA backend's kernels (GPU)."""
+"""Fused WALL-OSS-0.5 and WALL-OSS-1.0-Nano operators against unfused torch (CPU) and CUDA kernels (GPU)."""
 
 import pytest
 import torch
@@ -137,7 +137,7 @@ MXFP8 = ("mxfp8_quantize", "mxfp8_layer_norm_quantize", "mxfp8_zero_centered_rms
          "mxfp8_qkv_rope_epilogue")
 FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm",
          "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler")
-WALLX2B = ("layer_norm_cast", "zero_centered_rms_norm", "add_zero_centered_rms_norm", "modulated_rms_norm",
+NANO = ("layer_norm_cast", "zero_centered_rms_norm", "add_zero_centered_rms_norm", "modulated_rms_norm",
            "gated_residual_modulated_rms_norm", "identity_layer_norms_", "qkv_norm_split", "qkv_norm_rope_kvcache",
            "rope_full", "rot_pos", "pos_embed_interp", "segment_attention", "gated_kvcache_attention",
            "gated_delta_net", "flow_input_embed")
@@ -170,7 +170,7 @@ def test_the_cuda_modules_register_their_operators_when_the_kernel_library_loads
     try:
         registry = registered(dict(requires=library, platforms=("sm120",), version="sha256:0"))
         names = registry.backend_ops("cuda:kernels")
-        assert set(names) == set(FUSED) | set(WALLX2B) | set(MXFP8) | set(PREFETCH)
+        assert set(names) == set(FUSED) | set(NANO) | set(MXFP8) | set(PREFETCH)
         # Filter by implementation: the Ascend backend registers some of the same operators after the CUDA modules.
         assert {i.platforms for name in names for i in registry.implementations(name)
                 if i.name == "cuda:kernels"} == {("sm120",)}
@@ -260,8 +260,8 @@ def _check(table, name, args, *, atol=0.0, bitwise=False, equal=False, relative=
 
 @gpu
 @pytest.mark.gpu
-def test_kernels_match_the_references_at_wall_oss_shapes(xc):
-    """Wall-OSS: ViT width 1280 (16 heads of 80, GLU with bias), expert 0 width 2048 and expert 1 width 1024 with
+def test_kernels_match_the_references_at_wall_oss_0_5_shapes(xc):
+    """WALL-OSS-0.5: ViT width 1280 (16 heads of 80, GLU with bias), expert 0 width 2048 and expert 1 width 1024 with
     16/2/128 attention heads, QKV bias and M-RoPE; FP32 norm weights."""
     g = torch.Generator().manual_seed(17)
     r = lambda *s, scale=1.0, dtype=BF16: _randn(*s, scale=scale, dtype=dtype, device="cuda", generator=g)  # noqa: E731
@@ -456,9 +456,9 @@ def test_qkv_norm_rope_kvcache_is_the_gemm_then_the_split_norms_and_rope():
 
 @gpu
 @pytest.mark.gpu
-def test_kernels_match_the_references_at_wallx2b_shapes(xc):
-    """Wall-X 2B: attention heads 8/2/256 (attention_kvcache and the gate as a second kernel), action width 1024,
-    16 action rows, 26 action values."""
+def test_kernels_match_the_references_at_wall_oss_1_0_nano_shapes(xc):
+    """WALL-OSS-1.0-Nano: attention heads 8/2/256 (attention_kvcache and a separate gate kernel),
+    action width 1024, 16 action rows, and 26 action values."""
     g = torch.Generator().manual_seed(16)
     r = lambda *s, scale=1.0, dtype=BF16: _randn(*s, scale=scale, dtype=dtype, device="cuda", generator=g)  # noqa: E731
     p, m, a = 430, 16, 1024

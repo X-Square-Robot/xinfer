@@ -149,7 +149,7 @@ Short bursts can run at higher clocks than this steady state, so a call can also
 ## Operator profile (`xinfer-profile ops`)
 
 ```bash
-xinfer-profile ops --model wall_oss --checkpoint /path/to/checkpoint \
+xinfer-profile ops --model wall-oss-0.5 --checkpoint /path/to/checkpoint \
   --requests requests.msgpack --requests-per-run 2 --out profile
 ```
 
@@ -190,8 +190,8 @@ This command requires the lane engine's admission and stage spans. The explicit-
 unsupported; use its in-process `Policy` interface for inference.
 
 ```bash
-xinfer-profile load --model wall_oss --checkpoint /path/to/checkpoint --requests observation.msgpack \
-  --robots 8 --out artifacts/wall-oss-load
+xinfer-profile load --model wall-oss-0.5 --checkpoint /path/to/checkpoint --requests observation.msgpack \
+  --robots 8 --out artifacts/wall-oss-0.5-load
 ```
 
 Where a request's time goes in the engine when several robots share it: what `xinfer-profile ops` does not see,

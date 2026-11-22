@@ -11,10 +11,22 @@ import importlib
 
 PLUGIN_GROUP = "xinfer.models"
 
+WALL_OSS_0_5_ID = "wall-oss-0.5"
+WALL_OSS_1_0_NANO_ID = "wall-oss-1.0-nano"
+
 _BUILTIN = {
-    "wall_oss": "xinfer.models.wall_oss.model:WallOSS",
-    "wallx2b": "xinfer.models.wallx2b.model:Wallx2b",
+    WALL_OSS_0_5_ID: "xinfer.models.wall_oss_0_5.model:WallOSS05",
+    WALL_OSS_1_0_NANO_ID: "xinfer.models.wall_oss_1_0_nano.model:WallOSS10Nano",
 }
+
+
+def canonical_model_name(name: str) -> str:
+    """Normalize the capitalization of the two built-in model IDs.
+
+    Entry-point names and import paths keep their original spelling.
+    """
+    normalized = name.casefold()
+    return normalized if normalized in (WALL_OSS_0_5_ID, WALL_OSS_1_0_NANO_ID) else name
 
 
 def register_model(name: str, target: str) -> None:
@@ -34,7 +46,7 @@ def available_models() -> tuple[str, ...]:
     """List the model names that can be served, without importing model code.
 
     Returns:
-        The registered names and the ``xinfer.models`` entry point names, sorted.
+        Registered names and ``xinfer.models`` entry point names, sorted.
     """
     from importlib.metadata import entry_points
 
@@ -58,7 +70,9 @@ def get_model_class(name: str):
     Raises:
         KeyError: ``name`` is neither registered, an import path, nor an entry point.
     """
-    target = _BUILTIN.get(name, name if ":" in name else None)
+    target = _BUILTIN.get(name) or _BUILTIN.get(canonical_model_name(name))
+    if target is None and ":" in name:
+        target = name
     if target is not None:
         module, _, attr = target.partition(":")
         return getattr(importlib.import_module(module), attr)

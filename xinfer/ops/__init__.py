@@ -174,7 +174,7 @@ for _spec in (
     OpSpec("mxfp8_qkv_rope_epilogue",
            "mxfp8_qkv_rope_epilogue(x(q, s), weight(q[3HD, K], s), bias, cos[M, R/2], sin, num_heads, head_dim)"
            " -> bf16[M, 3HD]", mxfp8.qkv_rope_epilogue),
-    # Fused vision, language and action operators for Wall-X 2B.
+    # Fused vision, language and action operators for WALL-OSS-1.0-Nano.
     OpSpec("layer_norm_cast", "layer_norm_cast(x, weight, bias, eps) -> x.dtype  # FP32 inside",
            norm.layer_norm_cast),
     OpSpec("zero_centered_rms_norm", "zero_centered_rms_norm(x, w, eps) -> x̂·(1 + w)  # FP32, one rounding",
@@ -227,7 +227,7 @@ for _spec in (
            "qkv_norm_rope_kvcache(x[M, K], weight[(H + 2KV)D + G, K], q_weight[D], k_weight[D], cos[M, R/2],"
            " sin, k_cache[KV, rows, D], v_cache, start, H, KV, D, eps) -> [M, HD + G]  # K/V written in place",
            gemm.qkv_norm_rope_kvcache),
-    # Fused BF16 operators used by Wall-OSS.
+    # Fused BF16 operators used by WALL-OSS-0.5.
     OpSpec("gemm_epilogue",
            "gemm_epilogue(x[M, K], weight[N, K], bias[N]=None, *, activation=None, residual=None, residual_gate[R, N]"
            "=None, row_class[M]=None, row_scale[M]=None) -> [M, N]  # residual + bf16(act(y)·gate[row_class])",

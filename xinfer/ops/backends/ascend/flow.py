@@ -1,4 +1,4 @@
-"""Ascend flow-head operators (Wall-X 2B action stage): the input embedding and the Euler step.
+"""Ascend flow-head operators (WALL-OSS-1.0-Nano action stage): the input embedding and the Euler step.
 
 Both entries take the operator's own parameters in order; everything the models pass is forwarded unchanged, so
 the OpSpec signatures stay the single description of the call. The delivery library's auto dispatch admits the

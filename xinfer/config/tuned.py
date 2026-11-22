@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from xinfer.models.registry import canonical_model_name
+
 TUNED_ROOT = Path(__file__).resolve().parents[1] / "tuned"
 REQUIRED = ("model", "arch", "quantization", "measured")
 
@@ -74,6 +76,8 @@ def load_tuned(path: str | Path) -> TunedTable:
 def find_tuned(model: str, arch: str | None, quantization: str | None, root: Path = TUNED_ROOT) -> TunedTable | None:
     """Look up the table ``<root>/<model>/<arch>-<quantization>.json``.
 
+    Built-in configurations use the canonical ID as the directory name.
+
     Args:
         model: registry name of the model.
         arch: platform architecture, e.g. ``"sm120"``; ``None`` on CPU.
@@ -88,5 +92,5 @@ def find_tuned(model: str, arch: str | None, quantization: str | None, root: Pat
     """
     if not arch or not quantization:
         return None
-    path = root / model / f"{arch}-{quantization}.json"
+    path = root / canonical_model_name(model) / f"{arch}-{quantization}.json"
     return load_tuned(path) if path.is_file() else None

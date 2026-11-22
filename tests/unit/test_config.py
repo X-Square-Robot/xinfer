@@ -125,6 +125,19 @@ def test_tuned_tables_load_with_provenance(tmp_path):
         load_tuned(bad)
 
 
+@pytest.mark.parametrize("model_id", ["wall-oss-1.0-nano", "wall-oss-0.5"])
+def test_tuned_builtin_model_names_use_canonical_directories(tmp_path, model_id):
+    directory = tmp_path / model_id
+    directory.mkdir()
+    (directory / "sm120-bf16.json").write_text(json.dumps({
+        "model": model_id, "arch": "sm120", "quantization": "bf16", "lanes": {"action": 2},
+        "measured": TABLE.measured,
+    }))
+    expected = find_tuned(model_id, "sm120", "bf16", root=tmp_path)
+    assert expected.lanes == {"action": 2}
+    assert find_tuned(model_id.upper(), "sm120", "bf16", root=tmp_path) == expected
+
+
 def test_stream_priorities_put_the_final_stage_first_and_preserve_explicit_values(tmp_path):
     default = resolve(ThreeStage(), _platform(), model_name="m", tuned=None)
     assert default.engine_config().stream_priorities == {"vision": 0, "prefill": 0, "action": -1}

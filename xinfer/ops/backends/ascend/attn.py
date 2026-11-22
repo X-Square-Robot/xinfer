@@ -109,7 +109,7 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_
     return out.reshape(q.shape[0], q.shape[1], -1)
 
 
-# ---------------------------------------------------------------- Wall-X 2B attention family
+# ---------------------------------------------------------------- WALL-OSS-1.0-Nano attention family
 # One packed-segment entry serves both 2B attention operators: ``causal`` picks the mask and ``out_gate`` folds the
 # output gate into the same kernel, which is exactly how the reference composes them.
 _attention_varlen = getattr(xc, "attention_varlen", None) if xc is not None else None

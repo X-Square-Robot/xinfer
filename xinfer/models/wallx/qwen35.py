@@ -1,6 +1,6 @@
-"""Shared stages and weight loading for the Wall-X 2B Qwen3.5 backbone.
+"""Shared stages and weight loading for the WALL-OSS-1.0-Nano Qwen3.5 backbone.
 
-Wall-X 2B runs a vision transformer and a prompt stream with Gated DeltaNet and gated full-attention layers.
+WALL-OSS-1.0-Nano runs a vision transformer and a prompt stream with Gated DeltaNet and gated full-attention layers.
 Action tokens read the prompt through the full-attention layers. This module loads the backbone weights and
 implements vision and prefill. The model subclass provides its configuration, processors, flow head and denoiser.
 """

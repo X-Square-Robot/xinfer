@@ -69,7 +69,7 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_
         _graph_safe_attention, q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
 
 
-# ---------------------------------------------------------------- Wall-X 2B attention family
+# ---------------------------------------------------------------- WALL-OSS-1.0-Nano attention family
 # These three compose the same reference helpers, with the graph-safe primitive injected, so the 2B stages keep
 # working under NPU graph capture when no native entry serves the layout.
 

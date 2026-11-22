@@ -1,4 +1,4 @@
-"""Qwen3.5 hybrid decoder layers and the adaptive-norm action expert layer used by Wall-X 2B.
+"""Qwen3.5 hybrid decoder layers and the adaptive-norm action expert layer used by WALL-OSS-1.0-Nano.
 
 The prompt stack alternates Gated DeltaNet layers (linear attention with a short causal convolution) and
 gated full-attention layers (``out · sigmoid(gate)``, per-head q/k RMSNorm, partial rotary). The action expert

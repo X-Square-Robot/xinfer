@@ -154,7 +154,7 @@ def serve_and_load(args, robots: int, out: Path) -> list[dict]:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--name", required=True, help="row label, e.g. 'Wall-OSS · BF16 optimized · RTX 5090'")
+    parser.add_argument("--name", required=True, help="row label, e.g. 'WALL-OSS-0.5 · BF16 optimized · RTX 5090'")
     parser.add_argument("--model", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--model-options", default="{}", help="JSON options for xinfer-serve and Policy")

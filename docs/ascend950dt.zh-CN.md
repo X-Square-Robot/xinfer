@@ -8,7 +8,7 @@
 `Policy(device="npu:0")` 选择设备。设置 `ASCEND_RT_VISIBLE_DEVICES` 后，编号相对于可见卡集合。
 平台后端名称是 `ascend`，torch 设备串是 `npu:N`。
 
-Wall-OSS 沿用原有 checkpoint 和请求格式。服务默认在 CPU 上处理图像。PyACL DVPP V2 可用时，用顶层模型
+WALL-OSS-0.5 沿用原有 checkpoint 和请求格式。服务默认在 CPU 上处理图像。PyACL DVPP V2 可用时，用顶层模型
 选项 `--model-options '{"image_preprocess_device":"gpu"}'` 或 `Policy(image_preprocess_device="gpu")`
 选择设备图像处理。平台支持时，`Policy` 默认使用设备路径。不要把该选项放入 `processing`。
 不支持的 JPEG 格式（包括渐进式 JPEG）会记录告警，再由主机解码、设备缩放。精度和性能结果应记录图像路径。
@@ -70,9 +70,9 @@ XInfer 的 `gemm_epilogue`，既有 `xcompute.gemm` 则保留自身接口。不�
 保持该契约的内核替换或支持形状扩展，只需要发布配套的 xcompute 包与动态库。通过既有共享加载器绑定、重启，
 并重跑 eager/图执行的算子检查、通道冒烟、精度与时延基准。新增算子语义或签名须单独修改算子契约。
 
-### Wall-OSS 算子清单
+### WALL-OSS-0.5 算子清单
 
-默认接线下，除不做任何事的 `prefetch_weights` 和 `join_prefetch` 外，Wall-OSS 调用的每一个算子都选择
+默认接线下，除不做任何事的 `prefetch_weights` 和 `join_prefetch` 外，WALL-OSS-0.5 调用的每一个算子都选择
 `ascend:xcompute`：共 11 项算子绑定，另有 2 个算子依次调用它们，且对完整请求通过的
 逐 layout 分发审计确认全部调用 layout 准入（没有任何算子运行在 torch 参考上）。这不代表 11 个独立的
 自定义内核；下表列出实测构建中的实际路由与计算实现。可用性取决于配套的包和动态库。实现须同时支持
@@ -102,16 +102,16 @@ cache 写入位置 768，以及符合条件的连续缓冲区。其他 prompt �
 
 `prefetch_weights` 和 `join_prefetch`（action）在 NPU 上不做任何事（使用参考实现）。名为 `qkv_rope_epilogue` 的 xcompute 导出须接受算子的 `qk_order` 关键字参数；标准顺序对两个取值都适用。
 
-Wall-OSS action 使用普通 RMSNorm、带 bias 的 QKV 和无调制的 GLU。
+WALL-OSS-0.5 action 使用普通 RMSNorm、带 bias 的 QKV 和无调制的 GLU。
 切换动态库后，应使用相同请求和图像路径重跑[精度](precision.zh-CN.md)与
-[性能](performance.zh-CN.md#昇腾-950dt)验证。
+[性能](benchmark.zh-CN.md#性能表)验证。
 
-### Wall-X 2B 算子清单
+### WALL-OSS-1.0-Nano 算子清单
 
-Wall-X 2B 在三个阶段共声明 21 个不同算子，默认接线下全部 21 个都选择 `ascend:xcompute`：对完整请求通过的
+WALL-OSS-1.0-Nano 在三个阶段共声明 21 个不同算子，默认接线下全部 21 个都选择 `ascend:xcompute`：对完整请求通过的
 逐 layout 分发审计确认 21/21、全部调用 layout 准入，没有任何算子运行在 torch 参考上。这些绑定都不含本仓库
 手写的内核。下表只列出其中 18 个，另外三个 `gemm_epilogue`、`gemm_glu_epilogue`、`qkv_rope_epilogue` 与
-上方 Wall-OSS 表所描述的是同一批入口，重复列出只会重复路由、而不是重复算子。
+上方 WALL-OSS-0.5 表所描述的是同一批入口，重复列出只会重复路由、而不是重复算子。
 
 | 算子 | 阶段 | 入口 | 说明 |
 |---|---|---|---|
@@ -139,12 +139,12 @@ Wall-X 2B 在三个阶段共声明 21 个不同算子，默认接线下全部 21
 不显式 pin 就不会被选中。
 
 四个注意力算子另有 graph-safe 的 torch 组合（`backends/ascend/_torch_attn.py`），白名单之外的布局在图捕获下
-仍然可用，而不会退到无法捕获的 SDPA。两侧遵循与 Wall-OSS 相同的规则：先查选择器再调用，入口拒绝的布局留在
+仍然可用，而不会退到无法捕获的 SDPA。两侧遵循与 WALL-OSS-0.5 相同的规则：先查选择器再调用，入口拒绝的布局留在
 分部支持路径上，而不是变成运行时错误。
 
 ### CANN 官方算子（可选）
 
-`xinfer/ops/backends/ascend/official.py` 与 `xinfer/ops/backends/ascend/cann.py` 让 Wall-X 2B 的算子改由
+`xinfer/ops/backends/ascend/official.py` 与 `xinfer/ops/backends/ascend/cann.py` 让 WALL-OSS-1.0-Nano 的算子改由
 TorchNPU 自带的 CANN 入口承接。两个模块的注册优先级都低于 xcompute 入口，因此**默认一个都不会被选中**：
 部署跑的是 xcompute 入口，只有显式指定时才会用到它们。
 
@@ -161,11 +161,11 @@ TorchNPU 自带的 CANN 入口承接。两个模块的注册优先级都低于 x
 用 pin 指定，例如：
 
 ```bash
-xinfer-serve --model wallx2b --checkpoint /path --device npu:0 \
+xinfer-serve --model wall-oss-1.0-nano --checkpoint /path --device npu:0 \
     --op-backends gemm_epilogue=ascend:npu_linear
 ```
 
-[性能表](performance.zh-CN.md)报告的是默认 xcompute 接线；这些 pin 是偏好官方算子的部署的替代选择。
+需要使用官方算子的部署可通过这些 pin 显式选择。
 
 ## 图执行
 

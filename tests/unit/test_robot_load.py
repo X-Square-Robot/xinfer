@@ -145,7 +145,8 @@ def test_wallx_robots_send_rtc_fields_from_the_previous_response(tmp_path):
     assert sum(item["sent_inference_delay"].values()) == 4  # every steady request carries RTC fields
 
 
-@pytest.mark.parametrize(("metadata", "steps"), [({"model": "wall-x"}, 5), ({"flow_steps": 10}, 10),
+@pytest.mark.parametrize(("metadata", "steps"), [({"model": "wall-oss-0.5"}, 5),
+                                 ({"model": "wall-oss-1.0-nano", "flow_steps": 10}, 10),
                                                   ({"rtc": {"num_flow_steps": 10}}, 10), (None, 5)])
 def test_rtc_requests_ask_for_the_flow_steps_the_service_declares(metadata, steps):
     assert robot_load.flow_steps(metadata) == steps

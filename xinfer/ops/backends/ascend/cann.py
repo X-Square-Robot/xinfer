@@ -1,4 +1,4 @@
-"""Wall-X 2B operators on CANN's own operator library, through TorchNPU's official entries.
+"""WALL-OSS-1.0-Nano operators on CANN's own operator library, through TorchNPU's official entries.
 
 The reference composition casts the weight to FP32 on every call: ``x.float() @ weight.float().t()``. At the shapes
 this model uses that is an 8 MB conversion per call, and the action stage alone makes three hundred of them, so the
@@ -11,7 +11,7 @@ arithmetic the reference already did.
 These entries are **not** the default. They sit below the xcompute ones by priority, so a deployment runs on the
 xcompute kernels unless it opts in with ``--op-backends`` naming this library, e.g.
 ``--op-backends gemm_epilogue=ascend:npu_linear``. Measured end to end they were no faster than xcompute (370.4 ms
-against 374.4 ms for one Wall-X 2B request, inside run-to-run noise), so the default stays where the documented
+against 374.4 ms for one WALL-OSS-1.0-Nano request, inside run-to-run noise), so the default stays where the documented
 numbers were taken. The ``partial`` checks keep every layout the official operator cannot take on the reference.
 """
 

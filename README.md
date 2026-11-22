@@ -18,68 +18,41 @@
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
-**XInfer is an inference and serving framework for vision-language-action
-(VLA) models.** Our goal is fast, stable, and accurate model inference serving
-for robots, from onboard inference to shared fleet serving.
-
-The design and its evaluation are described in our paper, [Scaling VLA Serving Under Robotic Execution Constraints](https://arxiv.org/abs/2611.14969).
+**XInfer** is an inference and serving framework for vision-language-action (VLA) models.
 
 ## Features at a glance
 
 - **Real-time chunking (RTC).** Predict the next action chunk from a new observation while the robot executes the current one.
-- **Ultra-low single-robot latency.** Wall-X 2B in BF16 measured 22.3 ms P50 per request on an RTX 5090.
-- **Multi-robot serving on one accelerator.** Robots share model weights, and vision encoding can overlap with action generation across requests.
+- **Ultra-low single-robot latency.** WALL-OSS-1.0-Nano in BF16 measured 20.1 ms P50 per request on an RTX 5090.
+- **Multi-robot serving on one accelerator.** Fine-grained stage scheduling lets inference stages from different requests overlap asynchronously on multiple CUDA streams.
 - **Low-precision quantization.** Apply MXFP8 or NVFP4 to selected groups of linear layers.
 - **Hardware backends.** NVIDIA RTX 5090, Jetson Thor, Ascend 950DT, and Huixi Rhino RPU (R1) support in development.
-- **High-performance kernels.** Use Xcompute fused kernels and FlashAttention, or plug in another kernel library.
-
-## Why XInfer
-
-- **Fast.** Low single-request latency and more robots per accelerator.
-  Asynchronous stage dispatch, device events, and graph replay where supported
-  reduce host overhead. Stage queues and zero-wait batching combine compatible
-  queued requests, sharing weights and overlapping work across stages.
-- **Stable.** Predictable latency and a service that keeps running under fleet
-  load, with warmup before serving, admission limits, and per-request failure
-  isolation.
-- **Accurate.** Outputs follow the original model. Batch size can affect floating-point rounding. See the [precision guide](docs/precision.md) for the Wall-X 2B validation criteria.
-- **Extensible.** Reusable layers and stage interfaces
-  simplify model integration. Platform and operator adapters connect model
-  code to new chips and optimized kernels.
+- **High-performance kernels.** Use optimized fused kernels and optional FlashAttention, or plug in another kernel library.
 
 ## Quick start
 
-Use Python 3.10+ and a PyTorch build matched to your accelerator. These examples use NVIDIA CUDA. Install from this checkout:
+The CUDA examples require Python 3.10+, CUDA-enabled PyTorch, and a [compatible BF16 WALL-OSS-1.0-Nano checkpoint](docs/models/wall_oss_1_0_nano.md#checkpoint-requirements). Install from the repository root.
 
 ```bash
 python -m pip install -e ".[models,serve]"
 ```
 
-The default Wall-X 2B BF16 path uses the CUDA kernels in this repository. Build them for your GPU and
-check the selected backends in the [kernel guide](docs/kernels.md). Without the built library,
-XInfer uses the slower PyTorch reference implementations.
-
-The examples use BF16 and require a [compatible Wall-X 2B checkpoint](docs/models/wallx2b.md#checkpoint-requirements), including its tokenizer and normalization files.
+For the optimized path, [build the CUDA kernels](docs/kernels.md). XInfer can also run with PyTorch reference kernels.
 
 ### Serve a model
 
 ```bash
 xinfer-serve \
-  --model wallx2b \
-  --checkpoint /path/to/checkpoint \
+  --model wall-oss-1.0-nano \
+  --checkpoint /path/to/wall-oss-1.0-nano-checkpoint \
   --device cuda \
   --warmup observation.msgpack \
   --port 33985
 ```
 
-`observation.msgpack` is one representative request in the
-[request format](docs/models/wallx2b.md#request-and-response). Warmup runs before the
-server accepts connections. For RTC traffic, include both a standard request and
-an RTC request in `--warmup`.
+Use a [model request](docs/models/wall_oss_1_0_nano.md#request-and-response) as `observation.msgpack`. For RTC, pass both a standard request and an RTC request to `--warmup`.
 
-Connect at `ws://127.0.0.1:33985` using WebSocket + msgpack. See the
-[serving guide](docs/serving.md) for the protocol, health endpoint, and
-deployment options.
+Connect to `ws://127.0.0.1:33985` with WebSocket + msgpack. See the [serving guide](docs/serving.md) for deployment options.
 
 ### Run in Python
 
@@ -90,7 +63,7 @@ from xinfer import Policy
 from xinfer.frontend.protocol import unpackb
 
 observation = unpackb(Path("observation.msgpack").read_bytes())
-policy = Policy("wallx2b", "/path/to/checkpoint", device="cuda")
+policy = Policy("wall-oss-1.0-nano", "/path/to/wall-oss-1.0-nano-checkpoint", device="cuda")
 
 try:
     policy.warmup([observation])
@@ -99,90 +72,118 @@ finally:
     policy.engine.shutdown()
 ```
 
-The response contains the model's action chunk. Camera names, state fields,
-and action representations are documented in each model guide.
-
 ## Models and hardware
 
 | Model | Model ID | Precision | Real-time chunking | Guide |
 |---|---|---|---|---|
-| Wall-X 2B | `wallx2b` | BF16; optional MXFP8 or NVFP4 for vision and prefill (action stays BF16) | Supported | [Setup and inputs](docs/models/wallx2b.md) |
+| WALL-OSS-1.0-Nano | `wall-oss-1.0-nano` | BF16; optional MXFP8 or NVFP4 for vision and prefill (action stays BF16) | Supported | [Setup and inputs](docs/models/wall_oss_1_0_nano.md) |
+| WALL-OSS-0.5 | `wall-oss-0.5` | BF16 | Supported | [Setup and inputs](docs/models/wall_oss_0_5.md) |
 
-Wall-X 2B requires a compatible checkpoint supplied separately. See the [Wall-X 2B guide](docs/models/wallx2b.md) for the serving command and desktop robot request format. The [performance table](docs/performance.md) compares single-request latency, robot capacity and throughput for Wall-X 2B on an RTX 5090 and on an Ascend 950DT; the [Ascend guide](docs/ascend950dt.md#wall-x-2b-operator-list) lists which operators the model runs there.
+WALL-OSS-0.5 requires the [internal checkpoint layout](docs/models/wall_oss_0_5.md#requirements).
 
 | Hardware | Device | Runtime |
 |---|---|---|
 | NVIDIA GPUs · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
 | NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA |
-| Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN |
-| Rhino RPU (R1) | `rpu` | Rhino Launch SDK AOT · [Profile](docs/models/wallx2b_rpu.md) |
+| Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN · [Setup](docs/ascend950dt.md) |
+| Rhino RPU (R1, experimental) | `rpu` | Rhino Launch SDK AOT · [Profile](docs/models/wall_oss_1_0_nano_rpu.md) |
 | CPU | `cpu` | Reference implementations and tests |
-
-Each accelerator runs its own Engine and weights.
-
-Optimized CUDA execution uses the kernel library built from this repository and the optional FlashAttention
-backend; see [kernels](docs/kernels.md).
-Ascend binds a prebuilt Ascend **xcompute** build, with NPU graphs and
-DVPP device images; see the [Ascend guide](docs/ascend950dt.md).
 
 ## Performance
 
-Single-request latency and capacity of each serving configuration, measured with `benchmarks/performance.py`
-([conditions](docs/performance.md)):
+Single-accelerator measurements from `benchmarks/performance.py` using the production robot request format (three camera views per request). The single-request P50 and fleet-load figures come from separate runs. See the [performance guide](docs/performance.md) for benchmark conditions and reproduction status.
 
-| # | Model | Precision, composition | Accelerator | Single request P50 | Robots per accelerator | Server P50 at capacity | Server P95 at capacity | Peak throughput |
-|---|---|---|---|---|---|---|---|---|
-| 1 | Wall-X 2B | BF16, optimized | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
-| 2 | Wall-X 2B | NVFP4 vision and prefill, optimized | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
-| 3 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+<table>
+  <thead>
+    <tr>
+      <th scope="col" rowspan="2">Model</th>
+      <th scope="col" rowspan="2">Precision and stages</th>
+      <th scope="col" rowspan="2">Accelerator</th>
+      <th scope="col">Single-request latency</th>
+      <th scope="col" colspan="3">Closed-loop fleet serving</th>
+    </tr>
+    <tr>
+      <th scope="col">P50</th>
+      <th scope="col">Capacity (robots)</th>
+      <th scope="col">Server P50 / P95 at capacity</th>
+      <th scope="col">Peak throughput</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>WALL-OSS-1.0-Nano</td>
+      <td>BF16</td>
+      <td>RTX 5090</td>
+      <td>20.1 ms</td>
+      <td>14</td>
+      <td>85 / 107 ms</td>
+      <td>81.3 req/s</td>
+    </tr>
+    <tr>
+      <td>WALL-OSS-1.0-Nano</td>
+      <td>MXFP8 vision and prefill</td>
+      <td>RTX 5090</td>
+      <td>15.1 ms</td>
+      <td>25</td>
+      <td>67 / 88 ms</td>
+      <td>141.0 req/s</td>
+    </tr>
+    <tr>
+      <td>WALL-OSS-1.0-Nano</td>
+      <td>BF16</td>
+      <td><a href="https://github.com/X-Square-Robot/xinfer/pull/33">Ascend 950DT</a></td>
+      <td>20.6 ms</td>
+      <td>15</td>
+      <td>129 / 163 ms</td>
+      <td>83.9 req/s</td>
+    </tr>
+    <tr>
+      <td>WALL-OSS-1.0-Nano</td>
+      <td>BF16</td>
+      <td>Jetson AGX Thor</td>
+      <td>TBD</td>
+      <td colspan="3">TBD</td>
+    </tr>
+    <tr>
+      <td>WALL-OSS-1.0-Nano</td>
+      <td>NVFP4 vision and prefill</td>
+      <td>RTX 5090</td>
+      <td>TBD</td>
+      <td colspan="3">TBD</td>
+    </tr>
+  </tbody>
+</table>
+
+Server P50 / P95 is measured at the listed robot capacity. Peak throughput is the highest steady-state rate across tested loads and rounds.
+
+## WALL-OSS-1.0-Nano in Production: Parcel Sorting
+
+| Hardware | Parcel throughput (parcels/h) |
+|---|---:|
+| NVIDIA RTX 5090 | 2,231 |
+| Huixi | 2,190 |
 
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. X-Square Robot’s Xcompute library provides fused kernels alongside optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. Huixi R1 uses a separate experimental native path from Python Policy." width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. The operator registry supports optimized fused kernels, optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. Huixi R1 uses a separate experimental native path from Python Policy." width="100%">
 </p>
 
-The Frontend handles input and output processing. Models define stage
-computation and tensor handoffs; the Engine manages admission, queues,
-batching, and resource lifetimes. At model load, the operator registry binds an implementation for each operator on the target device.
-X-Square Robot’s **Xcompute** library provides fused kernels such as QKV projection with RoPE and residual
-addition with RMSNorm. The same registry supports optional CUDA FlashAttention, PyTorch references and
-third-party kernels. Platform adapters handle device execution. On CUDA, Ascend and CPU, the Python API and network
-service share the same Engine. The dashed Huixi R1 path shows the proposed in-process
-Wall-X 2B backend using the Rhino Launch SDK. See the
-[Engine guide](docs/engine.md) for the execution model and
-[configuration](docs/configuration.md) for defaults and overrides.
+The engine schedules model stages. The operator registry selects device kernels at load time. The dashed line marks the experimental Huixi R1 path. See the [engine guide](docs/engine.md) for scheduling details.
 
 ## Benchmarks
 
-Evaluate single-request latency and the number of robots served within a
-defined response-latency target:
-
-| Tool | Measures |
-|---|---|
-| [Single-request latency](benchmarks/request_latency.py) | Input processing, Engine execution, output processing, and total time in process |
-| [Robot load](benchmarks/robot_load.py) | Client and server latency, throughput, errors, and action-queue underflow under concurrent robot traffic |
-| [Performance table runner](benchmarks/performance.py) | Single-request latency and robot capacity for one serving configuration |
-
-For commands and measurement definitions, see the [benchmark guide](docs/benchmark.md). For stage timings and numerical checks, see the [Wall-X 2B validation](docs/models/wallx2b_validation.md).
+See the [benchmark guide](docs/benchmark.md) for commands and the [Nano validation results](docs/models/wall_oss_1_0_nano_validation.md) for stage timings and accuracy.
 
 ## Documentation
 
-| Topic | Start here |
+| Task | Guides |
 |---|---|
-| Deploy a service | [Serving](docs/serving.md) |
-| Understand scheduling and CUDA graphs | [Engine](docs/engine.md) |
-| Configure a deployment | [Configuration](docs/configuration.md) |
-| Build and enable the optimized kernels | [Kernels](docs/kernels.md) |
-| Select numerical formats | [Quantization](docs/quantization.md) |
-| Validate model outputs | [Precision](docs/precision.md) |
-| Profile operators | [Profiling](docs/profiling.md) |
-| Monitor a service with Prometheus and Grafana | [Metrics](docs/metrics.md) |
-| Extend the framework | [Model interface](xinfer/models/interface.py) · [Architecture and design](docs/design.md) |
+| Deploy | [Serving](docs/serving.md) · [Configuration](docs/configuration.md) · [Metrics](docs/metrics.md) |
+| Optimize | [Kernels](docs/kernels.md) · [Quantization](docs/quantization.md) · [Precision](docs/precision.md) · [Profiling](docs/profiling.md) |
+| Extend | [Architecture and design](docs/design.md) · [Model interface](xinfer/models/interface.py) |
 
 ## Citation
-
-If you use XInfer in your research, please cite our paper:
 
 ```bibtex
 @misc{zhang2026scalingvlaservingrobotic,
@@ -198,9 +199,8 @@ If you use XInfer in your research, please cite our paper:
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for code conventions, tests, and
-performance evidence requirements.
+See the [contribution guide](CONTRIBUTING.md).
 
----
+## License
 
-This distribution does not currently include a license.
+The XInfer source code is licensed under the [Apache License 2.0](LICENSE).

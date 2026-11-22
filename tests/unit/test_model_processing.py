@@ -136,8 +136,8 @@ def test_invalid_policies_fail_at_construction(options):
         BucketSpec(**options)
 
 
-def test_wall_oss_uses_exact_width_when_bucketing_is_disabled():
-    from xinfer.models.wall_oss.processing import ProcessingConfig
+def test_wall_oss_0_5_uses_exact_width_when_bucketing_is_disabled():
+    from xinfer.models.wall_oss_0_5.processing import ProcessingConfig
 
     assert ProcessingConfig(prompt_bucket=0).bucket_spec().width(50) == 50
     assert ProcessingConfig().bucket_spec().width(50) == 64

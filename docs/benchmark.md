@@ -17,9 +17,9 @@ installed (`pip install -e '.[models]'`) and the model's assets, as for
 `xinfer-serve`:
 
 ```bash
-python benchmarks/request_latency.py --model wall_oss --checkpoint /path/to/checkpoint \
+python benchmarks/request_latency.py --model wall-oss-0.5 --checkpoint /path/to/checkpoint \
   --model-options '{"quantization": "bf16"}' --requests-file flow.msgpack rtc.msgpack \
-  --runs 50 --warmup-runs 5 --out artifacts/wall-oss-latency.json
+  --runs 50 --warmup-runs 5 --out artifacts/wall-oss-0.5-latency.json
 ```
 
 - **Request files** are wire requests, as for `xinfer-serve --warmup`: JSON (`.json`) or msgpack, each holding one
@@ -73,8 +73,8 @@ arrangements, so two builds are compared round by round.
 
 The requests depend on the model:
 
-- **Wall-OSS and Wall-X 2B** use the default synthetic desktop observations, with two 640×480 JPEG wrist views, a raw 1280×720 head view and
-  fresh random arm poses for each request. Camera views are generated once per robot. Pose ranges are xyz within 0.5 m, roll/pitch/yaw within π, gripper 0..1. Wall-OSS writes the state into its
+- **WALL-OSS-0.5 and WALL-OSS-1.0-Nano** use the default synthetic desktop observations, with two 640×480 JPEG wrist views, a raw 1280×720 head view and
+  fresh random arm poses for each request. Camera views are generated once per robot. Pose ranges are xyz within 0.5 m, roll/pitch/yaw within π, gripper 0..1. WALL-OSS-0.5 writes the state into its
   prompt as text, so the prompt length varies, as with real robots (739–756 tokens for 200 random poses). After the
   first response each request carries RTC fields:
   - the previous chunk, shifted by the executed steps;
@@ -91,7 +91,7 @@ warmup, and 8 rounds:
 
 ```bash
 python benchmarks/robot_load.py --url ws://127.0.0.1:33985 --robots 8 \
-  --requests 80 --warmup-requests 20 --rounds 8 --out artifacts/wall-oss-n8
+  --requests 80 --warmup-requests 20 --rounds 8 --out artifacts/wall-oss-0.5-n8
 python benchmarks/robot_load.py --url ws://127.0.0.1:33985 --robots 7 --requests-file requests.json \
   --requests 80 --warmup-requests 20 --rounds 8 --out artifacts/no-rtc-n7
 ```
@@ -129,20 +129,20 @@ is 0 when no round has errors or missing rows.
 
 ## Performance table
 
-The [performance table](performance.md) reports Wall-OSS and Wall-X 2B on an RTX 5090. Run `benchmarks/performance.py` on an idle GPU with a compatible checkpoint and representative wire requests.
+The [performance table](performance.md) reports WALL-OSS-1.0-Nano results. Run `benchmarks/performance.py` on an idle GPU with a compatible checkpoint and representative wire requests.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "Wall-OSS" --model wall_oss \
+CUDA_VISIBLE_DEVICES=1 python benchmarks/performance.py --name "WALL-OSS-0.5" --model wall-oss-0.5 \
   --checkpoint /path/to/checkpoint --latency-requests flow.msgpack rtc.msgpack \
-  --warmup flow.msgpack rtc.msgpack --robots 3 4 5 --out artifacts/perf-wall-oss
+  --warmup flow.msgpack rtc.msgpack --robots 3 4 5 --out artifacts/perf-wall-oss-0.5
 ```
 
-For Wall-X 2B, supply your own `requests.msgpack` in the [desktop request format](models/wallx2b.md#request-and-response) and one flow and one RTC request for service warmup. The published row used a set of 216 requests for the single-request benchmark. The load client generates its own desktop traffic and sends a shifted action chunk after the first response.
+For WALL-OSS-1.0-Nano, supply your own `requests.msgpack` in the [desktop request format](models/wall_oss_1_0_nano.md#request-and-response) and one flow and one RTC request for service warmup. The published row used a set of 216 requests for the single-request benchmark. The load client generates its own desktop traffic and sends a shifted action chunk after the first response.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python benchmarks/performance.py --name "Wall-X 2B" --model wallx2b \
-  --checkpoint /path/to/wallx2b-checkpoint --latency-requests requests.msgpack \
-  --warmup flow.msgpack rtc.msgpack --robots 8 12 14 15 16 --out artifacts/perf-wallx2b
+CUDA_VISIBLE_DEVICES=0 python benchmarks/performance.py --name "WALL-OSS-1.0-Nano" --model wall-oss-1.0-nano \
+  --checkpoint /path/to/wall-oss-1.0-nano-checkpoint --latency-requests requests.msgpack \
+  --warmup flow.msgpack rtc.msgpack --robots 8 12 14 15 16 --out artifacts/perf-wall-oss-1.0-nano
 ```
 
 - **Single request:** `request_latency.py` on the model's request set (50 runs after 5 warmup runs), with the views
@@ -151,7 +151,7 @@ CUDA_VISIBLE_DEVICES=0 python benchmarks/performance.py --name "Wall-X 2B" --mod
 - **Load:** for each robot count, in increasing order, a newly started `xinfer-serve` with the default settings and
   the model's warmup files, then `robot_load.py` with the repository convention (80 requests per robot, the first 20
   dropped, 8 rounds with random start phases). The default workload sends synthetic desktop observations with RTC for both
-  Wall-OSS and Wall-X 2B. Passing `--load-requests` replays the supplied requests. The script stops at the first
+  WALL-OSS-0.5 and WALL-OSS-1.0-Nano. Passing `--load-requests` replays the supplied requests. The script stops at the first
   robot count that fails.
 - **Capacity:** start below saturation and increase the number of robots. Stop at the first count with any errors or missing responses, or when the median of the eight round server P50s exceeds 1.5 times the previous count's median. The first count provides a baseline. Report the last passing count, or a lower bound if every tested count passes. Report the median round P50 and P95 at capacity and the highest measured throughput across all counts.
 - **Single-request breakdown:** report the median end-to-end time, the sum of the median preparation and output times on the host, and the median engine time.

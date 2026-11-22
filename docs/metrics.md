@@ -77,7 +77,7 @@ GPU utilization, memory, clocks and power come from the NVIDIA DCGM exporter, no
 dashboard, and a Docker Compose file that runs both:
 
 ```bash
-python -m xinfer.entrypoints.serve --model wall_oss --checkpoint /path/to/checkpoint --port 33985
+python -m xinfer.entrypoints.serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --port 33985
 cd examples/monitoring
 docker compose up -d
 ```

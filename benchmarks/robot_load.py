@@ -8,11 +8,11 @@ response arrives if that is later. While responses are faster than the period, t
 for the whole round, so each round measures one random arrangement of the robots' send times, the same one for
 the same seed.
 
-Requests are synthetic Wall-OSS observations carrying the RTC fields computed from the previous response, or,
+Requests are synthetic WALL-OSS-0.5 observations carrying the RTC fields computed from the previous response, or,
 with ``--requests-file``, the given requests in turn without RTC fields (for models without RTC). The
 first ``--warmup-requests`` of each robot are excluded from the statistics, not from the error
 count. Each round uses new connections, robots and start delays. A response counts as successful when it has no
-``error`` and its ``status``, if present, is ``"ok"``; a Wall-OSS response must also carry absolute poses. See
+``error`` and its ``status``, if present, is ``"ok"``; a WALL-OSS-0.5 response must also carry absolute poses. See
 docs/benchmark.md.
 """
 
@@ -81,7 +81,7 @@ def result_fields(response, sent: float, received: float) -> dict:
 
 def flow_steps(metadata) -> int:
     """The flow steps an RTC request asks for: the service's (``flow_steps``, or ``rtc.num_flow_steps``), else the
-    Wall-OSS default."""
+    WALL-OSS-0.5 default."""
     from virtual_robot import NUM_FLOW_STEPS
 
     metadata = metadata if isinstance(metadata, dict) else {}
@@ -186,7 +186,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--robots", type=int, default=1)
     parser.add_argument("--requests-file", nargs="+",
                         help="send these requests (JSON or msgpack files with one request or a list) instead of "
-                             "synthetic Wall-OSS observations, without RTC fields")
+                             "synthetic WALL-OSS-0.5 observations, without RTC fields")
     parser.add_argument("--requests", type=int, default=80, help="requests per robot and round, warmup included")
     parser.add_argument("--warmup-requests", type=int, default=20)
     parser.add_argument("--rounds", type=int, default=8)

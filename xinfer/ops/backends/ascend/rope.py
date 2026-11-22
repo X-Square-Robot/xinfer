@@ -1,4 +1,4 @@
-"""Ascend rotary position embedding and the vision position operators for Wall-X 2B.
+"""Ascend rotary position embedding and the vision position operators for WALL-OSS-1.0-Nano.
 
 ``rope_full`` rotates the rotary prefix of every head and passes the rest through, which is what the entry's
 ``Rope.full`` does with ``interleave=False`` (the half-split layout the reference uses). ``rot_pos`` and
@@ -34,7 +34,7 @@ def rope_full(q, k, cos, sin, rotary_dim):
     return _full(q, k, cos, sin, False, rotary_dim)
 
 
-# --------------------------------------------------------------- Wall-X 2B vision positions
+# --------------------------------------------------------------- WALL-OSS-1.0-Nano vision positions
 _position_functions = (has_functions("pos_embed_interp", "get_token_counts")
                        and has_functions("rot_pos"))
 _grids = {}  # (host grids, merge size, device) -> (grid, out_cumsum, hw_cumsum, rot_cumsum, total)

@@ -223,7 +223,7 @@ class VisionTower(nn.Module):
             pixel_values: ``[N, in_features]`` packed patch rows (cast to ``dtype``).
             layout: ``vision_layout`` of the images: ``positions``, ``window_index`` and ``reverse_index``
                 (on the model's device) and the host lists ``cu_window`` and ``cu_full``.
-            dtype: Activation dtype (BF16 for Wall-OSS).
+            dtype: Activation dtype (BF16 for WALL-OSS-0.5).
 
         Returns:
             ``[N / merge², out_hidden_size]`` in ``dtype``, in the merge-unit order of ``pixel_values``.
