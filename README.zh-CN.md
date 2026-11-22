@@ -108,16 +108,21 @@ Wall-X 2B 需要自备兼容的 checkpoint，部署命令和请求格式见 [Wal
 
 ## 性能
 
-各服务配置的单请求时延和容量，用 `benchmarks/performance.py` 测得（[测量条件](docs/performance.zh-CN.md)）：
+以下为使用 `benchmarks/performance.py` 测得的单加速器结果。测量条件和复现进度见[性能指南](docs/performance.zh-CN.md)。
 
-| # | 模型 | 精度、组合 | 加速器 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 | 容量点服务端 P95 | 峰值吞吐 |
-|---|---|---|---|---|---|---|---|---|
-| 1 | Wall-OSS | BF16，优化组合 | RTX 5090 | 49.0 ms | 4 | 128 ms | 142 ms | 25.6 req/s |
-| 2 | Wall-X 2B | BF16，优化组合 | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
-| 3 | Wall-OSS | BF16，优化组合 | Jetson AGX Thor | 95.4 ms | 2 | 123 ms | 141 ms | 11.5 req/s |
-| 4 | Wall-X 2B | 视觉和预填充 NVFP4，优化组合 | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
-| 5 | Wall-OSS | BF16，优化组合 | 昇腾 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
-| 6 | Wall-X 2B | BF16，优化组合 | 昇腾 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+| 模型 | 精度与阶段 | 加速器 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 / P95 | 峰值吞吐 |
+|---|---|---|---|---|---|---|
+| Wall-X 2B | BF16 | RTX 5090 | 22.3 ms | 14 | 85 / 107 ms | 81.3 req/s |
+| Wall-X 2B | 视觉和预填充 MXFP8 | RTX 5090 | 15.1 ms | 25 | 67 / 88 ms | 141.0 req/s |
+| Wall-X 2B | BF16 | 昇腾 950DT | 20.6 ms | 15 | 129 / 163 ms | 83.9 req/s |
+| Wall-OSS | BF16 | RTX 5090 | 49.0 ms | 4 | 128 / 142 ms | 25.6 req/s |
+| Wall-OSS | BF16 | 昇腾 950DT | 38.8 ms | 5 | 122 / 139 ms | 33.2 req/s |
+| Wall-OSS | BF16 | Jetson AGX Thor | 95.4 ms | 2 | 123 / 141 ms | 11.5 req/s |
+
+MXFP8 量化视觉和预填充阶段的部分线性层。动作阶段保留 BF16。
+
+- **RTX 5090 上的 NVFP4。** 已提供预设。仓内优化算子见 [PR #28](https://github.com/X-Square-Robot/xinfer/pull/28)。通过精度验证后再补充性能数据（**TBD**）。
+- **昇腾 950DT。** 现有后端使用预构建的 Xcompute 库。仓内算子见 [PR #33](https://github.com/X-Square-Robot/xinfer/pull/33)。这组昇腾 950DT 测量的公开构建产物和复现步骤待补充（**TBD**）。
 
 ## 工作原理
 

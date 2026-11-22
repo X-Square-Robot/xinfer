@@ -129,17 +129,21 @@ DVPP device images; see the [Ascend guide](docs/ascend950dt.md).
 
 ## Performance
 
-Single-request latency and capacity of each serving configuration, measured with `benchmarks/performance.py`
-([conditions](docs/performance.md)):
+Single-accelerator measurements from `benchmarks/performance.py`. See the [performance guide](docs/performance.md) for benchmark conditions and reproduction status.
 
-| # | Model | Precision, composition | Accelerator | Single request P50 | Robots per accelerator | Server P50 at capacity | Server P95 at capacity | Peak throughput |
-|---|---|---|---|---|---|---|---|---|
-| 1 | Wall-OSS | BF16, optimized | RTX 5090 | 49.0 ms | 4 | 128 ms | 142 ms | 25.6 req/s |
-| 2 | Wall-X 2B | BF16, optimized | RTX 5090 | 22.3 ms | 14 | 85 ms | 107 ms | 81.3 req/s |
-| 3 | Wall-OSS | BF16, optimized | Jetson AGX Thor | 95.4 ms | 2 | 123 ms | 141 ms | 11.5 req/s |
-| 4 | Wall-X 2B | NVFP4 vision and prefill, optimized | RTX 5090 | 15.2 ms | 28 | 103 ms | 145 ms | 154.3 req/s |
-| 5 | Wall-OSS | BF16, optimized | Ascend 950DT | 80.8 ms | 2 | 120 ms | 128 ms | 16.1 req/s |
-| 6 | Wall-X 2B | BF16, optimized | Ascend 950DT | 79.7 ms | ≥ 2 | 87 ms | 93 ms | 11.2 req/s |
+| Model | Precision and stages | Accelerator | Single-request P50 | Robots per accelerator | Server P50 / P95 at capacity | Peak throughput |
+|---|---|---|---|---|---|---|
+| Wall-X 2B | BF16 | RTX 5090 | 22.3 ms | 14 | 85 / 107 ms | 81.3 req/s |
+| Wall-X 2B | MXFP8 vision and prefill | RTX 5090 | 15.1 ms | 25 | 67 / 88 ms | 141.0 req/s |
+| Wall-X 2B | BF16 | Ascend 950DT | 20.6 ms | 15 | 129 / 163 ms | 83.9 req/s |
+| Wall-OSS | BF16 | RTX 5090 | 49.0 ms | 4 | 128 / 142 ms | 25.6 req/s |
+| Wall-OSS | BF16 | Ascend 950DT | 38.8 ms | 5 | 122 / 139 ms | 33.2 req/s |
+| Wall-OSS | BF16 | Jetson AGX Thor | 95.4 ms | 2 | 123 / 141 ms | 11.5 req/s |
+
+MXFP8 quantizes selected vision and prefill linear layers. The action stage stays in BF16.
+
+- **NVFP4 on RTX 5090.** The preset is available. In-tree optimized kernels are tracked in [PR #28](https://github.com/X-Square-Robot/xinfer/pull/28). Performance with a checkpoint that passes precision validation is **TBD**.
+- **Ascend 950DT.** The existing backend uses a prebuilt Xcompute library. In-tree kernels are tracked in [PR #33](https://github.com/X-Square-Robot/xinfer/pull/33). Public build artifacts and reproduction steps for these Ascend 950DT measurements are **TBD**.
 
 ## How it works
 

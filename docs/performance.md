@@ -58,3 +58,17 @@ deterministic initial noise through the default dispatch and through the referen
 build, comparing the denormalized action predictions end to end.
 
 See the [Ascend guide](ascend950dt.md) for the operator and graph configuration.
+
+## Additional RTX 5090 and Ascend 950DT measurements
+
+Each run used one accelerator. The MXFP8 configuration quantizes selected vision and prefill linear layers and keeps the action stage in BF16. Public build artifacts and reproduction instructions for these runs are **TBD**.
+
+| Model | Precision and stages | Accelerator | Single-request P50 | Robots per accelerator | Server P50 / P95 at capacity | Peak throughput |
+|---|---|---|---|---|---|---|
+| Wall-X 2B | MXFP8 vision and prefill | RTX 5090 | 15.1 ms | 25 | 67 / 88 ms | 141.0 req/s |
+| Wall-X 2B | BF16 | Ascend 950DT | 20.6 ms | 15 | 129 / 163 ms | 83.9 req/s |
+| Wall-OSS | BF16 | Ascend 950DT | 38.8 ms | 5 | 122 / 139 ms | 33.2 req/s |
+
+- **MXFP8 on RTX 5090.** The [vision and prefill preset](models/wallx2b_design.md#mxfp8) leaves the action stage in BF16. [PR #20](https://github.com/X-Square-Robot/xinfer/pull/20) documents the preset and its own validation run.
+- **Ascend 950DT.** The [Ascend guide](ascend950dt.md) describes the prebuilt Xcompute backend already available. [PR #33](https://github.com/X-Square-Robot/xinfer/pull/33) tracks building the kernels from source.
+- **NVFP4 on RTX 5090.** The exploratory NVFP4 result used a prebuilt Xcompute library. The tested post-training checkpoint did not pass the precision gate. Reproducing the optimized path from this repository is tracked in [PR #28](https://github.com/X-Square-Robot/xinfer/pull/28). Performance with a checkpoint that passes precision validation is **TBD**.

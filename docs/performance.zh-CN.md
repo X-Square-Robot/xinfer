@@ -46,3 +46,17 @@
 两项检查都是端到端的。Wall-OSS 在图像预处理位于 NPU（DVPP）上、与基准同路径的条件下通过了内部精度门禁。Wall-X 2B 跑固定噪声动作检查：十个注入确定性初始噪声的请求分别过默认分发与同一构建的参考组合，端到端比较去归一化后的动作预测。
 
 算子与图的配置见[昇腾指南](ascend950dt.zh-CN.md)。
+
+## RTX 5090 和昇腾 950DT 补充测量
+
+每组测试使用一张加速卡。MXFP8 配置量化视觉和预填充阶段的部分线性层，动作阶段保留 BF16。这些测试的公开构建产物和复现步骤待补充（**TBD**）。
+
+| 模型 | 精度与阶段 | 加速器 | 单请求 P50 | 单卡机器人数 | 容量点服务端 P50 / P95 | 峰值吞吐 |
+|---|---|---|---|---|---|---|
+| Wall-X 2B | 视觉和预填充 MXFP8 | RTX 5090 | 15.1 ms | 25 | 67 / 88 ms | 141.0 req/s |
+| Wall-X 2B | BF16 | 昇腾 950DT | 20.6 ms | 15 | 129 / 163 ms | 83.9 req/s |
+| Wall-OSS | BF16 | 昇腾 950DT | 38.8 ms | 5 | 122 / 139 ms | 33.2 req/s |
+
+- **RTX 5090 上的 MXFP8。** [视觉和预填充预设](models/wallx2b_design.zh-CN.md#mxfp8)的动作阶段保留 BF16。[PR #20](https://github.com/X-Square-Robot/xinfer/pull/20)记录了预设和该 PR 自身的验证结果。
+- **昇腾 950DT。** [昇腾指南](ascend950dt.zh-CN.md)介绍现有的预构建 Xcompute 后端。[PR #33](https://github.com/X-Square-Robot/xinfer/pull/33)跟进算子源码构建。
+- **RTX 5090 上的 NVFP4。** NVFP4 探索性测试使用了预构建的 Xcompute 库。受测 checkpoint 在训练后量化，未通过精度门禁。[PR #28](https://github.com/X-Square-Robot/xinfer/pull/28)跟进从本仓库复现优化路径。通过精度验证后再补充性能数据（**TBD**）。
