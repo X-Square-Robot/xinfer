@@ -1,0 +1,12 @@
+The XInfer RPU backend for WALL-OSS-1.0-Nano adapts checkpoint handling,
+camera preprocessing, and evaluation geometry helpers from RhinoForge.
+The following notice is reproduced from RhinoForge:
+
+RhinoForge
+Copyright 2026 HUIXI-AI
+
+This product includes software developed by HUIXI-AI.
+
+The Huixi logo shown in the project README identifies the project organization.
+The Apache License 2.0 does not grant trademark rights beyond the uses stated
+in that license.
