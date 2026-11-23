@@ -14,7 +14,7 @@ GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel
 
 当原生 attention 内核不覆盖输入形状时，分段 attention 和带门控的因果 attention 可用 flash-attn，有无输出门控的前缀 KV 缓存 attention 可用编译的 FlexAttention，门控 delta 规则可用 FLA。首次以给定设备、形状、类型、步长和选项在 eager 模式调用时，会尝试可选库。CUDA Graph 录制可以使用已验证可运行的路径，首次就在录制中遇到的新形状则使用参考实现。启动前可设 `XINFER_FLASH_ATTN=0`、`XINFER_FLEX_ATTENTION=0` 或 `XINFER_FLA=0` 关闭对应库。`xinfer-profile check` 的 `routes` 字段按观测到的 attention 调用形状列出实际运行的库。
 
-对于已测范围以外的输入，如果 split-KV 内核和 FlexAttention 都可用，带或不带输出门控的前缀 KV 缓存注意力默认会比较这两种实现。在启动前设置 `XINFER_OP_TUNING=0` 可跳过计时，按固定顺序选择实现。eager 预热时，两种实现读取相同的缓存，分别写入独立输出。原生结果相对 FlexAttention 的 L2 相对误差须小于 1%。同一进程内，相同设备、布局和选项会复用合格且较快的实现。CUDA Graph 录制时复用已有选择，未命中则使用静态顺序。
+对于已测范围以外的输入，如果 split-KV 内核和 FlexAttention 都可用，带或不带输出门控的前缀 KV 缓存注意力默认会比较这两种实现。在启动前设置 `XINFER_OP_TUNING=0` 可跳过计时，按固定顺序选择实现。eager 预热时，两种实现读取相同的缓存，分别写入独立输出。原生结果相对 FlexAttention 的 L2 相对误差须小于 1%。同一进程内，相同设备、布局和选项会复用合格且较快的实现。CUDA Graph 录制时复用已有选择，未命中则使用静态顺序。 静态选路会先检查所有输入（包括 V 缓存的步幅），支持时直接调用原生内核，否则再尝试 FlexAttention 和 PyTorch。
 
 在 Jetson Thor 上，FlexAttention 需要能识别 `sm_110a` 的 PTX 汇编器。如果 Triton 3.6 提示自带的 `ptxas-blackwell` 不支持该目标，请将 `CUDA_HOME` 指向支持 Thor 的 CUDA 工具包，并在启动 XInfer 前设置 `TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"`。
 
