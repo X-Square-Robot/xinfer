@@ -51,6 +51,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from xinfer.ops.backends.cuda import gemm_tuning
 from xinfer.ops.backends.cuda._native import KERNELS, NATIVE, Carver, arch, derived, empty_mxfp8, lib, scratch
 from xinfer.ops.backends.cuda.norm import add_rms_norm, rmsnorm
 from xinfer.ops.layout import mxfp8 as layout
@@ -146,13 +147,23 @@ def _cublas(out, c, workspace, residual=None):
     it is where it is dense, the residual added to the FP32 product. MXFP8 operands: the product is rounded to
     BF16 before the residual is added."""
     if c.mxfp8:
-        lib.gemm_generic_mxfp8(out, c.x, c.x_scale, c.weight, c.weight_scale, c.bias, workspace, False)
+        operands = (c.x, c.x_scale, c.weight, c.weight_scale, c.bias)
+        if gemm_tuning.settings()[0] == "0":
+            lib.gemm_generic_mxfp8(out, *operands, workspace, False)
+        else:
+            gemm_tuning.execute(out, operands, "mxfp8",
+                                lambda target, i: lib.gemm_select_mxfp8(target, *operands, workspace, False, i))
         if residual is not None:
             lib.gemm_epilogue_residual(out, residual, None, 1.0)
         return
     kn = not c.weight.is_contiguous() and c.weight.t().is_contiguous()
     w = c.weight.t() if kn else weight_nk(c.weight)
-    lib.gemm_generic(out, c.x, w, c.bias, residual, 1.0, 1.0, workspace, kn)
+    operands = (c.x, w, c.bias, residual)
+    if gemm_tuning.settings()[0] == "0" or (residual is not None and residual.data_ptr() == out.data_ptr()):
+        lib.gemm_generic(out, *operands, 1.0, 1.0, workspace, kn)
+    else:
+        gemm_tuning.execute(out, operands, "dense_kn" if kn else "dense_nk",
+                            lambda target, i: lib.gemm_select_dense(target, *operands, 1.0, 1.0, workspace, kn, i))
 
 
 def _generic_gemm(c, out):
