@@ -2,7 +2,7 @@
 
 English | [简体中文](wall_oss_1_0_nano.zh-CN.md)
 
-Use the model ID `wall-oss-1.0-nano` to serve a BF16 WALL-OSS-1.0-Nano checkpoint on a CUDA GPU or on an Ascend 950DT NPU; the [Ascend guide](../ascend950dt.md#wall-oss-10-nano-operator-list) covers the operator list and the device setup for the latter, and the commands below use `--device cuda`. The model takes three camera views, the state of a desktop dual-arm robot and a task instruction. Each call predicts 16 steps for both arms. Real-time chunking (RTC) can pin part of the previous action so consecutive predictions overlap.
+Use the model ID `wall-oss-1.0-nano` to serve a BF16 WALL-OSS-1.0-Nano checkpoint on a CUDA GPU or on an Ascend 950DT NPU; the [Ascend guide](../ascend950dt.md) covers the build and device setup for the latter, and the commands below use `--device cuda`. The model takes three camera views, the state of a desktop dual-arm robot and a task instruction. Each call predicts 16 steps for both arms. Real-time chunking (RTC) can pin part of the previous action so consecutive predictions overlap.
 
 See the [validation results](wall_oss_1_0_nano_validation.md) for latency, single-GPU capacity and open-loop accuracy on the RTX 5090.
 

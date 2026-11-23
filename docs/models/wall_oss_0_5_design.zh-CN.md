@@ -38,7 +38,7 @@
 | 步骤 | 算子 | 本模型形状下的 kernel |
 |---|---|---|
 | ViT 和语言模型的残差加法 + RMSNorm | `add_rms_norm`（第一个归一化用 `rms_norm`） | `add_rmsnorm` / `rmsnorm` |
-| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue`（`qk_order="any"`：Q 和 K 只给注意力用） | `qkv_proj_rope` → cuBLASLt 加一个 RoPE kernel；SM110 上 `tcgen05_qkv_rope_bf16_sm110`（Q、K 为旋转对顺序） |
+| ViT QKV + bias + 2-D RoPE | `qkv_rope_split`（`qk_order="any"`：Q 和 K 只给注意力用） | `qkv_proj_rope` → cuBLASLt 加一个 RoPE kernel；SM110 上 `tcgen05_qkv_rope_bf16_sm110`（Q、K 为旋转对顺序） |
 | ViT 注意力（窗口、全注意力块） | `varlen_attention` | flash-attention 2 |
 | ViT 投影和 MLP down（+ bias）+ 残差加法 + 下一层 RMSNorm | `gemm_add_rms_norm` | `gemm` → cuBLASLt、`add_rmsnorm`；集成显卡（Jetson Thor）上 `gemm` 带残差 → cuBLASLt（β·C）加 `rmsnorm` |
 | merger（+ bias；fc1 + GELU） | `gemm_epilogue` | `gemm` → cuBLASLt |

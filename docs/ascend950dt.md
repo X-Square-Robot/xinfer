@@ -2,6 +2,8 @@
 
 English | [简体中文](ascend950dt.zh-CN.md)
 
+WALL-OSS-0.5 and WALL-OSS-1.0-Nano use the shared operator registry and engine on Ascend 950DT. The AOT kernels build from this repository into `xinfer_kernels_ascend.so`. WALL-OSS-0.5 also compiles in-tree JIT kernels during warmup.
+
 ## Runtime
 
 Install matching PyTorch and TorchNPU and source CANN before importing TorchNPU. Select the device with
@@ -20,176 +22,44 @@ decoder exposing `device`, `__call__(jpegs)` and `close()`. The platform owns ve
 ordering. The engine preserves the input mapping, uploads raw frames and applies the common resize steps
 to both raw and decoded images.
 
-## External xcompute backend
+## Build
 
-Install a prebuilt Ascend xcompute shared library and the Python package from the same build. The shared
-loader in `xinfer/ops/backends/_xcompute.py` disables rebuild-on-import and serves every hardware backend.
-CUDA and Ascend use the same configuration:
+Build on aarch64 with the CANN 9.3 Toolkit and matching Ascend 950DT operator package, compatible PyTorch and TorchNPU, Ascend TileLang, CMake 3.24 or later, and TVM-FFI. Set `CANN_ROOT` to the installed Toolkit directory.
+
+```bash
+CANN_ROOT=/path/to/cann-9.3
+source "$CANN_ROOT/set_env.sh"
+export BISHENG_HOME="$CANN_ROOT"
+python -m pip install -e ".[kernels,models,serve]"
+cmake -S xinfer/ops/backends/ascend/src -B build/kernels-ascend \
+  -DPython_EXECUTABLE="$(command -v python)" \
+  -DXINFER_ASCEND_SOC=ascend950dt \
+  -DXINFER_CANN_RUNTIME="$CANN_ROOT" \
+  -DXINFER_BISHENG_HOME="$CANN_ROOT"
+cmake --build build/kernels-ascend --parallel "${BUILD_JOBS:-4}"
+```
+
+The build writes `xinfer_kernels_ascend.so` beside the Python backend. The loader records the library's SHA-256 and supported SoC in operator-selection metadata.
 
 | Variable | Meaning |
 |---|---|
-| `XINFER_XCOMPUTE_LIBRARY` | optional path to `xcompute.so`; otherwise the package locates its library |
-| `XINFER_XCOMPUTE` | `0` disables xcompute implementations |
+| `XINFER_ASCEND_KERNELS_LIBRARY` | optional path to `xinfer_kernels_ascend.so`; otherwise the package locates its library |
+| `XINFER_ASCEND_KERNELS` | `0` disables the in-tree native implementations |
+
+An absent implicit library leaves native operators unregistered, so their next available implementations run. A missing or broken explicit library is an error. Unsupported call layouts use the operator's torch fallback before native launch; an error from an admitted native launch propagates without a torch retry.
+
+## Run
 
 ```bash
-export PYTHONPATH=/path/to/xcompute-release/python:$PYTHONPATH
-export XINFER_XCOMPUTE_LIBRARY=/path/to/xcompute-release/xcompute.so
+source examples/ascend/wall_oss_0_5.env
+xinfer-serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --device npu:0 \
+  --model-options "$ASCEND_MODEL_OPTIONS" --op-backends "$ASCEND_OP_BACKENDS" \
+  --warmup flow.msgpack rtc.msgpack --port 33985
 ```
 
-Supported implementations are selected automatically. A missing library or entry leaves the operator on its
-next available implementation. `--op-backends gemm_epilogue=ascend` pins an implementation; a pin without a
-matching registration is an error. Partial implementations cache their capability decision per call key and
-run unsupported calls on their torch fallback. Native execution errors propagate to the caller. Check the
-startup selection table or `Policy.describe()["ops"]` for the selected backend, library and version. Selection
-does not prove native coverage for every call shape.
+For WALL-OSS-1.0-Nano, source [wall_oss_1_0_nano.env](../examples/ascend/wall_oss_1_0_nano.env) and use `--model wall-oss-1.0-nano` with its checkpoint and requests. Both recipes use BF16 and CPU image processing. WALL-OSS-1.0-Nano uses the shared RTC gripper limit of 5.0. Stage graphs capture during warmup. Use `--resolved-config FILE` to inspect selected operators and service settings. In-tree operators report `ascend:kernels`; selection does not prove native coverage for every call shape.
 
-The optional CANN bridge is built by xcompute with `-DBUILD_ASCEND_CANN_GDR=ON -DBUILD_ASCEND_CANN_INFERENCE=ON`.
-The external package owns workspaces and FP32 epilogues. The validated environment uses CANN 9.1.1 and
-TorchNPU 2.10.0.post4.
-
-### Operator-compatible exports
-
-A paired Ascend xcompute package may export any of the eight operator names in the table below as Python
-callables directly in its module namespace. XInfer binds these exports before the existing CANN/legacy routes.
-For example, `xcompute.gemm_epilogue` implements XInfer's `gemm_epilogue`, while the existing `xcompute.gemm`
-entry keeps its own interface. Packages without these exports keep their existing routes. A package providing
-all eight exports needs no CANN bridge imports from XInfer. Partial packages use bridges or torch fallbacks for
-the other operators.
-
-Exporting an operator name declares this contract:
-
-- **Signature.** Match the parameters and positional/keyword kinds of the operator's reference in
-  [`gemm.py`](../xinfer/ops/reference/gemm.py), [`attn.py`](../xinfer/ops/reference/attn.py) or
-  [`norm.py`](../xinfer/ops/reference/norm.py). Parameter names and kinds are checked at load time. Raw FFI
-  functions with output/workspace arguments need a Python adapter in xcompute; dynamic module attribute lookup
-  is not used to discover operator exports. XInfer explicitly supplies every optional argument using its own
-  defaults, so provider defaults do not affect these calls.
-- **Numerics.** Preserve the reference's accumulation dtype and BF16 rounding points, including FP32 GEMM
-  epilogues and RoPE before conversion, FP32 AdaRMS inputs to GLU, and the BF16 residual sum before FP32 RMSNorm.
-  An implementation must pass operator conformance and the model's precision gate; an export alone is not
-  numerical validation.
-- **Returns and mutation.** Preserve output shape, dtype and tuple order. `prefix_kvcache_attention` returns
-  `[B, M, H*D]`; `add_rms_norm` returns `(sum, normalized)`. `qkv_rope_kvcache` updates only the documented K/V
-  cache slice in place and returns Q. Other inputs remain unchanged. The linked references define the complete
-  shape and ownership contracts.
-- **Execution.** Run asynchronously on the current stream and support both eager execution and graph
-  capture/replay. Prepare reusable workspaces during the initial eager call. Tensor outputs may use a
-  capture-safe allocator; capture must not synchronize the host or make untracked or unsafe allocations.
-  Keep buffers alive through queued work and isolate mutable workspace across concurrent streams/lanes.
-- **Partial support.** Reject unsupported layouts or options with `ValueError` before launching work or mutating
-  inputs. Support decisions must depend on the cached call key: tensor metadata, scalar options and, for varlen
-  attention, segment boundaries. XInfer caches the first eager decision and uses the operator's torch fallback
-  for rejected keys. Execution failures propagate; a later failure of an admitted key is not retried on torch.
-
-A kernel replacement or a larger supported shape domain that preserves this contract requires only a matching
-xcompute package/library release. Bind it through the existing shared loader, restart, and rerun eager/graph
-operator checks, lane smoke, precision and latency benchmarks. New operator semantics or signatures require a
-separate operator-contract change.
-
-### WALL-OSS-0.5 operator list
-
-Every operator WALL-OSS-0.5 calls, except the no-op `prefetch_weights` and `join_prefetch`, selects `ascend:xcompute`
-with the default wiring: eleven operator bindings and two operators that call them in turn, and a
-per-layout dispatch audit of a full request pass confirmed every call layout admitted (no operator ran on a torch
-reference). These are not eleven independent custom kernels: the table records the actual routes and compute
-implementations in the measured build. Availability depends on the paired package and binary. Implementations must
-support both eager execution and graph capture. Legacy eager-only raw GEMM, GLU and varlen entries are not
-registered. Without operator-compatible exports or CANN bridges, these operators use their torch implementations
-in both modes.
-
-| Operator | Stage | Route in the measured build | Compute implementation |
-|---|---|---|---|
-| `gemm_epilogue` | vision, prefill, action | `CannProjection.gemm_epilogue` | CANN Mm + Torch epilogue |
-| `gemm_glu_epilogue` | vision, prefill, action | `CannProjection.gemm_glu_epilogue` | CANN Mm + Torch FP32 SiLU-GLU |
-| `qkv_rope_epilogue` | vision | `CannProjection.qkv_rope_epilogue` | CANN Mm + Torch bias/RoPE |
-| `qkv_rope_kvcache` | prefill, action | `xcompute.qkv_proj_rope` | The unified projection entry with its K/V-cache epilogue; the CANN action bridge is the fallback for builds without it |
-| `varlen_attention` | vision | `CannAttention.varlen_attention` | CANN FIA V5 (TND) |
-| `causal_attention` | prefill | `CannAttention.causal_attention` | CANN FIA V5 (BNSD) + Torch mask/layout |
-| `prefix_kvcache_attention` | action | `CannAttention.prefix_kvcache_attention` | CANN FIA V5 (BNSD) + Torch mask/layout |
-| `add_rms_norm` | vision, prefill, action | `xcompute.add_rmsnorm` | Custom AOT kernels; the package entry serves every row count and takes the BF16 weight the vision stores |
-| `gemm_add_rms_norm`, `mlp_add_rms_norm` | vision; prefill | the `gemm_epilogue`, `gemm_glu_epilogue` and `add_rms_norm` bindings above, in turn | the same calls as those operators |
-| `rms_norm` | vision, prefill, action | `xcompute.rmsnorm` | Custom AOT kernels; the input norms of all three streams |
-| `linear` | action | `xcompute.gemm` | The unified GEMM entry (CANN Mm at these shapes); leading dimensions are flattened for its rank-matching operands |
-| `flow_velocity_euler` | action | `xcompute.denoise_output_euler` | Custom AOT kernels; the auto table's admitted envelope retried as the named `ascend_tilelang` domain |
-
-Here CANN Mm is ACLNN Matmul, and FIA V5 is CANN FusedInferAttentionScore V5. The custom QKV bias/RoPE/cache
-epilogue is restricted to the action shape with 16 tokens, hidden width 1024, 16 query heads, 2 KV heads,
-head width 128 and cache append position 768, with compatible contiguous buffers. Other prompt widths and
-prefill use Torch/TorchNPU epilogues; the matrix multiplication remains CANN in both cases. The latency
-receipts do not record conditional-kernel hit counts or the share of time spent in CANN, custom kernels and
-reference operations. An exported alternative entry does not establish that the measured model selected it.
-
-`prefetch_weights` and `join_prefetch` (action) do nothing on the NPU (their references). An xcompute export named `qkv_rope_epilogue` must take the operator's `qk_order` keyword; the standard order serves both values.
-
-WALL-OSS-0.5 action uses ordinary RMSNorm, biased QKV and unmodulated GLU.
-Switching binaries requires rerunning [precision](precision.md) and
-[performance](benchmark.md#performance-table) checks with the same requests and image path.
-
-### WALL-OSS-1.0-Nano operator list
-
-WALL-OSS-1.0-Nano declares twenty-one distinct operators across its three stages, and with the default wiring every one
-of them selects `ascend:xcompute`: a per-layout dispatch audit of a full request pass confirmed all twenty-one
-with every call layout admitted, so no operator runs on a torch reference. None of these bindings is a
-hand-written kernel in this repository. The table below lists eighteen of the twenty-one because the other
-three — `gemm_epilogue`, `gemm_glu_epilogue` and `qkv_rope_epilogue` — are the same entries the WALL-OSS-0.5 table
-above already describes, so repeating their routes would duplicate the routes rather than the operators.
-
-| Operator | Stage | Entry | Notes |
-|---|---|---|---|
-| `layer_norm_cast` | vision | `xcompute.layernorm_inplace` | ViT layer norm; the entry overwrites its first tensor, so the binding clones — the caller keeps using its input as the residual |
-| `segment_attention` | vision | `xcompute.attention_varlen` | Packed segments, no gate; the host segment layout with `max_seqlen`, planned and cached per grid list |
-| `rot_pos` | vision | the `rot_pos` / `get_token_counts` library functions | 2-D rotary angles; host-planned grid tensors cached per (grids, merge, device), as the CUDA backend binds them |
-| `pos_embed_interp` | vision | the `pos_embed_interp` library function | Bilinear position-table interpolation over the same cached grid tensors |
-| `rope_full` | prefill | `xcompute.Rope.full` | Half-split partial rotary (`interleave=False`) |
-| `zero_centered_rms_norm` | prefill | `xcompute.Rmsnorm(zero_centered=True)` | Scales by `1 + w`, the checkpoint's raw weight |
-| `add_zero_centered_rms_norm` | prefill | `xcompute.AddRmsnorm(zero_centered=True)` | Returns `(sum, normalized)`, the entry's own order |
-| `linear` | prefill | `xcompute.gemm` | The unified GEMM entry; leading dimensions are flattened for its rank-matching operands |
-| `qkv_norm_split` | prefill | the `qwen35_vla_qkv_norm_replace_forward` library function | Every row a text row; the split is the kernel's outputs, the zero-centered norm its own |
-| `gated_causal_attention` | prefill | `xcompute.attention_varlen(causal=True, out_gate=…)`, else the CANN attention bridge's own gated composition | Grouped keys/values are repeated to the query heads, as the reference's helper does; the bridge path serves the head sets the packed entry's white list does not |
-| `gated_delta_net` | prefill | `xcompute.CannGatedDeltaNet` | Same parameters in the same order; the entry admits batch 1, 16 K heads and 128-wide heads |
-| `qkv_norm_rope_kvcache` | action | `xcompute.qkv_proj_rope` | The unified projection entry with the `QkNorm(zero_centered=True)` and K/V-cache epilogues; this build sizes its workspace per stream |
-| `modulated_rms_norm` | action | `xcompute.Adarmsnorm` | Modulation tables are FP32 `[B, 3K]` |
-| `gated_residual_modulated_rms_norm` | action | `xcompute.Adarmsnorm(residual=…, branch_gate=…)` | The same entry, which returns `(output, gate, residual_output)` for this form |
-| `identity_layer_norms_` | action | `xcompute.double_adarmsnorm_gated_residual_inplace` | Overwrites `residual` and `branch`; the post norm's gate is returned |
-| `gated_kvcache_attention` | action | `prefix_kvcache_attention` + the BF16 gate | The reference's two steps, with the cache attention served natively |
-| `flow_input_embed` | action | `xcompute.denoise_input_embed` | FP32 activations and a 3-D weight, as the flow head stores them; the auto table's refusal retried as the named `ascend_tilelang` domain |
-| `flow_velocity_euler` | action | `xcompute.denoise_output_euler` | `dt` is keyword-only in the entry; the named `ascend_tilelang` domain covers the A-26 action width outside the auto table's measured envelope |
-
-The official-operator and CANN bridge registrations live in `backends/ascend/official.py` and
-`backends/ascend/cann.py` and are the only places the backend calls TorchNPU's own operators or the CANN bridge
-rather than xcompute entries; both sit below the xcompute ones in priority, so none of them is selected without
-an explicit pin.
-
-The four attention operators also have a graph-safe torch composition (`backends/ascend/_torch_attn.py`), so a
-layout outside the entries' white list still runs under capture instead of falling back to SDPA, which cannot be
-captured. Both halves follow the same rule as WALL-OSS-0.5: the selectors are checked before the call, and a layout
-the entries reject stays on the partial-support path rather than surfacing as a runtime error.
-
-### CANN official operators (opt-in)
-
-`xinfer/ops/backends/ascend/official.py` and `xinfer/ops/backends/ascend/cann.py` serve WALL-OSS-1.0-Nano operators
-from TorchNPU's own CANN entries rather than from xcompute. Both modules register below the xcompute entries in
-priority, so **none of them is selected by default**: a deployment runs the xcompute entries, and reaches these
-only by naming one explicitly.
-
-| Operator | CANN entry | Note |
-|---|---|---|
-| `linear` | `torch_npu.npu_linear` | Flattens the leading dimensions |
-| `qkv_norm_split` | `torch_npu.npu_rms_norm` | The split is views; the zero-centered norm is the official RMSNorm with `1 + w` |
-| `gemm_epilogue` | `torch_npu.npu_linear` + FP32 epilogue | The epilogue stays in FP32, where the reference rounds |
-| `gemm_glu_epilogue` | `torch_npu.npu_linear` + `silu·mul` | The AdaRMS input norm is the reference's |
-| `qkv_norm_rope_kvcache` | `torch_npu.npu_linear` + the reference's norm/rope step | Takes the BF16 weight instead of casting it per call |
-| `zero_centered_rms_norm` | `torch_npu.npu_rms_norm` with `1 + w` | The checkpoint stores the raw weight |
-| `layer_norm_cast` | `F.layer_norm` | One ACLNN call |
-
-Select one with the pin, for example:
-
-```bash
-xinfer-serve --model wall-oss-1.0-nano --checkpoint /path --device npu:0 \
-    --op-backends gemm_epilogue=ascend:npu_linear
-```
-
-These pins select the official operators for deployments that use them.
+The official TorchNPU implementations remain opt-in. For example, `--op-backends gemm_epilogue=ascend:npu_linear` selects the official linear implementation for that operator.
 
 ## Graphs
 
@@ -223,18 +93,34 @@ and [post7 pool creation](https://github.com/Ascend/pytorch/blob/3363ea59d49f3e0
 The post7 `ExternalStream` wrapper cannot replace a lane stream: its documented restrictions include event
 recording/waiting, allocator stream tracking and graph capture; see the [upstream contract](https://github.com/Ascend/pytorch/blob/3363ea59d49f3e08cfd8d4a1f532b756ccda0682/torch_npu/npu/streams.py#L112-L177).
 
+## Benchmark
+
+Use the shared [benchmark protocol](benchmark.md#performance-table) with the same recipe for latency and load.
+
+```bash
+source examples/ascend/wall_oss_0_5.env
+python benchmarks/performance.py --name "WALL-OSS-0.5 · BF16 · Ascend 950DT" \
+  --model wall-oss-0.5 --checkpoint /path/to/checkpoint --device npu:0 \
+  --model-options "$ASCEND_MODEL_OPTIONS" --op-backends "$ASCEND_OP_BACKENDS" \
+  --latency-requests flow.msgpack rtc.msgpack --warmup flow.msgpack rtc.msgpack \
+  --robots 3 4 5 --out artifacts/perf-wall-oss-0-5-ascend
+```
+
+For WALL-OSS-1.0-Nano, measure [single-request latency](benchmark.md#single-request) with its recipe and captured request set. Bind the test processes to the device's local CPU NUMA node.
+
 ## Validation
 
-Run tests with one visible, exclusively reserved card. Compare fixed prepared inputs and explicit noise
-between eager and graph execution, then exercise real requests through the WebSocket service. Check lazy
-capture on a cold request without warmup and on a new shape after warmup, followed by replay of that shape. Run the
-[precision gate](precision.md) and [benchmarks](benchmark.md), recording source and library identity,
+The Ascend host tests run without an NPU, CANN, or the native library:
+
+```bash
+XINFER_ASCEND_KERNELS=0 pytest -q tests/ascend
+```
+
+These tests check loader, layout, workspace, lifetime, and recipe contracts; they do not execute Ascend kernels or establish device numerics. On an exclusively reserved 950DT, build the native library and run both recipes. Compare fixed prepared inputs and explicit noise between eager and graph execution, then exercise real requests through the WebSocket service. Check lazy capture on a cold request without warmup and on a new shape after warmup, followed by replay of that shape.
+
+Run the [precision gate](precision.md) and [benchmarks](benchmark.md), recording source and library identity,
 composition, operator selection, image path, checkpoint identity and graph counters. Keep accelerator traces
 and experiments outside the inference package. Measure request latency and robot capacity without a profiler.
-
 Select the NPU with `benchmarks/performance.py --device npu:0`; put image settings in its existing
 `--model-options`. For isolated backend or eager comparisons, use the existing options of `Policy` or
 `xinfer-serve`.
-
-The validated release also passed 24 concurrent requests using eight fixed-input variants in three submission
-orders. Outputs were bitwise equal to sequential execution, and both lanes of every stage replayed their graphs.

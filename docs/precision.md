@@ -34,6 +34,3 @@ stage with its checkpoint's BF16 sampler on full checkpoints ([WALL-OSS-1.0-Nano
 
 Every change that can alter a model's outputs also passes an internal precision gate on real robot data before it
 is released. Its data and tools are not part of this repository.
-
-On Ascend 950DT, the xcompute implementations listed in the [Ascend guide](ascend950dt.md) passed the same internal
-gate, with image processing on the CPU and on the device.

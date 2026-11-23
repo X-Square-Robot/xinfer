@@ -80,4 +80,4 @@ The BF16 fleet figures are from the November 13 run on SM120 kernel revision `73
 
 ## Ascend 950DT
 
-Public build artifacts and reproduction steps for this BF16 measurement are **TBD**. See the [Ascend guide](ascend950dt.md) for device setup and operator configuration. In-tree Ascend kernels are tracked in [PR #33](https://github.com/X-Square-Robot/xinfer/pull/33).
+Public build artifacts for this BF16 measurement are **TBD**. See the [Ascend guide](ascend950dt.md) for in-tree kernel build, device setup and operator configuration.
