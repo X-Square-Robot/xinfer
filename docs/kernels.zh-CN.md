@@ -16,6 +16,8 @@ GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel
 
 设置 `XINFER_KV_TUNING=1` 后，当前构建包含对应注意力头配置、但输入不在已测范围时，会对前缀 KV 缓存比较 split-KV 内核与 FlexAttention。eager 预热时，两种实现读取相同的缓存，分别写入独立输出。原生结果相对 FlexAttention 的 L2 相对误差须小于 1%。同一进程内，相同设备、布局和选项会复用合格且较快的实现。CUDA Graph 录制时复用已有选择，未命中则使用静态顺序。
 
+在 Jetson Thor 上，FlexAttention 需要能识别 `sm_110a` 的 PTX 汇编器。如果 Triton 3.6 提示自带的 `ptxas-blackwell` 不支持该目标，请将 `CUDA_HOME` 指向支持 Thor 的 CUDA 工具包，并在启动 XInfer 前设置 `TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"`。
+
 ## 编译
 
 编译需要 CUDA 13 工具链、CMake 3.24 或更高版本（SM110 需要 3.28）、`apache-tvm-ffi` Python 包和 CUTLASS 头文件（子模块）：

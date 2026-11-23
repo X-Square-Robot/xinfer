@@ -16,6 +16,8 @@ Outside the native attention shapes, segment and gated causal attention can use 
 
 Set `XINFER_KV_TUNING=1` to compare the split-KV kernel and FlexAttention for prefix KV-cache calls outside the measured ranges when the in-tree build includes their head configuration. During eager warmup, both implementations read the same cache and write separate outputs. A native result must agree with FlexAttention within 1% relative L2 error. The faster eligible implementation is reused for the same device, layout and options within the process. CUDA Graph capture uses an existing choice or follows the static order on a miss.
 
+On Jetson Thor, FlexAttention needs a PTX assembler that recognizes `sm_110a`. If Triton 3.6 reports that its bundled `ptxas-blackwell` rejects this target, set `TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"` before starting XInfer, with `CUDA_HOME` pointing to a toolkit that supports Thor.
+
 ## Build
 
 Building needs the CUDA 13 toolkit, CMake 3.24 or later (3.28 for SM110), the `apache-tvm-ffi` Python package and the CUTLASS headers (a submodule):
