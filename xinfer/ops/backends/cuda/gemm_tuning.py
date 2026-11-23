@@ -15,18 +15,25 @@ import torch
 from xinfer.ops.backends.cuda._native import NATIVE, capturing, lib
 
 _indices = {}
+_buckets = {}
 _lock = RLock()
 
 
 @cache
 def settings():
-    mode = os.environ.get("XINFER_GEMM_TUNING", "0")
+    mode = os.environ.get("XINFER_GEMM_TUNING", "1")
     if mode not in ("0", "1", "frozen"):
         raise ValueError("XINFER_GEMM_TUNING must be 0, 1 or frozen")
     name = os.environ.get("XINFER_GEMM_TUNING_FILE")
     if mode == "frozen" and not name:
         raise ValueError("frozen GEMM tuning requires XINFER_GEMM_TUNING_FILE")
-    return mode, Path(name).expanduser() if name else None
+    path = Path(name).expanduser() if name else None
+    if mode == "1" and (os.environ.get("XINFER_GEMM_TUNING_READONLY") == "1"
+                        or (path and path.exists() and path.stat().st_mode & 0o222 == 0)):
+        mode = "readonly"
+    if mode != "frozen" and lib is not None and not hasattr(lib, "gemm_select_dense"):
+        mode = "0"  # Libraries built before candidate enumeration still provide the heuristic entry.
+    return mode, path
 
 
 @cache
@@ -115,8 +122,69 @@ def _choose(out, ids, run):
     return winner
 
 
+def _aligned(t, rows):
+    shape = (rows, *t.shape[1:])
+    offset = (_alignment(t) % 256) // t.element_size()
+    return t.new_empty((rows * t[0].numel() + offset,))[offset:].view(shape)
+
+
+def _bucket_key(format, out, operands):
+    x = operands[0]
+    if x is None:
+        return None
+    count = (x.shape[0] - 1) // 64
+    # The rows vary across a bucket. Preserve strides, base alignment and all weight metadata.
+    def rows(t):
+        return None if t is None else (t.shape[1:], t.stride(), str(t.dtype), _alignment(t))
+
+    if format == "mxfp8":
+        _, scale, weight, w_scale, bias = operands
+        rest = (str(scale.dtype), _alignment(scale), _layout(weight), _layout(w_scale), _layout(bias))
+    else:
+        _, weight, bias, residual = operands
+        rest = (_layout(weight), _layout(bias), rows(residual))
+    signature = ("bucket64", _hardware(out.device), format, count, rows(out), rows(x), rest)
+    return json.dumps(signature, separators=(",", ":"))
+
+
+def _check_endpoints(out, operands, format, run, winner):
+    m = out.shape[0]
+    low = 1 + ((m - 1) // 64) * 64
+    for rows in (low, low + 63):
+        if rows == m:
+            continue
+        args = list(operands)
+        x = args[0] = _aligned(operands[0], rows)
+        x.view(torch.uint8).copy_(operands[0][:1].view(torch.uint8).expand_as(x.view(torch.uint8)))
+        if format == "mxfp8":
+            size = ((rows + 127) // 128) * 128 * ((x.shape[1] // 32 + 3) // 4) * 4
+            args[1] = _aligned(operands[1].reshape(-1), size)
+            args[1].view(torch.uint8).fill_(127)
+        elif args[-1] is not None:
+            args[-1] = _aligned(operands[-1], rows)
+            args[-1].copy_(operands[-1][:1].expand_as(args[-1]))
+        scratch = _aligned(out, rows)
+        def trial(target, index):
+            return run(target, index, args)
+        try:
+            ids = str(trial(scratch, -1)).split()
+            if winner not in ids:
+                return False
+            index = ids.index(winner)
+            trial(scratch, 0)
+            baseline = scratch.clone()
+            trial(scratch, index)
+            if not torch.equal(scratch, baseline) or _time(trial, scratch, index) > _time(trial, scratch, 0):
+                return False
+        except RuntimeError as error:
+            if "cuBLAS status 15" not in str(error):
+                raise
+            return False
+    return True
+
+
 def execute(out, operands, format, run):
-    """Use exact shapes and address alignments. The trial output never aliases a model buffer."""
+    """Cache launch indices per exact shape and validate a portable algorithm ID across each 64-row bucket."""
     mode, path = settings()
     device = out.device
     signature = (format, _layout(out), tuple(_layout(t) for t in operands))
@@ -134,16 +202,25 @@ def execute(out, operands, format, run):
                 if not ids:  # empty product
                     return run(out, 0)
                 key = json.dumps((_hardware(device), signature), separators=(",", ":"))
-                if mode == "frozen":
-                    winner = _snapshot(path).get(key)
-                    if winner not in ids:
-                        raise ValueError(f"No matching frozen GEMM algorithm for this call in {path}")
+                bucket = _bucket_key(format, out, operands)
+                cache_key = (path, bucket)
+                if mode in ("readonly", "frozen"):
+                    record = _snapshot(path) if path and path.exists() else {}
                 else:
-                    winner = _read(path).get(key) if path and path.exists() else None
+                    record = _read(path) if path and path.exists() else {}
+                winner = record.get(key) or record.get(bucket)
+                if mode == "frozen" and winner not in (*ids, "heuristic"):
+                    raise ValueError(f"No matching frozen GEMM algorithm for this call in {path}")
+                if winner is None and mode == "1":
+                    winner = _buckets.get(cache_key) if bucket else None
                     if winner is None:
                         winner = _choose(out, ids, run)
+                        if bucket:
+                            if winner == ids[0] or not _check_endpoints(out, operands, format, run, winner):
+                                winner = "heuristic"
+                            _buckets[cache_key] = winner
                         if path:
-                            winner = _store(path, key, winner)
+                            winner = _store(path, bucket or key, winner)
                 index = ids.index(winner) if winner in ids else 0
                 _indices[local_key] = index
     return run(out, index)

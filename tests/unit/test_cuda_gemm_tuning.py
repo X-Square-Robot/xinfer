@@ -156,3 +156,41 @@ print(hashlib.sha256(out.view(torch.uint8).cpu().numpy().tobytes()).hexdigest())
         return subprocess.check_output([sys.executable, "-c", code], env=env, text=True, timeout=120).strip()
     measured = launch("1")
     assert path.is_file() and launch("frozen") == measured
+
+def test_default_and_readonly_deployment_settings(tmp_path, monkeypatch):
+    path = tmp_path / "deployment.json"
+    monkeypatch.delenv("XINFER_GEMM_TUNING", raising=False)
+    monkeypatch.delenv("XINFER_GEMM_TUNING_READONLY", raising=False)
+    monkeypatch.setenv("XINFER_GEMM_TUNING_FILE", str(path))
+    tuning.settings.cache_clear()
+    try:
+        assert tuning.settings() == ("1", path)
+        monkeypatch.setenv("XINFER_GEMM_TUNING_READONLY", "1")
+        tuning.settings.cache_clear()
+        assert tuning.settings() == ("readonly", path)
+        monkeypatch.setattr(tuning, "_hardware", lambda d: ("cpu",))
+        monkeypatch.setattr(torch.cuda, "device", lambda d: nullcontext())
+        monkeypatch.setattr(tuning, "capturing", lambda d: False)
+        calls = []
+        def launch(out, i):
+            calls.append(i)
+            return "first second"
+        tuning.execute(torch.ones(2, 2), (None,), "dense_nk", launch)
+        assert calls == [-1, 0] and not path.exists()
+    finally:
+        tuning.settings.cache_clear()
+
+def test_bucket_candidate_is_checked_at_both_endpoints(monkeypatch):
+    rows = []
+    out = torch.ones(33, 8)
+    operands = out.clone(), torch.ones(8, 8), None, None
+    def launch(target, index, args):
+        assert args[0].shape == target.shape
+        if index == -1:
+            rows.append(target.shape[0])
+            return "first second"
+        target.copy_(args[0])
+    monkeypatch.setattr(tuning, "_time", lambda _, target, index: 1.0 if index == 0 else 0.5)
+    assert tuning._check_endpoints(out, operands, "dense_nk", launch, "second")
+    assert rows == [1, 64]
+    assert not tuning._check_endpoints(out, operands, "dense_nk", launch, "unknown")

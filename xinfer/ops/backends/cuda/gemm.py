@@ -151,8 +151,9 @@ def _cublas(out, c, workspace, residual=None):
         if gemm_tuning.settings()[0] == "0":
             lib.gemm_generic_mxfp8(out, *operands, workspace, False)
         else:
-            gemm_tuning.execute(out, operands, "mxfp8",
-                                lambda target, i: lib.gemm_select_mxfp8(target, *operands, workspace, False, i))
+            def launch(target, i, args=operands):
+                return lib.gemm_select_mxfp8(target, *args, workspace, False, i)
+            gemm_tuning.execute(out, operands, "mxfp8", launch)
         if residual is not None:
             lib.gemm_epilogue_residual(out, residual, None, 1.0)
         return
@@ -162,8 +163,9 @@ def _cublas(out, c, workspace, residual=None):
     if gemm_tuning.settings()[0] == "0" or (residual is not None and residual.data_ptr() == out.data_ptr()):
         lib.gemm_generic(out, *operands, 1.0, 1.0, workspace, kn)
     else:
-        gemm_tuning.execute(out, operands, "dense_kn" if kn else "dense_nk",
-                            lambda target, i: lib.gemm_select_dense(target, *operands, 1.0, 1.0, workspace, kn, i))
+        def launch(target, i, args=operands):
+            return lib.gemm_select_dense(target, *args, 1.0, 1.0, workspace, kn, i)
+        gemm_tuning.execute(out, operands, "dense_kn" if kn else "dense_nk", launch)
 
 
 def _generic_gemm(c, out):

@@ -75,4 +75,4 @@ CUDA kernel library for this GPU: docs/kernels.md
 
 ## 通用 GEMM 调优
 
-通用 GEMM 默认采用 cuBLASLt 的第一个启发式算法。使用本版本构建的库时，可在启动前设 `XINFER_GEMM_TUNING=1`，在每种形状和内存对齐方式的首次 eager 调用中比较候选算法。候选算法要在预热输入上与默认算法的结果一致，且耗时中位数至少快 5%。试跑使用独立输出缓冲区。原地残差更新沿用默认算法。将 `XINFER_GEMM_TUNING_FILE` 指向可写的 JSON 路径，可以跨进程共享选择。可复现回放时设 `XINFER_GEMM_TUNING=frozen`，并指向同一文件。在 CUDA Graph 录制前先对每种形状做 eager 预热。冻结模式下缺失或不兼容的选择会报错，普通调优模式在冷启动录制时使用默认算法。
+通用 GEMM 默认在首次即时执行时对可用的 cuBLASLt 算法计时。设置 `XINFER_GEMM_TUNING=0` 可直接使用第一个启发式算法。候选结果须与基线一致、耗时中位数至少降低 5%，并且在每 64 行一组的两个端点输出一致且不变慢。原地残差更新使用启发式算法。用 `XINFER_GEMM_TUNING_FILE` 可跨进程复用记录。部署时设 `XINFER_GEMM_TUNING_READONLY=1`，未命中就用启发式算法。已有的精确形状记录仍可读取；严格回放 `XINFER_GEMM_TUNING=frozen` 在记录缺失或不兼容时会报错。CUDA Graph 录制前需预热。
