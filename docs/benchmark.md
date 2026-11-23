@@ -23,7 +23,7 @@ python benchmarks/request_latency.py --model wall-oss-0.5 --checkpoint /path/to/
 ```
 
 - **Request files** are wire requests, as for `xinfer-serve --warmup`: JSON (`.json`) or msgpack, each holding one
-  request map or a list of them.
+  request map or a list of them. Use the same three-JPEG request file when comparing the two models.
 - **Warmup.** The script runs each request once, capturing its CUDA graphs on every lane and batch size, then
   discards `--warmup-runs` timed runs.
 - **Timed runs.** Requests are taken in turn, one at a time, and each is timed in three steps:
@@ -73,7 +73,7 @@ arrangements, so two builds are compared round by round.
 
 The requests depend on the model:
 
-- **WALL-OSS-0.5 and WALL-OSS-1.0-Nano** use the default synthetic desktop observations, with two 640×480 JPEG wrist views, a raw 1280×720 head view and
+- **WALL-OSS-0.5 and WALL-OSS-1.0-Nano** use the default synthetic desktop observations, with two 640×480 JPEG wrist views, a 1280×720 JPEG head view and
   fresh random arm poses for each request. Camera views are generated once per robot. Pose ranges are xyz within 0.5 m, roll/pitch/yaw within π, gripper 0..1. WALL-OSS-0.5 writes the state into its
   prompt as text, so the prompt length varies, as with real robots (739–756 tokens for 200 random poses). After the
   first response each request carries RTC fields:

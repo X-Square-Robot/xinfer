@@ -20,7 +20,7 @@ python benchmarks/request_latency.py --model wall-oss-0.5 --checkpoint /path/to/
   --runs 50 --warmup-runs 5 --out artifacts/wall-oss-0.5-latency.json
 ```
 
-- **请求文件**是传输格式（wire）的请求，与 `xinfer-serve --warmup` 相同：JSON（`.json`）或 msgpack，每个文件包含一个请求映射或其列表。
+- **请求文件**是传输格式（wire）的请求，与 `xinfer-serve --warmup` 相同：JSON（`.json`）或 msgpack，每个文件包含一个请求映射或其列表。比较两个模型时，各次测量使用同一份含三路 JPEG 的请求文件。
 - **预热。** 脚本把每个请求运行一次，在每个通道（lane）和批大小上捕获其 CUDA graph，然后丢弃 `--warmup-runs` 次计时运行。
 - **计时运行。** 请求轮流执行，一次一个，每个请求分三步计时：
   - `prepare_ms`：模型在 CPU 上的输入处理（解码、resize、分词、归一化）；
@@ -52,7 +52,7 @@ python -m pip install numpy 'websockets>=12' msgpack msgpack-numpy opencv-python
 
 请求内容取决于模型：
 
-- **WALL-OSS-0.5 和 WALL-OSS-1.0-Nano** 默认使用桌面机器人的合成观测，包含两路 640×480 JPEG 腕部视图、一路 1280×720 原始头部视图和随机的手臂位姿（xyz 在 0.5 m 内，roll/pitch/yaw 在 π 内，夹爪 0..1）。每台机器人预先生成一组相机图像并重复发送，每次请求重新生成位姿。WALL-OSS-0.5 把状态以文本形式写入 prompt，因此 prompt 长度会变化，与真实机器人一样（200 个随机位姿为 739–756 token）。第一个响应之后，每个请求携带 RTC 字段：
+- **WALL-OSS-0.5 和 WALL-OSS-1.0-Nano** 默认使用桌面机器人的合成观测，包含两路 640×480 JPEG 腕部视图、一路 1280×720 JPEG 头部视图和随机的手臂位姿（xyz 在 0.5 m 内，roll/pitch/yaw 在 π 内，夹爪 0..1）。每台机器人预先生成一组相机图像并重复发送，每次请求重新生成位姿。WALL-OSS-0.5 把状态以文本形式写入 prompt，因此 prompt 长度会变化，与真实机器人一样（200 个随机位姿为 739–756 token）。第一个响应之后，每个请求携带 RTC 字段：
   - 上一个动作块，按已执行的步数平移；
   - `inference_delay`：最近五次延迟的第 75 百分位数（初始为 5），限制在 1..`--max-inference-delay` 个模型步之间，再加 2；
   - `num_flow_steps`：服务元数据帧声明的 flow 步数（`flow_steps` 或 `rtc.num_flow_steps`），未声明时为 5。
