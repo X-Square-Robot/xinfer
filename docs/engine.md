@@ -34,9 +34,12 @@ completion thread:
 returning from it does not mean GPU execution has completed.
 
 If waiting on a final-stage event raises, that batch's requests fail and the
-completion thread goes on. `Engine.health()` returns why the engine can no
-longer serve (its engine or completion thread has stopped), else None;
-`xinfer-serve` polls it ([serving](serving.md)). With `Engine.stats_sink` set,
+completion thread goes on. `Engine.health(hang_timeout=None)` returns why the
+engine can no longer serve, else None: its engine or completion thread has
+stopped, the device reports a sticky CUDA error (a non-blocking query of the
+default stream raises it), or, with `hang_timeout`, an admitted request has
+not finished within that many seconds. `xinfer-serve` polls it
+([serving](serving.md#run)). With `Engine.stats_sink` set,
 the completion thread reports each completed request's admission wait and
 stage waits and executions to it as `RequestStats`
 ([metrics](metrics.md#collection)).

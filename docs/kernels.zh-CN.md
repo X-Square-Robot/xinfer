@@ -68,3 +68,7 @@ CUDA kernel library for this GPU: docs/kernels.md
 `ascend` 后端通过 `xinfer/ops/backends/_xcompute.py` 绑定外部的 xcompute 构建，使用
 `XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0` 设置。可用实现会自动选中；不支持的调用使用 torch 回退。
 运行环境、图像处理和 NPU 图执行见[昇腾指南](ascend950dt.zh-CN.md)。
+
+## 通用 GEMM 调优
+
+通用 GEMM 默认采用 cuBLASLt 的第一个启发式算法。使用本版本构建的库时，可在启动前设 `XINFER_GEMM_TUNING=1`，在每种形状和内存对齐方式的首次 eager 调用中比较候选算法。候选算法要在预热输入上与默认算法的结果一致，且耗时中位数至少快 5%。试跑使用独立输出缓冲区。原地残差更新沿用默认算法。将 `XINFER_GEMM_TUNING_FILE` 指向可写的 JSON 路径，可以跨进程共享选择。可复现回放时设 `XINFER_GEMM_TUNING=frozen`，并指向同一文件。在 CUDA Graph 录制前先对每种形状做 eager 预热。冻结模式下缺失或不兼容的选择会报错，普通调优模式在冷启动录制时使用默认算法。

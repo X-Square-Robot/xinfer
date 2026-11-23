@@ -3,8 +3,7 @@
 // or, w_kn, as w[K, N]; and the same product of MXFP8 operands with a BF16 result. It runs every call no
 // specialized kernel takes; the epilogues cuBLASLt lacks run in epilogue.cu.
 //
-// The algorithm is cuBLASLt's heuristic choice for a fixed workspace size (never timed), so it is the same
-// in every process.
+// The original exports select cuBLASLt's first heuristic. The selection API can enumerate or launch its candidates.
 #include <cublasLt.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/optional.h>
@@ -16,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <vector>
 
 #include "common/tvm_ffi_cuda_tensor.h"
 
@@ -45,11 +45,38 @@ uint32_t Alignment(const void* p) {
 struct Plan {
   cublasLtMatmulDesc_t desc = nullptr;
   cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
-  cublasLtMatmulAlgo_t algo{};
+  std::vector<cublasLtMatmulAlgo_t> algorithms;
 };
 
-// (device, m, n, k, bias, residual, algo index, alignments of w, a, residual/out, bias, fp32, w_kn)
-using PlanKey = std::tuple<int, int64_t, int64_t, int64_t, bool, bool, int64_t, uint32_t, uint32_t, uint32_t,
+// A heuristic's rank and process-local bytes are not persistent identifiers. Use its public configuration
+// attributes and match against candidates enumerated by the same cuBLASLt version in the new process.
+template <typename T>
+std::string ConfigValue(const cublasLtMatmulAlgo_t& algo, cublasLtMatmulAlgoConfigAttributes_t attribute) {
+  T value{};
+  size_t written = 0;
+  Check(cublasLtMatmulAlgoConfigGetAttribute(&algo, attribute, &value, sizeof(value), &written),
+        "cublasLtMatmulAlgoConfigGetAttribute");
+  return std::to_string(value);
+}
+
+std::string AlgorithmIds(const Plan& plan) {
+  std::string ids;
+  for (const auto& algo : plan.algorithms) {
+    if (!ids.empty()) ids += ' ';
+    ids += ConfigValue<int32_t>(algo, CUBLASLT_ALGO_CONFIG_ID);
+    for (auto attr : {CUBLASLT_ALGO_CONFIG_TILE_ID, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                      CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING,
+                      CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, CUBLASLT_ALGO_CONFIG_STAGES_ID}) {
+      ids += ":" + ConfigValue<uint32_t>(algo, attr);
+    }
+    ids += ":" + ConfigValue<uint16_t>(algo, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID);
+    ids += ":" + ConfigValue<uint16_t>(algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID);
+  }
+  return ids;
+}
+
+// (device, m, n, k, bias, residual, alignments of w, a, residual/out, bias, fp32, w_kn)
+using PlanKey = std::tuple<int, int64_t, int64_t, int64_t, bool, bool, uint32_t, uint32_t, uint32_t,
                            uint32_t, bool, bool>;
 
 struct State {
@@ -74,13 +101,13 @@ cublasLtHandle_t Handle(State& s, int device) {
 
 // Row-major out[M, N] = a[M, K] @ w[N, K]^T is column-major out^T[N, M] = w^T @ a: cuBLASLt "TN" with
 // m' = N, n' = M, so the bias epilogue (one value per row of out^T) is the per-column bias of out.
-Plan& GetPlan(State& s, const PlanKey& key, int64_t algo_index) {
+Plan& GetPlan(State& s, const PlanKey& key) {
   auto it = s.plans.find(key);
   if (it != s.plans.end()) return it->second;
   const int device = std::get<0>(key);
   const int64_t m = std::get<1>(key), n = std::get<2>(key), k = std::get<3>(key);
   const bool has_bias = std::get<4>(key);
-  const bool fp32 = std::get<11>(key), w_kn = std::get<12>(key);
+  const bool fp32 = std::get<10>(key), w_kn = std::get<11>(key);
   const cudaDataType dtype = fp32 ? CUDA_R_32F : CUDA_R_16BF;
   Plan p;
   Check(cublasLtMatmulDescCreate(&p.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F), "cublasLtMatmulDescCreate");
@@ -109,7 +136,7 @@ Plan& GetPlan(State& s, const PlanKey& key, int64_t algo_index) {
   const uint64_t ws = kWorkspaceBytes;
   Check(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)),
         "MAX_WORKSPACE_BYTES");
-  const uint32_t align_w = std::get<7>(key), align_a = std::get<8>(key), align_c = std::get<9>(key);
+  const uint32_t align_w = std::get<6>(key), align_a = std::get<7>(key), align_c = std::get<8>(key);
   Check(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &align_w,
                                              sizeof(align_w)),
         "MIN_ALIGNMENT_A");
@@ -138,7 +165,7 @@ Plan& GetPlan(State& s, const PlanKey& key, int64_t algo_index) {
     throw std::runtime_error("gemm generic: cuBLASLt has no algorithm for M=" + std::to_string(m) +
                              " N=" + std::to_string(n) + " K=" + std::to_string(k));
   }
-  p.algo = results[algo_index < found ? algo_index : found - 1].algo;
+  for (int i = 0; i < found; ++i) p.algorithms.push_back(results[i].algo);
   return s.plans.emplace(key, p).first->second;
 }
 
@@ -146,8 +173,8 @@ Plan& GetPlan(State& s, const PlanKey& key, int64_t algo_index) {
 
 int64_t GenericWorkspaceSize() { return kWorkspaceBytes; }
 
-void GemmGeneric(TensorView out, TensorView a, TensorView w, Optional<TensorView> bias, Optional<TensorView> residual,
-                 double alpha, double beta, TensorView workspace, bool w_kn) {
+std::string SelectDense(TensorView out, TensorView a, TensorView w, Optional<TensorView> bias, Optional<TensorView> residual,
+                 double alpha, double beta, TensorView workspace, bool w_kn, int64_t index) {
   using namespace xinfer::ffi;
   const char* op = "gemm_generic";
   const bool fp32 = IsFloat32(a.dtype());
@@ -186,21 +213,21 @@ void GemmGeneric(TensorView out, TensorView a, TensorView w, Optional<TensorView
     throw std::runtime_error("gemm_generic: workspace must hold " + std::to_string(kWorkspaceBytes) +
                              " bytes");
   }
-  if (m == 0 || n == 0) return;
+  if (m == 0 || n == 0) return {};
 
   const int device = out.device().device_id;
   cudaStream_t stream = Stream(out);
-  const int64_t algo_index = 0;
   const void* c_ptr = residual.has_value() ? residual.value().data_ptr() : out.data_ptr();
   uint32_t align_c = Alignment(out.data_ptr());
   if (residual.has_value()) align_c = std::min(align_c, Alignment(c_ptr));
   const uint32_t align_bias = bias.has_value() ? Alignment(bias.value().data_ptr()) : 0;
-  const PlanKey key{device, m, n, k, bias.has_value(), residual.has_value(), algo_index,
+  const PlanKey key{device, m, n, k, bias.has_value(), residual.has_value(),
                     Alignment(w.data_ptr()), Alignment(a.data_ptr()), align_c, align_bias, fp32, w_kn};
 
   State& s = GetState();
   std::lock_guard<std::mutex> lock(s.mu);
-  Plan& p = GetPlan(s, key, algo_index);
+  Plan& p = GetPlan(s, key);
+  if (index == -1) return AlgorithmIds(p);
   if (bias.has_value()) {
     const void* bias_ptr = bias.value().data_ptr();
     Check(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr)),
@@ -209,22 +236,23 @@ void GemmGeneric(TensorView out, TensorView a, TensorView w, Optional<TensorView
   const float alpha_f = static_cast<float>(alpha);
   const float beta_f = residual.has_value() ? static_cast<float>(beta) : 0.0f;
   Check(cublasLtMatmul(Handle(s, device), p.desc, &alpha_f, w.data_ptr(), p.a, a.data_ptr(), p.b, &beta_f, c_ptr,
-                       p.c, out.data_ptr(), p.c, &p.algo, workspace.data_ptr(), kWorkspaceBytes, stream),
+                       p.c, out.data_ptr(), p.c, &p.algorithms.at(index), workspace.data_ptr(), kWorkspaceBytes, stream),
         "cublasLtMatmul");
+  return {};
 }
 
 namespace {
 
 // MXFP8 (E4M3 data, E8M0 1x32 SWIZZLE_32_4_4 scales = cuBLASLt VEC32_UE8M0) plans:
-// (device, m, n, k, bias, fast_accum, algo index, alignments of w, a, out)
-using MxPlanKey = std::tuple<int, int64_t, int64_t, int64_t, bool, bool, int64_t, uint32_t, uint32_t, uint32_t>;
+// (device, m, n, k, bias, fast_accum, alignments of w, a, out)
+using MxPlanKey = std::tuple<int, int64_t, int64_t, int64_t, bool, bool, uint32_t, uint32_t, uint32_t>;
 
 std::map<MxPlanKey, Plan>& MxPlans() {
   static std::map<MxPlanKey, Plan> plans;
   return plans;
 }
 
-Plan& GetMxPlan(State& s, const MxPlanKey& key, int64_t algo_index, const void* w_scale, const void* a_scale) {
+Plan& GetMxPlan(State& s, const MxPlanKey& key, const void* w_scale, const void* a_scale) {
   auto& plans = MxPlans();
   auto it = plans.find(key);
   if (it != plans.end()) return it->second;
@@ -266,7 +294,7 @@ Plan& GetMxPlan(State& s, const MxPlanKey& key, int64_t algo_index, const void* 
   const uint64_t ws = kWorkspaceBytes;
   Check(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)),
         "MAX_WORKSPACE_BYTES");
-  const uint32_t align_w = std::get<7>(key), align_a = std::get<8>(key), align_c = std::get<9>(key);
+  const uint32_t align_w = std::get<6>(key), align_a = std::get<7>(key), align_c = std::get<8>(key);
   Check(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, &align_w,
                                              sizeof(align_w)),
         "MIN_ALIGNMENT_A");
@@ -291,15 +319,15 @@ Plan& GetMxPlan(State& s, const MxPlanKey& key, int64_t algo_index, const void* 
     throw std::runtime_error("gemm generic MXFP8: cuBLASLt has no algorithm for M=" + std::to_string(m) +
                              " N=" + std::to_string(n) + " K=" + std::to_string(k));
   }
-  p.algo = results[algo_index < found ? algo_index : found - 1].algo;
+  for (int i = 0; i < found; ++i) p.algorithms.push_back(results[i].algo);
   return plans.emplace(key, p).first->second;
 }
 
 }  // namespace
 
 // out[M, N] (BF16) = a[M, K] @ w[N, K]^T (+ bias) for MXFP8 a / w (E4M3 + E8M0 1x32 SWIZZLE_32_4_4 scales).
-void GemmGenericMxfp8(TensorView out, TensorView a, TensorView a_scale, TensorView w, TensorView w_scale,
-                      Optional<TensorView> bias, TensorView workspace, bool fast_accum) {
+std::string SelectMx(TensorView out, TensorView a, TensorView a_scale, TensorView w, TensorView w_scale,
+                      Optional<TensorView> bias, TensorView workspace, bool fast_accum, int64_t index) {
   using namespace xinfer::ffi;
   CheckCuda(out, "out");
   CheckBFloat16(out, "out");
@@ -334,15 +362,15 @@ void GemmGenericMxfp8(TensorView out, TensorView a, TensorView a_scale, TensorVi
   if (NumBytes(workspace) < kWorkspaceBytes) {
     throw std::runtime_error("gemm_generic_mxfp8: workspace must hold " + std::to_string(kWorkspaceBytes) + " bytes");
   }
-  if (m == 0 || n == 0) return;
+  if (m == 0 || n == 0) return {};
   const int device = out.device().device_id;
   cudaStream_t stream = Stream(out);
-  const int64_t algo_index = 0;
-  const MxPlanKey key{device, m, n, k, bias.has_value(), fast_accum, algo_index,
+  const MxPlanKey key{device, m, n, k, bias.has_value(), fast_accum,
                       Alignment(w.data_ptr()), Alignment(a.data_ptr()), Alignment(out.data_ptr())};
   State& s = GetState();
   std::lock_guard<std::mutex> lock(s.mu);
-  Plan& p = GetMxPlan(s, key, algo_index, w_scale.data_ptr(), a_scale.data_ptr());
+  Plan& p = GetMxPlan(s, key, w_scale.data_ptr(), a_scale.data_ptr());
+  if (index == -1) return AlgorithmIds(p);
   // A' = weight, B' = activation (column-major trick, see GetPlan).
   const void* sa = w_scale.data_ptr();
   const void* sb = a_scale.data_ptr();
@@ -357,13 +385,29 @@ void GemmGenericMxfp8(TensorView out, TensorView a, TensorView a_scale, TensorVi
   }
   const float alpha_f = 1.0f, beta_f = 0.0f;
   Check(cublasLtMatmul(Handle(s, device), p.desc, &alpha_f, w.data_ptr(), p.a, a.data_ptr(), p.b, &beta_f,
-                       out.data_ptr(), p.c, out.data_ptr(), p.c, &p.algo, workspace.data_ptr(), kWorkspaceBytes,
+                       out.data_ptr(), p.c, out.data_ptr(), p.c, &p.algorithms.at(index), workspace.data_ptr(), kWorkspaceBytes,
                        stream),
         "cublasLtMatmul (MXFP8)");
+  return {};
 }
+
+void GemmGeneric(TensorView out, TensorView a, TensorView w, Optional<TensorView> bias, Optional<TensorView> residual,
+                 double alpha, double beta, TensorView workspace, bool w_kn) {
+  SelectDense(out, a, w, bias, residual, alpha, beta, workspace, w_kn, 0);
+}
+
+void GemmGenericMxfp8(TensorView out, TensorView a, TensorView a_scale, TensorView w, TensorView w_scale,
+                      Optional<TensorView> bias, TensorView workspace, bool fast_accum) {
+  SelectMx(out, a, a_scale, w, w_scale, bias, workspace, fast_accum, 0);
+}
+
+int64_t CublasLtVersion() { return cublasLtGetVersion(); }
 
 }  // namespace xinfer::gemm
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_generic_mxfp8, xinfer::gemm::GemmGenericMxfp8);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_generic_workspace_size, xinfer::gemm::GenericWorkspaceSize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_generic, xinfer::gemm::GemmGeneric);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_select_dense, xinfer::gemm::SelectDense);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_select_mxfp8, xinfer::gemm::SelectMx);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_cublaslt_version, xinfer::gemm::CublasLtVersion);

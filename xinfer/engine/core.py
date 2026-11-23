@@ -255,6 +255,7 @@ class Engine:
         # Called on the completer thread with each completed request's RequestStats (xinfer.observability.stats), or
         # None; xinfer-serve sets it after the warmup to record its metrics.
         self.stats_sink = None
+        self._admitted: dict[int, float] = {}  # request id -> admission time, until the request finishes
         self._engine_thread = threading.Thread(target=self._run_engine_loop, name="xinfer-engine", daemon=True)
         self._completer = threading.Thread(target=self._completion_loop, name="xinfer-completer", daemon=True)
         # DeviceImage inputs are decoded off the engine thread: on one thread (the platform's decoder keeps state and
@@ -395,15 +396,24 @@ class Engine:
         """Requests waiting for admission, and admitted requests whose slots are not free yet."""
         return len(self._waiting), self.slots.in_use()
 
-    def health(self) -> str | None:
+    def health(self, hang_timeout: float | None = None) -> str | None:
         """Why the engine can no longer serve, or None while it can: its engine, completion or device-image thread
-        has stopped.
+        has stopped, the device reports a sticky error (after which every CUDA call fails), or, with
+        ``hang_timeout``, an admitted request has not finished within that many seconds.
 
         Meant for a supervisor polling a started engine; after ``shutdown`` the threads are stopped too.
         """
         for thread in (self._engine_thread, self._completer, self._device_thread):
             if not thread.is_alive():
                 return f"{thread.name} thread stopped"
+        if self.platform.is_cuda:
+            try:
+                torch.cuda.default_stream(self.platform.device).query()  # does not wait; raises a sticky error
+            except RuntimeError as exc:
+                return f"device error: {exc}"
+        oldest = min(self._admitted.values(), default=None)
+        if hang_timeout and oldest is not None and time.perf_counter() - oldest > hang_timeout:
+            return f"no progress: a request admitted {time.perf_counter() - oldest:.1f} s ago has not finished"
         return None
 
     def shutdown(self) -> None:
@@ -526,6 +536,7 @@ class Engine:
                     return admitted
                 self._waiting.popleft()
             request.admitted_at = time.perf_counter()
+            self._admitted[request.id] = request.admitted_at
             stream = self._upload
             stream_context = self._device_module.stream(stream) if stream is not None else contextlib.nullcontext()
             admitted = True
@@ -1023,6 +1034,7 @@ class Engine:
             locked: True when the caller already holds ``self._lock``.
             after: event of a failed dispatch's enqueued work; the slot keeps the request's tensors until it completes.
         """
+        self._admitted.pop(request.id, None)
         if request.handle is not None:
             if after is not None:
                 self.slots.tensors(request.handle)["failed_dispatch"] = (request.inputs, dict(request.outputs))
