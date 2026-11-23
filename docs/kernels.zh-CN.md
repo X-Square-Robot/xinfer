@@ -40,6 +40,10 @@ xinfer-serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --device cuda
 
 XInfer 从自己的包目录加载 `xinfer_kernels.so`。设置 `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` 时改为加载在别处用同一份源码编译的库。`XINFER_KERNELS=0` 关闭这个后端。同样的环境变量也适用于 `Policy`、测试和 benchmark。
 
+## Flow 内核覆盖范围
+
+在受支持的 GPU 上，只要原生内核支持输入的形状、类型、布局和可选参数，`flow_input_embed` 和 `flow_velocity_euler` 就直接运行原生内核，包括实测范围之外的兼容形状。Flow 没有需要比较耗时的外部库，因此设置 `XINFER_OP_TUNING=0` 时也按这条规则选路。不支持的输入使用 torch 参考实现，并沿用严格模式的诊断。`xinfer-profile check` 会显示所选档位和内核入口，例如 `measured (denoise_input_embed)` 或 `can_run (denoise_output_euler)`。
+
 ## 检查
 
 `xinfer-serve` 在模型加载后会记录每个算子的后端：

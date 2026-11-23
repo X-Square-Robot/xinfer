@@ -40,6 +40,10 @@ xinfer-serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --device cuda
 
 XInfer loads `xinfer_kernels.so` from its package directory. `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` loads a library built elsewhere from the same sources. `XINFER_KERNELS=0` turns the backend off. The same variables apply to `Policy`, the tests and the benchmarks.
 
+## Flow kernel coverage
+
+On a supported GPU, `flow_input_embed` and `flow_velocity_euler` run the native kernel whenever it accepts the input shapes, dtypes, layouts and optional operands. This includes compatible shapes outside the measured ranges. Flow has no external library candidate to time, so this rule also applies with `XINFER_OP_TUNING=0`. Unsupported inputs use the torch reference and follow the usual strict-mode diagnostics. `xinfer-profile check` reports the tier and kernel entry, for example `measured (denoise_input_embed)` or `can_run (denoise_output_euler)`.
+
 ## Check
 
 `xinfer-serve` logs each operator's backend when the model is loaded:
