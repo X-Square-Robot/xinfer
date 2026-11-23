@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 
 from xinfer.ops.backends.cuda._native import derived, kernel, lib, scratch
-from xinfer.ops.backends.cuda.gemm import weight_kn, weight_nk
+from xinfer.ops.backends.cuda.gemm import ACTIVATIONS, weight_kn, weight_nk
 from xinfer.ops.layout import mxfp8 as layout
 
 
@@ -248,3 +248,47 @@ class tile_qkv_rope_mxfp8_sm120(_tile_mxfp8_sm120):
         rope_columns = (c.rope[0] + c.rope[1]) * 64
         lib.tile_mxfp8_qkv_rope_sm120(out, c.x, c.x_scale, cls.weight(c, rope_columns), c.bias, c.rope[4],
                                       rope_columns)
+
+
+# ---------------------------------------------------------------------------
+# NVFP4 operands
+# ---------------------------------------------------------------------------
+@kernel("gemm", 120)
+class cutlass_nvfp4_sm120:
+    """CUTLASS block-scaled NVFP4 GEMM (no split-K) with the global scale and the bias on the FP32 accumulator,
+    rounded to BF16, then in the same kernel a BF16 residual added after that rounding, or a GELU and the NVFP4
+    output: the generic path's result bit for bit. The kernel picks its tile from the shape and the SM count.
+
+    ``ENTRIES``: the calls taken, as (features, whether a bias may be added to them, ``(N, K)`` -> ranges of M).
+    """
+
+    ENTRIES = (
+        (frozenset({"nvfp4"}), False, {(512, 2048): [(1, 1280)], (2048, 2048): [(1, 832), (960, 1152), (1408, 2048)],
+                                       (2048, 6144): [(1, 512), (1408, 2048)], (4096, 2048): [(64, 512), (704, 1280)],
+                                       (6144, 2048): [(96, 256), (448, 768)]}),
+        (frozenset({"nvfp4", "bias"}), False, {(2048, 4096): [(1, 640), (1408, 2048)]}),
+        (frozenset({"nvfp4", "residual"}), True, {(1024, 1024): [(1, 2048)], (1024, 4096): [(1, 2048)]}),
+        (frozenset({"nvfp4", "gelu_tanh", "quantize"}), True, {(4096, 1024): [(1, 2048)]}),
+        (frozenset({"nvfp4", "gelu", "quantize"}), True, {(4096, 4096): [(64, 1920)]}),
+    )
+
+    FORMAT = "nvfp4"
+    SHAPES = {shape: ranges for _, _, shapes in ENTRIES for shape, ranges in shapes.items()}
+
+    @classmethod
+    def takes(cls, c):
+        if not hasattr(lib, "nvfp4_gemm_cutlass_sm120") or not hasattr(lib, "nvfp4_gemm_act_quant_cutlass_sm120"):
+            return False
+        return any((c.features == features or bias and c.features == features | {"bias"}) and _tuned(shapes, c)
+                   for features, bias, shapes in cls.ENTRIES)
+
+    @staticmethod
+    def run(c, out):
+        # the kernel reads the bias and the residual 16 bytes at a time: an unaligned view is copied
+        bias, residual = (t.clone() if t is not None and t.data_ptr() % 16 else t for t in (c.bias, c.residual))
+        if c.quantize:
+            lib.nvfp4_gemm_act_quant_cutlass_sm120(out[0], out[1], c.x, c.x_scale, c.weight, c.weight_scale, bias,
+                                                   float(c.alpha), ACTIVATIONS[c.activation], -1)
+        else:
+            lib.nvfp4_gemm_cutlass_sm120(out, c.x, c.x_scale, c.weight, c.weight_scale, bias, residual,
+                                         float(c.alpha), -1)
