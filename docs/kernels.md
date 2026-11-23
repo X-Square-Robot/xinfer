@@ -63,3 +63,7 @@ The `ascend` backend binds an external xcompute build through `xinfer/ops/backen
 `XINFER_XCOMPUTE_LIBRARY` / `XINFER_XCOMPUTE=0` settings. Available implementations are selected automatically;
 unsupported calls use their torch fallback. See the [Ascend guide](ascend950dt.md) for runtime, image processing
 and NPU graphs.
+
+## Tuning generic GEMMs
+
+The generic GEMM uses cuBLASLt's first heuristic by default. With a library built from this revision, set `XINFER_GEMM_TUNING=1` before startup to time eligible algorithms on the first eager call for each exact shape and alignment. A candidate must match the heuristic output on the warmup input and beat its median time by 5%. Trials write to private output storage. In-place residual updates keep the heuristic. Set `XINFER_GEMM_TUNING_FILE` to a writable JSON path to share choices across processes. For reproducible replay set `XINFER_GEMM_TUNING=frozen` and point it at that file. Warm each shape eagerly before graph capture. Frozen mode reports a missing or incompatible choice; a cold capture in ordinary tuning mode uses the heuristic.
