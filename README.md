@@ -131,7 +131,7 @@ Single-accelerator measurements from `benchmarks/performance.py` using the produ
     <tr>
       <td>WALL-OSS-1.0-Nano</td>
       <td>BF16</td>
-      <td><a href="https://github.com/X-Square-Robot/xinfer/pull/33">Ascend 950DT</a></td>
+      <td>Ascend 950DT</td>
       <td>20.6 ms</td>
       <td>15</td>
       <td>129 / 163 ms</td>

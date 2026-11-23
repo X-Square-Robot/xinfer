@@ -223,6 +223,11 @@ def gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, resid
                  (residual, residual_gate, row_class, row_scale))
 
 
+def gemm_split(x, weight, split_size, *, row_scale=None) -> OpCost:
+    """The full GEMM of ``gemm_epilogue``; split output views add no product or packing traffic."""
+    return gemm_epilogue(x, weight, row_scale=row_scale)
+
+
 def gemm_glu_epilogue(x, weight, *, bias=None, modulation=None, row_class=None, eps=1e-6) -> OpCost:
     """``2·M·N·K`` over the gate and up rows on the pipe of ``x.dtype``, writing ``[M, N/2]``; also reads the input
     norm's modulation and row classes."""
@@ -279,9 +284,10 @@ FORMULAS: dict[str, Callable[..., OpCost]] = {formula.__name__: formula for form
     linear, conv2d, chunk_gated_delta_rule, causal_attention, action_attention, masked_joint_attention,
     kvcache_attention, prefix_attention, varlen_attention, mxfp8_gemm, mxfp8_gemm_rope, mxfp8_gemm_silu_mul,
     mxfp8_gemm_residual, mxfp8_gemm_epilogue, mxfp8_gemm_glu_quantize, mxfp8_qkv_rope_epilogue,
-    nvfp4_gemm, nvfp4_gemm_epilogue, nvfp4_gemm_glu_quantize, nvfp4_qkv_rope_epilogue, gemm_epilogue,
+    nvfp4_gemm, nvfp4_gemm_epilogue, nvfp4_gemm_glu_quantize, nvfp4_qkv_rope_epilogue, gemm_epilogue, gemm_split,
     gemm_glu_epilogue, gemm_add_rms_norm, mlp_add_rms_norm, qkv_rope_epilogue, qkv_rope_kvcache,
     prefix_kvcache_attention, flow_velocity_euler)}
+FORMULAS["qkv_rope_split"] = qkv_rope_epilogue
 
 
 def op_cost(name: str, args: tuple, kwargs: Mapping[str, object], outputs) -> OpCost:

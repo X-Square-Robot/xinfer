@@ -80,4 +80,4 @@ BF16 并发数据来自 11 月 13 日的测试，使用 SM120 算子版本 `7336
 
 ## 昇腾 950DT
 
-这组 BF16 测量的公开构建产物和复现步骤待补充（**TBD**）。设备与算子配置见[昇腾指南](ascend950dt.zh-CN.md)。仓内昇腾算子见 [PR #33](https://github.com/X-Square-Robot/xinfer/pull/33)。
+这组 BF16 测量的公开构建产物待补充（**TBD**）。仓内算子的编译、设备设置与算子配置见[昇腾指南](ascend950dt.zh-CN.md)。

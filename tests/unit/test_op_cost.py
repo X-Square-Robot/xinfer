@@ -80,6 +80,7 @@ FORMULA_CASES = {
     "nvfp4_qkv_rope_epilogue": (((A4, S4), (W4, S4, 0.5), t(32), t(4, 2, dtype=F32), t(4, 2, dtype=F32), 2, 4),
                                 OpCost(GEMM, 128 + 512 + 1024 + 512 + 64 + 64, 4 * 32 * 2, "nvfp4")),
     "gemm_epilogue": ((X, W, t(32)), OpCost(GEMM, 512 + 4096 + 64, 4 * 32 * 2, "bf16")),
+    "gemm_split": ((X, W, 16), OpCost(GEMM, 512 + 4096, 4 * 32 * 2, "bf16")),
     "gemm_glu_epilogue": ((X, W), OpCost(GEMM, 512 + 4096, 4 * 16 * 2, "bf16")),  # 16 gate and 16 up rows
     # bias [32] (64 bytes), residual [1, 4, 32] (256 bytes), FP32 norm weight [32] (128 bytes); writes the sum and
     # its norm
@@ -99,6 +100,7 @@ FORMULA_CASES = {
                                  OpCost(4 * 16 * 2 * 4 * 5 * 10, 1280 + 8 + 2 * 1280, 1280, "bf16")),
     "flow_velocity_euler": ((VALUES, STREAM, t(4, 32), 0.1), OpCost(2 * 6 * 4 * 32, 96 + 384 + 256, 96, "bf16")),
 }
+FORMULA_CASES["qkv_rope_split"] = FORMULA_CASES["qkv_rope_epilogue"]
 
 
 def test_formulas_are_registered_operators_with_the_reference_parameters():

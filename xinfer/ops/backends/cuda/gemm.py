@@ -467,10 +467,26 @@ def _rope_table(cos, sin):
     return _rope_tables[key]
 
 
+def _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order):
+    return qkv_proj_rope(x.contiguous(), weight, bias, rope_table=_rope_table(cos, sin), num_heads=num_heads,
+                         head_dim=head_dim, qk_order=qk_order)
+
+
 @register("qkv_rope_epilogue", backend="cuda", deterministic=False, **NATIVE)
 def qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
-    return qkv_proj_rope(x.contiguous(), weight, bias, rope_table=_rope_table(cos, sin), num_heads=num_heads,
-                            head_dim=head_dim, qk_order=qk_order)
+    return _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+
+
+@register("qkv_rope_split", backend="cuda", deterministic=False, **NATIVE)
+def qkv_rope_split(x, weight, bias, cos, sin, num_heads, head_dim, *, qk_order="standard"):
+    out = _qkv_rope_packed(x, weight, bias, cos, sin, num_heads, head_dim, qk_order=qk_order)
+    return out.view(x.shape[0], 3, num_heads, head_dim).unbind(1)
+
+
+@register("gemm_split", backend="cuda", deterministic=False, **NATIVE)
+def gemm_split(x, weight, split_size, *, row_scale=None):
+    out = gemm_epilogue(x, weight, row_scale=row_scale)
+    return out[:, :split_size], out[:, split_size:]
 
 
 @register("qkv_norm_rope_kvcache", backend="cuda", deterministic=False, **NATIVE)

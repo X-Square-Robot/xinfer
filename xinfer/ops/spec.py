@@ -50,8 +50,11 @@ class OpSpec:
         name: operator name; layers access the selected implementation as ``table.<name>``.
         signature: human-readable call signature with shapes and dtypes (documentation only, not parsed).
         reference: the torch reference implementation that defines the semantics.
+        fallback: optional source operator and adapter. Binding the selected source callable to the
+            adapter's first argument implements this operator.
     """
 
     name: str
     signature: str
     reference: Callable
+    fallback: tuple[str, Callable] | None = None

@@ -60,7 +60,7 @@ the shape, else the operator's torch reference. All BF16, like the reference.
 | Step | Operator | Kernel at this model's shapes |
 |---|---|---|
 | ViT and LM residual add + RMSNorm | `add_rms_norm` (`rms_norm` for the first norm) | `add_rmsnorm` / `rmsnorm` |
-| ViT QKV + bias + 2-D RoPE | `qkv_rope_epilogue` (`qk_order="any"`: Q and K only feed the attention) | `qkv_proj_rope` → cuBLASLt and a RoPE kernel; on SM110 `tcgen05_qkv_rope_bf16_sm110` (Q and K in rotary-pair order) |
+| ViT QKV + bias + 2-D RoPE | `qkv_rope_split` (`qk_order="any"`: Q and K only feed the attention) | `qkv_proj_rope` → cuBLASLt and a RoPE kernel; on SM110 `tcgen05_qkv_rope_bf16_sm110` (Q and K in rotary-pair order) |
 | ViT attention (windows, full blocks) | `varlen_attention` | flash-attention 2 |
 | ViT projection and MLP down (+ bias) + residual add + the next RMSNorm | `gemm_add_rms_norm` | `gemm` → cuBLASLt, `add_rmsnorm`; on integrated GPUs (Jetson Thor) `gemm` with the residual → cuBLASLt (β·C), `rmsnorm` |
 | Merger (+ bias; fc1 + GELU) | `gemm_epilogue` | `gemm` → cuBLASLt |

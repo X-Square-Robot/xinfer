@@ -136,6 +136,62 @@ def test_engine_runs_three_stages(composition):
     assert torch.isfinite(out["predict_action"]).all()
 
 
+def test_bf16_vision_uses_the_selected_projection_op(tiny, split_vision_ops):
+    from xinfer.models.wall_oss_0_5.model import WallOSS05
+
+    calls = set()
+
+    def record(implementation):
+        def call(*args, **kwargs):
+            if implementation.op in ("qkv_rope_split", "qkv_rope_epilogue"):
+                calls.add((implementation.op, implementation.backend))
+            return implementation.function(*args, **kwargs)
+
+        return call
+
+    with ops.use_ops(split_vision_ops.wrapped(record)):
+        model = WallOSS05.from_checkpoint(tiny.root, device="cpu", processing={"prompt_bucket": 0})
+    run_stage(model, "vision", _request(model).tensors, "cpu")
+    assert calls == {("qkv_rope_split", "test-vision")}
+
+
+@pytest.mark.parametrize(("delay", "rtc_rows"), [(0, 0), (3, H)])
+def test_public_attention_pins_serve_prefill_and_action(tiny_optimized, delay, rtc_rows):
+    from xinfer.models.wall_oss_0_5.model import WallOSS05
+
+    calls = {"causal_attention": 0, "prefix_kvcache_attention": 0}
+
+    def causal(q, k, v, *, scale=None):
+        calls["causal_attention"] += 1
+        return ops.reference.causal_attention(q, k, v, scale=scale)
+
+    def prefix(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+        calls["prefix_kvcache_attention"] += 1
+        assert flash_mask is not None
+        return ops.reference.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
+                                                       flash_mask=flash_mask, scale=scale)
+
+    registry = ops.OpRegistry()
+    for name in ops.registry.names():
+        registry.define(ops.registry.spec(name))
+    for name, function in (("causal_attention", causal), ("prefix_kvcache_attention", prefix)):
+        registry.add(name, function, backend="test-attention", platforms=("cpu",),
+                     contract=ops.Contract(numerics="bitwise"))
+    platform = resolve_platform("cpu")
+    table = registry.build_table(platform, backends=dict.fromkeys(calls, "test-attention"), reference_only=True)
+    with ops.use_ops(table):
+        model = WallOSS05.from_checkpoint(tiny_optimized.root, device="cpu", processing={"prompt_bucket": 0})
+    inputs = _request(model, delay=delay, rtc_rows=rtc_rows).tensors
+    inputs.update(run_stage(model, "vision", inputs, "cpu"))
+    for stage in ("prefill", "action"):
+        expected = run_stage(tiny_optimized, stage, inputs, "cpu")
+        actual = run_stage(model, stage, inputs, "cpu")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        inputs.update(actual)
+    layers = model.config.num_hidden_layers
+    assert calls == {"causal_attention": layers - 1, "prefix_kvcache_attention": layers * inputs["num_steps"]}
+
+
 def test_split_equals_joint_prefill_action_forward(tiny):
     """Step-0 velocity from (prefill stage + action stage) equals one joint pass."""
     request = _request(tiny)
@@ -205,7 +261,7 @@ def test_the_optimized_composition_is_the_default_and_takes_one_request_per_acti
 
     assert tiny_optimized.numerics == "optimized"
     assert tiny_optimized.capabilities().batch_sizes["action"] == (1,)
-    assert tiny_optimized.capabilities().stage_ops == OPTIMIZED_STAGE_OPS  # what the startup check reads
+    assert tiny_optimized.capabilities().stage_ops == OPTIMIZED_STAGE_OPS
 
 
 @pytest.mark.parametrize(("delay", "rtc_rows"), [(0, 0), (3, 15)])

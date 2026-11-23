@@ -1,8 +1,7 @@
 """Ascend entry discovery and cached partial-support adapters.
 
-The shared xcompute loader loads and pairs the package and library once. These helpers discover usable
-exports and optional bridges, and share layout-based fallback across GEMM, attention and normalization.
-The registry selects a backend at model build time; unsupported call layouts remain the backend's concern.
+Unsupported layouts fall back before launch; execution errors for an admitted
+layout propagate. Native implementations share one library and fingerprint.
 """
 
 import inspect
@@ -12,49 +11,86 @@ from pathlib import Path
 
 import torch
 
-from xinfer.ops.backends._xcompute import ASCEND_XCOMPUTE
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend import core as _glue_core
 
-xc = ASCEND_XCOMPUTE["requires"]
-VERSION = ASCEND_XCOMPUTE["version"]
+class _AscendKernelsNamespace:
+    __name__ = "kernels"
+
+    def __getattr__(self, name):
+        return getattr(_glue_core, name)
+
+    @staticmethod
+    def explicit_export(name):
+        return _glue_core.explicit_export(name)
+
+
+xc = _AscendKernelsNamespace() if _native.lib is not None else None
+PRIORITY = 10
+PLATFORMS = _native.BUILD_SOCS
+VERSION = _native.NATIVE["version"]
+
+
+def _explicit_export(name):
+    """The namespace's explicitly defined ``name``, or None — never a ``__getattr__`` product.
+
+    The paired-loader rule ``canonical`` keeps through this re-homing: a module-level
+    ``__getattr__`` may expose raw, output-first launcher functions, whose names alone do
+    not establish the XInfer operator contract. A package answers from its own definitions;
+    the in-tree namespace answers through its ``explicit_export`` (the core module's
+    curated registry — the surface its own dynamic lookups serve).
+    """
+    if xc is None:
+        return None
+    reader = getattr(type(xc), "explicit_export", None)
+    if callable(reader):
+        return reader(name)
+    return vars(xc).get(name)
 
 
 def canonical(name, reference):
-    """An explicit Python export with the operator's call signature, or None.
+    """An explicit glue export with the operator's call signature, or None.
 
-    Inspect the package namespace directly: a module-level __getattr__ may expose raw, output-first FFI
-    functions, whose names alone do not establish the XInfer operator contract.
-    The registry checks our wrappers' signatures, so the wrapped provider also needs this check.
+    Inspect the glue namespace's explicitly defined surface only: a module-level
+    ``__getattr__`` may expose raw, output-first launcher functions, whose names
+    alone do not establish the XInfer operator contract. The registry checks our
+    wrappers' signatures, so the wrapped provider also needs this check.
     """
-    function = vars(xc).get(name) if xc is not None else None
+    function = _explicit_export(name)
     if not callable(function):
         return None
     expected = inspect.signature(reference)
     try:
         actual = inspect.signature(function)
     except (TypeError, ValueError) as exc:
-        raise TypeError(f"xcompute.{name} must expose the Python operator signature {expected}") from exc
+        raise TypeError(f"glue.{name} must expose the Python operator signature {expected}") from exc
     actual_parameters = tuple((p.name, p.kind) for p in actual.parameters.values())
     expected_parameters = tuple((p.name, p.kind) for p in expected.parameters.values())
     if actual_parameters != expected_parameters:
-        raise TypeError(f"xcompute.{name} has signature {actual}; expected {expected}")
+        raise TypeError(f"glue.{name} has signature {actual}; expected {expected}")
     return function
 
 
 def has_functions(*names):
-    """Whether the paired library exports every requested function."""
-    return xc is not None and all(callable(getattr(xc.xcompute_lib, name, None)) for name in names)
+    """Whether the core library exports every requested launcher.
+
+    The former tvm_ffi probe over the paired v22 library; here the glue core
+    owns the entries, so probe its namespace (entries are absent exactly when
+    the kernels are not built or the envelope is not carried).
+    """
+    return xc is not None and all(callable(getattr(xc, name, None)) for name in names)
 
 
 def entry(*names):
-    """The paired package when every Python entry is available, otherwise None for ``requires``."""
+    """The kernel namespace when every Python entry is available, otherwise None for ``requires``."""
     return xc if xc is not None and all(callable(getattr(xc, name, None)) for name in names) else None
 
 
 def bridge(name):
-    """An optional bridge from the paired Python package; missing dependencies still raise."""
+    """A backend kernel module by name; missing modules still raise, absent families return None."""
     if xc is None:
         return None
-    module_name = f"xcompute.kernel.{name}"
+    module_name = f"xinfer.ops.backends.ascend.{name}"
     try:
         module = import_module(module_name)
     except ModuleNotFoundError as exc:
@@ -63,10 +99,8 @@ def bridge(name):
             return None
         raise
     path = getattr(module, "__file__", None)
-    if not path or not Path(path).resolve().is_relative_to(Path(xc.__file__).resolve().parent):
-        raise RuntimeError(f"{module_name} must come from the paired xcompute package")
-    if getattr(module, "xcompute_lib", xc.xcompute_lib) is not xc.xcompute_lib:
-        raise RuntimeError(f"{module_name} must use the paired xcompute library")
+    if not path or not Path(path).resolve().is_relative_to(Path(__file__).resolve().parent):
+        raise RuntimeError(f"{module_name} must come from the in-tree ascend backend package")
     return module
 
 

@@ -57,7 +57,7 @@ The native RPU operator package described in §14 and §18.2 is an operator-laye
 | §11.4 Bundled models | Implemented | WALL-OSS-0.5 supports reference and optimized BF16 compositions. The optimized composition on RTX 5090 passes the internal precision gate. WALL-OSS-1.0-Nano uses a Qwen3.5 backbone and supports RTC on the desktop dual-arm robot. |
 | §12 Quantization | Partially implemented | The framework supports per-group `QuantConfig`. WALL-OSS-0.5 runs in BF16. MXFP8 and NVFP4 have PyTorch reference operators. See [quantization](quantization.md). |
 | §13 Platform | Partially implemented | Only device capability descriptions and CUDA / CPU resolution (`xinfer/platforms/`); streams, events, copy primitives, `register_host` (`frontend/shm.py` currently calls `cudaHostRegister` directly), `classify_error`, `derive` / `validate` and plugin activation are not implemented; Thor (sm110) is unverified |
-| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; CUDA uses the in-tree native library and flash-attn, while Ascend retains an external xcompute compatibility provider alongside its other providers (§14.2); `xinfer.ops.conformance` is not implemented |
+| §14 Operators | Partially implemented | `OpSpec` and contracts, the registry, build-time selection and the selection table are implemented; CUDA and Ascend use their in-tree native libraries; CUDA also uses flash-attn (§14.2); `xinfer.ops.conformance` is not implemented |
 | §15 Protocol and frontend | Partially implemented | WebSocket + msgpack, compatible with the x2robot client; `xinfer.Policy` in-process API; Client SDK and compatibility adapters not implemented |
 | §16 Observability and benchmark tools | Partially implemented | The service exposes [Prometheus metrics](metrics.md). Use the [benchmarks](benchmark.md) for single-request latency and closed-loop capacity, and [xinfer-profile](profiling.md) to measure operator, queue and stage times. |
 | §17 Testing | Partially implemented | CPU unit and contract tests; GPU and asset tests need local assets and are run manually; CI (GitHub Actions, `.github/workflows/ci.yml`) runs ruff, the repository and documentation checks and the CPU tests |
@@ -124,7 +124,7 @@ Three layers take three words, and one object never takes two names inside one l
 | Layer | Word | Written as | Not used for |
 |---|---|---|---|
 | torch device | `npu` | device strings `npu:0`, the `torch.npu` / `torch_npu` API, `platforms/npu.py` (the module that resolves a torch device), `Platform.is_npu`, `NpuJpegDecoder` | backend or vendor identity |
-| platform and backend | `ascend` | `PlatformCapabilities.device_type == "ascend"`, platform name `ascend-<arch>`, `xinfer/ops/backends/ascend/`, selection names `ascend:xcompute` and `ascend:torch` | torch device strings |
+| platform and backend | `ascend` | `PlatformCapabilities.device_type == "ascend"`, platform name `ascend-<arch>`, `xinfer/ops/backends/ascend/`, operator selection `ascend:kernels` | torch device strings |
 | toolchain | `cann` | prose and error text about DVPP, ACLNN and FIA; `load_npu_media` imports CANN's Python ACL | selectors of any kind |
 
 Rules:
@@ -610,7 +610,7 @@ Validation requirements:
 
 Native backends live under `xinfer/ops/backends/<backend>/`: Python bindings accompany the maintained source and CMake build in `src/`. CUDA builds `xinfer_kernels.so`; RPU builds `xinfer_rpu.so`. Both load AOT libraries through TVM-FFI; importing a Python package does not compile device code. Build instructions are in [CUDA kernels](kernels.md) and `docs/rpu_ops.md` in the separate operator-source change.
 
-For registered tensor operators, a backend names the hardware (`cuda`, `ascend`); the torch reference (`reference`) is available on supported torch devices. Operator-category modules such as `cuda/attn.py`, `gemm.py`, `norm.py` and `flow.py` declare implementations with `xinfer.ops.register`, passing the library as `requires`. If an optional library is unavailable, its implementations are not registered and selection may use a valid reference implementation. CUDA's `_native.py` loads the in-tree native library and records its target architectures and fingerprint. Ascend still uses `backends/_xcompute.py` for its external xcompute compatibility provider, checking the paired Python package and shared library; this port does not migrate that provider's implementations into XInfer.
+For registered tensor operators, a backend names the hardware (`cuda`, `ascend`); the torch reference (`reference`) is available on supported torch devices. Operator-category modules such as `cuda/attn.py`, `gemm.py`, `norm.py` and `flow.py` declare implementations with `xinfer.ops.register`, passing the library as `requires`. If an optional library is unavailable, its implementations are not registered and selection may use a valid reference implementation. CUDA and Ascend each use a `_native.py` loader for their in-tree library. Each loader records the supported hardware and build fingerprint.
 
 ```python
 try:
@@ -622,7 +622,7 @@ except ImportError:
 def causal_attention(q, k, v, *, scale=None): ...
 ```
 
-`register` adds to the process-wide registry, so importing a backend module registers its implementations; `OpRegistry.load_plugins()` imports the built-in backend modules, then the modules named by the `xinfer.ops` entry point group. `OpRegistry.add`, the one way into a registry, checks implementation parameters against the reference when one exists and registers it as `backend:library` (`cuda:kernels`). `XINFER_KERNELS=0`, `XINFER_XCOMPUTE=0` and `XINFER_FLASH_ATTN=0` leave the corresponding libraries out. The process-wide registry loads the plugins before its first `build_table`. A pin (`--op-backends`) names a backend, a library or both.
+`register` adds to the process-wide registry, so importing a backend module registers its implementations; `OpRegistry.load_plugins()` imports the built-in backend modules, then the modules named by the `xinfer.ops` entry point group. `OpRegistry.add`, the one way into a registry, checks implementation parameters against the reference when one exists and registers it as `backend:library` (`cuda:kernels`, `ascend:kernels`). `XINFER_KERNELS=0`, `XINFER_ASCEND_KERNELS=0` and `XINFER_FLASH_ATTN=0` leave the corresponding libraries out. The process-wide registry loads the plugins before its first `build_table`. A pin (`--op-backends`) names a backend, a library or both.
 
 - The implementation is selected at model build time, not dispatched on every call. An implementation that supports only some calls of an operator runs the others on the reference itself, as CUDA's native `prefix_kvcache_attention` does for the cache shapes its kernel does not take.
 - When operators a model calls run on a fused reference on a CUDA device, one warning names them. `XINFER_OPS_STRICT=1` turns this warning into an error (CI and benchmarks).
@@ -813,8 +813,7 @@ XInfer/
 │   │   ├── reference/              # references on supported torch platforms: attn.py, gemm.py, norm.py, flow.py, rope.py, elementwise.py, conv.py, mxfp8.py, nvfp4.py
 │   │   ├── layout/                 # storage layouts of the low-precision formats: mxfp8.py, nvfp4.py
 │   │   ├── backends/
-│   │   │   ├── _xcompute.py        # external Ascend compatibility-provider loader
-│   │   │   ├── ascend/             # current Ascend adapters, including the external xcompute provider
+│   │   │   ├── ascend/             # Ascend operator bindings, native loader and src/ AOT build
 │   │   │   ├── cuda/               # operator-category bindings, native loader and src/ AOT build
 │   │   │   └── rpu/                # family/prepared bindings, asset validation and src/ host/device sources
 │   │   └── conformance/            # planned shared backend conformance suite
@@ -858,12 +857,12 @@ XInfer/
 
 ### 18.2 Native operator sources and the integration boundary
 
-Native operator implementation is maintained in `xinfer/ops/backends/<backend>/src`, alongside its Python bindings and tests. The framework and operator layers have separate responsibilities within one repository; a separately installed xcompute package is not the default source of native CUDA or RPU kernels. The existing Ascend xcompute compatibility provider remains external until its implementation is explicitly migrated. Integration and delivery requirements are:
+Native operator implementation is maintained in `xinfer/ops/backends/<backend>/src`, alongside its Python bindings and tests. The framework and operator layers have separate responsibilities within one repository. Integration and delivery requirements are:
 
 | Item | Convention |
 |---|---|
 | Implementation | In-tree native sources, generic family bindings and catalog entries cover the operators required by supported models; model-specific packing, constants and operation order stay in the model integration |
-| Binding | AOT libraries loaded through TVM-FFI: `xinfer_kernels.so` for CUDA tensor operators and `xinfer_rpu.so` for RPU prepared execution; `torch.library` adapters are added for concrete PyTorch integration needs (§14.2) |
+| Binding | AOT libraries loaded through TVM-FFI: `xinfer_kernels.so` for CUDA tensor operators, `xinfer_kernels_ascend.so` for Ascend tensor operators and `xinfer_rpu.so` for RPU prepared execution; `torch.library` adapters are added for concrete PyTorch integration needs (§14.2) |
 | Validation | Host contracts and build checks are separate from device-source compilation, real-device numerics, replay and model precision/performance gates (§14.1, §17); a host-only or SDK-stub test establishes no device acceptance |
 | Versioning and release | Record library identity, hash and supported capabilities, and validate the backend-specific ABI/build metadata; RPU also matches the native catalog and external asset manifest (§14.3) |
 | Third-party dependencies | Preserve upstream source attribution and applicable license copies; vendor SDKs, compilers and generated RPU assets remain external. Attribution and terms accompany the operator change in `THIRD_PARTY_NOTICES.md` |

@@ -116,26 +116,11 @@ def test_add_rms_norm_is_the_rounded_sum_and_its_norm():
     assert torch.equal(total, residual + x) and torch.equal(normed, reference.rms_norm(residual + x, w, 1e-6))
 
 
-def _fake_package(monkeypatch, tmp_path):
-    """A stand-in ``xcompute`` package whose library is ``tmp_path/xcompute.so``, importable as ``xcompute``."""
-    import importlib.machinery
-    import sys
-    import types
-
-    path = tmp_path / "xcompute.so"
-    path.write_bytes(b"")
-    package = types.ModuleType("xcompute")
-    package.__spec__ = importlib.machinery.ModuleSpec("xcompute", None)
-    package.KERNEL_LIB_PATH = str(path)
-    monkeypatch.setitem(sys.modules, "xcompute", package)
-    monkeypatch.setenv("XCOMPUTE_LIBRARY_PATH", str(path))
-    return package
-
-
 MXFP8 = ("mxfp8_quantize", "mxfp8_layer_norm_quantize", "mxfp8_zero_centered_rms_norm_quantize",
          "mxfp8_add_zero_centered_rms_norm_quantize", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
          "mxfp8_qkv_rope_epilogue")
-FUSED = ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache", "rms_norm",
+FUSED = ("gemm_epilogue", "gemm_split", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_split",
+         "qkv_rope_kvcache", "rms_norm",
          "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm", "prefix_kvcache_attention", "flow_velocity_euler")
 NANO = ("layer_norm_cast", "zero_centered_rms_norm", "add_zero_centered_rms_norm", "modulated_rms_norm",
            "gated_residual_modulated_rms_norm", "identity_layer_norms_", "qkv_norm_split", "qkv_norm_rope_kvcache",
@@ -201,24 +186,6 @@ def test_cuda_operators_use_the_reference_for_a_shape_their_kernel_does_not_take
     assert torch.equal(cuda_flow.flow_velocity_euler(x, h, readout, 0.25),
                        flow.flow_velocity_euler(x, h, readout, 0.25))
     launch.assert_not_called()
-
-
-def test_the_xcompute_library_comes_from_the_installed_package(monkeypatch, tmp_path):
-    from xinfer.ops.backends import _xcompute
-
-    package = _fake_package(monkeypatch, tmp_path)
-    assert _xcompute._package_library() == package.KERNEL_LIB_PATH
-    monkeypatch.setattr(_xcompute.importlib.util, "find_spec", lambda name: None)
-    assert _xcompute._package_library() is None
-
-
-def test_xinfer_xcompute_0_skips_xcompute(monkeypatch):
-    from xinfer.ops.backends import _xcompute
-
-    calls = []
-    monkeypatch.setattr(_xcompute, "_package_library", lambda: calls.append(True))
-    monkeypatch.setenv("XINFER_XCOMPUTE", "0")
-    assert _xcompute._import() is None and calls == []
 
 
 # --------------------------------------------------------------------------- the kernel library (GPU, RTX 5090)
