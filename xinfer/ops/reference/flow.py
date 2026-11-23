@@ -36,6 +36,8 @@ def flow_velocity_euler(x: torch.Tensor, h: torch.Tensor, weight: torch.Tensor, 
     p = h.float() @ weight.float().t()
     if dof_mask is not None:
         m = dof_mask.float()
+        if m.ndim == 2:  # a mask shared by all action rows of its batch entry
+            m = m[:, None, :]
         p = padding_velocity * (1 - m) + p * m
     out = x + dt * p
     if pinned is not None:

@@ -44,7 +44,7 @@ def test_check_distinguishes_accepted_and_declined_calls_on_the_same_backend(tmp
     from xinfer.ops.backends.cuda import flow
     from xinfer.ops.spec import Contract
 
-    x, weight = torch.ones(1, 2, 4), torch.ones(1, 8, 4)
+    x, weight = torch.ones(1, 2, 4), torch.ones(1, 16, 4)
     monkeypatch.setattr(flow, "denoise_input_embed_takes", lambda x, weight: x.size(1) == 1)
     monkeypatch.setattr(flow, "denoise_input_embed", lambda x, weight, **kw: x @ weight[0].T)
     monkeypatch.setenv("XINFER_OPS_STRICT", "1")
@@ -61,7 +61,8 @@ def test_check_distinguishes_accepted_and_declined_calls_on_the_same_backend(tmp
     assert _write_check(tmp_path, "tiny", "cuda", base, stages, replay) == 1
     row, = json.loads((tmp_path / "check.json").read_text())["rows"]
     assert row["observed"] and row["backend"] == "cuda" and row["library"] == "kernels"
-    assert row["reference_calls"] == [{"shape": "x=float32[1,2,4] weight=float32[1,8,4]", "source": "flow_input_embed"}]
+    shape = "x=float32[1,2,4] weight=float32[1,16,4]"
+    assert row["reference_calls"] == [{"shape": shape, "source": "flow_input_embed"}]
     assert "x=float32[1,2,4]" in (tmp_path / "check.md").read_text()
     with pytest.raises(RuntimeError, match="flow_input_embed.*XINFER_OPS_STRICT"):
         base.flow_input_embed(x, weight)

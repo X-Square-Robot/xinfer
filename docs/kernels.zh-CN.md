@@ -36,6 +36,10 @@ xinfer-serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --device cuda
 
 XInfer 从自己的包目录加载 `xinfer_kernels.so`。设置 `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` 时改为加载在别处用同一份源码编译的库。`XINFER_KERNELS=0` 关闭这个后端。同样的环境变量也适用于 `Policy`、测试和 benchmark。
 
+## Flow 内核覆盖范围
+
+Flow 嵌入和 Euler 更新默认使用实测过的内核范围。设置 `XINFER_FLOW_UNMEASURED=1`，可以在构建目标 GPU 上启用已编译内核支持的其他形状。选择时会检查张量类型、对齐、布局、掩码、加数和可选的行替换。不支持的布局会运行参考实现，并沿用严格模式的诊断。`xinfer-profile check` 中的 `kernels:measured` 表示实测范围，`kernels:can_run` 表示兼容但未测速的调用。
+
 ## 检查
 
 `xinfer-serve` 在模型加载后会记录每个算子的后端：

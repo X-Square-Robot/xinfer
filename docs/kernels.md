@@ -36,6 +36,10 @@ xinfer-serve --model wall-oss-0.5 --checkpoint /path/to/checkpoint --device cuda
 
 XInfer loads `xinfer_kernels.so` from its package directory. `XINFER_KERNELS_LIBRARY=/path/to/xinfer_kernels.so` loads a library built elsewhere from the same sources. `XINFER_KERNELS=0` turns the backend off. The same variables apply to `Policy`, the tests and the benchmarks.
 
+## Flow kernel coverage
+
+Flow embedding and Euler updates use the measured kernel ranges by default. Set `XINFER_FLOW_UNMEASURED=1` to use other shapes accepted by the compiled kernels on their build target. Eligibility includes tensor dtype, alignment and layout, masks, addends and optional overrides. Unsupported layouts run the reference and follow the usual strict-mode diagnostics. In `xinfer-profile check`, `kernels:measured` and `kernels:can_run` distinguish a measured range from a compatible unmeasured call.
+
 ## Check
 
 `xinfer-serve` logs each operator's backend when the model is loaded:
