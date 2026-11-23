@@ -5,7 +5,7 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from xinfer.ops.backends.cuda import _kv_tuning as tuning
+from xinfer.ops.backends.cuda import _op_tuning as tuning
 from xinfer.ops.backends.cuda import attn
 
 

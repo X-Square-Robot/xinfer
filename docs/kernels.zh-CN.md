@@ -16,6 +16,8 @@ GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel
 
 对于已测范围以外的输入，如果 split-KV 内核和 FlexAttention 都可用，带或不带输出门控的前缀 KV 缓存注意力默认会比较这两种实现。在启动前设置 `XINFER_OP_TUNING=0` 可跳过计时，按固定顺序选择实现。eager 预热时，两种实现读取相同的缓存，分别写入独立输出。原生结果相对 FlexAttention 的 L2 相对误差须小于 1%。同一进程内，相同设备、布局和选项会复用合格且较快的实现。CUDA Graph 录制时复用已有选择，未命中则使用静态顺序。 静态选路会先检查所有输入（包括 V 缓存的步幅），支持时直接调用原生内核，否则再尝试 FlexAttention 和 PyTorch。
 
+对超出已测范围的分段注意力、带门控的因果注意力和门控 Delta 预填充，如果原生内核和外部库都支持，也会比较两者。记录包含设备、构建、外部库版本和输入布局。用 `XINFER_GEMM_TUNING_FILE` 跨进程复用记录；部署时设置 `XINFER_GEMM_TUNING_READONLY=1`，未命中就走静态选路。
+
 在 Jetson Thor 上，FlexAttention 需要能识别 `sm_110a` 的 PTX 汇编器。如果 Triton 3.6 提示自带的 `ptxas-blackwell` 不支持该目标，请将 `CUDA_HOME` 指向支持 Thor 的 CUDA 工具包，并在启动 XInfer 前设置 `TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"`。
 
 ## 编译

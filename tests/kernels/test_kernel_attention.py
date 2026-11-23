@@ -107,7 +107,7 @@ def test_varlen_takes_only_listed_calls(rnd):
     assert not attn.attention_varlen_takes(rnd(64, 12, 64), [0, 64])  # heads no kernel is tuned for
     assert not attn.attention_varlen_takes(rnd(64, 16, 64), [0, 32])  # bounds that do not end at T
     with pytest.raises(ValueError):
-        attn.attention_varlen(rnd(64, 12, 64), rnd(64, 12, 64), rnd(64, 12, 64), [0, 64])
+        attn.attention_varlen(rnd(64, 12, 64), rnd(64, 12, 64), rnd(64, 12, 64), [0, 32])
 
 
 def test_takes_only_listed_calls(rnd):

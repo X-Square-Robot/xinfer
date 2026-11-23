@@ -170,7 +170,7 @@ def test_the_cuda_modules_register_their_operators_when_the_kernel_library_loads
     try:
         registry = registered(dict(requires=library, platforms=("sm120",), version="sha256:0"))
         names = registry.backend_ops("cuda:kernels")
-        assert set(names) == set(FUSED) | set(NANO) | set(MXFP8) | set(PREFETCH)
+        assert set(names) == set(FUSED) | set(NANO) | set(MXFP8) | set(PREFETCH) | {"gated_causal_attention"}
         # Filter by implementation: the Ascend backend registers some of the same operators after the CUDA modules.
         assert {i.platforms for name in names for i in registry.implementations(name)
                 if i.name == "cuda:kernels"} == {("sm120",)}
