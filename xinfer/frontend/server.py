@@ -11,7 +11,10 @@ response (docs/design.md §9.2, §15).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import itertools
+import json
 import os
 import signal
 import sys
@@ -21,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from typing import Any
 
-from xinfer.frontend.protocol import INTERNAL_ERROR, INVALID_REQUEST, OK, packb, unpackb
+from xinfer.frontend.protocol import INTERNAL_ERROR, INVALID_REQUEST, OK, TIMEOUT, UNAVAILABLE, packb, unpackb
 from xinfer.models.interface import connect
 
 
@@ -39,7 +42,7 @@ def run_frontend(index: int, pipe, options: dict) -> None:
     Hides all CUDA devices, uses one CPU thread for torch and the math
     libraries, makes SIGTERM exit cleanly so the shared-memory buffers are
     unlinked, builds the model's CPU processors (no weights) and serves
-    WebSocket connections until the process is terminated.
+    WebSocket connections until the process is terminated (SIGTERM: after answering the requests it received).
 
     Before serving, each ``options["warmup"]`` entry ``(request, engine outputs)`` runs through the
     InputProcessor and OutputProcessor once, so the first robots do not pay first-call costs such as numba
@@ -53,7 +56,9 @@ def run_frontend(index: int, pipe, options: dict) -> None:
         options: ``model``, ``checkpoint``, ``model_options``, ``host``, ``port``, ``buffers`` (ring
             size), ``buffer_bytes`` (bytes per buffer), ``workers`` (processing threads), ``shm_prefix``,
             ``metrics`` (record ``FrontendMetrics`` and answer ``GET /metrics``) and optionally ``env`` (sent in the
-            metadata frame, default ``"x2robot"``).
+            metadata frame, default ``"x2robot"``), ``info`` (the ``GET /info`` fields the server knows) and
+            ``request_timeout`` (seconds the engine may take for a request before it is answered ``timeout``; 0:
+            no limit).
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = ""  # frontends never touch the GPU
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # until the event loop runs; unwind to unlink the buffers
@@ -84,14 +89,16 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
 
     Pipe protocol with the engine's bridge thread: the frontend sends
     ``("ready", index, None, None)`` once it listens, and
-    ``("request", request_id, connection, manifest)`` per request; the engine answers
+    ``("request", request_id, robot, manifest)`` per request; the engine answers
     ``(request_id, "ok", outputs)`` or ``(request_id, status, error_repr)``. A receiver thread
     resolves the matching futures on the event loop. Input and output
     processing run on ``options["workers"]`` threads: their heavy parts (image
     decode and resize) release the GIL, so requests of different connections
     are processed at the same time. ``GET /healthz`` and ``/ready`` on the same port return 200; with
     ``options["metrics"]``, ``GET /metrics`` returns every process's metrics (``xinfer.observability.metrics``) and
-    each answered request is recorded, else it returns 404.
+    each answered request is recorded, else it returns 404. On SIGTERM the frontend stops listening, answers
+    further messages with ``unavailable``, and once it answered every request it had received (or ``xinfer-serve``
+    exited) closes the connections with code 1001 (going away) and returns.
 
     Args:
         index: frontend number.
@@ -108,31 +115,46 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
 
     recorded = server_metrics.FrontendMetrics() if options.get("metrics") else None
     loop = asyncio.get_running_loop()
-    # SIGTERM ends the loop. A handler raising SystemExit is lost when it runs inside a __del__.
+    # SIGTERM drains the frontend (see the end). A handler raising SystemExit is lost when it runs inside a __del__.
     terminated = asyncio.Event()
     loop.add_signal_handler(signal.SIGTERM, terminated.set)
     pending: dict[int, asyncio.Future] = {}
+    answering = 0  # requests received and not answered yet
     request_ids = itertools.count()
     connections = itertools.count()
     send_lock = threading.Lock()
     worker = ThreadPoolExecutor(max_workers=options["workers"], thread_name_prefix=f"xinfer-prepare-{index}")
 
+    def answered(request_id, status, payload):
+        future = pending.pop(request_id, None)
+        if future is not None:
+            _resolve(future, status, payload)
+
+    def engine_gone():
+        terminated.set()
+        for request_id in list(pending):
+            answered(request_id, UNAVAILABLE, "the engine has stopped")
+
     def receive():
-        """Receiver thread: resolve pending futures with the engine's replies until the pipe closes."""
+        """Receiver thread: resolve pending futures with the engine's replies until the pipe closes, then drain the
+        frontend as on SIGTERM: without the engine process (killed, for example by the OOM killer) it can answer
+        nothing, and it must not keep the port."""
         while True:
             try:
                 message = pipe.recv()
             except (EOFError, OSError):
-                return
+                break
             if message is None:
-                return
+                break
             request_id, status, payload = message
-            future = pending.pop(request_id, None)
-            if future is not None:
-                loop.call_soon_threadsafe(_resolve, future, status, payload)
+            loop.call_soon_threadsafe(answered, request_id, status, payload)
+        loop.call_soon_threadsafe(engine_gone)
 
-    threading.Thread(target=receive, name=f"xinfer-frontend-rx-{index}", daemon=True).start()
+    receiver = threading.Thread(target=receive, name=f"xinfer-frontend-rx-{index}", daemon=True)
+    receiver.start()
     hello = packb(dict(metadata, env=options.get("env", "x2robot")))
+    info = dict(options.get("info", {}), metadata_sha256=hashlib.sha256(hello).hexdigest(),
+                connection_state=getattr(prepare, "connect", None) is not None)
 
     async def handler(websocket):
         """Serve one robot connection: send the metadata frame, then answer requests one at a time.
@@ -163,12 +185,19 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
 
     async def _answer(websocket, connection, prepare_connection):
         """Send the metadata frame, then answer the connection's requests until it closes (``handler``)."""
+        nonlocal answering
         await websocket.send(hello)
         async for message in websocket:
+            if terminated.is_set():
+                with contextlib.suppress(websockets.ConnectionClosed):  # it may be closing already
+                    await websocket.send(packb({"status": UNAVAILABLE, "error": "the server is shutting down"}))
+                continue
+            answering += 1
             received_at = time.perf_counter()
             buffer, status = None, INVALID_REQUEST
             try:
                 observation = unpackb(message)
+                robot_id = observation.get("robot_id")  # else the connection is the robot
                 prepared = await loop.run_in_executor(worker, prepare_connection, observation)
                 prepared_at = time.perf_counter()
                 status = INTERNAL_ERROR
@@ -178,13 +207,23 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
                     raise RuntimeError("prepared request does not fit a shared-memory buffer")
                 request_id = next(request_ids)
                 future = loop.create_future()
-                pending[request_id] = future
                 with send_lock:
-                    pipe.send(("request", request_id, connection, packed))
-                outputs = await future
-                engine_done_at = time.perf_counter()
-                ring.release(buffer)
+                    pipe.send(("request", request_id, connection if robot_id is None else str(robot_id), packed))
+                # The receiver schedules replies on this loop. Transfer the lease before yielding to it.
+                pending[request_id] = future
+
+                def release(done, index=buffer):
+                    ring.release(index)
+                    if not done.cancelled():
+                        done.exception()  # consume late errors after a timeout or disconnect
+
+                future.add_done_callback(release)
                 buffer = None
+                try:
+                    outputs = await asyncio.wait_for(asyncio.shield(future), options.get("request_timeout") or None)
+                except asyncio.TimeoutError:
+                    raise EngineError(TIMEOUT, f"not finished within {options['request_timeout']:g} s") from None
+                engine_done_at = time.perf_counter()
                 response = await loop.run_in_executor(worker, finish, outputs, prepared)
                 finished_at = time.perf_counter()
                 response["status"] = OK
@@ -208,13 +247,21 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
                 if recorded is not None:
                     recorded.answered(status)
                 await websocket.send(packb(reply))
+            finally:
+                answering -= 1
 
     async def process_request(connection, request):
-        """Answer ``/healthz``, ``/ready`` and ``/metrics``; return None to continue the WebSocket handshake."""
+        """Answer ``/healthz``, ``/ready``, ``/info`` (JSON) and ``/metrics``; return None to continue the WebSocket
+        handshake."""
         # Plain HTTP health check on the serving port. Frontends start only
         # after the engine finished warmup, so an open port means ready.
         if request.path in ("/healthz", "/ready"):
             return connection.respond(HTTPStatus.OK, "ok\n")
+        if request.path == "/info":
+            response = connection.respond(HTTPStatus.OK, json.dumps(info))
+            del response.headers["Content-Type"]
+            response.headers["Content-Type"] = "application/json"
+            return response
         if request.path.split("?")[0] == "/metrics":
             if recorded is None:
                 return connection.respond(HTTPStatus.NOT_FOUND, "metrics are disabled\n")
@@ -226,12 +273,15 @@ async def _serve(index, pipe, options, prepare, finish, metadata, ring) -> None:
         return None
 
     server = await websockets.serve(handler, options["host"], options["port"], reuse_port=True,
-                                    max_size=None, compression=None, ping_interval=None,
+                                    max_size=None, compression=None, ping_interval=None, close_timeout=1,
                                     process_request=process_request)
     with send_lock:
         pipe.send(("ready", index, None, None))
     await terminated.wait()
-    server.close()  # stop listening; asyncio.run cancels the handlers still waiting for the engine
+    server.close(close_connections=False)  # stop listening; answer the requests already received
+    while (answering or pending) and receiver.is_alive():  # the receiver stops when xinfer-serve has exited
+        await asyncio.sleep(0.01)
+    await asyncio.gather(*(connection.close(1001) for connection in server.connections))  # going away
 
 
 def _resolve(future: asyncio.Future, status: str, payload: Any) -> None:

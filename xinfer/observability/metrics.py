@@ -128,7 +128,8 @@ class EngineMetrics:
                              multiprocess_mode="livesum", registry=registry)
         self.running = Gauge("xinfer_requests_running", "Admitted requests not yet finished.",
                              multiprocess_mode="livesum", registry=registry)
-        self.healthy = Gauge("xinfer_engine_healthy", "1 while the engine's threads run, else 0.",
+        self.healthy = Gauge("xinfer_engine_healthy",
+                             "1 while the engine's threads run and its device has no error, else 0.",
                              multiprocess_mode="livesum", registry=registry)
         self.late_captures = Counter(
             "xinfer_cudagraph_captures_after_warmup", "CUDA graphs captured while serving: shapes the warmup did "
