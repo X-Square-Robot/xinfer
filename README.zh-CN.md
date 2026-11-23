@@ -131,7 +131,7 @@ WALL-OSS-0.5 需要使用[内部 checkpoint 布局](docs/models/wall_oss_0_5.zh-
     <tr>
       <td>WALL-OSS-1.0-Nano</td>
       <td>BF16</td>
-      <td><a href="https://github.com/X-Square-Robot/xinfer/pull/33">昇腾 950DT</a></td>
+      <td>昇腾 950DT</td>
       <td>20.6 ms</td>
       <td>15</td>
       <td>129 / 163 ms</td>
