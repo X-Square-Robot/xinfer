@@ -62,15 +62,15 @@ def _nvimgcodec_decoder(index: int):
     """NVIDIA's nvImageCodec decoder for CUDA device ``index`` and its sRGB decode parameters, one per device; None
     where nvImageCodec is not installed or has no decoder for the device (the capability ``device_images``).
 
-    One CPU thread: by default nvImageCodec starts one per visible core, and they spin while they wait; in a container
-    with a CPU quota that slows the frontends and the engine under load. Nothing is decoded here: a decode at platform
+    Two host threads let nvJPEG process multiple camera views during hybrid decoding. Bounding their number also
+    avoids a spinning thread per visible core in containers with a CPU quota. Decoding at platform
     resolution left every later CUDA graph replay of the process slower (on an RTX 5090, up to 1 ms per WALL-OSS-0.5
     request).
     """
     try:
         from nvidia import nvimgcodec
 
-        return (nvimgcodec.Decoder(device_id=index, max_num_cpu_threads=1),
+        return (nvimgcodec.Decoder(device_id=index, max_num_cpu_threads=2),
                 nvimgcodec.DecodeParams(color_spec=nvimgcodec.ColorSpec.SRGB))
     except (ImportError, OSError, RuntimeError):  # not installed, or no decoder for this device
         return None

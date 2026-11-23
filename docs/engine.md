@@ -138,10 +138,9 @@ and makes the thread's stream wait for that copy; it keeps the images until an
 event after the copy has completed and then decodes into them again, so a call
 neither allocates new images nor waits for the GPU. On an RTX 5090
 (nvImageCodec 0.10) a call takes 0.4–0.7 ms of the thread for a request's
-camera views. The decoder has one CPU thread: nvImageCodec's default, one per
-visible core, spins while it waits and slowed the frontends and the engine
-under load in a container with a CPU quota. One device-image thread is enough,
-and the decoder is called from it only. The JPEG bytes stay in host memory,
+camera views. The decoder can use up to two host threads, allowing multiple camera views to
+be processed in parallel during hybrid decoding. Capping the pool avoids one
+spinning thread per visible core in CPU-limited containers. The JPEG bytes stay in host memory,
 where nvImageCodec reads the bitstream.
 
 Whether a CUDA device has device images is checked by creating the decoder,
