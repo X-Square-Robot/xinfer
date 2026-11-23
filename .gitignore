@@ -15,6 +15,9 @@ htmlcov/
 # The CUDA kernel library built from xinfer/ops/backends/cuda/src
 /xinfer/ops/backends/cuda/xinfer_kernels.so
 
+# The Ascend kernel library built from xinfer/ops/backends/ascend/src
+/xinfer/ops/backends/ascend/xinfer_kernels_ascend.so
+
 # Local configuration and credentials
 .env
 .env.*

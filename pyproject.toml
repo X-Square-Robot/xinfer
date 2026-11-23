@@ -31,8 +31,9 @@ models = [
 gpu-image = [
     "nvidia-nvimgcodec-cu13>=0.10",
 ]
-# The CUDA kernel library (xinfer/ops/backends/cuda/src) is called through TVM-FFI; building it also needs CMake, the
-# CUDA toolkit and the CUTLASS submodule (docs/kernels.md).
+# The kernel libraries (xinfer/ops/backends/cuda/src and xinfer/ops/backends/ascend/src) are called through
+# TVM-FFI; building them also needs CMake and their hardware toolchains (docs/kernels.md,
+# xinfer/ops/backends/ascend/src/README.md).
 kernels = [
     "apache-tvm-ffi>=0.1",
 ]
@@ -65,7 +66,8 @@ xinfer-profile = "xinfer.entrypoints.profile:main"
 include = ["xinfer*"]
 
 [tool.setuptools.package-data]
-xinfer = ["tuned/*/*.json", "ops/backends/cuda/xinfer_kernels.so"]
+xinfer = ["tuned/*/*.json", "ops/backends/cuda/xinfer_kernels.so", "ops/backends/ascend/xinfer_kernels_ascend.so",
+          "ops/backends/ascend/src/third_party/tilelang/LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -77,6 +79,8 @@ markers = [
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+# Keep the device generators and vendored native sources outside package linting.
+extend-exclude = ["xinfer/ops/backends/ascend/src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
@@ -84,3 +88,7 @@ select = ["E", "F", "W"]
 [tool.ruff.lint.per-file-ignores]
 # Markdown tables in the module docstrings
 "xinfer/ops/backends/cuda/attn.py" = ["E501"]
+# Preserve the existing CANN launch adapters' descriptor names and callable tables.
+"xinfer/ops/backends/ascend/_cann_primitives.py" = ["E741"]
+"xinfer/ops/backends/ascend/cann_projection.py" = ["E731"]
+"xinfer/ops/backends/ascend/core.py" = ["F841"]
