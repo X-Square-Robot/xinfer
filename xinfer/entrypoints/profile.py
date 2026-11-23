@@ -9,6 +9,9 @@ activity, and attributes every GPU activity to its operator call and stage. Then
 graph replay, the serving path, for each stage's GPU span. It writes ``ops.md``, ``ops.csv``, ``ops.json``,
 ``stages.md``, ``trace.json`` (the eager kineto trace), ``trace-graphs.json`` and ``meta.json`` to ``--out``.
 
+``xinfer-profile check``: replay CUDA requests eagerly and write the observed reference fallbacks to
+``check.json`` and ``check.md``. A fallback on any supplied request gives exit status 1.
+
 ``xinfer-profile load``: each request's segment times under closed-loop virtual robots
 (``xinfer.observability.load_profile``): in the engine, waiting for a slot, and per stage the queue, the lane's wait
 for the inputs and upstream stages on the GPU and the run, with the batch size. In process by default; with
@@ -37,7 +40,8 @@ from pathlib import Path
 BOUND_COLUMNS = ("bound_us_per_call", "efficiency", "limiter")
 OP_COLUMNS = {"op": "Operator", "shape": "Call shape", "calls": "Calls", "us_per_call": "µs/call",
               "total_us": "Total µs", "share": "Share", "gflop_per_call": "GFLOP/call", "mb_per_call": "MB/call",
-              "bound_us_per_call": "Bound µs/call", "efficiency": "Efficiency", "limiter": "Limiter", "cost": "Cost"}
+              "bound_us_per_call": "Bound µs/call", "efficiency": "Efficiency", "limiter": "Limiter", "cost": "Cost",
+              "reference": "Torch reference"}
 DIGITS = {"us_per_call": 2, "bound_us_per_call": 2, "gflop_per_call": 3, "mb_per_call": 3}
 STAGE_COLUMNS = {"stage": "Stage", "dispatches": "Dispatches", "host_us": "Host µs", "gpu_span_us": "GPU span µs",
                  "operators_us": "Operators µs", "outside_us": "Outside µs", "overlap_us": "Overlap µs",
@@ -45,13 +49,14 @@ STAGE_COLUMNS = {"stage": "Stage", "dispatches": "Dispatches", "host_us": "Host 
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    """Parse the ``xinfer-profile`` command line (``ops`` and ``load`` subcommands)."""
+    """Parse the ``xinfer-profile`` command line (``ops``, ``check`` and ``load`` subcommands)."""
     parser = argparse.ArgumentParser(prog="xinfer-profile", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("ops", help="the GPU time, cost and bound of every operator")
     load = commands.add_parser("load", help="per-request segment times under closed-loop robot load")
-    for sub in (command, load):
+    check = commands.add_parser("check", help="replay requests and report CUDA operator reference fallbacks")
+    for sub in (command, load, check):
         sub.add_argument("--model", required=True, help="registered model name or module:Class")
         sub.add_argument("--checkpoint", required=True)
         sub.add_argument("--requests", required=True, help="request file (JSON or msgpack), as for --warmup")
@@ -288,8 +293,37 @@ def _load(args) -> int:
     return 0
 
 
+def _write_check(out, model, device, table, stage_ops, references):
+    """Report what ran and keep declared but unexercised stage operators visible."""
+    selections = {row["op"]: row for row in table.report()}
+    calls = {}
+    for label, source in sorted(references.references.items()):
+        name, _, shape = label.removeprefix("op::").partition(" ")
+        calls.setdefault(name, []).append({"shape": shape, "source": source})
+    rows = []
+    ops = references.seen.union(*stage_ops.values())
+    for op in sorted(ops):
+        selection = selections[op]
+        rows.append({"op": op, "stages": ", ".join(s for s, names in stage_ops.items() if op in names),
+                     "backend": selection["backend"], "library": selection["library"],
+                     "observed": op in references.seen, "reference_calls": calls.get(op, [])})
+    ok = not references.references
+    summary = ("No slow reference fallback observed." if ok else "Slow reference fallbacks observed.")
+    lines = [f"# CUDA operator check for {model}", "", summary, ""]
+    for row in rows:
+        status = "observed" if row["observed"] else "not exercised"
+        lines.append(f"- `{row['op']}` ({row['backend']}, {status})")
+        for call in row["reference_calls"]:
+            lines.append(f"  - {call['source']}: `{call['shape']}`")
+    (out / "check.md").write_text("\n".join(lines) + "\n")
+    report = {"model": model, "device": str(device), "ok": ok, "rows": rows}
+    (out / "check.json").write_text(json.dumps(report, indent=2))
+    print(f"{summary} See {out / 'check.md'}")
+    return 0 if ok else 1
+
+
 def main(argv=None) -> int:
-    """Run ``xinfer-profile ops`` or ``xinfer-profile load`` (see the module docstring)."""
+    """Run the selected profiler command."""
     args = parse_args(argv)
     if args.command == "load":
         return _load(args)
@@ -304,30 +338,52 @@ def main(argv=None) -> int:
 
     platform = resolve_platform(args.device)
     if not platform.is_cuda:
-        raise SystemExit("xinfer-profile ops needs a CUDA device")
+        raise SystemExit(f"xinfer-profile {args.command} needs a CUDA device")
     args.out.mkdir(parents=True, exist_ok=True)
     options = apply_image_preprocess_device(json.loads(args.model_options), platform, default="cpu")
     ops.registry.load_plugins()
     base = ops.registry.build_table(platform)
-    recorder = op_profile.CostRecorder()
-    table = annotate.profiled_ops(base).wrapped(recorder)
+    references = op_profile.ReferenceRecorder()
+    table = base.wrapped(references)
+    if args.command == "ops":
+        recorder = op_profile.CostRecorder()
+        table = annotate.profiled_ops(table).wrapped(recorder)
     with ops.use_ops(table):
         model = get_model_class(args.model).from_checkpoint(args.checkpoint, device=platform.device, ops=table,
                                                             **options)
     prepare = model.input_processor()
     requests = [prepare(request) for request in read_requests(args.requests)]
-    count = args.requests_per_run or len(requests)
-    quantization = options.get("quantization", "bf16")
+    if not requests:
+        raise SystemExit("the request file is empty")
+    # Check execution on the supplied requests separately from one-time checkpoint conversion.
+    references.seen.clear()
+    references.references.clear()
+    quantization = getattr(model, "quantization", options.get("quantization", "bf16"))
 
-    def profile(cudagraphs: bool, trace: Path) -> op_profile.Attribution:
+    def engine_for(cudagraphs):
         resolved = resolve(model, platform, model_name=args.model,
                            quantization=quantization if isinstance(quantization, str) else None,
                            explicit=ExplicitSettings(cudagraphs=cudagraphs))
-        engine = Engine(model, platform, resolved.engine_config())
+        return Engine(model, platform, resolved.engine_config())
+
+    if args.command == "check":
+        engine = engine_for(False)
+        try:
+            for request in requests:
+                engine.run(request)
+        finally:
+            engine.shutdown()
+        return _write_check(args.out, args.model, platform.device, base, model.capabilities().stage_ops, references)
+
+    count = args.requests_per_run or len(requests)
+
+    def profile(cudagraphs: bool, trace: Path) -> op_profile.Attribution:
+        engine = engine_for(cudagraphs)
         try:
             for request in requests * 2:  # warmup: lazy initialization, autotuning, graph capture; costs if eager
                 engine.run(request)
             recorder.active = False
+            references.active = False
             annotate.configure(annotate.kineto)
             events = _profile(lambda: [engine.run(requests[i % len(requests)]) for i in range(count)], trace)
         finally:
@@ -344,7 +400,8 @@ def main(argv=None) -> int:
     else:
         peaks, peaks_source = PEAKS.get(environment["gpu"]["name"]), "table"
     stages = set(args.stages.split(",")) if args.stages else None
-    rows = [r for r in op_profile.op_rows(eager, count, recorder.costs, peaks) if not stages or r["stage"] in stages]
+    rows = [r for r in op_profile.op_rows(eager, count, recorder.costs, peaks, references.references)
+            if not stages or r["stage"] in stages]
     stage_rows = [r for r in op_profile.stage_rows(eager, count, replay) if not stages or r["stage"] in stages]
     covered = op_profile.coverage(eager)
     columns = {k: v for k, v in OP_COLUMNS.items() if peaks or k not in BOUND_COLUMNS}

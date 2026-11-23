@@ -65,7 +65,7 @@ import torch
 from xinfer.ops import reference
 from xinfer.ops.backends.cuda._native import BUILD_ARCHS, NATIVE, arch, capturing, lib, scratch
 from xinfer.ops.reference import attn as reference_attn
-from xinfer.ops.registry import register
+from xinfer.ops.registry import note_reference_call, register
 
 flash_attn = flash_attn_2_cuda = None
 if os.environ.get("XINFER_FLASH_ATTN", "1") != "0":
@@ -493,6 +493,7 @@ def gated_delta_rule_prefill(qkv, zba, conv_weight, A_log, dt_bias, norm_weight,
 @register("prefix_kvcache_attention", backend="cuda", **NATIVE)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
     if not attention_kvcache_takes(q, k_cache):
+        note_reference_call("prefix_kvcache_attention", q.shape, k_cache.shape)
         return reference_attn.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
                                                        flash_mask=flash_mask, scale=scale)
     return attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
@@ -503,6 +504,7 @@ def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_
 def segment_attention(q, k, v, cu_seqlens, *, scale=None):
     bounds = tuple(cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else cu_seqlens)
     if not attention_varlen_takes(q, bounds):
+        note_reference_call("segment_attention", q.shape, bounds)
         return reference.varlen_attention(q, k, v, bounds, scale=scale)
     return attention_varlen(q, k, v, bounds, softmax_scale=scale).view(q.shape)
 
@@ -510,6 +512,7 @@ def segment_attention(q, k, v, cu_seqlens, *, scale=None):
 @register("gated_kvcache_attention", backend="cuda", **NATIVE)
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
     if not attention_kvcache_takes(q, k_cache):
+        note_reference_call("gated_kvcache_attention", q.shape, k_cache.shape)
         return reference_attn.gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate,
                                                       flash_mask=flash_mask, scale=scale)
     return attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
@@ -522,6 +525,7 @@ def gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_he
     b, n, _ = qkv.shape
     rows = (qkv.reshape(b * n, -1), zba.reshape(b * n, -1))
     if b != 1 or head_k_dim != head_v_dim or not gated_delta_rule_prefill_takes(*rows, num_k_heads=num_k_heads):
+        note_reference_call("gated_delta_net", qkv.shape, zba.shape, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
         return reference_attn.gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads,
                                               num_v_heads, head_k_dim, head_v_dim, eps)
     out = gated_delta_rule_prefill(*rows, conv_weight, A_log, dt_bias, norm_weight, num_k_heads=num_k_heads,

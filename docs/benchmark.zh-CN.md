@@ -91,6 +91,8 @@ python benchmarks/robot_load.py --url ws://127.0.0.1:33985 --robots 7 --requests
 
 ## 性能表
 
+CUDA 性能测试在单请求延迟和多机器人服务中均设置 `XINFER_OPS_STRICT=1`。融合算子使用慢速参考实现时会报错，包括选中 CUDA 后端却仅对特定形状回退的情况。要测量这种配置，请传入 `--allow-reference`。选项会记录在 `row.json` 中。
+
 [性能表](performance.zh-CN.md)列出 WALL-OSS-1.0-Nano 的测量结果。准备兼容的 checkpoint 和代表性请求后，在空闲 GPU 上运行 `benchmarks/performance.py`。
 
 ```bash

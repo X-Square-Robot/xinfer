@@ -20,10 +20,43 @@ import torch
 from xinfer.observability import annotate
 from xinfer.observability.op_cost import FORMULAS, OpCost, op_cost
 from xinfer.observability.roofline import roofline
+from xinfer.ops import is_slow_fallback
+from xinfer.ops.registry import observe_reference_calls
 
 GPU = ("kernel", "gpu_memcpy", "gpu_memset")
 LAUNCH = ("cuda_runtime", "cuda_driver")
 OUTSIDE = "(outside operators)"
+
+
+class ReferenceRecorder:
+    """Collect the operator and call signature on the eager execution thread of this table."""
+
+    def __init__(self):
+        self.seen = set()
+        self.references = {}
+        self.active = True
+
+    def __call__(self, implementation):
+        function, op = implementation.function, implementation.op
+        params = annotate.parameter_names(function)
+        selected_reference = is_slow_fallback(implementation, "cuda")
+
+        @functools.wraps(function)
+        def recorded(*args, **kwargs):
+            if not self.active:
+                return function(*args, **kwargs)
+            self.seen.add(op)
+
+            def reference(source):
+                label = annotate.label(f"op::{op}", annotate.call_args(params, args, kwargs))
+                self.references[label] = source
+
+            if selected_reference:
+                reference("selected reference")
+            with observe_reference_calls(reference):
+                return function(*args, **kwargs)
+
+        return recorded
 
 
 class CostRecorder:
@@ -152,12 +185,14 @@ def coverage(attribution: Attribution) -> dict:
             "in_operators_us": sum(w[3] for w in under_ops)}
 
 
-def op_rows(attribution: Attribution, requests: int, costs: dict[str, OpCost], peaks: dict | None) -> list[dict]:
+def op_rows(attribution: Attribution, requests: int, costs: dict[str, OpCost], peaks: dict | None,
+            references: dict[str, str] | None = None) -> list[dict]:
     """Per stage, one row per operator call shape and one for the activity outside operators; per request.
 
     Rows are sorted by GPU time within each stage (stages in the order they first run). ``share`` is of the stage's
     GPU time; the bound columns are None without ``peaks``, a cost, or a peak for the cost's pipe.
     """
+    references = references or {}
     stage_of = [d[0] for d in attribution.dispatches]
     calls, time, stage_total = defaultdict(int), defaultdict(float), defaultdict(float)
     for dispatch, label in attribution.calls:
@@ -188,7 +223,8 @@ def op_rows(attribution: Attribution, requests: int, costs: dict[str, OpCost], p
                 "bound_us_per_call": bound.seconds * 1e6 if bound else None,
                 "efficiency": bound.seconds * 1e6 / per_call if bound and per_call else None,
                 "limiter": bound.limiter if bound else None,
-                "cost": None if label == OUTSIDE else "formula" if op in FORMULAS else "generic"})
+                "cost": None if label == OUTSIDE else "formula" if op in FORMULAS else "generic",
+                "reference": references.get(label, "")})
     return rows
 
 

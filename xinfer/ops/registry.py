@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import functools
 import importlib
 import inspect
 import logging
@@ -42,6 +43,36 @@ STRICT_ENV = "XINFER_OPS_STRICT"
 def strict() -> bool:
     """Whether ``XINFER_OPS_STRICT`` (not ``0``) turns slow fallbacks into errors (CI and benchmarks)."""
     return os.environ.get(STRICT_ENV, "0") != "0"
+
+
+# A profiled op installs its listener on the thread actually executing the call.
+_reference_listener = contextvars.ContextVar("xinfer_reference_listener", default=None)
+
+
+@contextlib.contextmanager
+def observe_reference_calls(listener):
+    """Send reference fallbacks in this call to the profiler, including in strict mode."""
+    token = _reference_listener.set(listener)
+    try:
+        yield
+    finally:
+        _reference_listener.reset(token)
+
+
+@functools.lru_cache(maxsize=1024)
+def _warn_reference(op, signature):
+    logger.warning("%s: running the torch reference for %s", op, signature)
+
+
+def note_reference_call(op, *signature):
+    """Report a CUDA backend delegating this shape or option set to its torch reference."""
+    listener = _reference_listener.get()
+    if listener is not None:
+        listener(op)
+    elif strict():
+        raise RuntimeError(f"{op}: running the torch reference for {signature} ({STRICT_ENV} is set)")
+    else:
+        _warn_reference(op, signature)
 
 
 def _skipped(name: str) -> bool:

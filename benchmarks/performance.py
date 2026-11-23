@@ -118,6 +118,13 @@ def machine_snapshot(npu: bool) -> dict:
     return {"gpu_processes": gpu_processes(), "loadavg": os.getloadavg()}
 
 
+def _inference_env(args):
+    """Only the two CUDA inference processes inherit the benchmark's strictness setting."""
+    if args.npu:
+        return None
+    return {**os.environ, "XINFER_OPS_STRICT": "0" if args.allow_reference else "1"}
+
+
 def serve_and_load(args, robots: int, out: Path) -> list[dict]:
     """A new service, ``robot_load.py`` with ``robots`` robots against it, the service stopped; the round summaries."""
     out.mkdir(parents=True)
@@ -131,7 +138,7 @@ def serve_and_load(args, robots: int, out: Path) -> list[dict]:
         command += ["--device", args.device]
     log_path = out / "server.log"
     with log_path.open("w") as log:
-        server = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        server = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=_inference_env(args))
         try:
             while "XINFER READY" not in log_path.read_text(errors="replace"):
                 if server.poll() is not None:
@@ -168,6 +175,8 @@ def main(argv=None) -> int:
                              "applied to the single-request run so both halves use one wiring")
     parser.add_argument("--port", type=int, default=34000)
     parser.add_argument("--out", type=Path, required=True, help="new output directory")
+    parser.add_argument("--allow-reference", action="store_true",
+                        help="allow CUDA benchmark runs that use slow torch operator references")
     args = parser.parse_args(argv)
     device_type = args.device.partition(":")[0] if args.device is not None else "cuda"
     if device_type not in ("cuda", "npu"):
@@ -187,7 +196,7 @@ def main(argv=None) -> int:
         command += ["--op-backends", args.op_backends]
     if args.device is not None:
         command += ["--device", args.device]
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=_inference_env(args))
     latency = json.loads(target.read_text())
     result["latency"] = {k: latency[k] for k in ("total_ms", "prepare_ms", "engine_ms", "output_ms",
                                                  "captures_after_warmup")}
