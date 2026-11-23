@@ -128,7 +128,9 @@ def test_errors_fail_the_run(tmp_path):
 
 
 def test_wallx_robots_send_rtc_fields_from_the_previous_response(tmp_path):
-    pytest.importorskip("cv2")
+    import base64
+
+    cv2 = pytest.importorskip("cv2")
     poses = np.zeros((17, 7), np.float32)
     received = []
     reply = {"status": "ok", "follow1_pos": poses, "follow2_pos": poses, "server_timing": {"infer_ms": 2.0}}
@@ -136,7 +138,11 @@ def test_wallx_robots_send_rtc_fields_from_the_previous_response(tmp_path):
         code = robot_load.main(["--url", url, "--requests", "5", "--warmup-requests", "1", "--rounds", "1",
                                 "--out", str(tmp_path / "out")])
     assert code == 0 and len(received) == 5
-    assert "prev_action_chunk" not in received[0] and received[0]["views"]["camera_front"].shape == (720, 1280, 3)
+    assert "prev_action_chunk" not in received[0]
+    for name, size in (("camera_front", (720, 1280)), ("camera_left", (480, 640)), ("camera_right", (480, 640))):
+        jpeg = base64.b64decode(received[0]["views"][name], validate=True)
+        assert jpeg.startswith(b"\xff\xd8\xff")
+        assert cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR).shape == (*size, 3)
     for request in received[1:]:
         assert request["prev_action_chunk"].shape == (17, 14) and 3 <= request["inference_delay"] <= 8
         assert request["num_flow_steps"] == 5 and request["instruction"] == virtual_robot.INSTRUCTION
