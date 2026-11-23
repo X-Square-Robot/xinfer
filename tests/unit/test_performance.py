@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
 import performance  # noqa: E402
 
@@ -78,7 +80,8 @@ def test_npu_device_and_model_options_reach_both_children(tmp_path, monkeypatch)
             (out / "summary.json").write_text(json.dumps({"rounds": [_round(50)] * performance.ROUNDS}))
 
     class Server:
-        def __init__(self, command, stdout, stderr):
+        def __init__(self, command, stdout, stderr, env):
+            assert env is None
             commands["server"] = command
             stdout.write("XINFER READY\n")
             stdout.flush()
@@ -109,12 +112,15 @@ def test_npu_device_and_model_options_reach_both_children(tmp_path, monkeypatch)
     assert machine["before"]["npu_smi"] == "Ascend inventory"
 
 
-def test_cuda_default_leaves_image_selection_to_policy_capabilities(tmp_path, monkeypatch):
+@pytest.mark.parametrize("extra,strict", [([], "1"), (["--allow-reference"], "0")])
+def test_cuda_image_selection_and_reference_policy_reach_both_children(tmp_path, monkeypatch, extra, strict):
     from xinfer.config import apply_image_preprocess_device
 
     options = {}
+    monkeypatch.setenv("XINFER_OPS_STRICT", "caller")
 
     def run(command, **kwargs):
+        assert kwargs["env"]["XINFER_OPS_STRICT"] == strict
         options["latency"] = json.loads(command[command.index("--model-options") + 1])
         output = Path(command[command.index("--out") + 1])
         output.write_text(json.dumps({"device": "CUDA", "total_ms": {"p50": 25},
@@ -122,6 +128,7 @@ def test_cuda_default_leaves_image_selection_to_policy_capabilities(tmp_path, mo
                                       "captures_after_warmup": {}}))
 
     def serve(args, robots, out):
+        assert performance._inference_env(args)["XINFER_OPS_STRICT"] == strict
         options["server"] = json.loads(args.model_options)
         return [_round(151)] * performance.ROUNDS
 
@@ -130,7 +137,10 @@ def test_cuda_default_leaves_image_selection_to_policy_capabilities(tmp_path, mo
     monkeypatch.setattr(performance, "environment", lambda npu: {})
     assert performance.main(["--name", "CUDA", "--model", "m", "--checkpoint", "ckpt",
                              "--latency-requests", "latency.json", "--warmup", "warmup.json", "--robots", "1",
-                             "--out", str(tmp_path / "result")]) == 0
+                             "--out", str(tmp_path / "result"), *extra]) == 0
+    assert performance.os.environ["XINFER_OPS_STRICT"] == "caller"
+    result = json.loads((tmp_path / "result" / "row.json").read_text())
+    assert result["args"]["allow_reference"] == bool(extra)
     assert set(options) == {"latency", "server"}
     assert all("image_preprocess_device" not in child for child in options.values())
     # Without nvImageCodec, Policy must retain its supported CPU image path.

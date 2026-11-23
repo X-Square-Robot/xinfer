@@ -32,8 +32,7 @@ INSTRUCTION = ("Pick up the red cup from the left side of the table with the rig
 
 
 class Observations:
-    """Seeded synthetic observations in the desktop robot wire schema: two JPEG wrist views, a raw head view and
-    random arm poses.
+    """Seeded synthetic observations in the desktop robot wire schema: three JPEG camera views and random arm poses.
 
     Generate the camera views once per robot so JPEG encoding does not delay each request. Each
     arm's pose is a random xyz position within 0.5 m of the origin, roll/pitch/yaw within pi and a gripper value
@@ -46,16 +45,16 @@ class Observations:
         self.rng = np.random.default_rng(seed)
         self.pose_rng = np.random.default_rng([seed, 1])
         self.views = {"camera_left": self._jpeg(), "camera_right": self._jpeg(),
-                      "camera_front": self.rng.integers(0, 255, (720, 1280, 3), dtype=np.uint8)}
+                      "camera_front": self._jpeg(720, 1280)}
 
     def _pose(self) -> list[float]:
         uniform = self.pose_rng.uniform
         return [*uniform(-0.5, 0.5, 3).tolist(), *uniform(-np.pi, np.pi, 3).tolist(), float(uniform(0.0, 1.0))]
 
-    def _jpeg(self) -> str:
+    def _jpeg(self, height: int = 480, width: int = 640) -> str:
         import cv2
 
-        ok, encoded = cv2.imencode(".jpg", self.rng.integers(0, 255, (480, 640, 3), dtype=np.uint8))
+        ok, encoded = cv2.imencode(".jpg", self.rng.integers(0, 255, (height, width, 3), dtype=np.uint8))
         if not ok:
             raise RuntimeError("JPEG encoding failed")
         return base64.b64encode(encoded.tobytes()).decode("ascii")

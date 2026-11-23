@@ -31,3 +31,18 @@ class Tiny(VLAModel):
 
     def decode(self, batch):
         batch.out["y"].copy_(self.rms_norm(batch.inputs["h"], self.norm_weight, 1e-6))
+
+
+class ReferenceProjection(Tiny):
+    """Exercise a GEMM option the CUDA backend delegates to the torch reference."""
+
+    @classmethod
+    def from_checkpoint(cls, path, *, device, ops=None, **options):
+        model = super().from_checkpoint(path, device=device, ops=ops, **options)
+        model.project = ops.gemm_epilogue
+        return model
+
+    def encode(self, batch):
+        output = batch.out["h"]
+        residual = torch.zeros_like(output)
+        output.copy_(self.project(batch.inputs["x"], self.weight, activation="silu", residual=residual))

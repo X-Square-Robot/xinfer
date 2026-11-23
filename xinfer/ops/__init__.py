@@ -118,6 +118,12 @@ for _spec in (
         "varlen_attention(q, k, v, cu_seqlens, *, scale=None) -> Tensor  # packed [T, H, D]",
         reference.varlen_attention,
     ),
+):
+    registry.define(_spec)
+
+# These public operators have dedicated CUDA kernels or low-precision implementations.
+# Their torch references can execute several operations for a single registered call.
+_cuda_kernel_specs = (
     OpSpec(
         "mxfp8_quantize",
         "mxfp8_quantize(x_bf16[M, K], *, share_scale_128=True) -> (e4m3[M, K], e8m0 scales uint8)",
@@ -300,18 +306,18 @@ for _spec in (
     OpSpec("nvfp4_qkv_rope_epilogue",
            "nvfp4_qkv_rope_epilogue(x(q, s), weight(q[3HD, K/2], s, g), bias, cos[M, R/2], sin, num_heads, head_dim)"
            " -> bf16[M, 3HD]", nvfp4.qkv_rope_epilogue),
-):
+)
+CUDA_FUSED_OPS = frozenset(spec.name for spec in _cuda_kernel_specs)
+for _spec in _cuda_kernel_specs:
     registry.define(_spec)
-del _spec
+del _spec, _cuda_kernel_specs
 
 
-def _is_slow_fallback(implementation) -> bool:
-    """Whether this selection only composes torch code, whatever backend name it registered under.
-
-    The reference is one case; the Ascend backend's graph-safe attention is the other — it registers as
-    ``ascend:torch`` so it composes torch primitives in place of a kernel, exactly as slow as the reference.
-    """
-    return implementation.backend == REFERENCE_BACKEND or implementation.library == "torch"
+def is_slow_fallback(implementation, device_type: str) -> bool:
+    """Whether a selected implementation runs a fused operator on composed torch code."""
+    fused = CUDA_FUSED_OPS if device_type == "cuda" else FUSED_OPS
+    on_torch = implementation.backend == REFERENCE_BACKEND or implementation.library == "torch"
+    return implementation.op in fused and on_torch
 
 
 def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[str]:
@@ -338,7 +344,7 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
         return []
 
     names = sorted({name for names in stage_ops.values() for name in names
-                    if _is_slow_fallback(table.selection(name)) and name in FUSED_OPS})
+                    if is_slow_fallback(table.selection(name), kind)})
     if names:
         hint = ("Build the CUDA kernel library for this GPU: docs/kernels.md" if kind == "cuda" else
                 "Install the Ascend xcompute build, or set XINFER_XCOMPUTE_LIBRARY to it: docs/ascend950dt.md")

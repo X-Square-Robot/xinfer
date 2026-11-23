@@ -14,6 +14,17 @@ Operator profiling builds on these pieces:
 | Operator profile | `xinfer-profile ops`, `xinfer.observability.op_profile` | GPU time, cost and bound of every operator call shape of a model, per stage |
 | Load profile | `xinfer-profile load`, `xinfer.observability.load_profile` | each request's time in the engine under closed-loop robot load: admission, per stage queue, GPU wait and run, batch size |
 
+## Check CUDA operator fallbacks
+
+Replay requests eagerly to see which fused operators used a PyTorch reference. Include the input sizes and options you want to check.
+
+```bash
+xinfer-profile check --model wall-oss-1.0-nano --checkpoint /path/to/checkpoint \
+  --requests requests.msgpack --device cuda --out artifacts/kernel-check
+```
+
+`check.md` and `check.json` list the selected backend, observed operators and input signatures that used a reference. Exit status 1 means a supplied request exercised a slow reference. An operator marked “not exercised” needs another input to check it. The command collects every observed fallback even when `XINFER_OPS_STRICT=1` is set. In `xinfer-profile ops`, the Torch reference column shows fallbacks observed during eager warmup for the same call signature.
+
 ## Annotations
 
 ```python
