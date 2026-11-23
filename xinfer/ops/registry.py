@@ -20,6 +20,7 @@ import os
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 
 from xinfer.ops.spec import Contract, OpSpec
 from xinfer.platforms.interface import Platform
@@ -153,6 +154,10 @@ def _parameters(function: Callable) -> tuple | None:
         return None
 
 
+def _pick(candidates: list[Implementation], pin: str | None) -> Implementation | None:
+    return next((i for i in candidates if pin is None or pin in (i.name, i.backend, i.library)), None)
+
+
 class OpTable:
     """The operators selected for one platform; attribute access returns callables.
 
@@ -182,7 +187,15 @@ class OpTable:
         Returns:
             The wrapped ``OpTable``.
         """
-        selections = {name: replace(i, function=wrap(i)) for name, i in self._selections.items()}
+        selections = {}
+        for name, implementation in self._selections.items():
+            function = wrap(implementation)
+            binder = getattr(implementation.function, "bind", None)
+            if binder is not None:
+                def bind(*, layer_index, _i=implementation, _binder=binder):
+                    return wrap(replace(_i, function=_binder(layer_index=layer_index)))
+                function.bind = bind
+            selections[name] = replace(implementation, function=function)
         return OpTable(self.platform_name, selections)
 
     def __getattr__(self, name: str) -> Callable:
@@ -199,6 +212,17 @@ class OpTable:
     def selection(self, name: str) -> Implementation:
         """The ``Implementation`` selected for operator ``name`` (KeyError if it is not in the table)."""
         return self._selections[name]
+
+    def bind(self, name: str, *, layer_index: int) -> Callable:
+        """Bind an operator's existing implementation to a layer at model construction.
+
+        A backend may expose ``function.bind(layer_index=...)`` to resolve a layer-specific
+        numerical path once. The callable still has the operator's original signature and
+        contract. Without a binder, including references, the selected function is unchanged.
+        """
+        function = self.selection(name).function
+        binder = getattr(function, "bind", None)
+        return function if binder is None else binder(layer_index=layer_index)
 
     def report(self) -> list[dict]:
         """One row per operator, for the startup selection table.
@@ -391,6 +415,9 @@ class OpRegistry:
         the platform is an error. Otherwise the highest-priority supported implementation is selected and the
         reference is the fallback.
 
+        For split projections a split pin takes precedence. A pin on the packed projection selects
+        that provider's dedicated split or a view adapter over its packed implementation.
+
         Args:
             platform: the platform to select for.
             backends: operator name → pin; takes precedence over ``reference_only``.
@@ -409,20 +436,26 @@ class OpRegistry:
         unknown = set(backends) - set(self._specs)
         if unknown:
             raise KeyError(f"unknown operators in backend selection: {sorted(unknown)}")
+        # Stable priority order keeps the first registration when ranks are equal.
+        supported = {name: sorted((i for i in impls if i.supports(platform)), key=lambda i: -i.priority)
+                     for name, impls in self._impls.items()}
         selections = {}
-        for name in self._specs:
-            # stable sort: among equal priorities the first registered comes first
-            candidates = sorted((i for i in self._impls[name] if i.supports(platform)), key=lambda i: -i.priority)
-            if name in backends:
-                pin = backends[name]
-                pinned = [i for i in candidates if pin in (i.name, i.backend, i.library)]
-                if not pinned:
-                    raise RuntimeError(f"backend {pin!r} for {name!r} does not support {platform.name}")
-                selections[name] = pinned[0]
-            elif reference_only:
-                selections[name] = next(i for i in candidates if i.backend == REFERENCE_BACKEND)
-            else:
-                selections[name] = candidates[0]
+        for name, spec in self._specs.items():
+            pin = backends.get(name, REFERENCE_BACKEND if reference_only else None)
+            selected = _pick(supported[name], pin)
+            if spec.fallback is not None:
+                source, adapter = spec.fallback
+                inherited = name not in backends and source in backends
+                packed = _pick(supported.get(source, []), backends[source] if inherited else pin)
+                if packed is not None:
+                    if inherited:
+                        selected = next((i for i in supported[name] if i.name == packed.name), None)
+                    needs_fallback = selected is None or selected.backend == REFERENCE_BACKEND
+                    if needs_fallback and packed.backend != REFERENCE_BACKEND:
+                        selected = replace(packed, op=name, function=partial(adapter, packed.function))
+            if selected is None:
+                raise RuntimeError(f"backend {pin!r} for {name!r} does not support {platform.name}")
+            selections[name] = selected
         return OpTable(platform.name, selections)
 
 

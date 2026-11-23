@@ -40,8 +40,9 @@ logger = logging.getLogger(__name__)
 
 # The operators whose references compose torch code in place of a backend kernel (the fused families of
 # xinfer/ops/reference/); ``warn_slow_fallbacks`` reports these when they run on the reference.
-FUSED_OPS = frozenset({"gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_kvcache",
-                       "prefix_kvcache_attention", "add_rms_norm", "gemm_add_rms_norm", "mlp_add_rms_norm",
+FUSED_OPS = frozenset({"gemm_epilogue", "gemm_split", "gemm_glu_epilogue", "qkv_rope_epilogue", "qkv_rope_split",
+                       "qkv_rope_kvcache", "prefix_kvcache_attention", "add_rms_norm", "gemm_add_rms_norm",
+                       "mlp_add_rms_norm",
                        "flow_velocity_euler", "mxfp8_gemm_epilogue", "mxfp8_gemm_glu_quantize",
                        "mxfp8_qkv_rope_epilogue"})
 
@@ -194,7 +195,7 @@ for _spec in (
            rope.rope_full),
     OpSpec("qkv_norm_split",
            "qkv_norm_split(packed[B, L, 2HD + 2KVD], q_weight, k_weight, num_heads, num_kv_heads, head_dim, eps)"
-           " -> (q, k, v, gate)  # [q_h | gate_h] per head, then K, V",
+           " -> (q, k, v, gate)  # token-major Q/K/V, or backend head-major views; gate [B, L, HD]",
            gemm.qkv_norm_split),
     OpSpec("segment_attention",
            "segment_attention(q[T, H, D], k, v, cu_seqlens, *, scale=None) -> [T, H, D]"
@@ -225,7 +226,8 @@ for _spec in (
            " pinned_rows=None) -> gate  # residual and branch updated in place", norm.identity_layer_norms_),
     OpSpec("qkv_norm_rope_kvcache",
            "qkv_norm_rope_kvcache(x[M, K], weight[(H + 2KV)D + G, K], q_weight[D], k_weight[D], cos[M, R/2],"
-           " sin, k_cache[KV, rows, D], v_cache, start, H, KV, D, eps) -> [M, HD + G]  # K/V written in place",
+           " sin, k_cache[KV, rows, D], v_cache, start, H, KV, D, eps) -> [M, HD + G],"
+           " or backend (q[1, H, M, D], gate[1, M, G])  # K/V written in place",
            gemm.qkv_norm_rope_kvcache),
     # Fused BF16 operators used by WALL-OSS-0.5.
     OpSpec("gemm_epilogue",
@@ -237,17 +239,24 @@ for _spec in (
            " eps)"
            " -> silu(x̂·W_gateᵀ)·(x̂·W_upᵀ)  # x̂ = AdaRMS(x), FP32",
            gemm.gemm_glu_epilogue),
+    OpSpec("gemm_split", "gemm_split(x[M, K], weight[N, K], split_size, *, row_scale[M]=None)"
+           " -> ([M, split_size], [M, N - split_size])  # gemm_epilogue, split without another rounding",
+           gemm.gemm_split, fallback=("gemm_epilogue", gemm.gemm_split_from)),
     OpSpec("qkv_rope_epilogue",
            "qkv_rope_epilogue(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads, head_dim, *,"
            " qk_order='standard') -> [Q | K | V]  # RoPE on the FP32 accumulator; 'any': Q/K channels may come in"
            " pair order", gemm.qkv_rope_epilogue),
+    OpSpec("qkv_rope_split", "qkv_rope_split(x[M, K], weight[3HD, K], bias, cos[M, R/2], sin, num_heads,"
+           " head_dim, *, qk_order='standard') -> (q[M,H,D], k[M,H,D], v[M,H,D])  # strides unspecified",
+           gemm.qkv_rope_split, fallback=("qkv_rope_epilogue", gemm.qkv_rope_split_from)),
     OpSpec("prefix_kvcache_attention",
            "prefix_kvcache_attention(q[B, M, H, D], k_cache[B, L, KV, D], v_cache, prefix_len[B], new_pos, *,"
            " flash_mask=None, scale=None) -> [B, M, HD]  # keys [0, prefix) ∪ [new_pos, new_pos + M)",
            attn.prefix_kvcache_attention),
     OpSpec("qkv_rope_kvcache",
            "qkv_rope_kvcache(x[M, K], weight[(H + 2KV)D, K], bias, cos[M, R/2], sin, k_cache[KV, rows, D], v_cache,"
-           " start, H, KV, D) -> [M, HD]  # K/V written in place", gemm.qkv_rope_kvcache),
+           " start, H, KV, D) -> [M, HD]  # K/V written in place",
+           gemm.qkv_rope_kvcache),
     OpSpec("add_rms_norm", "add_rms_norm(x, residual, weight[K], eps) -> (residual + x, rms_norm(sum))",
            norm.add_rms_norm),
     OpSpec("gemm_add_rms_norm",
@@ -341,7 +350,7 @@ def warn_slow_fallbacks(model: str, table: OpTable, stage_ops, device) -> list[s
                     if _is_slow_fallback(table.selection(name)) and name in FUSED_OPS})
     if names:
         hint = ("Build the CUDA kernel library for this GPU: docs/kernels.md" if kind == "cuda" else
-                "Install the Ascend xcompute build, or set XINFER_XCOMPUTE_LIBRARY to it: docs/ascend950dt.md")
+                "Build the Ascend kernel library for this NPU: docs/ascend950dt.md")
         message = (f"{model}: {len(names)} operators have no fast kernel loaded and fall back to slow torch code "
                    f"({', '.join(names)}). {hint}")
         if strict():
