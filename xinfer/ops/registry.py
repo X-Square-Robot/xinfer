@@ -49,14 +49,26 @@ def strict() -> bool:
 _reference_listener = contextvars.ContextVar("xinfer_reference_listener", default=None)
 
 
+_route_listener = contextvars.ContextVar("xinfer_route_listener", default=None)
+
+
+def note_route(library):
+    """Record the implementation that finished a profiled call."""
+    listener = _route_listener.get()
+    if listener is not None:
+        listener(library)
+
+
 @contextlib.contextmanager
-def observe_reference_calls(listener):
+def observe_reference_calls(listener, route=None):
     """Send reference fallbacks in this call to the profiler, including in strict mode."""
+    route_token = _route_listener.set(route)
     token = _reference_listener.set(listener)
     try:
         yield
     finally:
         _reference_listener.reset(token)
+        _route_listener.reset(route_token)
 
 
 @functools.lru_cache(maxsize=1024)
