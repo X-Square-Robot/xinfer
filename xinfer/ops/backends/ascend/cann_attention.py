@@ -1,0 +1,247 @@
+"""Internal Ascend ACLNN FIA V5 compositions for Wall-style attention."""
+
+from __future__ import annotations
+
+import math
+from itertools import pairwise
+from numbers import Integral, Real
+from threading import Lock
+
+import torch
+from xinfer.ops.backends.ascend import _native
+from xinfer.ops.backends.ascend.core import CORE
+try:  # split-kv-decode: opt-in decode-family kernel pair (XINFER_ASCEND_SPLIT_KV_DECODE)
+    from xinfer.ops.backends.ascend import split_kv_decode as _split_kv_decode
+except Exception:  # pragma: no cover - the route stays off without the lib
+    _split_kv_decode = None
+try:  # layout-reuse integration flags (XINFER_ASCEND_LAYOUT_REUSE, default off)
+    from xinfer.ops.backends.ascend.layout_reuse import enabled as _layout_reuse_enabled
+except Exception:  # pragma: no cover - optional mount
+
+    def _layout_reuse_enabled(_family):
+        return False
+
+_MAX_I32 = 2**31 - 1
+
+
+def _check_qkv(q, k, v, rank):
+    if (
+        q.ndim != rank
+        or k.ndim != rank
+        or k.shape != v.shape
+        or q.device.type != "npu"
+        or any(t.device != q.device or t.dtype != torch.bfloat16 for t in (q, k, v))
+        or not all(0 < dim <= _MAX_I32 for dim in (*q.shape, *k.shape))
+        or q.shape[-1] != k.shape[-1]
+        or q.shape[-1] > 512
+        or q.shape[-2] % k.shape[-2]
+    ):
+        raise ValueError("CANN attention requires compatible BF16 Q/K/V and positive dimensions on one NPU")
+
+
+def _check_tensor(tensor, q, name, shape, dtype):
+    if tensor.device != q.device or tensor.dtype != dtype or tensor.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}, dtype {dtype}, and device {q.device}")
+
+
+def _check_gate(gate, q, rank):
+    if q.ndim != rank or gate is None:
+        raise ValueError(f"gated CANN attention requires rank-{rank} Q and an output gate")
+    _check_tensor(gate, q, "gate", (*q.shape[:-2], q.shape[-2] * q.shape[-1]), torch.bfloat16)
+
+
+def _scale(scale, dim):
+    if scale is None:
+        return dim**-0.5
+    if not isinstance(scale, Real) or not math.isfinite(scale) or scale <= 0:
+        raise ValueError("attention scale must be a positive finite host number")
+    return float(scale)
+
+
+class CannAttention:
+    """Reuse vendor attention for cache, causal, and packed vision calls.
+
+    Warm up on each device and stream with the shapes and static parameters
+    that will be captured. Keep this instance alive while its graphs or
+    submissions are live. Returned tensors have their own storage.
+    """
+
+    def __init__(self):
+        self._bnsd_query = getattr(CORE, "cann_fia_v5_probe_workspace_size", None)
+        self._bnsd_launch = getattr(CORE, "cann_fia_v5_probe", None)
+        self._tnd_query = getattr(CORE, "cann_fia_vision_probe_workspace_size", None)
+        self._tnd_launch = getattr(CORE, "cann_fia_vision_probe", None)
+        if not all(callable(entry) for entry in
+                   (self._bnsd_query, self._bnsd_launch, self._tnd_query, self._tnd_launch)):
+            # Absorbed route (ffi_surface_alignment_v22.md C class): the
+            # production library keeps the FIA V5 cores as internal
+            # composition primitives without the cann_* FFI exports, so bind
+            # their raw C-ABI launchers through ctypes. Builds without either
+            # entry leave the pairs unbound and the capability probes below
+            # degrade to the canonical attention entries as before.
+            from xinfer.ops.backends.ascend import _cann_primitives
+
+            bnsd = _cann_primitives.bnsd_pair()
+            tnd = _cann_primitives.tnd_pair()
+            self._bnsd_query, self._bnsd_launch = bnsd if bnsd else (None, None)
+            self._tnd_query, self._tnd_launch = tnd if tnd else (None, None)
+        self._bsnd_output = _native.BRIDGE.bnsd_pair(bsnd_output=True)
+        self._buffers = {}
+        self._lock = Lock()
+
+    def _key(self, route, q, k, scale, *metadata):
+        stream = torch.npu.current_stream(q.device).npu_stream
+        return (route, q.device, stream, tuple(q.shape), tuple(k.shape), scale, *metadata)
+
+    def _warmed(self, key, create):
+        if key not in self._buffers:
+            if torch.npu.is_current_stream_capturing():
+                raise RuntimeError("warm up CANN attention on this stream and shape before graph capture")
+            self._buffers[key] = create()
+        return self._buffers[key]
+
+    def _run(self, q, k, v, key, parameters, query, launch, *, out=None):
+        if query is None or launch is None:
+            raise RuntimeError("the unified core library lacks the CANN FIA launchers")
+        if out is None:
+            out = torch.empty_like(q)
+
+        def allocate_workspace():
+            size = query(out, q, k, v, *parameters)
+            return torch.empty(size, dtype=torch.uint8, device=q.device)
+
+        workspace = self._warmed(("workspace", *key), allocate_workspace)
+        launch(out, workspace, q, k, v, *parameters)
+        return out
+
+    def _run_bnsd(self, q, k, v, key, drop_mask, scale, inner_precise, *, return_bnsd=False):
+        batch, heads, rows, dim = q.shape
+        # Wall-OSS: keep Q/K/V dense BNSD and let FIA write the projection's token rows directly.
+        if not return_bnsd and self._bsnd_output is not None and (batch, heads, k.shape[1], dim) == (1, 16, 2, 128):
+            out = q.new_empty((batch, rows, heads, dim))
+            # The released CORE wrapper passes sparse_mode (0) to raw FIA as innerPrecise.
+            return self._run(q, k, v, (*key, "BNSD_BSND"), (drop_mask, scale, 0, 0), *self._bsnd_output, out=out)
+        out = self._run(q, k, v, key, (drop_mask, scale, inner_precise, 0), self._bnsd_query, self._bnsd_launch)
+        return out if return_bnsd else out.transpose(1, 2)
+
+    def prefix_kvcache_attention(self, q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None,
+                                return_bnsd=False):
+        """Return packed [B,M,H*D], or the native buffer for the internal gated-attention store."""
+        _check_qkv(q, k_cache, v_cache, 4)
+        batch, rows, heads, dim = q.shape
+        length = k_cache.shape[1]
+        if k_cache.shape[0] != batch or not isinstance(new_pos, Integral) or not 0 <= new_pos <= length - rows:
+            raise ValueError("cache batch or host append position is invalid")
+        new_pos = int(new_pos)
+        _check_tensor(prefix_len, q, "prefix_len", (batch,), torch.int32)
+        if flash_mask is not None:
+            _check_tensor(flash_mask, q, "flash_mask", (batch, 1, length, 2), torch.int32)
+        scale = _scale(scale, dim)
+        if (
+            _split_kv_decode is not None
+            and _split_kv_decode.applies(q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale)
+        ):
+            return _split_kv_decode.prefix_kvcache_attention(
+                q, k_cache, v_cache, prefix_len, new_pos, flash_mask, scale, return_bnsd
+            )
+        key = self._key("cache", q, k_cache, scale)
+
+        def positions():
+            columns = torch.arange(length, device=q.device)[None, None, None, :]
+            query_rows = torch.arange(rows, device=q.device)[None, None, :, None]
+            return columns, query_rows
+
+        def make_drop_mask():
+            columns, query_rows = self._warmed(("positions", *key), positions)
+            keep = (columns < prefix_len.reshape(batch, 1, 1, 1)) | (
+                (columns >= new_pos) & (columns < new_pos + rows)
+            )
+            if flash_mask is not None:
+                lts = flash_mask[..., 0].unsqueeze(-2)
+                ute = flash_mask[..., 1].unsqueeze(-2)
+                keep = keep & (query_rows < lts) & (query_rows >= ute)
+            return (~keep.expand(batch, 1, rows, length)).contiguous()
+
+        # Native workspace belongs to this stream. Serialize host submission
+        # when two callers share it.
+        with self._lock:
+            drop_mask = make_drop_mask()
+            # Feed ACLNN's BNSD layout without per-call copies where the
+            # operator takes it: the wall-style caches arrive as permuted
+            # (B, L, KV, D) views of contiguous (B, KV, L, D) buffers, so the
+            # transpose back to BNSD is a view. FIA still needs dense input Q.
+            def cache_bnsd(tensor):
+                view = tensor.transpose(1, 2)
+                return view if view.is_contiguous() else view.contiguous()
+
+            query = q.transpose(1, 2)
+            if not query.is_contiguous():
+                if _layout_reuse_enabled("reuse_query_buffer"):
+                    def qbuf():
+                        return torch.empty((batch, heads, rows, dim), dtype=q.dtype, device=q.device)
+                    qbuf_v = self._warmed(("qbuf", *key), qbuf)
+                    qbuf_v.copy_(query)
+                    query = qbuf_v
+                else:
+                    query = query.contiguous()
+            keys, values = cache_bnsd(k_cache), cache_bnsd(v_cache)
+            out = self._run_bnsd(query, keys, values, key, drop_mask, scale, 2, return_bnsd=return_bnsd)
+        if return_bnsd:
+            return out
+        return out.reshape(batch, rows, heads * dim)
+
+    def gated_kvcache_attention(self, q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
+        """Attend to the visible cache prefix and new rows, then apply the BF16 gate."""
+        _check_gate(gate, q, 4)
+        out = self.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
+                                          flash_mask=flash_mask, scale=scale)
+        return out * torch.sigmoid(gate)
+
+    def causal_attention(self, q, k, v, *, scale=None):
+        """Attend causally over sequence-major BF16 [B,L,H,D] queries and grouped K/V."""
+        _check_qkv(q, k, v, 4)
+        batch, length, _, dim = q.shape
+        if k.shape[:2] != (batch, length):
+            raise ValueError("causal attention requires matching query and key batch and sequence lengths")
+        scale = _scale(scale, dim)
+        key = self._key("causal", q, k, scale)
+        query, keys, values = (t.transpose(1, 2).contiguous() for t in (q, k, v))
+        with self._lock:
+            # CANN 9.1.1 rejected sparse causal modes for this GQA shape. Keep the dense causal mask.
+            drop_mask = self._warmed(
+                ("mask", *key),
+                lambda: torch.ones((batch, 1, length, length), dtype=torch.bool, device=q.device).triu(1),
+            )
+            return self._run_bnsd(query, keys, values, key, drop_mask, scale, 0)
+
+    def gated_causal_attention(self, q, k, v, gate, *, scale=None):
+        """Attend causally over the entire padded prompt and apply the BF16 gate."""
+        _check_gate(gate, q, 3)
+        out = self.causal_attention(q[None], k[None], v[None], scale=scale)
+        return out[0].flatten(1) * torch.sigmoid(gate)
+
+    def varlen_attention(self, q, k, v, cu_seqlens, *, scale=None):
+        """Attend bidirectionally within static packed TND segments."""
+        _check_qkv(q, k, v, 3)
+        if q.shape != k.shape:
+            raise ValueError("packed attention requires identical Q/K/V shapes")
+        if (
+            not isinstance(cu_seqlens, (tuple, list))
+            or len(cu_seqlens) < 2
+            or not all(isinstance(index, Integral) for index in cu_seqlens)
+        ):
+            raise ValueError("packed attention requires static integer host offsets")
+        bounds = tuple(int(index) for index in cu_seqlens)
+        if bounds[0] != 0 or bounds[-1] != q.shape[0] or any(end < start for start, end in pairwise(bounds)):
+            raise ValueError("packed attention offsets must cover the token sequence in order")
+        # ACLNN takes positive cumulative endpoints, omitting empty segments.
+        endpoints = tuple(end for start, end in pairwise(bounds) if end > start)
+        scale = _scale(scale, q.shape[-1])
+        key = self._key("segments", q, k, scale, endpoints)
+        q, k, v = (t.contiguous() for t in (q, k, v))
+        with self._lock:
+            return self._run(q, k, v, key, (endpoints, scale), self._tnd_query, self._tnd_launch)
+
+    def segment_attention(self, q, k, v, cu_seqlens, *, scale=None):
+        """Run the packed bidirectional attention used by the vision stage."""
+        return self.varlen_attention(q, k, v, cu_seqlens, scale=scale)

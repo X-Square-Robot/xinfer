@@ -8,17 +8,18 @@ weight as it is and accumulate in FP32, and keep the epilogue in FP32 exactly wh
 Nothing here is a hand-written kernel: every entry is ``torch_npu``'s own operator, and the rest is the elementwise
 arithmetic the reference already did.
 
-These entries are **not** the default. They sit below the xcompute ones by priority, so a deployment runs on the
-xcompute kernels unless it opts in with ``--op-backends`` naming this library, e.g.
-``--op-backends gemm_epilogue=ascend:npu_linear``. Measured end to end they were no faster than xcompute (370.4 ms
+These entries are **not** the default. They sit below the provider ones by priority, so a deployment runs on the
+provider kernels unless it opts in with ``--op-backends`` naming this library, e.g.
+``--op-backends gemm_epilogue=ascend:npu_linear``. Measured end to end they were no faster than the provider (370.4 ms
 against 374.4 ms for one WALL-OSS-1.0-Nano request, inside run-to-run noise), so the default stays where the documented
 numbers were taken. The ``partial`` checks keep every layout the official operator cannot take on the reference.
+Contracts against the torch references: tolerance (the CANN operator compositions).
 """
 
 import torch
 import torch.nn.functional as F
 
-from xinfer.ops.backends.ascend._support import VERSION, partial
+from xinfer.ops.backends.ascend._support import partial
 from xinfer.ops.reference.gemm import ACTIVATIONS
 from xinfer.ops.reference.gemm import gemm_epilogue as reference_gemm_epilogue
 from xinfer.ops.reference.gemm import gemm_glu_epilogue as reference_gemm_glu_epilogue
@@ -34,6 +35,8 @@ try:
     import torch_npu
 except ImportError:  # a CPU-only install imports this module and registers nothing
     torch_npu = None
+
+VERSION = None if torch_npu is None else f"torch_npu {torch_npu.__version__}"
 
 _npu_linear = getattr(torch_npu, "npu_linear", None) if torch_npu is not None else None
 _npu_rms_norm = getattr(torch_npu, "npu_rms_norm", None) if torch_npu is not None else None

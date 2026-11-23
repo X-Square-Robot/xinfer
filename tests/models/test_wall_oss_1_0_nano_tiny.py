@@ -124,6 +124,74 @@ def test_the_optimized_composition_is_the_default(tiny_optimized):
     assert tiny_optimized.numerics == "optimized"
 
 
+def test_bf16_vision_uses_the_selected_projection_op(tiny, split_vision_ops):
+    from xinfer.models.wall_oss_1_0_nano.model import WallOSS10Nano
+
+    qkv_calls = set()
+
+    def record(implementation):
+        def call(*args, **kwargs):
+            if implementation.op in ("qkv_rope_split", "qkv_rope_epilogue"):
+                qkv_calls.add((implementation.op, implementation.backend))
+            return implementation.function(*args, **kwargs)
+
+        return call
+
+    with ops.use_ops(split_vision_ops.wrapped(record)):
+        model = WallOSS10Nano.from_checkpoint(tiny.checkpoint, device="cpu")
+    _run(model, "vision", _inputs(model))
+    assert qkv_calls == {("qkv_rope_split", "test-vision")}
+    stages = model.capabilities().stage_ops
+    assert set(stages["vision"]) & {"qkv_rope_split", "qkv_rope_epilogue"} == {"qkv_rope_split"}
+
+
+def test_bf16_prefill_uses_the_selected_split_and_layer_norms(tiny):
+    from xinfer.models.wall_oss_1_0_nano.model import WallOSS10Nano
+
+    registry = ops.OpRegistry()
+    for name in ops.registry.names():
+        registry.define(ops.registry.spec(name))
+    split_ref = registry.spec("gemm_split").reference
+    norm_ref = registry.spec("add_zero_centered_rms_norm").reference
+    split_calls, bindings, norm_calls = [], [], []
+
+    def split(x, weight, split_size, *, row_scale=None):
+        assert row_scale is not None
+        split_calls.append(split_size)
+        return split_ref(x, weight, split_size, row_scale=row_scale)
+
+    def norm(x, residual, weight, eps):
+        pytest.fail("prefill called the unbound residual norm")
+
+    def bind_norm(*, layer_index):
+        bindings.append(layer_index)
+
+        def bound(x, residual, weight, eps):
+            norm_calls.append(layer_index)
+            return norm_ref(x, residual, weight, eps)
+
+        return bound
+
+    norm.bind = bind_norm
+    for name, implementation in (("gemm_split", split), ("add_zero_centered_rms_norm", norm)):
+        registry.add(name, implementation, backend="test-prefill", platforms=("cpu",),
+                     contract=ops.Contract(numerics="bitwise"))
+    pins = dict.fromkeys(("gemm_split", "add_zero_centered_rms_norm"), "test-prefill")
+    table = registry.build_table(resolve_platform("cpu"), backends=pins, reference_only=True)
+    with ops.use_ops(table):
+        model = WallOSS10Nano.from_checkpoint(tiny.checkpoint, device="cpu")
+
+    prefill = model.prefill_stack
+    assert bindings == list(range(len(prefill.layers)))
+    inputs = _inputs(model)
+    inputs["image_embeds"] = _run(model, "vision", inputs)["image_embeds"]
+    _run(model, "prefill", inputs)
+    layer_types = prefill.config.layer_types[:len(prefill.layers)]
+    assert split_calls == [prefill.conv_dim] * layer_types.count("linear_attention")
+    assert norm_calls == [i for i in range(len(prefill.layers) - 1) for _ in range(2)]
+    assert set(pins) <= set(model.capabilities().stage_ops["prefill"])
+
+
 def test_quantization_selects_only_the_requested_stage(tiny):
     from xinfer.models.wall_oss_1_0_nano.model import WallOSS10Nano
 
@@ -248,3 +316,35 @@ def test_warmed_prompt_buckets_replay_without_capture(tiny):
     finally:
         engine.shutdown()
         eager.shutdown()
+
+
+def test_prefill_with_as_many_tokens_as_kv_heads():
+    from types import SimpleNamespace
+
+    from xinfer.models.wallx.optimized import OptimizedPrefill
+    from xinfer.ops.reference.gemm import qkv_norm_split
+    from xinfer.ops.reference.rope import rope_full
+
+    config = SimpleNamespace(hidden_size=8, intermediate_size=8, num_attention_heads=4,
+                             num_key_value_heads=2, head_dim=2, rotary_dim=2,
+                             linear_heads=(1, 1, 2, 2, 3), layer_types=('full_attention',),
+                             full_attention_layers=(0,), rms_norm_eps=1e-6)
+    with ops.use_ops(ops.registry.build_table(resolve_platform('cpu'))):
+        model = OptimizedPrefill(config).to_empty(device='cpu')
+    with torch.no_grad():
+        layer = model.layers[0]
+        layer.input_norm.zero_()
+        layer.q_norm.zero_()
+        layer.k_norm.zero_()
+        layer.qkv.copy_(torch.arange(layer.qkv.numel()).view_as(layer.qkv) * 0.01)
+        h = torch.arange(16, dtype=torch.bfloat16).view(1, 2, 8) * 0.1
+        cos, sin = torch.ones(1, 2, 1), torch.zeros(1, 2, 1)
+        _, x = model._norm(h, layer.input_norm, 'full_attention')
+        q, k, v, _ = qkv_norm_split(model._qkv(x, layer).view(1, 2, -1), layer.q_norm,
+                                    layer.k_norm, 4, 2, 2, 1e-6)
+        _, k = rope_full(q, k, cos, sin, 2)
+        assert not torch.equal(v, v.transpose(1, 2))
+        cache = torch.empty(1, 2, 1, 2, 2, 2, dtype=torch.bfloat16)
+        model(h, cos, sin, cache, torch.ones(2))
+    assert torch.equal(cache[0, 0], k.transpose(1, 2))
+    assert torch.equal(cache[0, 1], v.transpose(1, 2))

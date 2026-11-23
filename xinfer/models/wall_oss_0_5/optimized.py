@@ -30,12 +30,13 @@ DTYPE = torch.bfloat16
 FLOW_TIME_SCALE = 0.999
 
 OPTIMIZED_STAGE_OPS = {
-    "vision": ("gemm_epilogue", "gemm_glu_epilogue", "gemm_add_rms_norm", "qkv_rope_epilogue", "rms_norm",
+    "vision": ("gemm_epilogue", "gemm_glu_epilogue", "gemm_add_rms_norm", "qkv_rope_split", "rms_norm",
                "varlen_attention"),
     "prefill": ("gemm_epilogue", "qkv_rope_kvcache", "mlp_add_rms_norm", "rms_norm", "add_rms_norm",
                 "causal_attention"),
     "action": ("gemm_epilogue", "gemm_glu_epilogue", "qkv_rope_kvcache", "prefix_kvcache_attention",
-               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "prefetch_weights", "join_prefetch"),
+               "rms_norm", "add_rms_norm", "flow_velocity_euler", "linear", "silu", "prefetch_weights",
+               "join_prefetch"),
 }
 
 
@@ -98,9 +99,8 @@ class OptimizedVision(nn.Module):
         normed = ops.rms_norm(x, self.blocks[0].norm1, eps)
         for i, block in enumerate(self.blocks):
             cu_seqlens = layout["cu_full"] if i in c.fullatt_block_indexes else layout["cu_window"]
-            qkv = ops.qkv_rope_epilogue(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d,
-                                        qk_order="any")  # Q and K only feed the attention
-            q, k, v = qkv.view(n, 3, heads, d).unbind(1)
+            q, k, v = ops.qkv_rope_split(normed, block.qkv_weight, block.qkv_bias, cos, sin, heads, d,
+                                         qk_order="any")
             o = ops.varlen_attention(q, k, v, cu_seqlens).reshape(n, -1)
             x, normed = ops.gemm_add_rms_norm(o, block.proj_weight, x, block.norm2, eps, bias=block.proj_bias)
             hidden = ops.gemm_glu_epilogue(normed, block.gate_up_weight, bias=block.gate_up_bias)
@@ -111,8 +111,8 @@ class OptimizedVision(nn.Module):
         return ops.gemm_epilogue(merged, self.merger.fc2_weight, self.merger.fc2_bias)[layout["reverse_index"]]
 
 
-def _layer_params(hidden, intermediate, qkv_rows, q_width, down_t):
-    """Parameters of one decoder layer; the output and down projections stored ``[K, N]`` when ``down_t``."""
+def _layer_params(hidden, intermediate, qkv_rows, q_width, down_t=False):
+    """Parameters of one decoder layer; action output/down weights are physically ``[K, N]``."""
     shapes = dict(input_norm=(hidden,), qkv=(qkv_rows, hidden), qkv_bias=(qkv_rows,), post_norm=(hidden,),
                   gate_up=(2 * intermediate, hidden))
     if down_t:
@@ -135,7 +135,7 @@ class OptimizedPrefill(nn.Module):
         expert = c.experts[0]
         q_width = c.num_attention_heads * c.head_dim
         rows = q_width + 2 * c.num_key_value_heads * c.head_dim
-        self.layers = nn.ModuleList(_layer_params(expert.hidden_size, expert.intermediate_size, rows, q_width, False)
+        self.layers = nn.ModuleList(_layer_params(expert.hidden_size, expert.intermediate_size, rows, q_width)
                                     for _ in range(c.num_hidden_layers))
         self.ops = active_ops()
 
@@ -226,6 +226,11 @@ class OptimizedAction(nn.Module):
         flash_mask = torch.stack((lts, ute), dim=-1).to(torch.int32)[None, None].contiguous()
         cache = torch.empty((*prompt_kv.shape[:-2], p + horizon, d), dtype=prompt_kv.dtype, device=device)
         cache[..., :p, :].copy_(prompt_kv)
+        # Writes and attention reads share the same per-layer cache across all Euler steps.
+        cache_views = []
+        for i in range(len(self.layers)):
+            keys, values = cache[i, 0], cache[i, 1]
+            cache_views.append((keys[0], values[0], keys.transpose(1, 2), values.transpose(1, 2)))
         start = torch.full((1,), p, dtype=torch.int32, device=device)
         dof = x_in["dof_mask"].to(torch.float32)
         x = x_in["noise"].to(torch.float32)
@@ -240,6 +245,9 @@ class OptimizedAction(nn.Module):
             dof_mask, padding = dof, x_in["padding_action"].to(torch.float32) - x
         pinned_rows = delay.to(torch.int32) if rtc else None
         last = len(self.layers) - 1
+        prefetch_weights, qkv_rope_kvcache = ops.prefetch_weights, ops.qkv_rope_kvcache
+        gemm_epilogue, gemm_glu_epilogue = ops.gemm_epilogue, ops.gemm_glu_epilogue
+        add_rms_norm = ops.add_rms_norm
         for step in range(steps):
             tau = torch.where(pinned, torch.ones_like(times[step]), times[step])
             h = self.action_head.embed(x, tau, dof).to(DTYPE)
@@ -247,16 +255,16 @@ class OptimizedAction(nn.Module):
             for i, layer in enumerate(self.layers):
                 # this layer's later weights and the next layer's QKV, read while the QKV and attention run
                 following_qkv = self.layers[(i + 1) % len(self.layers)].qkv
-                ops.prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
-                keys, values = cache[i, 0], cache[i, 1]  # [1, KV, P + H, D]
-                q = ops.qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin, keys[0], values[0], p, heads,
-                                         kv_heads, d)
-                o = ops.prefix_kvcache_attention(q.view(1, horizon, heads, d), keys.transpose(1, 2),
-                                                 values.transpose(1, 2), start, p, flash_mask=flash_mask)
-                h, normed = ops.add_rms_norm(ops.gemm_epilogue(o[0], layer.o_t.t())[None], h, layer.post_norm, eps)
-                hidden = ops.gemm_glu_epilogue(normed[0], layer.gate_up)
+                prefetch_weights((layer.o_t, layer.gate_up, layer.down_t, following_qkv))
+                keys, values, k_arg, v_arg = cache_views[i]
+                q = qkv_rope_kvcache(normed[0], layer.qkv, layer.qkv_bias, cos, sin,
+                                     keys, values, p, heads, kv_heads, d)
+                o = ops.prefix_kvcache_attention(q.view(1, horizon, heads, d), k_arg, v_arg, start, p,
+                                                 flash_mask=flash_mask)
+                h, normed = add_rms_norm(gemm_epilogue(o[0], layer.o_t.t())[None], h, layer.post_norm, eps)
+                hidden = gemm_glu_epilogue(normed[0], layer.gate_up)
                 following = self.final_norm if i == last else self.layers[i + 1].input_norm
-                h, normed = ops.add_rms_norm(ops.gemm_epilogue(hidden, layer.down_t.t())[None], h, following, eps)
+                h, normed = add_rms_norm(gemm_epilogue(hidden, layer.down_t.t())[None], h, following, eps)
             x = ops.flow_velocity_euler(x, normed, self.action_head.proj_back.weight, dts[step], dof_mask, padding,
                                         pinned_rows, prefix)
         ops.join_prefetch()
@@ -267,8 +275,8 @@ def optimized_weight_mapping(model) -> dict[str, Source]:
     """Checkpoint key → tensor of the optimized composition, in its dtypes and orientations.
 
     The ViT, the token embedding and the action head load as for the reference composition (BF16; the action head
-    FP32), the language-model RMSNorm weights FP32. The action stage's output and down projections are stored
-    ``[K, N]``.
+    FP32), the language-model RMSNorm weights FP32. The action output/down weights are physically ``[K, N]``;
+    a backend that needs row-major ``[N, K]`` derives its representation once during eager warmup.
 
     Args:
         model: The ``WallOSS05`` shell built with ``numerics="optimized"``.

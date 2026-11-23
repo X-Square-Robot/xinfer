@@ -85,14 +85,15 @@ class OptimizedAction(nn.Module):
         """After loading, on the weights' device: the modulations of every step and norm, the step sizes on the
         host and the stacked input projection; then the FP32 projections are released.
 
-        ``modulations`` ``[steps + 1, norms, 1, 3·hidden]`` FP32: row ``k < steps`` holds every norm's modulation for
-        flow time ``t_k`` (the generated rows), row ``steps`` for flow time 1 (the pinned RTC rows).
+        Each step holds one FP32 view of shape ``[1, 3 * hidden]`` per norm.
+        The last step holds the modulation for pinned RTC rows.
         """
         head = self.flow_head
         times = self.times(head.w1.weight.device)
         conditions = head.condition(torch.cat((times[:-1], times.new_ones(1))))  # [steps + 1, cond] FP32
         mods = torch.stack([F.linear(conditions, p.weight, p.bias) for p in self.projections], dim=1)
-        self.modulations = mods[:, :, None].contiguous()
+        mods = mods.unsqueeze(2).contiguous()
+        self.modulations = tuple(step.unbind(0) for step in mods.unbind(0))
         self.host_steps = (times[1:] - times[:-1]).tolist()
         self.embed_weight = head.w1.weight[None].float().contiguous()
         del self.projections
@@ -133,6 +134,10 @@ class OptimizedAction(nn.Module):
                 return {name: step_mods[j]}
             return {name: step_mods[j], f"pinned_{name}": pinned_mods[j], "pinned_rows": pinned}
 
+        gemm_epilogue = ops.gemm_epilogue
+        gemm_glu_epilogue = ops.gemm_glu_epilogue
+        identity_layer_norms_ = ops.identity_layer_norms_
+        gated_residual_modulated_rms_norm = ops.gated_residual_modulated_rms_norm
         for step in range(c.num_steps):
             mods = self.modulations[step]
             h = ops.flow_input_embed(z, self.embed_weight, extra=dof)
@@ -142,30 +147,37 @@ class OptimizedAction(nn.Module):
                     if branch is None:
                         normed, gate_in = ops.modulated_rms_norm(h, eps=eps, **mod(mods, 2 * i))
                     else:
-                        normed, gate_in, h = ops.gated_residual_modulated_rms_norm(h, branch, gate, eps=eps,
-                                                                                   **mod(mods, 2 * i))
+                        normed, gate_in, h = gated_residual_modulated_rms_norm(h, branch, gate, eps=eps,
+                                                                               **mod(mods, 2 * i))
                     keys, vals = cache[full.index(i), 0], cache[full.index(i), 1]  # [1, KV, P + H, D]
                     packed = ops.qkv_norm_rope_kvcache(normed[0], layer.qkv, layer.q_norm, layer.k_norm, cos, sin,
                                                        keys[0], vals[0], p, heads, kv_heads, d, eps)
-                    o = ops.gated_kvcache_attention(packed[:, :heads * d].view(1, rows, heads, d),
-                                                    keys.transpose(1, 2), vals.transpose(1, 2), start, p,
-                                                    packed[None, :, heads * d:], flash_mask=flash_mask,
-                                                    scale=d ** -0.5)
-                    mixed = ops.gemm_epilogue(o[0], layer.o_t.t())[None]
-                    normed, gate, h = ops.gated_residual_modulated_rms_norm(h, mixed, gate_in, eps=eps,
-                                                                            **mod(mods, 2 * i + 1))
+                    if isinstance(packed, tuple):
+                        # Normalize the native head-major query to the OpSpec layout by view.
+                        q_attn, gate_rows = packed
+                        o = ops.gated_kvcache_attention(q_attn.transpose(1, 2), keys.transpose(1, 2),
+                                                        vals.transpose(1, 2), start, p, gate_rows,
+                                                        flash_mask=flash_mask, scale=d ** -0.5)
+                    else:
+                        o = ops.gated_kvcache_attention(packed[:, :heads * d].view(1, rows, heads, d),
+                                                        keys.transpose(1, 2), vals.transpose(1, 2), start, p,
+                                                        packed[None, :, heads * d:], flash_mask=flash_mask,
+                                                        scale=d ** -0.5)
+                    mixed = gemm_epilogue(o[0], layer.o_t.t())[None]
+                    normed, gate, h = gated_residual_modulated_rms_norm(h, mixed, gate_in, eps=eps,
+                                                                        **mod(mods, 2 * i + 1))
                 elif branch is None:
                     normed, gate_in = ops.modulated_rms_norm(h, eps=eps, **mod(mods, 2 * i))
-                    normed, gate, h = ops.gated_residual_modulated_rms_norm(h, normed, gate_in, eps=eps,
-                                                                            **mod(mods, 2 * i + 1))
+                    normed, gate, h = gated_residual_modulated_rms_norm(h, normed, gate_in, eps=eps,
+                                                                        **mod(mods, 2 * i + 1))
                 else:
-                    gate = ops.identity_layer_norms_(h, branch, gate, eps=eps,
-                                                     **{**mod(mods, 2 * i, "input_modulation"),
-                                                        **mod(mods, 2 * i + 1, "post_modulation")})
+                    gate = identity_layer_norms_(h, branch, gate, eps=eps,
+                                                 **{**mod(mods, 2 * i, "input_modulation"),
+                                                    **mod(mods, 2 * i + 1, "post_modulation")})
                     normed = branch
-                hidden = ops.gemm_glu_epilogue(normed[0], layer.gate_up)
-                branch = ops.gemm_epilogue(hidden, layer.down_t.t())[None]
-            normed, _, h = ops.gated_residual_modulated_rms_norm(h, branch, gate, eps=eps, **mod(mods, -1))
+                hidden = gemm_glu_epilogue(normed[0], layer.gate_up)
+                branch = gemm_epilogue(hidden, layer.down_t.t())[None]
+            normed, _, h = gated_residual_modulated_rms_norm(h, branch, gate, eps=eps, **mod(mods, -1))
             z = ops.flow_velocity_euler(z, normed, self.flow_head.action_proj_back.weight, self.host_steps[step],
                                         dof_mask, padding, pinned, prefix)
         out.copy_(z)
