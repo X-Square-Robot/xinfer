@@ -20,6 +20,7 @@ INVALID_REQUEST = "invalid_request"  # the request could not be decoded or prepa
 QUEUE_FULL = "queue_full"  # the engine's admission queue is full; retry later
 PER_ROBOT_LIMIT = "per_robot_limit"  # the robot already has its maximum of requests in flight
 UNAVAILABLE = "unavailable"  # the server is shutting down
+TIMEOUT = "timeout"  # the engine did not finish the request within --request-timeout
 INTERNAL_ERROR = "internal_error"  # the server failed while serving the request
 # Engine admission refusals (``AdmitError.code``) as response statuses.
 ADMIT_STATUS = {"queue_full": QUEUE_FULL, "per_robot_limit": PER_ROBOT_LIMIT, "stopped": UNAVAILABLE}

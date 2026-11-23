@@ -17,7 +17,7 @@
 
 | 名称 | 类型 | 标签 | 含义 |
 |---|---|---|---|
-| `xinfer_requests_total` | counter | `status` | 已发出的响应数，按响应状态分（`ok`、`invalid_request`、`queue_full`、`per_robot_limit`、`unavailable`、`internal_error`；见[服务](serving.zh-CN.md#协议)） |
+| `xinfer_requests_total` | counter | `status` | 已发出的响应数，按响应状态分（`ok`、`invalid_request`、`queue_full`、`per_robot_limit`、`unavailable`、`timeout`、`internal_error`；见[服务](serving.zh-CN.md#协议)） |
 | `xinfer_request_duration_seconds` | histogram | | 成功请求从收到消息到构造好响应的时间（`server_timing.infer_ms`） |
 | `xinfer_request_prepare_seconds` | histogram | | 解码和模型的 InputProcessor（`server_timing.prepare_ms`） |
 | `xinfer_request_engine_seconds` | histogram | | 共享内存打包和引擎往返（`server_timing.engine_ms`） |
@@ -25,7 +25,7 @@
 | `xinfer_connections` | gauge | | 打开的 WebSocket 连接数（机器人数） |
 | `xinfer_requests_waiting` | gauge | | 等待准入的请求数（上限为 `--max-queued-requests`） |
 | `xinfer_requests_running` | gauge | | 已准入、尚未完成的请求数（上限为 `--max-running-requests`） |
-| `xinfer_engine_healthy` | gauge | | 引擎各线程都在运行时为 1，否则为 0（随后服务退出） |
+| `xinfer_engine_healthy` | gauge | | 引擎各线程都在运行且设备没有错误时为 1，否则为 0（随后服务退出） |
 | `xinfer_admission_wait_seconds` | histogram | | 引擎中从提交到准入的时间 |
 | `xinfer_stage_wait_seconds` | histogram | `stage` | 每个请求：从该阶段可以开始（请求的输入已在设备上，或其上游阶段都已执行完）到该阶段的发射在设备上开始 |
 | `xinfer_stage_execution_seconds` | histogram | `stage` | 每个请求：为它服务的那次阶段发射在设备上的时间（发射的等待之后和阶段之后的 CUDA 计时事件之差；CPU 上为主机时间） |

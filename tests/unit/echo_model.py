@@ -3,6 +3,7 @@
 import itertools
 import os
 import threading
+import time
 
 import numpy as np
 import torch
@@ -34,7 +35,7 @@ class Prepare:
         if observation.get("rendezvous"):
             RENDEZVOUS.wait()
         tensors = {"x": torch.tensor(np.asarray(observation["x"], dtype=np.float32))[None]}
-        for key in ("fail", "exit"):  # make the stage raise, or end the engine thread
+        for key in ("fail", "exit", "hang", "spin", "slow"):  # stage behaviors, see EchoModel.act
             if observation.get(key):
                 tensors[key] = True
         meta = {"call": next(self.calls)}
@@ -85,4 +86,10 @@ class EchoModel(VLAModel):
             raise RuntimeError("stage failed")
         if "exit" in batch.inputs:
             raise SystemExit  # not caught by the engine loop
+        if "slow" in batch.inputs:
+            time.sleep(1)  # a request in flight for a second
+        if "hang" in batch.inputs:
+            threading.Event().wait()  # a dispatch that never returns
+        if "spin" in batch.inputs:  # a hung device; kept to seconds (2**34 cycles), as the kernel outlives the server
+            torch.cuda._sleep(1 << 34)
         torch.add(batch.inputs["x"] * self.scale, 1.0, out=batch.out["y"])

@@ -43,6 +43,7 @@ robot ◀──WebSocket── frontend: release the buffer → OutputProcessor 
   - `infer_ms`：从请求解码完成到响应编码完成；
   - `prepare_ms`、`engine_ms`、`output_ms`；
   - `frontend`：处理该请求的前端进程。
+- 请求可以在顶层字段 `robot_id` 中携带机器人 id，与 `state`、`views` 同级。这时引擎按机器人 id 跨连接限制在途请求数（`--per-robot-inflight`）；没有时按连接限制。
 - 失败的请求以 `{"status": ..., "error": "<message>"}` 应答，不带 `server_timing`；连接保持打开。机器人需要据此处理的协议错误还带有 `error_info`：
 
   | `status` | 含义 |
@@ -51,10 +52,12 @@ robot ◀──WebSocket── frontend: release the buffer → OutputProcessor 
   | `queue_full` | 引擎的准入队列已满（`--max-queued-requests`）；请稍后重试 |
   | `per_robot_limit` | 该机器人已有 `--per-robot-inflight` 个请求在途 |
   | `unavailable` | 服务正在关闭 |
+  | `timeout` | 引擎没有在 `--request-timeout` 内完成该请求 |
   | `internal_error` | 服务在处理该请求时出错（引擎或输出处理） |
 
   凡 `status` 不是 `"ok"` 的响应都应计为失败。
 - 同一端口上的 `GET /healthz`（或 `/ready`）返回 200。
+- `GET /info` 以 JSON 返回所服务的模型：`model`、`quantization`、`numerics`、`platform`、`version`、`capacity`（`--capacity`，或 null）、`metadata_sha256`（元数据帧的哈希）和 `connection_state`（模型的输入处理器是否保存按连接的状态）。
 - 同一端口上的 `GET /metrics` 返回引擎和所有前端的 Prometheus 指标（[指标](metrics.zh-CN.md)）。
 
 ## 运行
@@ -76,8 +79,12 @@ python -m xinfer.entrypoints.serve --model wall-oss-0.5 --checkpoint /path/to/ch
 | `--profile-dir` | 记录引擎的 span，停止时把每个请求的引擎分段写到该目录；用于剖析运行（`xinfer-profile load --serve`，[剖析](profiling.zh-CN.md#经过-xinfer-serve--serve)），记录随请求数增长 |
 | `--disable-metrics` | 不记录 Prometheus 指标；`GET /metrics` 返回 404（[指标](metrics.zh-CN.md)） |
 | `--reference-ops`, `--op-backends` | 只使用 torch 参考算子；为每个算子按后端、库或两者固定实现（`op=cuda`、`op=kernels`、`op=cuda:kernels`、`op=reference`），固定的实现优先于 `--reference-ops` |
+| `--hang-timeout` | 已准入的请求最多可用的秒数，超过则认为引擎挂起（默认 30）；0 关闭该检查 |
+| `--request-timeout` | 引擎处理一个请求最多可用的秒数，超过则机器人收到 `timeout`（默认 10；0 表示不限制）；引擎仍会把该请求处理完 |
+| `--capacity` | 本服务服务的机器人数，即按其 GPU 和模型配置实测的容量（[性能](performance.zh-CN.md)）；由 `GET /info` 报告 |
+| `--drain-timeout` | 收到 SIGTERM 后前端回复已收到请求最多可用的秒数（默认 10） |
 
-SIGINT/SIGTERM 会停止前端，释放 graph 和锁页缓冲区，并以 0 退出。服务每 0.5 s 检查一次 `Engine.health()`；当引擎无法继续服务（引擎线程或完成线程已停止）时，它以同样的方式关闭并以 1 退出，以便其监管进程重启它。
+SIGTERM 让服务排空：前端停止接受连接（包括健康检查），对之后的消息返回 `unavailable`，回复已收到的每个请求后以代码 1001（going away）关闭连接；此后才到达前端的消息得不到响应。然后服务释放 graph 和锁页缓冲区并以 0 退出，若这些请求在 `--drain-timeout` 秒内没有回复完则以 1 退出。SIGINT 的处理相同，但终端里的 Ctrl-C 也会发给前端，使它们立即停止。服务进程不在了的前端（例如被 OOM killer 杀掉）也以同样方式排空并退出。服务每 0.5 s 检查一次 `Engine.health()`。当引擎无法继续服务（引擎线程或完成线程已停止、设备报告 CUDA 粘滞错误，或者有请求准入超过 `--hang-timeout` 秒仍未完成）时，服务停止前端并以 1 退出，不等待设备，以便其监管进程重启它。挂起的 kernel 在服务退出后仍会继续运行（GPU 会释放它的显存），因此重启后的服务与它共用 GPU，直到它结束或 GPU 被重置。
 
 ## 压测
 
