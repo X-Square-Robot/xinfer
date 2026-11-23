@@ -9,17 +9,14 @@
     denoise_output_euler(x, h, weight, dt=, ...)    x + dt * (h @ weight^T), blended and pinned per row
 
 ``h`` is the decoder's normalized last hidden state; the kernel projects it to the action width, takes the Euler
-step and applies the per-element and per-row overrides, so no intermediate velocity tensor is written. One warp
-per row. It takes the sizes in ``SHAPES``, the ones it is tuned and tested on. ``denoise_input_embed`` embeds the
-step's actions for the decoder, 16 output features per CTA; its sizes are in ``EMBED_SHAPES``. Other calls run
-on the reference. XINFER_FLOW_UNMEASURED=1 also enables compatible unmeasured shapes.
+step and applies the per-element and per-row overrides, so no intermediate velocity tensor is written.
+``SHAPES`` and ``EMBED_SHAPES`` describe measured inputs. Both operators also run natively on other layouts
+accepted by their compiled kernel. Calls outside the kernel's capabilities use the torch reference.
 
 Contracts against the torch references: tolerance.
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 
@@ -48,6 +45,10 @@ def denoise_output_euler_takes(x, h, weight) -> bool:
         return False
     b, m, a = x.shape
     return all(lo <= v <= hi for v, (lo, hi) in ((b, ranges["batch"]), (m, ranges["m"]), (a, ranges["a"])))
+
+
+def _has_kernels(device):
+    return device.type == "cuda" and arch(device) in BUILD_ARCHS
 
 
 def _euler_shape(x, h, weight):
@@ -87,7 +88,7 @@ def denoise_output_euler(x, h, weight, *, dt, dof_mask=None, padding_velocity=No
     the first ``pinned[b]`` rows of request ``b`` keep ``x``, or take ``pinned_values`` (FP32 ``[B, M, A]``) when
     given. Writes ``out`` (default: ``x`` in place) and returns it.
     """
-    if x.device.type != "cuda" or arch(x.device) not in BUILD_ARCHS or not _euler_shape(x, h, weight):
+    if not _has_kernels(x.device) or not _euler_shape(x, h, weight):
         raise ValueError(f"denoise_output_euler: no kernel for x {tuple(x.shape)}, h {tuple(h.shape)} {h.dtype}, "
                          f"weight {tuple(weight.shape)} {weight.dtype} on SM{arch(h.device)} "
                          "(see denoise_output_euler_takes)")
@@ -161,7 +162,7 @@ def denoise_input_embed(x, weight, *, head_index=None, extra=None, input_mask=No
     Returns BF16 ``[B, M, N]``.
     """
     addends = tuple(addends)
-    if x.device.type != "cuda" or arch(x.device) not in BUILD_ARCHS or not _embed_shape(x, weight):
+    if not _has_kernels(x.device) or not _embed_shape(x, weight):
         raise ValueError(f"denoise_input_embed: no kernel for x {tuple(x.shape)}, weight {tuple(weight.shape)} on "
                          f"SM{arch(x.device)} (see denoise_input_embed_takes)")
     if len(addends) > 3:
@@ -189,21 +190,18 @@ def flow_input_embed(x, weight, head_index=None, extra=None, input_mask=None, ad
                      override_mask=None):
     options = dict(head_index=head_index, extra=extra, input_mask=input_mask, addends=tuple(addends),
                    override=override, override_mask=override_mask)
-    measured = denoise_input_embed_takes(x, weight)
-    enabled = measured or (os.environ.get("XINFER_FLOW_UNMEASURED") == "1" and arch(x.device) in BUILD_ARCHS)
-    if not enabled or not _embed_layout(x, weight, **options):
+    if not _has_kernels(x.device) or not _embed_layout(x, weight, **options):
         note_reference_call("flow_input_embed", x.shape, weight.shape)
         return reference_flow.flow_input_embed(x, weight, **options)
+    tier = "measured" if denoise_input_embed_takes(x, weight) else "can_run"
     out = denoise_input_embed(x, weight, **options)
-    note_route("kernels:measured" if measured else "kernels:can_run")
+    note_route(f"{tier} (denoise_input_embed)")
     return out
 
 
 @register("flow_velocity_euler", backend="cuda", **NATIVE)
 def flow_velocity_euler(x, h, weight, dt, dof_mask=None, padding_velocity=None, pinned=None, pinned_values=None):
-    measured = denoise_output_euler_takes(x, h, weight)
-    enabled = measured or (os.environ.get("XINFER_FLOW_UNMEASURED") == "1" and arch(x.device) in BUILD_ARCHS)
-    if not enabled or not _euler_layout(x, h, weight, dof_mask, padding_velocity, pinned, pinned_values):
+    if not _has_kernels(x.device) or not _euler_layout(x, h, weight, dof_mask, padding_velocity, pinned, pinned_values):
         note_reference_call("flow_velocity_euler", x.shape, h.shape, weight.shape)
         return reference_flow.flow_velocity_euler(x, h, weight, dt, dof_mask, padding_velocity, pinned, pinned_values)
     if dof_mask is not None and dof_mask.dtype == torch.bool:
@@ -211,5 +209,6 @@ def flow_velocity_euler(x, h, weight, dt, dof_mask=None, padding_velocity=None, 
     out = denoise_output_euler(x, h, weight, dt=float(dt), dof_mask=dof_mask, padding_velocity=padding_velocity,
                                pinned=None if pinned is None else pinned.to(torch.int32),
                                pinned_values=pinned_values, out=torch.empty_like(x))
-    note_route("kernels:measured" if measured else "kernels:can_run")
+    tier = "measured" if denoise_output_euler_takes(x, h, weight) else "can_run"
+    note_route(f"{tier} (denoise_output_euler)")
     return out

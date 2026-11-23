@@ -9,7 +9,7 @@ from xinfer.ops.reference import flow as ref
 
 
 def test_embedding_layout_falls_back_for_a_strided_mask_and_broadcast_addend(monkeypatch):
-    monkeypatch.setattr(flow, "denoise_input_embed_takes", lambda *_: True)
+    monkeypatch.setattr(flow, "_has_kernels", lambda device: True)
     monkeypatch.setattr(flow, "denoise_input_embed", lambda *_, **kw: pytest.fail("invalid native layout"))
     x, weight = torch.ones(2, 4, 8), torch.ones(1, 16, 8)
     mask = torch.ones(2, 8, dtype=torch.bool)[:, ::2]
@@ -30,35 +30,57 @@ def test_aligned_eligible_flow_rows_and_weight_layout(monkeypatch):
     padding = torch.zeros_like(x)
     assert flow._euler_layout(x, contiguous, w, mask, padding, None, None)
     assert not flow._euler_layout(x, h, w, mask, padding, None, None)
-    monkeypatch.setattr(flow, "denoise_output_euler_takes", lambda *_: True)
-    with observe_reference_calls(lambda _: None):
-        result = flow.flow_velocity_euler(x, h, w, 0.25, mask, padding)
-    assert torch.equal(result, x + 0.25 * (h @ w.T) * mask[:, None, :])
+    monkeypatch.setattr(flow, "_has_kernels", lambda device: True)
+    row_mask = torch.arange(4)[:, None].expand(4, 8) % 2 == 0
+    references = []
+    with observe_reference_calls(references.append):
+        result = flow.flow_velocity_euler(x, h, w, 0.25, row_mask, padding)
+    assert references == ["flow_velocity_euler"]
+    assert torch.equal(result, x + 0.25 * (h @ w.T) * row_mask)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("op", ["flow_input_embed", "flow_velocity_euler"])
-def test_unmeasured_routes_are_opt_in_and_match_the_reference(op, monkeypatch):
+@pytest.mark.parametrize("tier", ["measured", "can_run", "reference"])
+def test_flow_dispatch_uses_native_capabilities_without_tuning(op, tier, monkeypatch):
     device = torch.device("cuda", torch.cuda.current_device())
     if flow.arch(device) not in flow.BUILD_ARCHS:
         pytest.skip("requires the in-tree flow kernels for this device")
     generator = torch.Generator(device=device).manual_seed(213)
+
     def tensor(*shape):
         return torch.randn(shape, device=device, generator=generator)
-    x = tensor(2, 5, 8)
+
+    b, m, a = (1, 5, 26) if tier == "measured" else (2, 5, 8)
+    x = tensor(b, m, a)
     if op == "flow_input_embed":
-        args = x, tensor(1, 32, 8)
-        kw = {"override": tensor(2, 5, 32), "override_mask": tensor(2, 5) > 0}
+        entry = "denoise_input_embed"
+        width = 17 if tier == "reference" else 32
+        args = x, tensor(1, width, a)
+        options = {"override": tensor(b, m, width), "override_mask": tensor(b, m) > 0}
+        expected = ref.flow_input_embed(*args, **options)
     else:
-        args = x, tensor(2, 5, 1024).bfloat16(), tensor(8, 1024) / 32, 0.1
-        kw = {"dof_mask": tensor(2, 8) > 0, "padding_velocity": tensor(2, 5, 8)}
-    expected = getattr(ref, op)(*args, **kw)
-    monkeypatch.delenv("XINFER_FLOW_UNMEASURED", raising=False)
-    reference_calls, routes = [], []
-    with observe_reference_calls(reference_calls.append, routes.append):
-        assert torch.equal(getattr(flow, op)(*args, **kw), expected)
-        monkeypatch.setenv("XINFER_FLOW_UNMEASURED", "1")
-        result = getattr(flow, op)(*args, **kw)
-    assert reference_calls == [op] and routes == ["kernels:can_run"]
-    tolerance = 1e-2 if op == "flow_input_embed" else 2e-3
-    torch.testing.assert_close(result, expected, rtol=tolerance, atol=tolerance)
+        entry = "denoise_output_euler"
+        width = 96 if tier == "reference" else 1024
+        args = x, tensor(b, m, width).bfloat16(), tensor(a, width) / 32, 0.1
+        mask = tensor(b, a) > 0
+        # The native API also accepts [B, A]. Make its batch broadcast explicit for the torch reference.
+        full_mask = mask[:, None, :].expand_as(x)
+        padding = tensor(b, m, a)
+        options = {"dof_mask": full_mask if tier == "reference" else mask, "padding_velocity": padding}
+        expected = ref.flow_velocity_euler(*args, dof_mask=full_mask, padding_velocity=padding)
+    for setting in (None, "0", "1"):
+        if setting is None:
+            monkeypatch.delenv("XINFER_OP_TUNING", raising=False)
+        else:
+            monkeypatch.setenv("XINFER_OP_TUNING", setting)
+        references, routes = [], []
+        with observe_reference_calls(references.append, routes.append):
+            result = getattr(flow, op)(*args, **options)
+        if tier == "reference":
+            assert references == [op] and not routes
+            assert torch.equal(result, expected)
+        else:
+            assert not references and routes == [f"{tier} ({entry})"]
+            tolerance = 1e-2 if op == "flow_input_embed" else 2e-3
+            torch.testing.assert_close(result, expected, rtol=tolerance, atol=tolerance)

@@ -10,7 +10,7 @@ WALL-OSS-0.5 和 WALL-OSS-1.0-Nano 的默认组合在 CUDA 上使用融合算子
 
 kernel 库针对一种 GPU 架构编译，只在这种架构上注册算子。本仓库有 SM120（RTX 50 系列）和 SM110（Jetson Thor）的 kernel。
 
-GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`、`gemm_sm110.py`）：在 RTX 5090 上是实测不慢于 cuBLASLt 路径的行数区间；在 Jetson AGX Thor 上是连续三个或更多扫描点都快至少 5% 的行数区间，与参考 SM110 算子构建的选路一致，本库在参考请求上的输出与该构建逐位相同。在 SM110 上本库覆盖 WALL-OSS-0.5 和 WALL-OSS-1.0-Nano 的 BF16 计算组合。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
+GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`、`gemm_sm110.py`）：在 RTX 5090 上是实测不慢于 cuBLASLt 路径的行数区间；在 Jetson AGX Thor 上是连续三个或更多扫描点都快至少 5% 的行数区间，与参考 SM110 算子构建的选路一致，本库在参考请求上的输出与该构建逐位相同。在 SM110 上本库覆盖 WALL-OSS-0.5 和 WALL-OSS-1.0-Nano 的 BF16 计算组合。注意力和 flow 内核各自的已测形状列在 `attn.py` 和 `flow.py` 中。
 
 当原生 attention 内核不覆盖输入形状时，分段 attention 和带门控的因果 attention 可用 flash-attn，有无输出门控的前缀 KV 缓存 attention 可用编译的 FlexAttention，门控 delta 规则可用 FLA。首次以给定设备、形状、类型、步长和选项在 eager 模式调用时，会尝试可选库。CUDA Graph 录制可以使用已验证可运行的路径，首次就在录制中遇到的新形状则使用参考实现。启动前可设 `XINFER_FLASH_ATTN=0`、`XINFER_FLEX_ATTENTION=0` 或 `XINFER_FLA=0` 关闭对应库。`xinfer-profile check` 的 `routes` 字段按观测到的 attention 调用形状列出实际运行的库。
 
@@ -38,7 +38,7 @@ XInfer 从自己的包目录加载 `xinfer_kernels.so`。设置 `XINFER_KERNELS_
 
 ## Flow 内核覆盖范围
 
-Flow 嵌入和 Euler 更新默认使用实测过的内核范围。设置 `XINFER_FLOW_UNMEASURED=1`，可以在构建目标 GPU 上启用已编译内核支持的其他形状。选择时会检查张量类型、对齐、布局、掩码、加数和可选的行替换。不支持的布局会运行参考实现，并沿用严格模式的诊断。`xinfer-profile check` 中的 `kernels:measured` 表示实测范围，`kernels:can_run` 表示兼容但未测速的调用。
+在受支持的 GPU 上，只要原生内核支持输入的形状、类型、布局和可选参数，`flow_input_embed` 和 `flow_velocity_euler` 就直接运行原生内核，包括实测范围之外的兼容形状。Flow 没有需要比较耗时的外部库，因此设置 `XINFER_OP_TUNING=0` 时也按这条规则选路。不支持的输入使用 torch 参考实现，并沿用严格模式的诊断。`xinfer-profile check` 会显示所选档位和内核入口，例如 `measured (denoise_input_embed)` 或 `can_run (denoise_output_euler)`。
 
 ## 检查
 
