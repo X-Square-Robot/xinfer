@@ -9,6 +9,23 @@ from xinfer.ops.backends.cuda import _kv_tuning as tuning
 from xinfer.ops.backends.cuda import attn
 
 
+@pytest.mark.parametrize(("setting", "expected"), [(None, "kernels"), ("1", "kernels"), ("0", "static")])
+def test_op_tuning_controls_unmeasured_prefix_dispatch(monkeypatch, setting, expected):
+    if setting is None:
+        monkeypatch.delenv("XINFER_OP_TUNING", raising=False)
+    else:
+        monkeypatch.setenv("XINFER_OP_TUNING", setting)
+    monkeypatch.setattr(attn, "arch", lambda device: 120)
+    monkeypatch.setattr(attn, "BUILD_ARCHS", (120,))
+    monkeypatch.setattr(attn.libraries, "FLEX", True)
+    monkeypatch.setattr(tuning, "choose", lambda *args: "kernels")
+    monkeypatch.setattr(attn, "attention_kvcache", lambda *args, **kwargs: "kernels")
+    monkeypatch.setattr(attn, "flex_prefix", lambda *args, **kwargs: "static")
+    q = torch.empty(1, 8, 16, 128, dtype=torch.bfloat16)
+    cache = torch.empty(1, 48, 2, 128, dtype=q.dtype)
+    assert attn.prefix_kvcache_attention(q, cache, cache, torch.tensor([16]), 40) == expected
+
+
 def test_warmup_choices_are_scoped_to_layout_options_and_alignment(monkeypatch):
     calls = []
     monkeypatch.setattr(tuning, "_winners", {})
@@ -56,7 +73,7 @@ def test_an_unmeasured_native_kv_shape_uses_the_warmup_choice_in_capture(gated, 
     device = torch.device("cuda", torch.cuda.current_device())
     if attn.arch(device) not in attn.BUILD_ARCHS or not libraries.FLEX:
         pytest.skip("needs a native CUDA kernel build and FlexAttention")
-    monkeypatch.setenv("XINFER_KV_TUNING", "1")
+    monkeypatch.delenv("XINFER_OP_TUNING", raising=False)
     monkeypatch.setattr(tuning, "_winners", {})
     generator = torch.Generator(device=device).manual_seed(7)
 
@@ -74,6 +91,13 @@ def test_an_unmeasured_native_kv_shape_uses_the_warmup_choice_in_capture(gated, 
     reference_output = getattr(reference, op)(*args)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
+    with monkeypatch.context() as config:
+        config.setenv("XINFER_OP_TUNING", "0")
+        static_routes = []
+        with (torch.cuda.stream(stream),
+              observe_reference_calls(lambda _: pytest.fail("fallback"), static_routes.append)):
+            selected(*args)
+        assert static_routes == ["flex_attention"] and not tuning._winners
     routes = []
     with torch.cuda.stream(stream), observe_reference_calls(lambda _: pytest.fail("fallback"), routes.append):
         result = selected(*args)

@@ -24,8 +24,8 @@ order), deterministic, graph safe. ``varlen_attention``
 takes ``cu_seqlens`` as a host sequence; its device copy is created on the
 first (eager) call for each layout and reused, also inside captured graphs.
 
-The kernels of this backend (``_native``), each on the shapes it is tuned and tested on (``*_takes``); the other
-calls run on the reference:
+The ``*_takes`` predicates select these native kernels on measured shapes. For other compiled prefix KV-cache
+shapes, eager warmup compares the native kernel with FlexAttention unless ``XINFER_OP_TUNING=0``.
 
 | operator | function here |
 |---|---|
@@ -522,7 +522,7 @@ def _unmeasured_kv(q, k, v, prefix_len, new_pos, gate, flash_mask, scale):
         out = libraries.flex()(q, k, v, prefix_len, new_pos, flash_mask, scale)
         return out if gate is None else reference_attn.gate_output(out, gate)
 
-    if (os.environ.get("XINFER_KV_TUNING") == "1" and libraries.FLEX and _compiled_kvcache_takes(q, k)
+    if (os.environ.get("XINFER_OP_TUNING", "1") != "0" and libraries.FLEX and _compiled_kvcache_takes(q, k)
             and (flash_mask is None or flash_mask.shape[1] == 1)):
         args = (q, k, v, prefix_len, new_pos, gate, flash_mask, scale)
         winner = _kv_tuning.choose(op, args, native, external)
