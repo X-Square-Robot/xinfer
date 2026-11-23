@@ -114,3 +114,30 @@ def test_add_rmsnorm_nvfp4_is_the_quantized_bf16_norm(rows, k, weight_dtype, rnd
     assert torch.equal(total, want_total) and torch.equal(out[0], want[0])
     got, padding_zero = scales_of(out)
     assert torch.equal(got, scales_of(want)[0]) and padding_zero
+
+
+@needs_fp4_gemm
+@pytest.mark.parametrize("n,k,epilogue", [
+    (512, 2048, "plain"), (1024, 1024, "residual"), (4096, 1024, "gelu_tanh"),
+])
+def test_sm120_tile_matches_generic_gemm(n, k, epilogue, rnd, monkeypatch):
+    m = 17
+    x = gemm.quantize_nvfp4(rnd(m, k))
+    w = rnd(n, k, scale=0.05)
+    g = w.float().abs().amax().item() / (448 * 6)
+    weight = (*gemm.quantize_nvfp4(w, global_scale=g, mse=True), g)
+    bias = None if epilogue == "plain" else rnd(n)
+    options = {}
+    if epilogue == "residual":
+        options["residual"] = rnd(m, n)
+    elif epilogue == "gelu_tanh":
+        options.update(activation="gelu_tanh", quantize=True)
+    assert gemm.kernel_name("gemm", x, weight, bias, **options) == "cutlass_nvfp4_sm120"
+    actual = gemm.gemm(x, weight, bias, **options)
+    monkeypatch.setattr(gemm, "_kernel_for", lambda *args: None)
+    expected = gemm.gemm(x, weight, bias, **options)
+    if epilogue == "gelu_tanh":
+        assert torch.equal(actual[0], expected[0])
+        assert torch.equal(scales_of(actual)[0], scales_of(expected)[0])
+    else:
+        assert torch.equal(actual, expected)

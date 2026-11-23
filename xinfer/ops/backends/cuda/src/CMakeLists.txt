@@ -87,6 +87,7 @@ set(KERNEL_SM120_SOURCES
   gemm/sm120/tma_streamk_glu_bf16_sm120.cu
   gemm/sm120/gateup_silu.cu
   gemm/sm120/tile_mxfp8_sm120.cu
+  gemm/sm120/nvfp4_cutlass_sm120.cu
   attention/sm120/attention_varlen_lpt_bf16_sm120.cu
 )
 # Kernels whose results are specified bit for bit against torch keep IEEE arithmetic where the rest of the library
