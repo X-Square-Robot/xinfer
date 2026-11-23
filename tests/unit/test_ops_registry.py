@@ -236,3 +236,12 @@ def test_slow_fallbacks_fail_in_strict_mode(monkeypatch):
     with pytest.raises(RuntimeError, match="XINFER_OPS_STRICT"):
         ops.warn_slow_fallbacks("tiny", table, {"action": ("gemm_epilogue",)}, "cuda")
     assert ops.warn_slow_fallbacks("tiny", table, {"action": ("gemm_epilogue",)}, "cpu") == []
+
+
+def test_cuda_checks_composed_references_when_the_kernel_library_is_absent():
+    catalog = OpRegistry()
+    names = ("linear", "flow_input_embed", "qkv_norm_split", "nvfp4_gemm_epilogue", "mxfp8_layer_norm_quantize")
+    for name in names:
+        catalog.define(ops.registry.spec(name))
+    table = catalog.build_table(_platform())
+    assert ops.warn_slow_fallbacks("tiny", table, {"stage": names}, "cuda") == sorted(names[1:])

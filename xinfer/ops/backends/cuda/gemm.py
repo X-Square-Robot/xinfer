@@ -56,7 +56,7 @@ from xinfer.ops.backends.cuda._native import KERNELS, NATIVE, Carver, arch, deri
 from xinfer.ops.backends.cuda.norm import add_rms_norm, rmsnorm
 from xinfer.ops.layout import mxfp8 as layout
 from xinfer.ops.reference import gemm as reference
-from xinfer.ops.registry import register
+from xinfer.ops.registry import note_reference_call, register
 
 
 def _is_pair(t):
@@ -392,6 +392,8 @@ def gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, resid
                   row_scale=None):
     if residual_gate is not None or row_class is not None or (
             residual is not None and (activation is not None or row_scale is not None)):
+        note_reference_call("gemm_epilogue", x.shape, weight.shape, activation, residual is not None,
+                            residual_gate is not None, row_class is not None, row_scale is not None)
         return reference.gemm_epilogue(x, weight, bias, activation=activation, residual=residual,
                                        residual_gate=residual_gate, row_class=row_class, row_scale=row_scale)
     return gemm(x.contiguous(), weight, bias, activation=activation, residual=residual, row_scale=row_scale)
@@ -400,6 +402,7 @@ def gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, resid
 @register("gemm_glu_epilogue", backend="cuda", **NATIVE)
 def gemm_glu_epilogue(x, weight, *, bias=None, modulation=None, row_class=None, eps=1e-6):
     if modulation is not None:
+        note_reference_call("gemm_glu_epilogue", x.shape, weight.shape, "modulation")
         return reference.gemm_glu_epilogue(x, weight, bias=bias, modulation=modulation, row_class=row_class, eps=eps)
     return gemm_glu(x.contiguous(), weight, bias, activation="silu")
 

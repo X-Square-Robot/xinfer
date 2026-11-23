@@ -23,7 +23,7 @@ import torch
 
 from xinfer.ops.backends.cuda._native import BUILD_ARCHS, NATIVE, arch, lib
 from xinfer.ops.reference import flow as reference_flow
-from xinfer.ops.registry import register
+from xinfer.ops.registry import note_reference_call, register
 
 # arch -> K (hidden width) -> inclusive ranges of batch, M (rows) and A (action width)
 SHAPES = {
@@ -136,6 +136,7 @@ def flow_input_embed(x, weight, head_index=None, extra=None, input_mask=None, ad
     options = dict(head_index=head_index, extra=extra, input_mask=input_mask, addends=tuple(addends),
                    override=override, override_mask=override_mask)
     if not denoise_input_embed_takes(x, weight):
+        note_reference_call("flow_input_embed", x.shape, weight.shape)
         return reference_flow.flow_input_embed(x, weight, **options)
     return denoise_input_embed(x, weight, **options)
 
@@ -143,6 +144,7 @@ def flow_input_embed(x, weight, head_index=None, extra=None, input_mask=None, ad
 @register("flow_velocity_euler", backend="cuda", **NATIVE)
 def flow_velocity_euler(x, h, weight, dt, dof_mask=None, padding_velocity=None, pinned=None, pinned_values=None):
     if not denoise_output_euler_takes(x, h, weight):
+        note_reference_call("flow_velocity_euler", x.shape, h.shape, weight.shape)
         return reference_flow.flow_velocity_euler(x, h, weight, dt, dof_mask, padding_velocity, pinned, pinned_values)
     return denoise_output_euler(x, h, weight, dt=float(dt), dof_mask=dof_mask, padding_velocity=padding_velocity,
                                    pinned=None if pinned is None else pinned.to(torch.int32),

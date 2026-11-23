@@ -12,6 +12,8 @@ kernel 库针对一种 GPU 架构编译，只在这种架构上注册算子。�
 
 GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel 执行，否则走 cuBLASLt，epilogue 由单独的 kernel 完成。每个 kernel 接受的形状写在发射它的代码旁边（`xinfer/ops/backends/cuda/gemm_sm120.py`、`gemm_sm110.py`）：在 RTX 5090 上是实测不慢于 cuBLASLt 路径的行数区间；在 Jetson AGX Thor 上是连续三个或更多扫描点都快至少 5% 的行数区间，与参考 SM110 算子构建的选路一致，本库在参考请求上的输出与该构建逐位相同。在 SM110 上本库覆盖 WALL-OSS-0.5 和 WALL-OSS-1.0-Nano 的 BF16 计算组合。注意力和 flow 的 kernel 以同样方式列出各自的形状（`attn.py`、`flow.py`），范围之外的调用运行 torch 参考实现。
 
+当原生 attention 内核不覆盖输入形状时，分段 attention 和带门控的因果 attention 可用 flash-attn，有无输出门控的前缀 KV 缓存 attention 可用编译的 FlexAttention，门控 delta 规则可用 FLA。首次以给定设备、形状、类型、步长和选项在 eager 模式调用时，会尝试可选库。CUDA Graph 录制可以使用已验证可运行的路径，首次就在录制中遇到的新形状则使用参考实现。启动前可设 `XINFER_FLASH_ATTN=0`、`XINFER_FLEX_ATTENTION=0` 或 `XINFER_FLA=0` 关闭对应库。`xinfer-profile check` 的 `routes` 字段按观测到的 attention 调用形状列出实际运行的库。
+
 ## 编译
 
 编译需要 CUDA 13 工具链、CMake 3.24 或更高版本（SM110 需要 3.28）、`apache-tvm-ffi` Python 包和 CUTLASS 头文件（子模块）：
