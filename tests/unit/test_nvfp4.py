@@ -374,8 +374,8 @@ def nvfp4_backends():
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("m,n,k", [(868, 4096, 1024), (464, 2048, 6144), (217, 2048, 4096)])
-def test_xcompute_backends_follow_the_references(nvfp4_backends, m, n, k):
-    """xcompute against the references: the quantizer divides as the Wall-X kernels (``a · rcp.approx(b)``), so its
+def test_public_cuda_backends_follow_the_references(nvfp4_backends, m, n, k):
+    """Public CUDA quantization divides as the Wall-X kernels (``a · rcp.approx(b)``), so its
     elements may differ at rounding ties only; GEMMs differ by summation order only."""
     torch.manual_seed(m + n)
     t = nvfp4_backends
@@ -399,3 +399,24 @@ def test_xcompute_backends_follow_the_references(nvfp4_backends, m, n, k):
     glu = t.nvfp4_gemm_glu_quantize(x, weight)
     ref = nvfp4.gemm_glu_quantize(x, weight)
     assert float((nvfp4.dequantize(*glu) == nvfp4.dequantize(*ref)).float().mean()) > 0.95
+
+
+def test_cuda_projection_declines_16_column_input_before_launch():
+    from xinfer.ops.backends.cuda.gemm import nvfp4_gemm
+    from xinfer.ops.reference import nvfp4
+    from xinfer.ops.registry import observe_reference_calls
+
+    x = nvfp4.quantize(torch.ones(2, 16, dtype=torch.bfloat16))
+    w = nvfp4.quantize(torch.ones(32, 16, dtype=torch.bfloat16))
+    calls = []
+    with observe_reference_calls(calls.append):
+        actual = nvfp4_gemm(*x, *w)
+    assert calls == ["nvfp4_gemm"] and torch.equal(actual, nvfp4.gemm(*x, *w))
+
+
+def test_cuda_epilogue_rejects_quantized_residual():
+    from xinfer.ops.backends.cuda.gemm import nvfp4_gemm_epilogue
+
+    x = nvfp4.quantize(torch.ones(2, 32, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="residual and out_quant"):
+        nvfp4_gemm_epilogue(x, (*x, 1.0), residual=torch.ones(2, 2), out_quant=True)

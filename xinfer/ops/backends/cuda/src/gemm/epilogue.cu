@@ -12,6 +12,7 @@
 
 #include "common/cuda_pdl.cuh"
 #include "quant/mxfp8_format_core.cuh"
+#include "quant/nvfp4_format_core.cuh"
 #include "common/tvm_ffi_cuda_tensor.h"
 
 namespace xinfer::gemm {
@@ -303,6 +304,64 @@ __global__ void GluQuantKernel(uint8_t* q, uint8_t* scales, const __nv_bfloat16*
   }
 }
 
+// NVFP4 output (nvfp4_format_core.cuh, amax scales, global scale 1) of a BF16 GEMM result y: h = y (act < 0),
+// bf16(act(y)) (group 0) or bf16(act(gate_j) * up_j) (y [M, 2N] in GateIndex order of `group`), each the BF16 value
+// ActKernel / GluKernel would write, quantized. Two threads per 16-column block of h, eight columns each; threads
+// past the last block or row write the zero padding scale.
+__global__ void QuantNvfp4Kernel(uint8_t* q, uint8_t* scales, const __nv_bfloat16* y, int64_t m, int64_t padded_m,
+                                 int64_t n, int act, int64_t group, int scale_col_blocks, bool vector_loads) {
+  Enter();
+  const int64_t per_row = int64_t{scale_col_blocks} * 8;
+  const int64_t total = padded_m * per_row;
+  const int64_t k_blocks = n / xinfer::nvfp4::kBlock;
+  for (int64_t t = blockIdx.x * int64_t{blockDim.x} + threadIdx.x; t < total; t += int64_t{gridDim.x} * blockDim.x) {
+    const int64_t row = t / per_row;
+    const int j = static_cast<int>(t - row * per_row);
+    const int block = j / 2, half = j & 1;
+    const bool live = row < m && block < k_blocks;
+    float v[8];
+    float amax = 0.0f;
+    if (live) {
+      const int64_t col0 = int64_t{block} * 16 + half * 8;
+      // the eight inputs (and, for a GLU, the eight up values `group` columns on); contiguous when vector_loads
+      const int64_t base = group > 0 ? GateIndex(row, col0, n, group) : row * n + col0;
+      __align__(16) __nv_bfloat16 g8[8], u8[8];  // filled by 16-byte loads
+      if (vector_loads) {
+        *reinterpret_cast<uint4*>(g8) = *reinterpret_cast<const uint4*>(y + base);
+        if (group > 0) *reinterpret_cast<uint4*>(u8) = *reinterpret_cast<const uint4*>(y + base + group);
+      } else {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          const int64_t gi = group > 0 ? GateIndex(row, col0 + e, n, group) : base + e;
+          g8[e] = y[gi];
+          if (group > 0) u8[e] = y[gi + group];
+        }
+      }
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        float h;
+        if (group > 0) {
+          h = __bfloat162float(__float2bfloat16(Act(__bfloat162float(g8[e]), act) * __bfloat162float(u8[e])));
+        } else {
+          h = __bfloat162float(g8[e]);
+          if (act >= 0) h = __bfloat162float(__float2bfloat16(Act(h, act)));
+        }
+        v[e] = h;
+        amax = fmaxf(amax, fabsf(h));
+      }
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(__activemask(), amax, 1));
+    const int64_t offset = xinfer::nvfp4::ScaleOffset(row, block, scale_col_blocks);
+    if (!live) {
+      if (half == 0) scales[offset] = 0;
+      continue;
+    }
+    const float scale = xinfer::nvfp4::AmaxScale(amax, 1.0f);
+    if (half == 0) scales[offset] = xinfer::nvfp4::ScaleBits(scale);
+    *reinterpret_cast<uint32_t*>(q + row * (n / 2) + block * 8 + half * 4) = xinfer::nvfp4::Pack8(v, scale);
+  }
+}
+
 __device__ float BlockSum(float v, float* shared) {
   for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -534,6 +593,40 @@ void EpilogueGluQuant(TensorView q, TensorView scales, TensorView y, int64_t act
          ConstData<__nv_bfloat16>(y), m, n, q.size(1), static_cast<int>(act), group, share_128, scale_cols4);
 }
 
+void EpilogueQuantNvfp4(TensorView q, TensorView scales, TensorView y, int64_t act, int64_t group) {
+  using namespace xinfer::ffi;
+  CheckBf16Matrix(y, "y");
+  CheckCuda(q, "q");
+  CheckUInt8(q, "q");
+  CheckContiguous(q, "q");
+  CheckFloat8E4M3Storage(scales, "scales");
+  CheckContiguous(scales, "scales");
+  CheckSameDevice(q, y, "gemm_epilogue_quant_nvfp4: q");
+  CheckSameDevice(scales, y, "gemm_epilogue_quant_nvfp4: scales");
+  if (q.ndim() != 2) throw std::runtime_error("gemm_epilogue_quant_nvfp4: q must be rank-2");
+  const int64_t m = y.size(0), n = group > 0 ? y.size(1) / 2 : y.size(1);
+  if ((group > 0 && y.size(1) % 2) || q.size(0) != m || n % 16 || q.size(1) != n / 2) {
+    throw std::runtime_error("gemm_epilogue_quant_nvfp4: y [M, N] (GLU: [M, 2N]), q uint8 [M, N / 2], N % 16 == 0");
+  }
+  if (act < -1 || act > 2 || (group > 0 && (act != 0 && act != 1))) {
+    throw std::runtime_error("gemm_epilogue_quant_nvfp4: act must be -1 or 0..2 (GLU: 0 silu or 1 gelu_tanh)");
+  }
+  if (group < 0 || (group > 0 && n % group)) throw std::runtime_error("gemm_epilogue_quant_nvfp4: group must divide N");
+  if (NumBytes(scales) < xinfer::nvfp4::ScaleStorageBytes(m, n)) {
+    throw std::runtime_error("gemm_epilogue_quant_nvfp4: scale storage too small (SWIZZLE_32_4_4)");
+  }
+  if (reinterpret_cast<uintptr_t>(q.data_ptr()) % 4) {
+    throw std::runtime_error("gemm_epilogue_quant_nvfp4: q must be 4-byte aligned (four bytes per store)");
+  }
+  if (m * n == 0) return;
+  const int scale_col_blocks = static_cast<int>((n / 16 + 3) / 4);
+  const int64_t padded_m = (m + 127) / 128 * 128;
+  // eight consecutive inputs per thread: N and the gate/up group are multiples of 8 (N % 16 == 0 is checked)
+  const bool vector_loads = (group == 0 || group % 8 == 0) && reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0;
+  Launch(Blocks(padded_m * scale_col_blocks * 8), Stream(y), QuantNvfp4Kernel, Data<uint8_t>(q), Data<uint8_t>(scales),
+         ConstData<__nv_bfloat16>(y), m, padded_m, n, static_cast<int>(act), group, scale_col_blocks, vector_loads);
+}
+
 void EpilogueQkNorm(TensorView qkv, TensorView q_weight, TensorView k_weight, int64_t q_heads, int64_t kv_heads,
                     int64_t head_dim, double eps, bool zero_centered) {
   using namespace xinfer::ffi;
@@ -565,3 +658,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_epilogue_rope, xinfer::gemm::EpilogueRope);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_epilogue_rope_kvcache, xinfer::gemm::EpilogueRopeKvcache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_epilogue_glu_quant, xinfer::gemm::EpilogueGluQuant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_epilogue_qk_norm, xinfer::gemm::EpilogueQkNorm);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemm_epilogue_quant_nvfp4, xinfer::gemm::EpilogueQuantNvfp4);

@@ -20,6 +20,7 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/function.h>
+#include <tvm/ffi/optional.h>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -31,6 +32,7 @@
 #include <type_traits>
 
 #include "common/tvm_ffi_cuda_tensor.h"
+#include "quant/nvfp4_format_core.cuh"
 
 #include "common/cuda_utils.h"
 #ifdef XINFER_WITH_SM110
@@ -517,7 +519,17 @@ bool TryRMSNormForwardWide(
   return true;
 }
 
-template<typename T, typename WeightDType, int VPT, bool ZeroCentered>
+// Optional NVFP4 copy of the normalized output (add_rmsnorm_zero_centered_nvfp4): the BF16 value the kernel writes,
+// quantized as quantize_nvfp4 does (nvfp4_format_core.cuh). The grid then covers the rows padded to 128; blocks past
+// num_tokens only write their row's zero scale bytes.
+struct Nvfp4Out {
+  uint8_t* data = nullptr;    // packed E2M1 [rows, hidden / 2]
+  uint8_t* scales = nullptr;  // E4M3 SWIZZLE_32_4_4 storage
+  int scale_col_blocks = 0;   // ceil(hidden / 16 / 4)
+  int64_t num_tokens = 0;
+};
+
+template<typename T, typename WeightDType, int VPT, bool ZeroCentered, bool Nvfp4 = false>
 __global__ void __launch_bounds__(1024)
 addRMSNormForwardWideKernel(
     T* __restrict__ sum_output, T* __restrict__ norm_output,
@@ -526,7 +538,8 @@ addRMSNormForwardWideKernel(
     float* __restrict__ rstd_output,
     const float epsilon, const int64_t hidden_size,
     const int64_t residual_row_stride, const int64_t input_row_stride,
-    const int64_t sum_row_stride, const int64_t norm_row_stride);
+    const int64_t sum_row_stride, const int64_t norm_row_stride, const Nvfp4Out nvfp4 = {});
+
 
 template<typename T, typename WeightDType, bool ZeroCentered>
 void LaunchAddRMSNormForwardWideKernel(
@@ -639,7 +652,7 @@ bool TryAddRMSNormForwardWide(
 // rmsnormForwardWideKernel's block configuration and accumulation order so the
 // fused op stays BITWISE identical to the materialized path
 // (sum = round(residual+input); rmsnorm(sum)) — tests assert this coupling.
-template<typename T, typename WeightDType, int VPT, bool ZeroCentered>
+template<typename T, typename WeightDType, int VPT, bool ZeroCentered, bool Nvfp4>
 __global__ void __launch_bounds__(1024)
 addRMSNormForwardWideKernel(
     T* __restrict__ sum_output, T* __restrict__ norm_output,
@@ -648,15 +661,24 @@ addRMSNormForwardWideKernel(
     float* __restrict__ rstd_output,
     const float epsilon, const int64_t hidden_size,
     const int64_t residual_row_stride, const int64_t input_row_stride,
-    const int64_t sum_row_stride, const int64_t norm_row_stride) {
+    const int64_t sum_row_stride, const int64_t norm_row_stride, const Nvfp4Out nvfp4) {
   constexpr int ELEMS = 8;
   static_assert(!std::is_same_v<T, float>, "wide path is for 16-bit tensors");
   const int tid = threadIdx.x;
   const int64_t row = blockIdx.x;
+  if constexpr (Nvfp4) {
+    if (row >= nvfp4.num_tokens) {  // a padding row of the scale storage
+      for (int b = tid; b < nvfp4.scale_col_blocks * 4; b += blockDim.x) {
+        nvfp4.scales[xinfer::nvfp4::ScaleOffset(row, b, nvfp4.scale_col_blocks)] = 0;
+      }
+      return;
+    }
+  }
   const T* res_row = residual + row * residual_row_stride;
   const T* in_row = input + row * input_row_stride;
   T* sum_row = sum_output + row * sum_row_stride;
-  T* norm_row = norm_output + row * norm_row_stride;
+  T* norm_row = nullptr;  // none when the NVFP4 call is given no norm output
+  if (!Nvfp4 || norm_output != nullptr) norm_row = norm_output + row * norm_row_stride;
   const int64_t vec_hidden = hidden_size / ELEMS;
 
   uint4 s_raw[VPT];
@@ -706,7 +728,24 @@ addRMSNormForwardWideKernel(
         if constexpr (ZeroCentered) wv += 1.0f;
         out_vals[j] = s_vals[j] * wv * irms;
       }
-      *reinterpret_cast<uint4*>(norm_row + i * ELEMS) = FloatsToRaw8<T>(out_vals);
+      const uint4 out_raw = FloatsToRaw8<T>(out_vals);
+      if (!Nvfp4 || norm_row != nullptr) *reinterpret_cast<uint4*>(norm_row + i * ELEMS) = out_raw;
+      if constexpr (Nvfp4) {
+        // The 16-column block of vectors i and i ^ 1 spans this thread and its neighbour (blockDim is even).
+        float h[ELEMS];
+        Raw8ToFloats<T>(out_raw, h);
+        float amax = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < ELEMS; ++j) amax = fmaxf(amax, fabsf(h[j]));
+        amax = fmaxf(amax, __shfl_xor_sync(__activemask(), amax, 1));
+        const float scale = xinfer::nvfp4::AmaxScale(amax, 1.0f);
+        if ((i & 1) == 0) {
+          nvfp4.scales[xinfer::nvfp4::ScaleOffset(row, static_cast<int>(i / 2), nvfp4.scale_col_blocks)] =
+              xinfer::nvfp4::ScaleBits(scale);
+        }
+        *reinterpret_cast<uint32_t*>(nvfp4.data + row * (hidden_size / 2) + i * 4) =
+            xinfer::nvfp4::Pack8(h, scale);
+      }
     }
   }
 }
@@ -1006,10 +1045,98 @@ void AddRMSNormZeroCentered(tvm::ffi::TensorView sum_output,
   AddRMSNormImpl<true>(sum_output, norm_output, residual, input, weight, epsilon);
 }
 
+template<typename T, typename WeightDType>
+void LaunchAddRMSNormNvfp4(T* sum_ptr, T* norm_ptr, const T* res_ptr, const T* in_ptr, const WeightDType* w_ptr,
+                           float epsilon, int64_t hidden_size, int64_t num_tokens, Nvfp4Out nvfp4,
+                           cudaStream_t stream) {
+  const int64_t vec_hidden = hidden_size / kWideElems;
+  const int vpt = PickWideVPTFwd(vec_hidden);
+  const int64_t block_size = WideBlockSize(vec_hidden, vpt);
+  const int64_t padded_rows = (num_tokens + 127) / 128 * 128;
+#define XINFER_ADD_RMSNORM_NVFP4(VPT)                                                                      \
+  addRMSNormForwardWideKernel<T, WeightDType, VPT, true, true><<<padded_rows, block_size, 0, stream>>>(      \
+      sum_ptr, norm_ptr, res_ptr, in_ptr, w_ptr, nullptr, epsilon, hidden_size, hidden_size, hidden_size, \
+      hidden_size, hidden_size, nvfp4)
+  switch (vpt) {
+    case 1: XINFER_ADD_RMSNORM_NVFP4(1); break;
+    case 2: XINFER_ADD_RMSNORM_NVFP4(2); break;
+    case 4: XINFER_ADD_RMSNORM_NVFP4(4); break;
+    default: throw std::runtime_error("add_rmsnorm_zero_centered_nvfp4: hidden size too large for the wide kernel");
+  }
+#undef XINFER_ADD_RMSNORM_NVFP4
+}
+
+// sum = bf16(residual + input), norm = the BF16 zero-centered RMSNorm of sum, and (data, scales) the NVFP4 of norm:
+// the wide kernel of add_rmsnorm_zero_centered (its sum and norm bit for bit) writing quantize_nvfp4 of the norm too;
+// the BF16 norm is written only into a given norm_output. BF16 contiguous [M, K] tensors, K a multiple of 64, 16-byte
+// aligned; weight [K] BF16 or FP32; data uint8 [M, K / 2] (4-byte aligned), scales E4M3 (or uint8) storage of the rows
+// padded to 128.
+void AddRMSNormZeroCenteredNvfp4(tvm::ffi::TensorView sum_output, tvm::ffi::Optional<tvm::ffi::TensorView> norm_output,
+                                 tvm::ffi::TensorView data, tvm::ffi::TensorView scales,
+                                 tvm::ffi::TensorView residual, tvm::ffi::TensorView input,
+                                 tvm::ffi::TensorView weight, double epsilon) {
+  namespace ffi = xinfer::ffi;
+  std::vector<const tvm::ffi::TensorView*> rows = {&sum_output, &residual, &input};
+  if (norm_output.has_value()) rows.push_back(&norm_output.value());
+  for (const tvm::ffi::TensorView* t : rows) {
+    ffi::CheckCuda(*t, "add_rmsnorm_zero_centered_nvfp4: tensors");
+    ffi::CheckBFloat16(*t, "add_rmsnorm_zero_centered_nvfp4: tensors");
+    ffi::CheckContiguous(*t, "add_rmsnorm_zero_centered_nvfp4: tensors");
+    ffi::CheckSameShape(*t, input, "add_rmsnorm_zero_centered_nvfp4: sum/norm/residual");
+    ffi::CheckSameDevice(*t, input, "add_rmsnorm_zero_centered_nvfp4: sum/norm/residual");
+  }
+  ffi::CheckUInt8(data, "data");
+  ffi::CheckContiguous(data, "data");
+  ffi::CheckFloat8E4M3Storage(scales, "scales");
+  ffi::CheckContiguous(scales, "scales");
+  ffi::CheckContiguous(weight, "weight");
+  for (const tvm::ffi::TensorView* t : {&data, &scales, &weight}) {
+    ffi::CheckSameDevice(*t, input, "add_rmsnorm_zero_centered_nvfp4: data/scales/weight");
+  }
+  const RMSNormShape shape = GetRMSNormShape(input);
+  const int64_t k = shape.hidden_size, m = shape.num_tokens;
+  if (k % 64 || PickWideVPTFwd(k / kWideElems) == 0 || weight.ndim() != 1 || weight.size(0) != k) {
+    throw std::runtime_error("add_rmsnorm_zero_centered_nvfp4: hidden must be a multiple of 64 within the wide kernel, "
+                             "weight [hidden]");
+  }
+  if (data.ndim() != 2 || data.size(0) != m || data.size(1) != k / 2 ||
+      ffi::NumBytes(scales) < xinfer::nvfp4::ScaleStorageBytes(m, k)) {
+    throw std::runtime_error("add_rmsnorm_zero_centered_nvfp4: data must be uint8 [M, K / 2] and scales hold the "
+                             "SWIZZLE_32_4_4 storage");
+  }
+  for (const void* ptr : {sum_output.data_ptr(), norm_output.has_value() ? norm_output.value().data_ptr() : nullptr,
+                          residual.data_ptr(), input.data_ptr(), weight.data_ptr()}) {
+    if (reinterpret_cast<uintptr_t>(ptr) % 16) throw std::runtime_error("add_rmsnorm_zero_centered_nvfp4: unaligned");
+  }
+  if (reinterpret_cast<uintptr_t>(data.data_ptr()) % 4) {
+    throw std::runtime_error("add_rmsnorm_zero_centered_nvfp4: data must be 4-byte aligned (four bytes per store)");
+  }
+  if (m == 0) return;
+  const Nvfp4Out nvfp4{static_cast<uint8_t*>(data.data_ptr()), static_cast<uint8_t*>(scales.data_ptr()),
+                       static_cast<int>(k / 64), m};
+  cudaStream_t stream = static_cast<cudaStream_t>(
+      TVMFFIEnvGetStream(input.device().device_type, input.device().device_id));
+  auto* sum_ptr = static_cast<__nv_bfloat16*>(sum_output.data_ptr());
+  auto* norm_ptr = norm_output.has_value() ? static_cast<__nv_bfloat16*>(norm_output.value().data_ptr()) : nullptr;
+  const auto* res_ptr = static_cast<const __nv_bfloat16*>(residual.data_ptr());
+  const auto* in_ptr = static_cast<const __nv_bfloat16*>(input.data_ptr());
+  if (IsFloat32(weight.dtype())) {
+    LaunchAddRMSNormNvfp4(sum_ptr, norm_ptr, res_ptr, in_ptr, static_cast<const float*>(weight.data_ptr()),
+                          static_cast<float>(epsilon), k, m, nvfp4, stream);
+  } else if (IsBFloat16(weight.dtype())) {
+    LaunchAddRMSNormNvfp4(sum_ptr, norm_ptr, res_ptr, in_ptr, static_cast<const __nv_bfloat16*>(weight.data_ptr()),
+                          static_cast<float>(epsilon), k, m, nvfp4, stream);
+  } else {
+    throw std::runtime_error("add_rmsnorm_zero_centered_nvfp4: weight must be FP32 or BF16");
+  }
+  sync_check_cuda_error();
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm, tvm_ffi_rmsnorm::RMSNorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(rmsnorm_zero_centered, tvm_ffi_rmsnorm::RMSNormZeroCentered);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(add_rmsnorm, tvm_ffi_rmsnorm::AddRMSNorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(add_rmsnorm_zero_centered, tvm_ffi_rmsnorm::AddRMSNormZeroCentered);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(add_rmsnorm_zero_centered_nvfp4, tvm_ffi_rmsnorm::AddRMSNormZeroCenteredNvfp4);
 
 // ======================== Backward: Persistent Kernel + Partial Reduction ========================
 //

@@ -21,6 +21,8 @@ from pathlib import Path
 
 import torch
 
+from xinfer.ops.layout import nvfp4 as nvfp4_layout
+
 from xinfer.ops.layout import mxfp8 as mxfp8_layout
 
 logger = logging.getLogger(__name__)
@@ -64,6 +66,11 @@ if lib is not None:
     NATIVE = dict(requires=types.SimpleNamespace(__name__="kernels"), platforms=tuple(f"sm{a}" for a in BUILD_ARCHS),
                   version=f"xinfer_kernels.so sha256:{_digest[:12]}")
 
+# Older public libraries can still serve BF16 and MXFP8.
+NVFP4_NATIVE = dict(NATIVE, platforms=("sm120",), requires=(
+    NATIVE["requires"] if 120 in BUILD_ARCHS and hasattr(lib, "gemm_generic_nvfp4") else None))
+
+
 _arch = {}
 
 
@@ -91,6 +98,12 @@ def kernel(op, arch):
         return cls
 
     return add
+
+
+def empty_nvfp4(rows, columns, device):
+    """An uninitialized NVFP4 pair ``(packed E2M1 uint8 [rows, columns / 2], E4M3 scales)``."""
+    return (torch.empty((rows, columns // 2), dtype=torch.uint8, device=device),
+            torch.empty(nvfp4_layout.scale_elements(rows, columns), dtype=torch.float8_e4m3fn, device=device))
 
 
 def empty_mxfp8(rows, columns, device):

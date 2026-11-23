@@ -1,6 +1,7 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/function.h>
+#include <tvm/ffi/optional.h>
 
 #include <cmath>
 #include <cstdint>
@@ -11,6 +12,7 @@
 #include <cuda_bf16.h>
 #include "common/cuda_utils.h"
 #include "common/reduction.cuh"
+#include "common/tvm_ffi_cuda_tensor.h"
 #include "quant/mxfp8_format_utils.cuh"
 #include "layernorm_rowreg_bf16.cuh"
 
@@ -366,9 +368,84 @@ void LayernormQuant(tvm::ffi::TensorView quantized, tvm::ffi::TensorView scales,
     xinfer::ffi::CheckLastCudaError("layernorm_quant_mxfp8 launch");
 }
 
+template <int kVectors>
+void LaunchRowRegNvfp4(int vectors, __nv_bfloat16* output, const __nv_bfloat16* input, const __nv_bfloat16* gamma,
+                       const __nv_bfloat16* beta, int rows, float epsilon, rowreg::Nvfp4Out nvfp4,
+                       cudaStream_t stream) {
+    if (vectors != kVectors) {
+        if constexpr (kVectors < rowreg::kMaxVectors) {
+            LaunchRowRegNvfp4<kVectors + 1>(vectors, output, input, gamma, beta, rows, epsilon, nvfp4, stream);
+        }
+        return;
+    }
+    const int blocks = (nvfp4.padded_rows + rowreg::kRowsPerBlock - 1) / rowreg::kRowsPerBlock;
+    rowreg::layernorm_quant_nvfp4_rowreg_kernel<kVectors>
+        <<<blocks, rowreg::kThreadsPerRow * rowreg::kRowsPerBlock, 0, stream>>>(
+            output, input, gamma, beta, rows, epsilon, nvfp4);
+}
+
+// The NVFP4 (data uint8 [M, K / 2], E4M3 SWIZZLE_32_4_4 scales) of the BF16 LayerNorm y, bit for bit quantize_nvfp4 of
+// the y that layernorm writes, and y itself into output when given. The register-resident kernel's envelope: BF16,
+// K % 128 == 0, K <= 2048, contiguous rows, 16-byte aligned.
+void LayernormQuantNvfp4(tvm::ffi::TensorView data, tvm::ffi::TensorView scales, tvm::ffi::Optional<tvm::ffi::TensorView> output,
+                         tvm::ffi::TensorView input, tvm::ffi::TensorView weight, tvm::ffi::TensorView bias, double epsilon) {
+    namespace ffi = xinfer::ffi;
+    ffi::CheckUInt8(data, "data");
+    ffi::CheckContiguous(data, "data");
+    ffi::CheckFloat8E4M3Storage(scales, "scales");
+    ffi::CheckContiguous(scales, "scales");
+    if (output.has_value()) {
+        Validate(output.value(), input, weight, bias, epsilon);
+    } else {  // Validate's checks of the inputs
+        int device = -1;
+        if (cudaGetDevice(&device) != cudaSuccess) throw std::runtime_error("layernorm: cannot get CUDA device");
+        CheckDense(input, "input", device, input.dtype());
+        CheckDense(weight, "weight", device, input.dtype());
+        CheckDense(bias, "bias", device, input.dtype());
+        if (!std::isfinite(epsilon) || epsilon <= 0 || epsilon > std::numeric_limits<float>::max())
+            throw std::runtime_error("layernorm: epsilon must be finite positive FP32");
+    }
+    const RowShape shape = GetRowShape(input);
+    const int64_t m = shape.num_tokens, k = shape.hidden_size;
+    if (input.dtype().code != kDLBfloat || input.dtype().bits != 16 || weight.dtype().code != kDLBfloat ||
+        bias.dtype().code != kDLBfloat || k % 128 != 0 || k > 128 * rowreg::kMaxVectors ||
+        weight.ndim() != 1 || weight.size(0) != k || bias.ndim() != 1 || bias.size(0) != k) {
+        throw std::runtime_error("layernorm_quant_nvfp4: BF16 [M, K] with K % 128 == 0 and K <= 2048, weight/bias [K]");
+    }
+    for (const void* pointer : {input.data_ptr(), weight.data_ptr(), bias.data_ptr(),
+                                output.has_value() ? output.value().data_ptr() : nullptr}) {
+        if (reinterpret_cast<uintptr_t>(pointer) % 16 != 0) throw std::runtime_error("layernorm_quant_nvfp4: unaligned");
+    }
+    if (reinterpret_cast<uintptr_t>(data.data_ptr()) % 4 != 0) {
+        throw std::runtime_error("layernorm_quant_nvfp4: data must be 4-byte aligned (four bytes per store)");
+    }
+    if (data.ndim() != 2 || data.size(0) != m || data.size(1) != k / 2 ||
+        ffi::NumBytes(scales) < xinfer::nvfp4::ScaleStorageBytes(m, k)) {
+        throw std::runtime_error("layernorm_quant_nvfp4: data must be uint8 [M, K / 2] and scales hold the "
+                                 "SWIZZLE_32_4_4 storage");
+    }
+    for (const tvm::ffi::TensorView* t : {&data, &scales, &weight, &bias}) {
+        ffi::CheckSameDevice(*t, input, "layernorm_quant_nvfp4: data/scales/weight/bias");
+    }
+    if (m == 0) return;
+    const rowreg::Nvfp4Out nvfp4{static_cast<uint8_t*>(data.data_ptr()), static_cast<uint8_t*>(scales.data_ptr()),
+                                 static_cast<int>((m + 127) / 128 * 128)};
+    cudaStream_t stream = static_cast<cudaStream_t>(
+        TVMFFIEnvGetStream(input.device().device_type, input.device().device_id));
+    LaunchRowRegNvfp4<1>(static_cast<int>(k / 128),
+                         output.has_value() ? static_cast<__nv_bfloat16*>(output.value().data_ptr()) : nullptr,
+                         static_cast<const __nv_bfloat16*>(input.data_ptr()),
+                         static_cast<const __nv_bfloat16*>(weight.data_ptr()),
+                         static_cast<const __nv_bfloat16*>(bias.data_ptr()), static_cast<int>(m),
+                         static_cast<float>(epsilon), nvfp4, stream);
+    sync_check_cuda_error();
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm, xinfer_layernorm::Layernorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm_quant_mxfp8, xinfer_layernorm::LayernormQuant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm_quant_mxfp8_fused_selected,
                               xinfer_layernorm::LayernormQuantFusedSelected);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm_quant_nvfp4, xinfer_layernorm::LayernormQuantNvfp4);
 
 }  // namespace xinfer_layernorm

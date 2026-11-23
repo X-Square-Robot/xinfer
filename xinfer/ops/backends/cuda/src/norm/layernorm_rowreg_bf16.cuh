@@ -6,7 +6,10 @@
 //                                       slice before writing);
 //   layernorm_quant_mxfp8_rowreg_kernel writes MXFP8 with one scale per 128 columns: vector i of a row's 16
 //                                       threads is the row's 128-wide tile i, so the tile amax is 4 more shuffles.
-//                                       Bit for bit the first kernel followed by quantize_mxfp8_into(.., true).
+//                                       Bit for bit the first kernel followed by quantize_mxfp8_into(.., true);
+//   layernorm_quant_nvfp4_rowreg_kernel writes NVFP4 (and y when given an output): vectors v and v ^ 1 of a row
+//                                       are one 16-column block, so the block amax is one more shuffle. Bit for bit
+//                                       the first kernel followed by quantize_nvfp4.
 //
 // Shape envelope (checked by the host): BF16 x / y / gamma / beta, K % 128 == 0, 128 <= K <= 2048, packed rows,
 // 16-byte aligned pointers (quantized 8-byte, scales 4-byte).
@@ -18,6 +21,7 @@
 
 #include "norm/bf16_vector.cuh"
 #include "quant/mxfp8_format_core.cuh"
+#include "quant/nvfp4_format_core.cuh"
 
 namespace xinfer_layernorm::rowreg {
 
@@ -143,6 +147,60 @@ __global__ __launch_bounds__(kThreadsPerRow * kQuantRowsPerBlock) void layernorm
     q[kThreadsPerRow * i] = packed;
     // the four 1x32 slots of tile i are four consecutive bytes
     if (sub == 0) scales[scale_offset(row, 4 * i, kVectors) / 4] = 0x01010101u * scale;
+  }
+}
+
+// The NVFP4 output of layernorm_quant_nvfp4_rowreg_kernel: data uint8 [rows, K / 2], E4M3 SWIZZLE_32_4_4 scales of
+// the rows padded to 128.
+struct Nvfp4Out {
+  uint8_t* data = nullptr;
+  uint8_t* scales = nullptr;
+  int padded_rows = 0;
+};
+
+// The grid covers the rows padded to 128: the threads of a padding row write its zero scale bytes. `output` may be
+// null (no BF16 y written).
+template <int kVectors>
+__global__ __launch_bounds__(kThreadsPerRow * kRowsPerBlock) void layernorm_quant_nvfp4_rowreg_kernel(
+    __nv_bfloat16* output, const __nv_bfloat16* input, const __nv_bfloat16* __restrict__ gamma,
+    const __nv_bfloat16* __restrict__ beta, int rows, float epsilon, Nvfp4Out nvfp4) {
+  using xinfer::normalization::unpack_bf16x8;
+  constexpr int kK = kVectors * 128;
+  constexpr int kScaleColBlocks = kK / 64;
+  const int sub = threadIdx.x % kThreadsPerRow;
+  const int row = blockIdx.x * kRowsPerBlock + threadIdx.x / kThreadsPerRow;
+  const bool live = row < rows;
+  uint4 xv[kVectors], gv[kVectors], bv[kVectors];
+  load_row_slice<kVectors>(xv, gv, bv, input, gamma, beta, live ? row : rows - 1, sub);
+  float mean, rstd;
+  row_statistics<kVectors>(xv, 0xffffffffu >> (32 - static_cast<int>(blockDim.x)), epsilon, mean, rstd);
+  if (!live) {
+    if (row < nvfp4.padded_rows && sub % 2 == 0) {  // the 16-column blocks of vectors sub, sub + 16, ...
+      for (int i = 0; i < kVectors; ++i) {
+        nvfp4.scales[xinfer::nvfp4::ScaleOffset(row, (sub + kThreadsPerRow * i) / 2, kScaleColBlocks)] = 0;
+      }
+    }
+    return;
+  }
+  uint4* y = nullptr;
+  if (output != nullptr) y = reinterpret_cast<uint4*>(output + static_cast<size_t>(row) * kK) + sub;
+#pragma unroll
+  for (int i = 0; i < kVectors; ++i) {
+    const uint4 result = normalize_bf16x8(xv[i], gv[i], bv[i], mean, rstd);
+    const int v = sub + kThreadsPerRow * i;  // with its neighbour v ^ 1 (lane sub ^ 1, same row) one 16-column block
+    float h[8];
+    unpack_bf16x8(result, h);
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(h[j]));
+    amax = fmaxf(amax, __shfl_xor_sync(__activemask(), amax, 1));
+    const float scale = xinfer::nvfp4::AmaxScale(amax, 1.0f);
+    if (v % 2 == 0) {
+      nvfp4.scales[xinfer::nvfp4::ScaleOffset(row, v / 2, kScaleColBlocks)] = xinfer::nvfp4::ScaleBits(scale);
+    }
+    *reinterpret_cast<uint32_t*>(nvfp4.data + static_cast<size_t>(row) * (kK / 2) + v * 4) =
+        xinfer::nvfp4::Pack8(h, scale);
+    if (y != nullptr) y[kThreadsPerRow * i] = result;
   }
 }
 

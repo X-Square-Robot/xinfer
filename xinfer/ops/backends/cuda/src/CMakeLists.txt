@@ -56,6 +56,7 @@ set(KERNEL_SOURCES
   norm/qkv_norm_split.cu
   norm/rmsnorm_quant_mxfp8.cu
   quant/mxfp8_quantization.cu
+  quant/nvfp4_quantization.cu
   position/rope.cu
   position/rot_pos.cu
   position/pos_embed_interp.cu
