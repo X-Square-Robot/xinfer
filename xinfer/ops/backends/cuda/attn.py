@@ -63,9 +63,10 @@ import os
 import torch
 
 from xinfer.ops import reference
+from xinfer.ops.backends.cuda import _attention_libraries as libraries
 from xinfer.ops.backends.cuda._native import BUILD_ARCHS, NATIVE, arch, capturing, lib, scratch
 from xinfer.ops.reference import attn as reference_attn
-from xinfer.ops.registry import note_reference_call, register
+from xinfer.ops.registry import note_route, register
 
 flash_attn = flash_attn_2_cuda = None
 if os.environ.get("XINFER_FLASH_ATTN", "1") != "0":
@@ -490,33 +491,78 @@ def gated_delta_rule_prefill(qkv, zba, conv_weight, A_log, dt_bias, norm_weight,
 # ---------------------------------------------------------------------------
 # Operators on them
 # ---------------------------------------------------------------------------
+@register("prefix_kvcache_attention", backend="cuda", requires=libraries.FLEX, priority=5)
+def flex_prefix(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
+    args = (q, k_cache, v_cache, prefix_len, new_pos)
+    return libraries.run("prefix_kvcache_attention", libraries.FLEX, (*args, flash_mask, scale),
+                         lambda: libraries.flex()(*args, flash_mask, scale),
+                         lambda: reference_attn.prefix_kvcache_attention(*args, flash_mask=flash_mask, scale=scale))
+
+
 @register("prefix_kvcache_attention", backend="cuda", **NATIVE)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
     if not attention_kvcache_takes(q, k_cache):
-        note_reference_call("prefix_kvcache_attention", q.shape, k_cache.shape)
-        return reference_attn.prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos,
-                                                       flash_mask=flash_mask, scale=scale)
-    return attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
-                                flash_mask=flash_mask, softmax_scale=scale)
+        return flex_prefix(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+    result = attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
+                               flash_mask=flash_mask, softmax_scale=scale)
+    note_route("kernels")
+    return result
+
+
+@register("segment_attention", backend="cuda", requires=flash_attn, priority=5)
+def flash_segment(q, k, v, cu_seqlens, *, scale=None):
+    bounds = tuple(cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else cu_seqlens)
+    args = (q, k, v, bounds)
+    return libraries.run("segment_attention", flash_attn, (*args, scale),
+                         lambda: varlen_attention(*args, scale=scale),
+                         lambda: reference.varlen_attention(*args, scale=scale))
 
 
 @register("segment_attention", backend="cuda", **NATIVE)
 def segment_attention(q, k, v, cu_seqlens, *, scale=None):
     bounds = tuple(cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else cu_seqlens)
     if not attention_varlen_takes(q, bounds):
-        note_reference_call("segment_attention", q.shape, bounds)
-        return reference.varlen_attention(q, k, v, bounds, scale=scale)
-    return attention_varlen(q, k, v, bounds, softmax_scale=scale).view(q.shape)
+        return flash_segment(q, k, v, bounds, scale=scale)
+    result = attention_varlen(q, k, v, bounds, softmax_scale=scale).view(q.shape)
+    note_route("kernels")
+    return result
+
+
+@register("gated_causal_attention", backend="cuda", requires=flash_attn, priority=5)
+def flash_gated_causal(q, k, v, gate, *, scale=None):
+    def external():
+        out = flash_attn.flash_attn_func(q[None], k[None], v[None], softmax_scale=scale, causal=True)
+        return reference_attn.gate_output(out[0].flatten(1), gate)
+
+    return libraries.run("gated_causal_attention", flash_attn, (q, k, v, gate, scale), external,
+                         lambda: reference_attn.gated_causal_attention(q, k, v, gate, scale=scale))
+
+
+@register("gated_kvcache_attention", backend="cuda", requires=libraries.FLEX, priority=5)
+def flex_gated(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
+    args = (q, k_cache, v_cache, prefix_len, new_pos)
+    return libraries.run("gated_kvcache_attention", libraries.FLEX, (*args, gate, flash_mask, scale),
+                         lambda: reference_attn.gate_output(libraries.flex()(*args, flash_mask, scale), gate),
+                         lambda: reference_attn.gated_kvcache_attention(*args, gate, flash_mask=flash_mask,
+                                                                         scale=scale))
 
 
 @register("gated_kvcache_attention", backend="cuda", **NATIVE)
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
     if not attention_kvcache_takes(q, k_cache):
-        note_reference_call("gated_kvcache_attention", q.shape, k_cache.shape)
-        return reference_attn.gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate,
-                                                      flash_mask=flash_mask, scale=scale)
-    return attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
-                                flash_mask=flash_mask, softmax_scale=scale, gate=gate)
+        return flex_gated(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask=flash_mask, scale=scale)
+    result = attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
+                               flash_mask=flash_mask, softmax_scale=scale, gate=gate)
+    note_route("kernels")
+    return result
+
+
+@register("gated_delta_net", backend="cuda", requires=libraries.FLA, priority=5)
+def fla_delta(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim,
+              head_v_dim, eps):
+    args = (qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim, head_v_dim, eps)
+    return libraries.run("gated_delta_net", libraries.FLA, args, lambda: libraries.fla_delta(*args),
+                         lambda: reference_attn.gated_delta_net(*args))
 
 
 @register("gated_delta_net", backend="cuda", **NATIVE)
@@ -524,10 +570,11 @@ def gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_he
                     head_v_dim, eps):
     b, n, _ = qkv.shape
     rows = (qkv.reshape(b * n, -1), zba.reshape(b * n, -1))
-    if b != 1 or head_k_dim != head_v_dim or not gated_delta_rule_prefill_takes(*rows, num_k_heads=num_k_heads):
-        note_reference_call("gated_delta_net", qkv.shape, zba.shape, num_k_heads, num_v_heads, head_k_dim, head_v_dim)
-        return reference_attn.gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads,
-                                              num_v_heads, head_k_dim, head_v_dim, eps)
+    if b != 1 or head_k_dim != HEAD_DIM or head_v_dim != HEAD_DIM or not gated_delta_rule_prefill_takes(
+            *rows, num_k_heads=num_k_heads):
+        return fla_delta(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim,
+                         head_v_dim, eps)
     out = gated_delta_rule_prefill(*rows, conv_weight, A_log, dt_bias, norm_weight, num_k_heads=num_k_heads,
-                                      eps=float(eps))
+                                   eps=float(eps))
+    note_route("kernels")
     return out.view(1, n, -1)

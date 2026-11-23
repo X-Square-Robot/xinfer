@@ -300,19 +300,27 @@ def _write_check(out, model, device, table, stage_ops, references):
     for label, source in sorted(references.references.items()):
         name, _, shape = label.removeprefix("op::").partition(" ")
         calls.setdefault(name, []).append({"shape": shape, "source": source})
+    routes = {}
+    for label, libraries in sorted(references.routes.items()):
+        name, _, shape = label.removeprefix("op::").partition(" ")
+        if libraries:
+            routes.setdefault(name, []).append({"shape": shape, "libraries": sorted(libraries)})
     rows = []
     ops = references.seen.union(*stage_ops.values())
     for op in sorted(ops):
         selection = selections[op]
         rows.append({"op": op, "stages": ", ".join(s for s, names in stage_ops.items() if op in names),
                      "backend": selection["backend"], "library": selection["library"],
-                     "observed": op in references.seen, "reference_calls": calls.get(op, [])})
+                     "observed": op in references.seen, "reference_calls": calls.get(op, []),
+                     "routes": routes.get(op, [])})
     ok = not references.references
     summary = ("No slow reference fallback observed." if ok else "Slow reference fallbacks observed.")
     lines = [f"# CUDA operator check for {model}", "", summary, ""]
     for row in rows:
         status = "observed" if row["observed"] else "not exercised"
         lines.append(f"- `{row['op']}` ({row['backend']}, {status})")
+        for call in row["routes"]:
+            lines.append(f"  - {', '.join(call['libraries'])}: `{call['shape']}`")
         for call in row["reference_calls"]:
             lines.append(f"  - {call['source']}: `{call['shape']}`")
     (out / "check.md").write_text("\n".join(lines) + "\n")
@@ -358,6 +366,7 @@ def main(argv=None) -> int:
     # Check execution on the supplied requests separately from one-time checkpoint conversion.
     references.seen.clear()
     references.references.clear()
+    references.routes.clear()
     quantization = getattr(model, "quantization", options.get("quantization", "bf16"))
 
     def engine_for(cudagraphs):

@@ -34,6 +34,7 @@ class ReferenceRecorder:
     def __init__(self):
         self.seen = set()
         self.references = {}
+        self.routes = defaultdict(set)
         self.active = True
 
     def __call__(self, implementation):
@@ -47,13 +48,15 @@ class ReferenceRecorder:
                 return function(*args, **kwargs)
             self.seen.add(op)
 
+            label = annotate.label(f"op::{op}", annotate.call_args(params, args, kwargs))
+
             def reference(source):
-                label = annotate.label(f"op::{op}", annotate.call_args(params, args, kwargs))
+                self.routes[label].add("reference")
                 self.references[label] = source
 
             if selected_reference:
                 reference("selected reference")
-            with observe_reference_calls(reference):
+            with observe_reference_calls(reference, self.routes[label].add):
                 return function(*args, **kwargs)
 
         return recorded

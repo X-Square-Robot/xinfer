@@ -12,6 +12,8 @@ The kernel library is built for one GPU architecture and registers its operators
 
 A GEMM runs on a kernel written for its architecture when the call is one that kernel was tuned on, and otherwise on cuBLASLt with the epilogue as a separate kernel. Each kernel lists the shapes it takes next to the code that launches it (`xinfer/ops/backends/cuda/gemm_sm120.py`, `gemm_sm110.py`): on an RTX 5090 the ranges of rows over which it was measured not slower than the cuBLASLt path; on a Jetson AGX Thor the ranges over which it was measured at least 5% faster at three or more consecutive scan points, matching the reference SM110 kernel build's selection and its bitwise outputs on the reference requests. On SM110 the library covers the BF16 compositions of WALL-OSS-0.5 and WALL-OSS-1.0-Nano. The attention and flow kernels list their shapes the same way (`attn.py`, `flow.py`), and the calls outside them run on the torch reference.
 
+Outside the native attention shapes, segment and gated causal attention can use flash-attn, prefix KV-cache attention with or without an output gate can use compiled FlexAttention, and the gated delta rule can use FLA. Optional libraries are tried on the first eager call for a device, shape, dtype, stride and option set. A confirmed route can run during graph capture. A cold capture uses the reference without probing. Set `XINFER_FLASH_ATTN=0`, `XINFER_FLEX_ATTENTION=0` or `XINFER_FLA=0` before startup to disable a library. The `routes` field in `xinfer-profile check` reports which libraries ran for each observed attention signature.
+
 ## Build
 
 Building needs the CUDA 13 toolkit, CMake 3.24 or later (3.28 for SM110), the `apache-tvm-ffi` Python package and the CUTLASS headers (a submodule):
