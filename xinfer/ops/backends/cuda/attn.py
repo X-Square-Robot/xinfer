@@ -64,7 +64,7 @@ import torch
 
 from xinfer.ops import reference
 from xinfer.ops.backends.cuda import _attention_libraries as libraries
-from xinfer.ops.backends.cuda import _kv_tuning
+from xinfer.ops.backends.cuda import _op_tuning
 from xinfer.ops.backends.cuda._native import BUILD_ARCHS, NATIVE, arch, capturing, lib, scratch
 from xinfer.ops.reference import attn as reference_attn
 from xinfer.ops.registry import note_route, register
@@ -292,7 +292,7 @@ def _compiled_kvcache_takes(q, k_cache):
 
 
 def attention_kvcache(q, k_cache, v_cache, *, prefix_len, new_pos=None, flash_mask=None, softmax_scale=None,
-                      gate=None, out=None):
+                      gate=None, out=None, causal=False):
     """Attention of ``q`` ``[B, M, H, D]`` over ``k_cache`` / ``v_cache`` ``[B, L, H_kv, D]`` (BF16, the last
     dimension dense); BF16 ``[B, M, H * D]``.
 
@@ -322,7 +322,7 @@ def attention_kvcache(q, k_cache, v_cache, *, prefix_len, new_pos=None, flash_ma
     need = int(lib.attention_kvcache_splitkv_workspace_size(b, m, heads, kv_heads, d, cache_rows, chunk))
     lib.attention_kvcache_splitkv(
         out, None, k_cache, v_cache, scratch("attention_kvcache", need, q.device), q, prefix_len, None, None,
-        flash_mask, None, None, -1 if new_pos is None else int(new_pos), False,
+        flash_mask, None, None, -1 if new_pos is None else int(new_pos), causal,
         1.0 / math.sqrt(d) if softmax_scale is None else float(softmax_scale), chunk, 0, False)
     if gate is not None:
         lib.sigmoid_gate_mul_inplace(out, gate, True)
@@ -406,6 +406,16 @@ def _plan(lengths, heads, sms):
     return pieces or [[0] * 8], team_start
 
 
+def _varlen_layout(q, k, v, bounds, scale):
+    return (q.device.type == "cuda" and q.ndim == 3 and q.shape[1] > 0 and q.shape[2] == 64
+            and arch(q.device) == 120 and 120 in BUILD_ARCHS
+            and 0 < q.numel() < 2**31 and len(bounds) >= 2 and bounds[0] == 0 and bounds[-1] == q.shape[0]
+            and all(a < b for a, b in zip(bounds, bounds[1:]))
+            and all(t.shape == q.shape and t.device == q.device and t.dtype == torch.bfloat16
+                    and t.stride()[1:] == (64, 1) and t.stride(0) % 8 == 0 and t.data_ptr() % 16 == 0 for t in (q, k, v))
+            and (scale is None or (math.isfinite(scale) and scale > 0)))
+
+
 def attention_varlen(q, k, v, segments, *, softmax_scale=None, out=None):
     """Attention of every row of ``q`` ``[T, H, D]`` over the ``k`` / ``v`` ``[T, H, D]`` rows of its own
     segment (BF16, the last dimension dense); BF16 ``[T, H * D]``.
@@ -414,7 +424,7 @@ def attention_varlen(q, k, v, segments, *, softmax_scale=None, out=None):
     of a segment layout and the scratch memory of a stream are made on their first call, which must not be inside
     a CUDA graph capture.
     """
-    if not attention_varlen_takes(q, segments):
+    if not _varlen_layout(q, k, v, segments, softmax_scale):
         raise ValueError(f"attention_varlen: no kernel for q {tuple(q.shape)} with segments {list(segments)} on "
                          f"SM{arch(q.device)} (see attention_varlen_takes)")
     if tuple(k.shape) != tuple(q.shape) or tuple(v.shape) != tuple(q.shape):
@@ -479,6 +489,23 @@ def gated_delta_rule_prefill_takes(qkv, zba, *, num_k_heads) -> bool:
     return lo <= qkv.shape[0] <= hi
 
 
+def _delta_layout(qkv, zba, conv, a, dt, norm, hk, hv, eps):
+    if qkv.device.type != "cuda" or qkv.ndim != 2 or zba.ndim != 2 or not 1 <= hk <= 64 or hv not in (hk, 2 * hk):
+        return False
+    n, width = qkv.shape
+    def dense(t, dtype, shapes):
+        return (t.device == qkv.device and t.dtype == dtype and t.shape in shapes and t.is_contiguous()
+                and t.data_ptr() % 16 == 0)
+    return (arch(qkv.device) in BUILD_ARCHS and 1 <= n <= 1024 and width == (2 * hk + hv) * HEAD_DIM
+            and zba.shape == (n, hv * (HEAD_DIM + 2)) and math.isfinite(eps) and eps > 0
+            and all(t.device == qkv.device and t.dtype == torch.bfloat16 and t.stride(1) == 1
+                    and t.stride(0) >= t.shape[1] and t.stride(0) % align == 0 and t.data_ptr() % (2 * align) == 0
+                    for t, align in ((qkv, 8), (zba, 2)))
+            and dense(conv, torch.bfloat16, ((width, 4), (width, 1, 4)))
+            and dense(a, torch.float32, ((hv,),)) and dense(dt, torch.float32, ((hv,),))
+            and dense(norm, torch.bfloat16, ((HEAD_DIM,),)))
+
+
 def gated_delta_rule_prefill(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, *, num_k_heads, eps=1e-6, out=None):
     """``qkv`` BF16 ``[S, (2 H_k + H_v) * 128]``: the q, k and v inputs of the convolution. ``zba`` BF16
     ``[S, H_v * 130]``: per value head the gate input ``z`` (128), then the logits of the write strength and of
@@ -487,7 +514,8 @@ def gated_delta_rule_prefill(qkv, zba, conv_weight, A_log, dt_bias, norm_weight,
 
     Returns BF16 ``[S, H_v * 128]``.
     """
-    if not gated_delta_rule_prefill_takes(qkv, zba, num_k_heads=num_k_heads):
+    hv = zba.shape[-1] // (HEAD_DIM + 2)
+    if not _delta_layout(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, hv, eps):
         raise ValueError(f"gated_delta_rule_prefill: no kernel for qkv {tuple(qkv.shape)}, zba {tuple(zba.shape)}, "
                          f"num_k_heads={num_k_heads} on SM{arch(qkv.device)} (see gated_delta_rule_prefill_takes)")
     key_heads, value_heads = _heads(qkv, zba, num_k_heads)
@@ -552,7 +580,7 @@ def _dispatch_kv(q, k, v, prefix_len, new_pos, gate, flash_mask, scale):
         return libraries.run(op, flex, args, external, reference)
     winner = "kernels"
     if flex and not attention_kvcache_takes(q, k) and os.environ.get("XINFER_OP_TUNING", "1") != "0":
-        winner = _kv_tuning.choose(op, args, native, external) or "kernels"
+        winner = _op_tuning.choose(op, args, native, external) or "kernels"
     result = native() if winner == "kernels" else external()
     note_route(winner)
     return result
@@ -573,14 +601,25 @@ def flash_segment(q, k, v, cu_seqlens, *, scale=None):
                          lambda: reference.varlen_attention(*args, scale=scale))
 
 
+def _attention_route(op, args, native, library, external, measured=False):
+    winner = "kernels"
+    if not measured and library and os.environ.get("XINFER_OP_TUNING", "1") != "0":
+        winner = _op_tuning.choose(op, args, native, external, library.__name__) or "kernels"
+    out = native() if winner == "kernels" else external()
+    note_route(winner)
+    return out
+
+
 @register("segment_attention", backend="cuda", **NATIVE)
 def segment_attention(q, k, v, cu_seqlens, *, scale=None):
     bounds = tuple(cu_seqlens.tolist() if torch.is_tensor(cu_seqlens) else cu_seqlens)
-    if not attention_varlen_takes(q, bounds):
+    cold_plan = (capturing(q.device) and ((q.device.index, q.shape[1], _lengths(bounds)[0]) not in _plans
+                 or (q.device.index, torch.cuda.current_stream(q.device).cuda_stream) not in _varlen_scratch))
+    if cold_plan or not _varlen_layout(q, k, v, bounds, scale):
         return flash_segment(q, k, v, bounds, scale=scale)
-    result = attention_varlen(q, k, v, bounds, softmax_scale=scale).view(q.shape)
-    note_route("kernels")
-    return result
+    return _attention_route("segment_attention", (q, k, v, bounds, scale),
+                            lambda: attention_varlen(q, k, v, bounds, softmax_scale=scale).view(q.shape), flash_attn,
+                            lambda: varlen_attention(q, k, v, bounds, scale=scale), attention_varlen_takes(q, bounds))
 
 
 @register("gated_causal_attention", backend="cuda", requires=flash_attn, priority=5)
@@ -591,6 +630,35 @@ def flash_gated_causal(q, k, v, gate, *, scale=None):
 
     return libraries.run("gated_causal_attention", flash_attn, (q, k, v, gate, scale), external,
                          lambda: reference_attn.gated_causal_attention(q, k, v, gate, scale=scale))
+
+
+@register("gated_causal_attention", backend="cuda", **NATIVE)
+def gated_causal_attention(q, k, v, gate, *, scale=None):
+    if q.device.type != "cuda" or q.ndim != 3 or k.ndim != 3 or v.shape != k.shape or q.shape[0] != k.shape[0]:
+        return flash_gated_causal(q, k, v, gate, scale=scale)
+    query, keys, values = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
+    total = q.shape[0]
+    if gate.shape != (total, q.shape[1] * q.shape[2]) or not total:
+        return flash_gated_causal(q, k, v, gate, scale=scale)
+    if not _compiled_kvcache_takes(query[:, :32], keys):
+        return flash_gated_causal(q, k, v, gate, scale=scale)
+    prefixes = torch.arange(0, total, 32, device=q.device, dtype=torch.int32)
+    # Every block sees the preceding keys and the causal part of its own rows.
+    def native():
+        out = torch.empty_like(gate, memory_format=torch.contiguous_format).unsqueeze(0)
+        for start in range(0, total, 32):
+            block = slice(start, start + 32)
+            prefix = prefixes[start // 32:start // 32 + 1]
+            attention_kvcache(query[:, block], keys, values, prefix_len=prefix, new_pos=start, causal=True,
+                              gate=gate[block].unsqueeze(0), softmax_scale=scale, out=out[:, block])
+        return out[0]
+
+    if not _kv_layout(query[:, :32], keys, values, prefixes[:1], 0, gate[:32].unsqueeze(0), None, scale):
+        return flash_gated_causal(q, k, v, gate, scale=scale)
+    def external():
+        output = flash_attn.flash_attn_func(query, keys, values, causal=True, softmax_scale=scale)
+        return reference_attn.gate_output(output[0].flatten(1), gate)
+    return _attention_route("gated_causal_attention", (q, k, v, gate, scale), native, flash_attn, external)
 
 
 @register("gated_kvcache_attention", backend="cuda", requires=libraries.FLEX, priority=5)
@@ -620,12 +688,14 @@ def fla_delta(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, n
 def gated_delta_net(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim,
                     head_v_dim, eps):
     b, n, _ = qkv.shape
-    rows = (qkv.reshape(b * n, -1), zba.reshape(b * n, -1))
-    if b != 1 or head_k_dim != HEAD_DIM or head_v_dim != HEAD_DIM or not gated_delta_rule_prefill_takes(
-            *rows, num_k_heads=num_k_heads):
-        return fla_delta(qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim,
-                         head_v_dim, eps)
-    out = gated_delta_rule_prefill(*rows, conv_weight, A_log, dt_bias, norm_weight, num_k_heads=num_k_heads,
-                                   eps=float(eps))
-    note_route("kernels")
-    return out.view(1, n, -1)
+    args = (qkv, zba, conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, head_k_dim, head_v_dim, eps)
+    if (b != 1 or zba.ndim != 3 or zba.shape[:2] != (b, n) or head_k_dim != HEAD_DIM or head_v_dim != HEAD_DIM
+            or not _delta_layout(qkv[0], zba[0], conv_weight, A_log, dt_bias, norm_weight, num_k_heads, num_v_heads, eps)):
+        return fla_delta(*args)
+
+    def native():
+        out = gated_delta_rule_prefill(qkv[0], zba[0], conv_weight, A_log, dt_bias, norm_weight,
+                                       num_k_heads=num_k_heads, eps=eps)
+        return out.view(1, n, -1)
+    return _attention_route("gated_delta_net", args, native, libraries.FLA, lambda: libraries.fla_delta(*args),
+                            gated_delta_rule_prefill_takes(qkv[0], zba[0], num_k_heads=num_k_heads))

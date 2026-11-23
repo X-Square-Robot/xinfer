@@ -16,6 +16,8 @@ Outside the native attention shapes, segment and gated causal attention can use 
 
 By default, prefix KV-cache attention (with or without an output gate) compares the split-KV kernel and FlexAttention for shapes outside the measured ranges when both implementations are available. Set `XINFER_OP_TUNING=0` before startup to use the compatible native kernel directly. The dispatch checks every input layout before launch, including V-cache strides. If the kernel declines the call it tries FlexAttention, then PyTorch. During eager warmup, both implementations read the same cache and write separate outputs. A native result must agree with FlexAttention within 1% relative L2 error. The faster eligible implementation is reused for the same device, layout and options within the process. CUDA Graph capture uses an existing choice or follows the static order on a miss.
 
+Segment attention, gated causal attention and gated delta prefill also compare native and optional library candidates when both accept an unmeasured call. The library choices are keyed by device, build, library versions and input layout. Use `XINFER_GEMM_TUNING_FILE` to share them across processes and `XINFER_GEMM_TUNING_READONLY=1` to reuse a deployment record without new timings. A read-only miss uses static routing.
+
 On Jetson Thor, FlexAttention needs a PTX assembler that recognizes `sm_110a`. If Triton 3.6 reports that its bundled `ptxas-blackwell` rejects this target, set `TRITON_PTXAS_BLACKWELL_PATH="$CUDA_HOME/bin/ptxas"` before starting XInfer, with `CUDA_HOME` pointing to a toolkit that supports Thor.
 
 ## Build
