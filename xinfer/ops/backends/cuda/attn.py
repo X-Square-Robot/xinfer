@@ -24,8 +24,8 @@ order), deterministic, graph safe. ``varlen_attention``
 takes ``cu_seqlens`` as a host sequence; its device copy is created on the
 first (eager) call for each layout and reused, also inside captured graphs.
 
-The kernels of this backend (``_native``), each on the shapes it is tuned and tested on (``*_takes``); the other
-calls run on the reference:
+The ``*_takes`` predicates select these native kernels on measured shapes. For other compiled prefix KV-cache
+shapes, eager warmup compares the native kernel with FlexAttention unless ``XINFER_OP_TUNING=0``.
 
 | operator | function here |
 |---|---|
@@ -64,6 +64,7 @@ import torch
 
 from xinfer.ops import reference
 from xinfer.ops.backends.cuda import _attention_libraries as libraries
+from xinfer.ops.backends.cuda import _kv_tuning
 from xinfer.ops.backends.cuda._native import BUILD_ARCHS, NATIVE, arch, capturing, lib, scratch
 from xinfer.ops.reference import attn as reference_attn
 from xinfer.ops.registry import note_route, register
@@ -269,7 +270,7 @@ def _chunk(device_arch, heads, cache_rows):
 
 
 def attention_kvcache_takes(q, k_cache) -> bool:
-    """Whether :func:`attention_kvcache` runs ``q`` ``[B, M, H, D]`` over ``k_cache`` ``[B, L, H_kv, D]`` here."""
+    """Whether this head configuration and (B, M, L) lie in the native kernel's measured range."""
     if q.dim() != 4 or k_cache.dim() != 4 or q.dtype != torch.bfloat16:
         return False
     device_arch = arch(q.device)
@@ -277,6 +278,17 @@ def attention_kvcache_takes(q, k_cache) -> bool:
     boxes = KVCACHE_SHAPES.get(device_arch, {}).get((heads, k_cache.shape[2], d)) if device_arch in BUILD_ARCHS else None
     return any(all(lo <= v <= hi for v, (lo, hi) in ((b, box["batch"]), (m, box["m"]), (k_cache.shape[1], box["l"])))
                for box in boxes or ())
+
+
+def _compiled_kvcache_takes(q, k_cache):
+    """Compiled head configurations and row limit of the split-KV kernel, including unmeasured cache lengths."""
+    if q.ndim != 4 or k_cache.ndim != 4 or q.dtype != torch.bfloat16 or k_cache.dtype != q.dtype:
+        return False
+    b, rows, heads, width = q.shape
+    device_arch = arch(q.device)
+    return (device_arch in BUILD_ARCHS and (heads, k_cache.shape[2], width) in KVCACHE_CHUNKS.get(device_arch, {})
+            and b == k_cache.shape[0] and width == k_cache.shape[3] and 1 <= b <= 8 and 1 <= rows <= 32
+            and rows <= k_cache.shape[1] <= 2048)
 
 
 def attention_kvcache(q, k_cache, v_cache, *, prefix_len, new_pos=None, flash_mask=None, softmax_scale=None,
@@ -290,9 +302,9 @@ def attention_kvcache(q, k_cache, v_cache, *, prefix_len, new_pos=None, flash_ma
     ``[B, M, H * D]`` (the last dimension dense); the result is multiplied by ``bf16(sigmoid(gate))`` in a second
     kernel.
     """
-    if not attention_kvcache_takes(q, k_cache):
+    if not _compiled_kvcache_takes(q, k_cache):
         raise ValueError(f"attention_kvcache: no kernel for q {tuple(q.shape)} over a cache {tuple(k_cache.shape)} "
-                         f"on SM{arch(q.device)} (see attention_kvcache_takes)")
+                         f"on SM{arch(q.device)} (unsupported compiled configuration)")
     b, m, heads, d = q.shape
     cache_rows, kv_heads = k_cache.shape[1], k_cache.shape[2]
     if tuple(v_cache.shape) != tuple(k_cache.shape) or k_cache.shape[0] != b or k_cache.shape[3] != d:
@@ -499,10 +511,34 @@ def flex_prefix(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, sc
                          lambda: reference_attn.prefix_kvcache_attention(*args, flash_mask=flash_mask, scale=scale))
 
 
+def _unmeasured_kv(q, k, v, prefix_len, new_pos, gate, flash_mask, scale):
+    op = "prefix_kvcache_attention" if gate is None else "gated_kvcache_attention"
+
+    def native():
+        return attention_kvcache(q, k, v, prefix_len=prefix_len, new_pos=new_pos, gate=gate,
+                                 flash_mask=flash_mask, softmax_scale=scale)
+
+    def external():
+        out = libraries.flex()(q, k, v, prefix_len, new_pos, flash_mask, scale)
+        return out if gate is None else reference_attn.gate_output(out, gate)
+
+    if (os.environ.get("XINFER_OP_TUNING", "1") != "0" and libraries.FLEX and _compiled_kvcache_takes(q, k)
+            and (flash_mask is None or flash_mask.shape[1] == 1)):
+        args = (q, k, v, prefix_len, new_pos, gate, flash_mask, scale)
+        winner = _kv_tuning.choose(op, args, native, external)
+        if winner is not None:
+            output = native() if winner == "kernels" else external()
+            note_route(winner)
+            return output
+    if gate is None:
+        return flex_prefix(q, k, v, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+    return flex_gated(q, k, v, prefix_len, new_pos, gate, flash_mask=flash_mask, scale=scale)
+
+
 @register("prefix_kvcache_attention", backend="cuda", **NATIVE)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
     if not attention_kvcache_takes(q, k_cache):
-        return flex_prefix(q, k_cache, v_cache, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
+        return _unmeasured_kv(q, k_cache, v_cache, prefix_len, new_pos, None, flash_mask, scale)
     result = attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
                                flash_mask=flash_mask, softmax_scale=scale)
     note_route("kernels")
@@ -550,7 +586,7 @@ def flex_gated(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=Non
 @register("gated_kvcache_attention", backend="cuda", **NATIVE)
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
     if not attention_kvcache_takes(q, k_cache):
-        return flex_gated(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask=flash_mask, scale=scale)
+        return _unmeasured_kv(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask, scale)
     result = attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
                                flash_mask=flash_mask, softmax_scale=scale, gate=gate)
     note_route("kernels")
