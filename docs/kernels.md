@@ -14,6 +14,8 @@ A GEMM runs on a kernel written for its architecture when the call is one that k
 
 Outside the native attention shapes, segment and gated causal attention can use flash-attn, prefix KV-cache attention with or without an output gate can use compiled FlexAttention, and the gated delta rule can use FLA. Optional libraries are tried on the first eager call for a device, shape, dtype, stride and option set. A confirmed route can run during graph capture. A cold capture uses the reference without probing. Set `XINFER_FLASH_ATTN=0`, `XINFER_FLEX_ATTENTION=0` or `XINFER_FLA=0` before startup to disable a library. The `routes` field in `xinfer-profile check` reports which libraries ran for each observed attention signature.
 
+Set `XINFER_KV_TUNING=1` to compare the split-KV kernel and FlexAttention for prefix KV-cache calls outside the measured ranges when the in-tree build includes their head configuration. During eager warmup, both implementations read the same cache and write separate outputs. A native result must agree with FlexAttention within 1% relative L2 error. The faster eligible implementation is reused for the same device, layout and options within the process. CUDA Graph capture uses an existing choice or follows the static order on a miss.
+
 ## Build
 
 Building needs the CUDA 13 toolkit, CMake 3.24 or later (3.28 for SM110), the `apache-tvm-ffi` Python package and the CUTLASS headers (a submodule):

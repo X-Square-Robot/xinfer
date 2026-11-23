@@ -14,6 +14,8 @@ GEMM 的调用落在某个专用 kernel 调优过的范围内时由这个 kernel
 
 当原生 attention 内核不覆盖输入形状时，分段 attention 和带门控的因果 attention 可用 flash-attn，有无输出门控的前缀 KV 缓存 attention 可用编译的 FlexAttention，门控 delta 规则可用 FLA。首次以给定设备、形状、类型、步长和选项在 eager 模式调用时，会尝试可选库。CUDA Graph 录制可以使用已验证可运行的路径，首次就在录制中遇到的新形状则使用参考实现。启动前可设 `XINFER_FLASH_ATTN=0`、`XINFER_FLEX_ATTENTION=0` 或 `XINFER_FLA=0` 关闭对应库。`xinfer-profile check` 的 `routes` 字段按观测到的 attention 调用形状列出实际运行的库。
 
+设置 `XINFER_KV_TUNING=1` 后，当前构建包含对应注意力头配置、但输入不在已测范围时，会对前缀 KV 缓存比较 split-KV 内核与 FlexAttention。eager 预热时，两种实现读取相同的缓存，分别写入独立输出。原生结果相对 FlexAttention 的 L2 相对误差须小于 1%。同一进程内，相同设备、布局和选项会复用合格且较快的实现。CUDA Graph 录制时复用已有选择，未命中则使用静态顺序。
+
 ## 编译
 
 编译需要 CUDA 13 工具链、CMake 3.24 或更高版本（SM110 需要 3.28）、`apache-tvm-ffi` Python 包和 CUTLASS 头文件（子模块）：
