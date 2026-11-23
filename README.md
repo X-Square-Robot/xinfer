@@ -148,8 +148,10 @@ Single-accelerator measurements from `benchmarks/performance.py` using the produ
       <td>WALL-OSS-1.0-Nano</td>
       <td>NVFP4 vision and prefill</td>
       <td>RTX 5090</td>
-      <td>TBD</td>
-      <td colspan="3">TBD</td>
+      <td>13.8 ms</td>
+      <td>28</td>
+      <td>72 / 116 ms</td>
+      <td>154.6 req/s</td>
     </tr>
   </tbody>
 </table>
