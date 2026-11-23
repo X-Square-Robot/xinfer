@@ -14,6 +14,17 @@
 | 算子剖析 | `xinfer-profile ops`、`xinfer.observability.op_profile` | 模型每种算子调用形状在各阶段的 GPU 时间、代价和下限 |
 | 负载剖析 | `xinfer-profile load`、`xinfer.observability.load_profile` | 闭环机器人负载下每个请求在引擎中的时间：准入，以及每个阶段的排队、GPU 等待与执行和批大小 |
 
+## 检查 CUDA 算子回退
+
+以 eager 模式回放请求，查看哪些融合算子使用了 PyTorch 参考实现。请求文件应覆盖要检查的输入尺寸和选项。
+
+```bash
+xinfer-profile check --model wall-oss-1.0-nano --checkpoint /path/to/checkpoint \
+  --requests requests.msgpack --device cuda --out artifacts/kernel-check
+```
+
+`check.md` 和 `check.json` 列出选中的后端、实际调用的算子和使用参考实现的输入签名。退出码 1 表示至少一个请求执行了慢速参考实现。标为“not exercised”的算子需用其他输入检查。即使设置了 `XINFER_OPS_STRICT=1`，此命令也会收集所有观测到的回退。`xinfer-profile ops` 的 Torch reference 列显示在 eager 预热时对相同调用签名观测到的回退。
+
 ## 标注
 
 ```python

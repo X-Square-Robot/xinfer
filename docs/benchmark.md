@@ -129,6 +129,8 @@ is 0 when no round has errors or missing rows.
 
 ## Performance table
 
+CUDA performance runs set `XINFER_OPS_STRICT=1` for both latency and fleet serving. A slow fused-operator reference raises an error even when the CUDA backend is selected and only a particular shape falls back. Pass `--allow-reference` to measure that configuration intentionally. The choice is recorded in `row.json`.
+
 The [performance table](performance.md) reports WALL-OSS-1.0-Nano results. Run `benchmarks/performance.py` on an idle GPU with a compatible checkpoint and representative wire requests.
 
 ```bash

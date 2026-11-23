@@ -69,7 +69,8 @@ def test_activities_go_to_the_innermost_spans_around_their_launches():
 
 
 def test_operator_rows_average_per_request_with_bounds():
-    rows = {(r["stage"], r["op"]): r for r in op_rows(attribute(EVENTS), 1, COSTS, PEAKS_)}
+    measured = op_rows(attribute(EVENTS), 1, COSTS, PEAKS_, {NORM: "selected reference"})
+    rows = {(r["stage"], r["op"]): r for r in measured}
     assert list(rows) == [("vision", "linear"), ("vision", "rms_norm"), ("vision", OUTSIDE), ("action", "linear"),
                           ("action", OUTSIDE)]
     linear = rows[("vision", "linear")]
@@ -77,7 +78,8 @@ def test_operator_rows_average_per_request_with_bounds():
     assert linear == pytest.approx({
         "stage": "vision", "op": "linear", "shape": "x=bfloat16[4,8] weight=bfloat16[16,8]", "calls": 1.0,
         "us_per_call": 16.0, "total_us": 16.0, "share": 16 / 25, "gflop_per_call": 1024e-9, "mb_per_call": 448e-6,
-        "bound_us_per_call": 0.448, "efficiency": 0.448 / 16, "limiter": "memory", "cost": "formula"})
+        "bound_us_per_call": 0.448, "efficiency": 0.448 / 16, "limiter": "memory", "cost": "formula", "reference": ""})
+    assert rows[("vision", "rms_norm")]["reference"] == "selected reference"
     assert rows[("vision", "rms_norm")]["cost"] == "generic" and rows[("vision", "rms_norm")]["share"] == 4 / 25
     outside = rows[("vision", OUTSIDE)]
     assert (outside["calls"], outside["us_per_call"], outside["total_us"], outside["share"], outside["cost"]) == \
