@@ -148,8 +148,10 @@ WALL-OSS-0.5 需要使用[内部 checkpoint 布局](docs/models/wall_oss_0_5.zh-
       <td>WALL-OSS-1.0-Nano</td>
       <td>视觉和预填充 NVFP4</td>
       <td>RTX 5090</td>
-      <td>TBD</td>
-      <td colspan="3">TBD</td>
+      <td>13.8 ms</td>
+      <td>28</td>
+      <td>72 / 116 ms</td>
+      <td>154.6 req/s</td>
     </tr>
   </tbody>
 </table>

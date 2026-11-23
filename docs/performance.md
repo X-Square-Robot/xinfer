@@ -59,8 +59,10 @@ Single-accelerator measurements for WALL-OSS-1.0-Nano from `benchmarks/performan
       <td>WALL-OSS-1.0-Nano</td>
       <td>NVFP4 vision and prefill</td>
       <td>RTX 5090</td>
-      <td>TBD</td>
-      <td colspan="3">TBD</td>
+      <td>13.8 ms</td>
+      <td>28</td>
+      <td>72 / 116 ms</td>
+      <td>154.6 req/s</td>
     </tr>
   </tbody>
 </table>
@@ -74,7 +76,9 @@ Capacity and server P50 / P95 describe the same robot count. Peak throughput is 
 
 ## RTX 5090
 
-The two single-request P50s were measured on November 21, 2026 on one idle RTX 5090 with SM120 kernel revision `4a62de1`, PyTorch 2.10.0+cu130, and FlashAttention 2.8.3.post1. Camera views were decoded and resized on the GPU. The single-request input set contained 216 recorded requests with three camera JPEGs each.
+On November 23, 2026, NVFP4 ran on public SM120 build `192b9fd` (library SHA-256 prefix `c0b3afbebebb`) with GPU image processing and PyTorch 2.10.0+cu130. The single-request P50 covers 50 timed runs. The closed-loop sweep started at 12 robots and increased by two, with eight rounds per count. The median server P50 rose from 72.0 ms at 28 robots to 186.7 ms at 30, crossing the capacity threshold. All rounds completed with zero errors and zero missing requests.
+
+The BF16 and MXFP8 single-request P50s were measured on November 21, 2026 on one idle RTX 5090 with SM120 kernel revision `4a62de1`, PyTorch 2.10.0+cu130, and FlashAttention 2.8.3.post1. Camera views were decoded and resized on the GPU. The single-request input set contained 216 recorded requests with three camera JPEGs each.
 
 The BF16 fleet figures are from the November 13 run on SM120 kernel revision `7336b0d`. The MXFP8 fleet figures are from the November 17 run on revision `f4cdb84`. Both used synthetic robot observations with real-time chunking. The [MXFP8 preset](models/wall_oss_1_0_nano_design.md#mxfp8) quantizes selected vision and prefill linear layers and keeps the action stage in BF16.
 
