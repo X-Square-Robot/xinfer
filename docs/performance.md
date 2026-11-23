@@ -52,8 +52,10 @@ Single-accelerator measurements for WALL-OSS-1.0-Nano from `benchmarks/performan
       <td>WALL-OSS-1.0-Nano</td>
       <td>BF16</td>
       <td>Jetson AGX Thor</td>
-      <td>TBD</td>
-      <td colspan="3">TBD</td>
+      <td>71.0 ms</td>
+      <td>2</td>
+      <td>82 / 88 ms</td>
+      <td>16.0 req/s</td>
     </tr>
     <tr>
       <td>WALL-OSS-1.0-Nano</td>
@@ -77,6 +79,10 @@ Capacity and server P50 / P95 describe the same robot count. Peak throughput is 
 The two single-request P50s were measured on November 21, 2026 on one idle RTX 5090 with SM120 kernel revision `4a62de1`, PyTorch 2.10.0+cu130, and FlashAttention 2.8.3.post1. Camera views were decoded and resized on the GPU. The single-request input set contained 216 recorded requests with three camera JPEGs each.
 
 The BF16 fleet figures are from the November 13 run on SM120 kernel revision `7336b0d`. The MXFP8 fleet figures are from the November 17 run on revision `f4cdb84`. Both used synthetic robot observations with real-time chunking. The [MXFP8 preset](models/wall_oss_1_0_nano_design.md#mxfp8) quantizes selected vision and prefill linear layers and keeps the action stage in BF16.
+
+## Jetson AGX Thor
+
+On November 23, 2026, the public SM110 build from XInfer `453e82e` (library SHA-256 prefix `dc44beaf6a32`) ran Nano BF16 with GPU image processing and PyTorch 2.10.0+cu130. The single-request P50 uses 50 timed runs. The closed-loop sweep ran eight rounds at each of one, two and three robots. At three robots the median server P50 rose from 82.3 to 180.5 ms, crossing the capacity threshold. All rounds completed with zero errors and zero missing requests.
 
 ## Ascend 950DT
 
