@@ -119,13 +119,13 @@ def nvimgcodec_stub(monkeypatch):
 
 @pytest.mark.parametrize("status", ["decodes", "no-decoder", None])
 def test_the_cuda_platform_has_device_images_where_nvimgcodec_has_a_decoder(nvimgcodec_stub, status):
-    """The capability only creates the decoder (one CPU thread) and decodes nothing; without one, the decoder names
+    """Probe by creating the decoder (up to two CPU threads). If unavailable, name
     the package to install."""
     calls = nvimgcodec_stub(status)
     assert (cuda._nvimgcodec_decoder(0) is not None) is (status == "decodes")  # the capability device_images
     assert [name for name, _ in calls] == ([] if status is None else ["init"])
     if status is not None:
-        assert calls[0][1] == {"device_id": 0, "max_num_cpu_threads": 1}
+        assert calls[0][1] == {"device_id": 0, "max_num_cpu_threads": 2}
     if status != "decodes":
         with pytest.raises(RuntimeError, match=r"nvImageCodec.*xinfer\[gpu-image\]"):
             cuda.CudaJpegDecoder(torch.device("cuda", 0))
@@ -171,7 +171,7 @@ def test_cuda_jpegs_are_ordered_retained_and_decoded_into_kept_images(monkeypatc
 
     class Decoder:
         def __init__(self, device_id, max_num_cpu_threads):
-            assert (device_id, max_num_cpu_threads) == (3, 1)
+            assert (device_id, max_num_cpu_threads) == (3, 2)
 
         def decode(self, data, params, cuda_stream, images=None):
             assert active.stream == allocation_stream and cuda_stream == 7

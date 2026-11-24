@@ -53,7 +53,7 @@ completion thread:
 
 解码器（`xinfer.engine.device_images`）在该线程上、处理第一个带设备图像的请求时由 `xinfer.platforms.devices.jpeg_decoder_for` 创建：在 CUDA 上是 NVIDIA 的 nvImageCodec（`xinfer.platforms.cuda.CudaJpegDecoder`）。没有 CUDA 设备或没有 nvImageCodec 时，每个带设备图像的请求都会以此为原因失败；在 `xinfer serve --warmup` 下，预热请求由相同的处理器准备，因此服务会在启动时失败。
 
-nvImageCodec 在解码器自己的 stream 上用 nvJPEG 的硬件解码器解码整批，它运行在 GPU 的 JPEG 引擎上（NVJPG，RTX 5090 和 Jetson Thor 都有）：熵解码和 IDCT 在那里执行，再由一个 CUDA kernel 像 libjpeg-turbo 一样做色度上采样并转成 RGB，因此解码出的视图与 CPU 路径相差不超过 1 级。解码出的图像属于 nvImageCodec 的内存。解码器在自己的 stream 上把它们拷进张量，并让线程的 stream 等待这次拷贝；它保留这些图像，直到拷贝之后记录的事件完成，再解码到这些图像里复用，所以一次调用既不分配新图像，也不等待 GPU。在 RTX 5090 上（nvImageCodec 0.10），一个请求的相机视图占用该线程 0.4–0.7 ms。解码器只用一个 CPU 线程：nvImageCodec 默认按可见核数起线程，等待时自旋，在有 CPU 配额的容器里压测时拖慢了前端和引擎。一个设备图像线程就够了，解码器也只从这个线程调用。JPEG 字节留在主机内存，nvImageCodec 从那里读取码流。
+nvImageCodec 在解码器自己的 stream 上用 nvJPEG 的硬件解码器解码整批，它运行在 GPU 的 JPEG 引擎上（NVJPG，RTX 5090 和 Jetson Thor 都有）：熵解码和 IDCT 在那里执行，再由一个 CUDA kernel 像 libjpeg-turbo 一样做色度上采样并转成 RGB，因此解码出的视图与 CPU 路径相差不超过 1 级。解码出的图像属于 nvImageCodec 的内存。解码器在自己的 stream 上把它们拷进张量，并让线程的 stream 等待这次拷贝；它保留这些图像，直到拷贝之后记录的事件完成，再解码到这些图像里复用，所以一次调用既不分配新图像，也不等待 GPU。在 RTX 5090 上（nvImageCodec 0.10），一个请求的相机视图占用该线程 0.4–0.7 ms。解码器最多使用两个 CPU 线程，混合解码时可以并行处理多路相机图像。限制线程数也能避免在有 CPU 配额的容器中为每个可见的核启动一个自旋线程。JPEG 字节留在主机内存，nvImageCodec 从那里读取码流。
 
 CUDA 设备是否支持设备图像，通过创建解码器来检查，不做解码。若在这时（平台解析时）解码，该进程之后的每次 CUDA graph 回放都会变慢：在 RTX 5090 上，回放中 kernel 之间的间隙从 0.5 µs 以下变为 0.5–1 µs，WALL-OSS-1.0-Nano 每个请求约多 0.6 ms，WALL-OSS-0.5 每个请求最多多 1 ms，不论请求是否带 JPEG。不在这时解码，单请求耗时与 XInfer 之前所用的 torchvision 解码器相同。
 
