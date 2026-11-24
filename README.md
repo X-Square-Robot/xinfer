@@ -141,8 +141,10 @@ Single-accelerator measurements from `benchmarks/performance.py` using the produ
       <td>WALL-OSS-1.0-Nano</td>
       <td>BF16</td>
       <td>Jetson AGX Thor</td>
-      <td>TBD</td>
-      <td colspan="3">TBD</td>
+      <td>71.0 ms</td>
+      <td>2</td>
+      <td>82 / 88 ms</td>
+      <td>16.0 req/s</td>
     </tr>
     <tr>
       <td>WALL-OSS-1.0-Nano</td>

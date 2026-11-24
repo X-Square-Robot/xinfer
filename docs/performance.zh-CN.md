@@ -52,8 +52,10 @@
       <td>WALL-OSS-1.0-Nano</td>
       <td>BF16</td>
       <td>Jetson AGX Thor</td>
-      <td>TBD</td>
-      <td colspan="3">TBD</td>
+      <td>71.0 ms</td>
+      <td>2</td>
+      <td>82 / 88 ms</td>
+      <td>16.0 req/s</td>
     </tr>
     <tr>
       <td>WALL-OSS-1.0-Nano</td>
@@ -77,6 +79,10 @@
 两项单请求 P50 均测于 2026 年 11 月 21 日。测试独占一张 RTX 5090，使用 SM120 算子版本 `4a62de1`、PyTorch 2.10.0+cu130 和 FlashAttention 2.8.3.post1。相机图像在 GPU 上解码并缩放。单请求输入集包含 216 条录制请求，每条请求有三路 JPEG 图像。
 
 BF16 并发数据来自 11 月 13 日的测试，使用 SM120 算子版本 `7336b0d`。MXFP8 并发数据来自 11 月 17 日的测试，使用版本 `f4cdb84`。两组测试均使用带实时分块的合成机器人观测。[MXFP8 预设](models/wall_oss_1_0_nano_design.zh-CN.md#mxfp8)量化视觉和预填充阶段的部分线性层，动作阶段保留 BF16。
+
+## Jetson AGX Thor
+
+2026 年 11 月 23 日，使用 XInfer `453e82e` 的公开 SM110 构建（内核库 SHA-256 前缀 `dc44beaf6a32`）和 PyTorch 2.10.0+cu130，在 GPU 上进行图像预处理并运行 Nano BF16。单请求 P50 来自 50 次计时。1、2、3 台机器人分别完成 8 轮闭环压测。增至 3 台时，服务端 P50 的中位数从 82.3 ms 上升至 180.5 ms，超过容量阈值。所有轮次均无错误或缺失请求。
 
 ## 昇腾 950DT
 
