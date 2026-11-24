@@ -511,7 +511,24 @@ def flex_prefix(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, sc
                          lambda: reference_attn.prefix_kvcache_attention(*args, flash_mask=flash_mask, scale=scale))
 
 
-def _unmeasured_kv(q, k, v, prefix_len, new_pos, gate, flash_mask, scale):
+def _kv_layout(q, k, v, prefix, new_pos, gate, mask, scale):
+    if not _compiled_kvcache_takes(q, k) or v.shape != k.shape:
+        return False
+    b, m, h, d = q.shape
+    length, kv_heads = k.shape[1:3]
+    return (all(t.dtype == q.dtype and t.device == q.device and t.stride(-1) == 1
+                and t.data_ptr() % 16 == 0 and all(s % 8 == 0 for s in t.stride()[:-1]) for t in (q, k, v))
+            and prefix.dtype == torch.int32 and prefix.device == q.device and prefix.shape == (b,)
+            and prefix.is_contiguous() and 0 <= new_pos <= length - m
+            and (scale is None or (math.isfinite(scale) and scale > 0))
+            and (gate is None or (gate.device == q.device and gate.dtype == q.dtype
+                                  and gate.shape == (b, m, h * d) and gate.stride(-1) == 1))
+            and (mask is None or (mask.device == q.device and mask.dtype == torch.int32
+                                  and mask.shape in ((b, 1, length, 2), (b, kv_heads, length, 2))
+                                  and mask.stride()[-2:] == (2, 1) and mask.data_ptr() % 8 == 0)))
+
+
+def _dispatch_kv(q, k, v, prefix_len, new_pos, gate, flash_mask, scale):
     op = "prefix_kvcache_attention" if gate is None else "gated_kvcache_attention"
 
     def native():
@@ -522,27 +539,29 @@ def _unmeasured_kv(q, k, v, prefix_len, new_pos, gate, flash_mask, scale):
         out = libraries.flex()(q, k, v, prefix_len, new_pos, flash_mask, scale)
         return out if gate is None else reference_attn.gate_output(out, gate)
 
-    if (os.environ.get("XINFER_OP_TUNING", "1") != "0" and libraries.FLEX and _compiled_kvcache_takes(q, k)
-            and (flash_mask is None or flash_mask.shape[1] == 1)):
-        args = (q, k, v, prefix_len, new_pos, gate, flash_mask, scale)
-        winner = _kv_tuning.choose(op, args, native, external)
-        if winner is not None:
-            output = native() if winner == "kernels" else external()
-            note_route(winner)
-            return output
-    if gate is None:
-        return flex_prefix(q, k, v, prefix_len, new_pos, flash_mask=flash_mask, scale=scale)
-    return flex_gated(q, k, v, prefix_len, new_pos, gate, flash_mask=flash_mask, scale=scale)
+    args = (q, k, v, prefix_len, new_pos, gate, flash_mask, scale)
+    flex = libraries.FLEX if flash_mask is None or (flash_mask.ndim == 4 and flash_mask.shape[1] == 1) else None
+    if not _kv_layout(q, k, v, prefix_len, new_pos, gate, flash_mask, scale):
+        def reference():
+            if gate is None:
+                return reference_attn.prefix_kvcache_attention(q, k, v, prefix_len, new_pos, flash_mask=flash_mask,
+                                                              scale=scale)
+            return reference_attn.gated_kvcache_attention(q, k, v, prefix_len, new_pos, gate, flash_mask=flash_mask,
+                                                          scale=scale)
+
+        return libraries.run(op, flex, args, external, reference)
+    winner = "kernels"
+    if flex and not attention_kvcache_takes(q, k) and os.environ.get("XINFER_OP_TUNING", "1") != "0":
+        winner = _kv_tuning.choose(op, args, native, external) or "kernels"
+    result = native() if winner == "kernels" else external()
+    note_route(winner)
+    return result
 
 
 @register("prefix_kvcache_attention", backend="cuda", **NATIVE)
 def prefix_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, *, flash_mask=None, scale=None):
-    if not attention_kvcache_takes(q, k_cache):
-        return _unmeasured_kv(q, k_cache, v_cache, prefix_len, new_pos, None, flash_mask, scale)
-    result = attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
-                               flash_mask=flash_mask, softmax_scale=scale)
-    note_route("kernels")
-    return result
+    return _dispatch_kv(q, k_cache, v_cache, prefix_len, new_pos, None, flash_mask, scale)
+
 
 
 @register("segment_attention", backend="cuda", requires=flash_attn, priority=5)
@@ -585,12 +604,8 @@ def flex_gated(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=Non
 
 @register("gated_kvcache_attention", backend="cuda", **NATIVE)
 def gated_kvcache_attention(q, k_cache, v_cache, prefix_len, new_pos, gate, *, flash_mask=None, scale=None):
-    if not attention_kvcache_takes(q, k_cache):
-        return _unmeasured_kv(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask, scale)
-    result = attention_kvcache(q, k_cache, v_cache, prefix_len=prefix_len, new_pos=int(new_pos),
-                               flash_mask=flash_mask, softmax_scale=scale, gate=gate)
-    note_route("kernels")
-    return result
+    return _dispatch_kv(q, k_cache, v_cache, prefix_len, new_pos, gate, flash_mask, scale)
+
 
 
 @register("gated_delta_net", backend="cuda", requires=libraries.FLA, priority=5)
