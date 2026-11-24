@@ -40,9 +40,7 @@ GEMM 的输入都是 BF16 计算组合给它的 BF16 张量，再用 amax 块缩
 | 动作 | 动作专家读取提示词 KV 缓存，保留原有计算方式。 |
 
 各分组也可以分别使用 `nvfp4` 和 `nvfp4_mse`，例如 `quantization={"groups":{"prefill":"nvfp4_mse"}}`。该预设要求
-`numerics="optimized"`，原生路径需要 SM120 和带 NVFP4 输入的 xcompute 构建：带残差的投影、提示词路径的投影和视觉
-fc1（量化输出）走 xcompute 的 CUTLASS NVFP4 kernel，带 RoPE 的 QKV 和 gate/up 投影走它的通用块缩放路径，结果相同。
-其他设备和不带 NVFP4 的构建使用 PyTorch NVFP4 算子。可用 `Policy.describe()["ops"]` 查看 `nvfp4_gemm_epilogue` 等
+`numerics="optimized"`，在 SM120 上编译仓库中的 CUDA 算子库即可使用原生 NVFP4 量化、融合归一化和块缩放投影。其他设备和不带 NVFP4 的构建使用 PyTorch NVFP4 算子。可用 `Policy.describe()["ops"]` 查看 `nvfp4_gemm_epilogue` 等
 `nvfp4_*` 算子的实际选择。E2M1 数值、缩放因子和算子形式见[量化指南](../quantization.zh-CN.md#nvfp4-格式)。
 
 ## 验证
@@ -51,8 +49,7 @@ fc1（量化输出）走 xcompute 的 CUTLASS NVFP4 kernel，带 RoPE 的 QKV �
 
 在 RTX 5090 和 xcompute `536ea8f`（带 MXFP8 GEMM 系列）上，MXFP8 从序列化请求到进程内返回响应的单请求 P50 为 17.0 ms（`benchmarks/request_latency.py`，图像在 GPU 上解码和缩放）：主机输入输出处理 3.4 ms，引擎 13.6 ms。同一构建上 BF16 为 22.3 ms（3.5 + 18.9）。机器人负载下（`benchmarks/performance.py`，每档 8 轮，14–24 台、步长 2），MXFP8 支撑 22 台，服务端 P50 / P95 中位数为 76 / 116 ms，24 台时为 151 ms。BF16 在 14 台时为 86 / 103 ms；14 台是它在 xcompute `7336b0d` 上的容量，那里 15 台时为 170 ms。MXFP8 对动作的改变超出舍入量级。启用 MXFP8 前，请在目标机器人任务上评估精度。
 
-NVFP4 的[算子测试](../../tests/unit/test_nvfp4.py)对照定义检查各形式；在配有兼容 xcompute 构建的 GPU 上，还会按 WALL-OSS-1.0-Nano
-的投影尺寸对比 xcompute 的 NVFP4 算子与 PyTorch 算子；小型 checkpoint 测试用 `quantization="nvfp4"` 运行三个阶段。
+[NVFP4 算子测试](../../tests/kernels/test_kernel_nvfp4.py)对比公开 CUDA 算子与 PyTorch 的输出。小型 checkpoint 测试用 `quantization="nvfp4"` 运行三个阶段。
 在 RTX 5090 和 xcompute `3a2bee6`（NVFP4 kernel 合入为 `7034bdf` 之前的提交，动作逐位相同）上，各阶段 graph
 耗时为视觉 1.5、预填充 3.1、动作 5.2 ms（共 9.8 ms；BF16 为 16.6 ms），单请求 P50 为 15.2 ms（3.5 + 11.7）。机器人负载下
 NVFP4 支撑 28 台，服务端 P50 / P95 中位数为 103 / 145 ms，30 台时为 167 ms；饱和吞吐 154.3 req/s（同一 GPU 上 MXFP8 为

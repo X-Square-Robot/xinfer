@@ -6,6 +6,7 @@ import torch
 
 from xinfer.ops.backends.cuda import _native
 from xinfer.ops.layout import mxfp8 as layout
+from xinfer.ops.reference import nvfp4
 
 DEVICE = torch.device("cuda")
 
@@ -44,8 +45,10 @@ def close(actual, expected, tolerance=5e-3):
 
 
 def dequantize(pair):
-    """FP32 values of an MXFP8 pair."""
-    values, scales = pair
+    """FP32 values of an MXFP8 pair, or of an NVFP4 pair or weight triple ``(values, scales, global_scale)``."""
+    values, scales = pair[0], pair[1]
+    if values.dtype == torch.uint8:  # NVFP4
+        return nvfp4.dequantize(values, scales) * (float(pair[2]) if len(pair) == 3 else 1.0)
     rows, k = values.shape
     exponent = scales[layout.scale_offsets(rows, k, values.device)][:, : k // 32].to(torch.int32)
     scale = torch.ldexp(torch.ones_like(exponent, dtype=torch.float32), exponent - 127)
@@ -53,3 +56,4 @@ def dequantize(pair):
 
 
 MXFP8_TOLERANCE = 6e-2  # relative error of a tensor rounded to E4M3 (a 3-bit mantissa: at most 1/16 an element)
+NVFP4_TOLERANCE = 0.15  # relative error of a tensor rounded to E2M1 (0, 0.5, 1, 1.5, 2, 3, 4, 6 times a block scale)

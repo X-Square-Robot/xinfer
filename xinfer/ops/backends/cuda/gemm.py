@@ -11,6 +11,9 @@
 | ``prefetch_weights``, ``join_prefetch`` | L2 prefetches on a side stream (integrated GPUs only) |
 | ``mxfp8_quantize`` | ``quantize_mxfp8`` |
 | ``mxfp8_gemm_epilogue``, ``mxfp8_gemm_glu_quantize``, ``mxfp8_qkv_rope_epilogue`` | the three with MXFP8 operands |
+| ``nvfp4_quantize`` | ``quantize_nvfp4`` |
+| ``nvfp4_gemm``, ``nvfp4_gemm_epilogue`` | ``gemm`` with NVFP4 operands |
+| ``nvfp4_gemm_glu_quantize``, ``nvfp4_qkv_rope_epilogue`` | ``gemm_glu``, ``qkv_proj_rope`` with NVFP4 operands |
 
     gemm(x, weight, bias, activation=,           out = act(row_scale * (x @ weight^T + bias)) + residual
          residual=, row_scale=, quantize=)
@@ -21,11 +24,14 @@
 
 The operands are BF16, ``x`` ``[M, K]`` and ``weight`` ``[N, K]`` as the model stores it (contiguous, or the
 transposed view of a contiguous ``[K, N]`` tensor), or both are MXFP8 pairs ``(values, scales)``
-(``xinfer.ops.layout.mxfp8``); the bias and the residual are BF16 either way. Results are BF16, or with
-``quantize=True`` an MXFP8 pair with one scale per 128 columns.
+(``xinfer.ops.layout.mxfp8``), or ``x`` is an NVFP4 pair ``(packed E2M1 [M, K / 2], scales)`` and ``weight`` an
+NVFP4 triple ``(packed E2M1 [N, K / 2], scales, global_scale)`` (``xinfer.ops.layout.nvfp4``); the bias and the
+residual are BF16 either way. Results are BF16, or with ``quantize=True`` a pair of the operands' format (MXFP8: one
+scale per 128 columns). With block-scaled operands the product is rounded to BF16 before the epilogue (an NVFP4
+weight's global scale and the bias apply to the FP32 accumulator).
 
 Every function runs through the generic path: one cuBLASLt GEMM, then the epilogue as a separate elementwise kernel
-(BF16 operands on any CUDA GPU, MXFP8 operands where cuBLASLt has block-scaled FP8 GEMMs: SM120). An architecture
+(BF16 operands on any CUDA GPU, MXFP8 and NVFP4 operands where cuBLASLt has block-scaled GEMMs: SM120). An architecture
 module (``gemm_sm120``, ``gemm_sm110``) adds kernels that fuse the epilogue into the GEMM; each kernel states the
 calls it takes (``takes``), and a function runs the first kernel of its architecture that takes the call, the generic
 path otherwise. A kernel that needs the weight in another memory order builds that copy on the weight's first call and
@@ -52,15 +58,23 @@ from typing import NamedTuple, Optional
 import torch
 
 from xinfer.ops.backends.cuda import gemm_tuning
-from xinfer.ops.backends.cuda._native import KERNELS, NATIVE, Carver, arch, derived, empty_mxfp8, lib, scratch
+from xinfer.ops.backends.cuda._native import (KERNELS, NATIVE, NVFP4_NATIVE, Carver, arch, derived, empty_mxfp8,
+                                              empty_nvfp4, lib, scratch)
 from xinfer.ops.backends.cuda.norm import add_rms_norm, rmsnorm
 from xinfer.ops.layout import mxfp8 as layout
+from xinfer.ops.layout import nvfp4 as nvfp4_layout
 from xinfer.ops.reference import gemm as reference
+from xinfer.ops.reference import nvfp4 as nvfp4_reference
 from xinfer.ops.registry import note_reference_call, register
 
 
 def _is_pair(t):
     return isinstance(t, (tuple, list)) and len(t) == 2
+
+
+def _is_nvfp4(x, weight):
+    """Whether ``(x, weight)`` are NVFP4 operands: ``(q, scales)`` and ``(q, scales, global_scale)``."""
+    return _is_pair(x) and isinstance(weight, (tuple, list)) and len(weight) == 3
 
 
 ACTIVATIONS = {"silu": 0, "gelu_tanh": 1, "gelu": 2}  # codes of the epilogue kernels
@@ -70,8 +84,8 @@ ACTIVATIONS = {"silu": 0, "gelu_tanh": 1, "gelu": 2}  # codes of the epilogue ke
 class Call:
     """One GEMM call as the kernels see it."""
 
-    x: torch.Tensor  # [M, K], contiguous: BF16, or the E4M3 values of an MXFP8 pair
-    weight: torch.Tensor  # [N, K] (gemm_glu: [2 N, K]) as passed by the caller: BF16, or E4M3 values
+    x: torch.Tensor  # [M, K], contiguous: BF16, or the E4M3 values of an MXFP8 pair (NVFP4: packed [M, K / 2])
+    weight: torch.Tensor  # [N, K] (gemm_glu: [2 N, K]) as passed by the caller: BF16, or E4M3 values (NVFP4: packed)
     bias: Optional[torch.Tensor]
     activation: Optional[str]
     m: int
@@ -79,10 +93,12 @@ class Call:
     k: int
     residual: Optional[torch.Tensor] = None  # BF16 [M, N]
     row_scale: Optional[torch.Tensor] = None  # FP32 [M]
-    x_scale: Optional[torch.Tensor] = None  # the scales of MXFP8 operands
+    x_scale: Optional[torch.Tensor] = None  # the scales of block-scaled operands
     weight_scale: Optional[torch.Tensor] = None
-    quantize: bool = False  # the result is an MXFP8 pair
+    quantize: bool = False  # the result is a pair of the operands' format
     rope: Optional[tuple] = None  # qkv_proj_rope: (heads, KV heads, head dim, rotary dim, packed table or None)
+    fmt: str = "bf16"  # "bf16", "mxfp8" or "nvfp4"
+    alpha: float = 1.0  # NVFP4: the weight's global scale, on the FP32 accumulator
     qk_order: str = "standard"  # qkv_proj_rope: "any" lets a kernel write Q and K in rotary-pair order
 
     @property
@@ -91,14 +107,18 @@ class Call:
 
     @property
     def mxfp8(self):
-        return self.x_scale is not None
+        return self.fmt == "mxfp8"
+
+    @property
+    def nvfp4(self):
+        return self.fmt == "nvfp4"
 
     @property
     def features(self):
-        """What the call asks for beyond the BF16 product: a subset of {"mxfp8", "bias", "residual", "row_scale",
-        <activation>, "quantize"}."""
+        """What the call asks for beyond the BF16 product: a subset of {"mxfp8" or "nvfp4", "bias", "residual",
+        "row_scale", <activation>, "quantize"}."""
         parts = {name for name in ("bias", "residual", "row_scale") if getattr(self, name) is not None}
-        parts |= {name for name in ("mxfp8", "quantize") if getattr(self, name)}
+        parts |= {name for name in ("mxfp8", "nvfp4", "quantize") if getattr(self, name)}
         return frozenset(parts | ({self.activation} if self.activation else set()))
 
 
@@ -144,8 +164,13 @@ _CUBLAS_BYTES = 0 if lib is None else int(lib.gemm_generic_workspace_size())
 
 def _cublas(out, c, workspace, residual=None):
     """out (BF16) = x @ weight^T (+ bias) (+ residual) through cuBLASLt. BF16 operands: on the weight's memory as
-    it is where it is dense, the residual added to the FP32 product. MXFP8 operands: the product is rounded to
+    it is where it is dense, the residual added to the FP32 product. Block-scaled operands: the product is rounded to
     BF16 before the residual is added."""
+    if c.nvfp4:
+        lib.gemm_generic_nvfp4(out, c.x, c.x_scale, c.weight, c.weight_scale, c.bias, workspace, float(c.alpha))
+        if residual is not None:
+            lib.gemm_epilogue_residual(out, residual, None, 1.0)
+        return
     if c.mxfp8:
         operands = (c.x, c.x_scale, c.weight, c.weight_scale, c.bias)
         if gemm_tuning.settings()[0] == "0":
@@ -177,6 +202,9 @@ def _generic_gemm(c, out):
     _cublas(y, c, workspace, c.residual)
     if c.row_scale is not None:
         lib.gemm_epilogue_row_scale(y, c.row_scale)
+    if c.quantize and c.nvfp4:  # the activation and the quantization of its BF16 result in one pass
+        lib.gemm_epilogue_quant_nvfp4(out[0], out[1], y, ACTIVATIONS.get(c.activation, -1), 0)
+        return
     if c.activation is not None:
         lib.gemm_epilogue_act(y, ACTIVATIONS[c.activation])
     if c.quantize:
@@ -188,7 +216,9 @@ def _generic_glu(c, out):
     workspace = carve.take(_CUBLAS_BYTES)
     y = carve.tensor((c.m, 2 * c.n), torch.bfloat16)  # [gate | up]
     _cublas(y, c, workspace)
-    if c.quantize:
+    if c.quantize and c.nvfp4:
+        lib.gemm_epilogue_quant_nvfp4(out[0], out[1], y, ACTIVATIONS[c.activation], c.n)
+    elif c.quantize:
         lib.gemm_epilogue_glu_quant(out[0], out[1], y, ACTIVATIONS[c.activation], c.n, True)
     else:
         lib.gemm_epilogue_glu(out, y, ACTIVATIONS[c.activation], c.n)
@@ -199,20 +229,34 @@ def _generic_glu(c, out):
 # ---------------------------------------------------------------------------
 def _call(op, x, weight, bias, activation, residual=None, row_scale=None, quantize=False):
     x_scale = weight_scale = None
-    if _is_pair(x) or _is_pair(weight):
+    fmt, alpha = "bf16", 1.0
+    if _is_nvfp4(x, weight):
+        (x, x_scale), (weight, weight_scale, alpha) = x, weight
+        fmt, alpha = "nvfp4", float(alpha)
+    elif _is_pair(x) or _is_pair(weight):
         if not (_is_pair(x) and _is_pair(weight)):
-            raise ValueError(f"{op}: x and weight must both be BF16 tensors or both be MXFP8 pairs")
+            raise ValueError(f"{op}: x and weight must both be BF16 tensors, both MXFP8 pairs, or an NVFP4 pair and "
+                             "an NVFP4 triple")
         (x, x_scale), (weight, weight_scale) = x, weight
-    dtypes = (torch.float8_e4m3fn, torch.uint8) if x_scale is not None else (torch.bfloat16,)
+        fmt = "mxfp8"
+    dtypes = {"bf16": (torch.bfloat16,), "mxfp8": (torch.float8_e4m3fn, torch.uint8), "nvfp4": (torch.uint8,)}[fmt]
     if x.dim() != 2 or weight.dim() != 2 or x.dtype not in dtypes or weight.dtype not in dtypes:
-        raise ValueError(f"{op}: x must be [M, K] and weight [N, K], both BF16 or both MXFP8 pairs")
+        raise ValueError(f"{op}: x must be [M, K] and weight [N, K], both BF16, MXFP8 or NVFP4")
     if not x.is_contiguous():
         raise ValueError(f"{op}: x must be contiguous")
     m, k = x.shape
     rows = weight.shape[0]
     if weight.shape[1] != k or weight.device != x.device:
         raise ValueError(f"{op}: weight {tuple(weight.shape)} does not match x {tuple(x.shape)} on {x.device}")
-    if x_scale is not None:
+    if fmt == "nvfp4":
+        k *= 2  # two E2M1 values per byte
+        if k % 32 or not weight.is_contiguous() or not alpha > 0:
+            raise ValueError(f"{op}: NVFP4 operands need K a multiple of 32, a contiguous weight and a positive "
+                             "global scale")
+        if (x_scale.numel() < nvfp4_layout.scale_elements(m, k)
+                or weight_scale.numel() < nvfp4_layout.scale_elements(rows, k)):
+            raise ValueError(f"{op}: the scales of an NVFP4 operand are shorter than layout.nvfp4.scale_elements")
+    elif fmt == "mxfp8":
         if k % 32 or not weight.is_contiguous():
             raise ValueError(f"{op}: MXFP8 operands need K a multiple of 32 and a contiguous weight")
         if x_scale.numel() < layout.scale_elements(m, k) or weight_scale.numel() < layout.scale_elements(rows, k):
@@ -233,24 +277,27 @@ def _call(op, x, weight, bias, activation, residual=None, row_scale=None, quanti
     if row_scale is not None and (row_scale.dtype != torch.float32 or row_scale.numel() != m
                                   or not row_scale.is_contiguous()):
         raise ValueError(f"{op}: row_scale must be a contiguous FP32 tensor of {m} elements")
-    if quantize and rows % 32:
-        raise ValueError(f"{op}: quantize needs an output width that is a multiple of 32")
-    return Call(x, weight, bias, activation, m, rows, k, residual, row_scale, x_scale, weight_scale, bool(quantize))
+    if quantize and rows % (16 if fmt == "nvfp4" else 32):
+        raise ValueError(f"{op}: quantize needs an output width that is a multiple of 32 (NVFP4: 16)")
+    return Call(x, weight, bias, activation, m, rows, k, residual, row_scale, x_scale, weight_scale, bool(quantize),
+                fmt=fmt, alpha=alpha)
 
 
 def _out(out, shape, c):
     if c.quantize:
+        empty, values, scale_elements = ((empty_nvfp4, (shape[0], shape[1] // 2), nvfp4_layout.scale_elements)
+                                         if c.nvfp4 else (empty_mxfp8, tuple(shape), layout.scale_elements))
         if out is None:
-            return empty_mxfp8(*shape, c.device)
-        if not _is_pair(out) or tuple(out[0].shape) != tuple(shape) or out[1].numel() < layout.scale_elements(*shape):
-            raise ValueError(f"out must be an MXFP8 pair for shape {tuple(shape)}")
+            return empty(*shape, c.device)
+        if not _is_pair(out) or tuple(out[0].shape) != values or out[1].numel() < scale_elements(*shape):
+            raise ValueError(f"out must be a pair of the operands' format for shape {tuple(shape)}")
         return out
     if out is None:
         return torch.empty(shape, dtype=torch.bfloat16, device=c.device)
     if tuple(out.shape) != tuple(shape) or out.dtype != torch.bfloat16 or not out.is_contiguous():
         raise ValueError(f"out must be a contiguous BF16 tensor of shape {tuple(shape)}")
-    if c.mxfp8 and c.residual is not None and out.data_ptr() == c.residual.data_ptr():
-        raise ValueError("with MXFP8 operands the residual cannot be the output")
+    if c.fmt != "bf16" and c.residual is not None and out.data_ptr() == c.residual.data_ptr():
+        raise ValueError("with MXFP8 or NVFP4 operands the residual cannot be the output")
     return out
 
 
@@ -367,6 +414,21 @@ def qkv_proj_rope(x, weight, bias=None, *, num_heads, head_dim, num_kv_heads=Non
     lib.gemm_epilogue_rope_kvcache(out, y, cos, sin, k_cache, v_cache, int(start), num_heads, num_kv_heads,
                                    head_dim, rotary_dim, False, False, table)
     return out
+
+
+def quantize_nvfp4(x, *, global_scale=1.0, mse=False, out=None):
+    """BF16 ``x`` ``[M, K]`` (K a multiple of 16) as an NVFP4 pair ``(packed E2M1 [M, K / 2], E4M3 scales)``: one
+    scale per 16 columns, ``e4m3(min(448, max(2^-6, amax / (6 g))))`` of the block's largest magnitude, or with
+    ``mse=True`` the E4M3 value of least squared reconstruction error (weights); the values ``e2m1(x / (scale g))``.
+    The quotients are ``a * rcp.approx(b)``, as in the Wall-X NVFP4 kernels (``xinfer.ops.reference.nvfp4``).
+
+    ``global_scale``: the per-tensor ``g`` (1 for activations).
+    """
+    if x.dim() != 2 or x.dtype != torch.bfloat16 or x.shape[1] % 16 or not x.is_contiguous():
+        raise ValueError("quantize_nvfp4: x must be a contiguous BF16 [M, K] tensor with K a multiple of 16")
+    data, scales = empty_nvfp4(*x.shape, x.device) if out is None else out
+    lib.quantize_nvfp4_into(data, scales, x, float(global_scale), bool(mse))
+    return data, scales
 
 
 def quantize_mxfp8(x, *, scale_block=128, out=None):
@@ -526,7 +588,60 @@ def mxfp8_gemm_glu_quantize(x, weight):
 @register("mxfp8_qkv_rope_epilogue", backend="cuda", **NATIVE)
 def mxfp8_qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim):
     return qkv_proj_rope(x, weight, bias, rope_table=_rope_table(cos, sin), num_heads=num_heads,
-                            head_dim=head_dim)
+                         head_dim=head_dim, rotary_dim=2 * cos.shape[-1])
+
+
+@register("nvfp4_quantize", backend="cuda", **NVFP4_NATIVE)
+def nvfp4_quantize(x, *, global_scale=1.0, mse=False):
+    return quantize_nvfp4(x.contiguous(), global_scale=global_scale, mse=mse)
+
+
+def _nvfp4_operands(x, weight, bias=None):
+    a, scales = x
+    w, w_scales, alpha = weight
+    return (0 < alpha <= torch.finfo(torch.float32).max
+            and a.ndim == w.ndim == 2 and a.shape[1] == w.shape[1] and a.shape[1] % 16 == 0 and w.shape[0] % 8 == 0
+            and all(t.device == a.device and t.is_contiguous() and t.data_ptr() % 16 == 0
+                    for t in (a, scales, w, w_scales)) and (bias is None or (bias.dtype == torch.bfloat16
+                    and bias.shape == (w.shape[0],) and bias.is_contiguous() and bias.device == a.device)))
+
+
+@register("nvfp4_gemm", backend="cuda", **NVFP4_NATIVE)
+def nvfp4_gemm(a_q, a_scales, w_q, w_scales, bias=None, *, alpha=1.0):
+    if not _nvfp4_operands((a_q, a_scales), (w_q, w_scales, alpha), bias):
+        note_reference_call("nvfp4_gemm", a_q.shape, w_q.shape)
+        return nvfp4_reference.gemm(a_q, a_scales, w_q, w_scales, bias, alpha=alpha)
+    return gemm((a_q, a_scales), (w_q, w_scales, alpha), bias)
+
+
+@register("nvfp4_gemm_epilogue", backend="cuda", **NVFP4_NATIVE)
+def nvfp4_gemm_epilogue(x, weight, bias=None, *, activation=None, residual=None, out_quant=False):
+    if residual is not None and out_quant:
+        raise ValueError("nvfp4 gemm_epilogue: residual and out_quant exclude each other")
+    if (not _nvfp4_operands(x, weight, bias) or (residual is not None and
+            (activation is not None or not residual.is_contiguous() or residual.dtype != torch.bfloat16
+             or residual.shape != (x[0].shape[0], weight[0].shape[0]) or residual.device != x[0].device))):
+        note_reference_call("nvfp4_gemm_epilogue", x[0].shape, weight[0].shape)
+        return nvfp4_reference.gemm_epilogue(x, weight, bias, activation=activation, residual=residual,
+                                             out_quant=out_quant)
+    return gemm(x, weight, bias, activation=activation, residual=residual, quantize=out_quant)
+
+
+@register("nvfp4_gemm_glu_quantize", backend="cuda", **NVFP4_NATIVE)
+def nvfp4_gemm_glu_quantize(x, weight):
+    if not _nvfp4_operands(x, weight):
+        note_reference_call("nvfp4_gemm_glu_quantize", x[0].shape, weight[0].shape)
+        return nvfp4_reference.gemm_glu_quantize(x, weight)
+    return gemm_glu(x, weight, activation="silu", quantize=True)
+
+
+@register("nvfp4_qkv_rope_epilogue", backend="cuda", **NVFP4_NATIVE)
+def nvfp4_qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim):
+    if not _nvfp4_operands(x, weight, bias):
+        note_reference_call("nvfp4_qkv_rope_epilogue", x[0].shape, weight[0].shape)
+        return nvfp4_reference.qkv_rope_epilogue(x, weight, bias, cos, sin, num_heads, head_dim)
+    return qkv_proj_rope(x, weight, bias, rope_table=_rope_table(cos, sin), num_heads=num_heads,
+                         head_dim=head_dim, rotary_dim=2 * cos.shape[-1])
 
 
 from xinfer.ops.backends.cuda import gemm_sm110, gemm_sm120  # noqa: E402, F401 - list the kernels of each architecture
