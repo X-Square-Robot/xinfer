@@ -1,3 +1,5 @@
+# Portions adapted from RhinoForge, Copyright 2026 HUIXI-AI, Apache-2.0.
+# See NOTICE, licenses/NOTICE.rhinoforge and THIRD_PARTY_NOTICES.md.
 """Exact wall_oss_1_0_nano CPU processing; no WALL-OSS-0.5 or RhinoForge runtime dependency.
 
 The banded image pipeline is adapted from RhinoForge's Wall Qwen3.5 adapter;

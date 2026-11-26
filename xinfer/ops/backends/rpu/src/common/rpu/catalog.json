@@ -1,0 +1,2256 @@
+{
+  "abi_version": 11,
+  "kernels": [
+    {
+      "name": "layernorm_f16",
+      "source": "layernorm/layernorm_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "layernorm"
+    },
+    {
+      "name": "rope_f16",
+      "source": "rope/rope_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32
+      ],
+      "module": "rope"
+    },
+    {
+      "name": "gelu_f16",
+      "source": "activation/gelu_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16
+      ],
+      "module": "activation"
+    },
+    {
+      "name": "all_reduce_residual",
+      "source": "comm/all_reduce_residual.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        16
+      ],
+      "module": "comm",
+      "dependencies": [
+        "comm/all_reduce_residual_impl.h"
+      ]
+    },
+    {
+      "name": "qkv_bias_n384k1024",
+      "source": "gemm/qkv_bias_n384k1024.rc",
+      "dependencies": [
+        "gemm/qkv_up_gemm_stream.h",
+        "gemm/qkv_up_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16,
+        32,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        12
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "o_n1024k128",
+      "source": "gemm/o_n1024k128.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "up_n512k1024",
+      "source": "gemm/up_n512k1024.rc",
+      "dependencies": [
+        "gemm/qkv_up_gemm_stream.h",
+        "gemm/qkv_up_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "down_n1024k512",
+      "source": "gemm/down_n1024k512.rc",
+      "dependencies": [
+        "gemm/qkv_up_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "qkv_zba_n1056k2048",
+      "source": "gemm/qkv_zba_n1056k2048.rc",
+      "dependencies": [
+        "gemm/streamed_qkv.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "qkv_qgate_n1024k2048",
+      "source": "gemm/qkv_qgate_n1024k2048.rc",
+      "dependencies": [
+        "gemm/streamed_qkv.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "o_n2048k256",
+      "source": "gemm/o_n2048k256.rc",
+      "dependencies": [
+        "gemm/streamed_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "gateup_n1536k2048",
+      "source": "gemm/gateup_n1536k2048.rc",
+      "dependencies": [
+        "gemm/streamed_gateup.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "down_n2048k768",
+      "source": "gemm/down_n2048k768.rc",
+      "dependencies": [
+        "gemm/streamed_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "patch_embed_n128k1536",
+      "source": "gemm/patch_embed_n128k1536.rc",
+      "dependencies": [
+        "gemm/mlp_projection.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "fc1_n512k4096",
+      "source": "gemm/fc1_n512k4096.rc",
+      "dependencies": [
+        "gemm/mlp_projection.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "down_n2048k512",
+      "source": "gemm/down_n2048k512.rc",
+      "dependencies": [
+        "gemm/mlp_projection.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "kcache_insert_f16",
+      "source": "attention/kcache_insert_f16.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "attention"
+    },
+    {
+      "name": "vcache_insert_f16",
+      "source": "attention/vcache_insert_f16.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "attention"
+    },
+    {
+      "name": "flash_attention_varlen_f16",
+      "source": "attention/flash_attention_varlen_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "attention"
+    },
+    {
+      "name": "add_vpb_f16",
+      "source": "elementwise/add_vpb_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "module": "elementwise"
+    },
+    {
+      "name": "fill_f16",
+      "source": "elementwise/fill_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16
+      ],
+      "module": "elementwise"
+    },
+    {
+      "name": "all_gather_f16",
+      "source": "comm/all_gather_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16,
+        16
+      ],
+      "module": "comm"
+    },
+    {
+      "name": "copy_physical_prefix_f16",
+      "source": "attention/copy_physical_prefix_f16.rc",
+      "argument_bits": [
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "attention"
+    },
+    {
+      "name": "gather_embedding_f16",
+      "source": "gemm/gather_embedding_f16.rc",
+      "argument_bits": [
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        16,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "kcache_insert_d256_f16",
+      "source": "attention/kcache_insert_d256_f16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "attention"
+    },
+    {
+      "name": "vcache_insert_d256_f16",
+      "source": "attention/vcache_insert_d256_f16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "attention"
+    },
+    {
+      "name": "causal_sdpa_d256_f16",
+      "source": "attention/causal_sdpa_d256_f16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "attention"
+    },
+    {
+      "name": "rmsnorm_f16",
+      "source": "normalization/rmsnorm_f16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "normalization"
+    },
+    {
+      "name": "causal_depthwise_conv1d_prefill_f16",
+      "source": "conv/causal_depthwise_conv1d_prefill_f16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "conv"
+    },
+    {
+      "name": "causal_depthwise_conv1d_step_f16",
+      "source": "conv/causal_depthwise_conv1d_step_f16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16
+      ],
+      "module": "conv"
+    },
+    {
+      "name": "silu_mul_fp16",
+      "source": "activation/silu_mul_fp16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "module": "activation"
+    },
+    {
+      "name": "bmm_fp16_spm",
+      "source": "gemm/batched/bmm_fp16_spm.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "bmm_fp16_spm_128x128x64_colcol",
+      "source": "gemm/batched/bmm_fp16_spm_128x128x64_colcol.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "bmm_fp16_spm_64x64x128_rowrow",
+      "source": "gemm/batched/bmm_fp16_spm_64x64x128_rowrow.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "bmm_fp16_spm_64x128x64_rowcol",
+      "source": "gemm/batched/bmm_fp16_spm_64x128x64_rowcol.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "bmm_fp16_spm_64x128x128_rowcol",
+      "source": "gemm/batched/bmm_fp16_spm_64x128x128_rowcol.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "gemm"
+    },
+    {
+      "name": "unit_tril_inv_fp16",
+      "source": "triangular/unit_tril_inv_fp16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        16
+      ],
+      "module": "triangular"
+    },
+    {
+      "name": "cumsum_fp16",
+      "source": "scan/cumsum_fp16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        16
+      ],
+      "module": "scan"
+    },
+    {
+      "name": "tp_qkv_compact_f16",
+      "source": "gemm/projection/tp_qkv_compact_f16.rc",
+      "dependencies": [
+        "gemm/streamed_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "qkv_expand_kv_f16",
+      "source": "layout/qkv_expand_kv_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "layout"
+    },
+    {
+      "name": "causal_sdpa_prefix_spm_d256_f16",
+      "source": "attention/causal_sdpa_prefix_spm_d256_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "attention"
+    },
+    {
+      "name": "vcache_insert_staged_d256_f16",
+      "source": "attention/vcache_insert_staged_d256_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "attention"
+    },
+    {
+      "name": "gemm_ddr_col_m32n256k1024_acc32",
+      "source": "gemm/gemm_ddr_col_m32n256k1024_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gemm_ddr_row_m32n1024k256_acc32",
+      "source": "gemm/gemm_ddr_row_m32n1024k256_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gemm_ddr_bias_m32n1024k64_acc32",
+      "source": "gemm/gemm_ddr_bias_m32n1024k64_acc32.rc",
+      "dependencies": [
+        "gemm/io_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gemm_ddr_bias_m32n64k1024_acc32",
+      "source": "gemm/gemm_ddr_bias_m32n64k1024_acc32.rc",
+      "dependencies": [
+        "gemm/io_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gemm_ddr_bias_scale_m32n1024k64_acc32",
+      "source": "gemm/gemm_ddr_bias_scale_m32n1024k64_acc32.rc",
+      "dependencies": [
+        "gemm/io_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "adaptive_rmsnorm_m32h1024_f16",
+      "source": "normalization/adaptive_rmsnorm_m32h1024_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "normalization",
+      "dependencies": [
+        "normalization/adaptive_rmsnorm_m32h1024_f16_impl.h"
+      ]
+    },
+    {
+      "name": "residual_gate_m32h1024_f16",
+      "source": "denoise_output/residual_gate_m32h1024_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "denoise_output",
+      "dependencies": [
+        "denoise_output/residual_gate_m32h1024_f16_impl.h"
+      ]
+    },
+    {
+      "name": "sigmoid_mul_m32d256_f16",
+      "source": "activation/sigmoid_mul_m32d256_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "activation"
+    },
+    {
+      "name": "euler_update_m32d64_f16",
+      "source": "denoise_output/euler_update_m32d64_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "denoise_output"
+    },
+    {
+      "name": "qk_rmsnorm_mrope_m32d256_f16",
+      "source": "fusion/qk_rmsnorm_mrope_m32d256_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "sdpa_masked_m32d256_f16",
+      "source": "attention/sdpa_masked_m32d256_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "attention"
+    },
+    {
+      "name": "rmsnorm_gdn_f16",
+      "source": "normalization/rmsnorm_gdn_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "normalization"
+    },
+    {
+      "name": "slice_last_f16",
+      "source": "elementwise/slice_last_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "transpose_nbc_c128_f16",
+      "source": "layout/transpose_nbc_c128_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "layout"
+    },
+    {
+      "name": "transpose_nbc_c1_f16",
+      "source": "layout/transpose_nbc_c1_f16.rc",
+      "argument_bits": [
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "layout"
+    },
+    {
+      "name": "binary_add_f16",
+      "source": "elementwise/binary_add_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "binary_sub_f16",
+      "source": "elementwise/binary_sub_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "binary_mul_f16",
+      "source": "elementwise/binary_mul_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "binary_max_f16",
+      "source": "elementwise/binary_max_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "scalar_mul_f16",
+      "source": "elementwise/scalar_mul_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "unary_f16",
+      "source": "elementwise/unary_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "bcast_rows_f16",
+      "source": "elementwise/bcast_rows_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "bcast_tiles_f16",
+      "source": "elementwise/bcast_tiles_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "elementwise"
+    },
+    {
+      "name": "l2norm_f16",
+      "source": "normalization/l2norm_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "normalization"
+    },
+    {
+      "name": "down_allreduce_rmsnorm_m32n1024k256_acc32",
+      "source": "fusion/down_allreduce_rmsnorm_m32n1024k256_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28
+      ],
+      "admission": "candidate",
+      "module": "fusion",
+      "dependencies": [
+        "fusion/down_allreduce_rmsnorm_m32n1024k256_acc32_impl.h"
+      ]
+    },
+    {
+      "name": "gate_up_silu_m32n256k1024_acc32",
+      "source": "fusion/gate_up_silu_m32n256k1024_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        16,
+        16,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "qknorm_qkv_rope_m32k1024_acc32",
+      "source": "fusion/qknorm_qkv_rope_m32k1024_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "conv_silu_prefill_f16",
+      "source": "fusion/conv_silu_prefill_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "gdr_prefill_f16",
+      "source": "fusion/gdr_prefill_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20,
+        22,
+        24,
+        25,
+        26,
+        28,
+        30,
+        32
+      ],
+      "admission": "candidate",
+      "dependencies": [
+        "fusion/gdr_helpers.h"
+      ],
+      "module": "fusion"
+    },
+    {
+      "name": "gemm_ddr_col_m16n256k1024_acc32",
+      "source": "gemm/gemm_ddr_col_m16n256k1024_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gemm_ddr_row_m16n1024k256_acc32",
+      "source": "gemm/gemm_ddr_row_m16n1024k256_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gemm_ddr_bias_m16n1024k64_acc32",
+      "source": "gemm/gemm_ddr_bias_m16n1024k64_acc32.rc",
+      "dependencies": [
+        "gemm/io_m16_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gemm_ddr_bias_m16n64k1024_acc32",
+      "source": "gemm/gemm_ddr_bias_m16n64k1024_acc32.rc",
+      "dependencies": [
+        "gemm/io_m16_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gemm_ddr_bias_scale_m16n1024k64_acc32",
+      "source": "gemm/gemm_ddr_bias_scale_m16n1024k64_acc32.rc",
+      "dependencies": [
+        "gemm/io_m16_gemm.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "adaptive_rmsnorm_m16h1024_f16",
+      "source": "normalization/adaptive_rmsnorm_m16h1024_f16.rc",
+      "dependencies": [
+        "normalization/adaptive_rmsnorm_m16h1024_f16_impl.h"
+      ],
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "normalization"
+    },
+    {
+      "name": "residual_gate_m16h1024_f16",
+      "source": "denoise_output/residual_gate_m16h1024_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "denoise_output",
+      "dependencies": [
+        "denoise_output/residual_gate_m16h1024_f16_impl.h"
+      ]
+    },
+    {
+      "name": "sigmoid_mul_m16d256_f16",
+      "source": "activation/sigmoid_mul_m16d256_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "activation"
+    },
+    {
+      "name": "euler_update_m16d64_f16",
+      "source": "denoise_output/euler_update_m16d64_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "denoise_output"
+    },
+    {
+      "name": "qk_rmsnorm_mrope_m16d256_f16",
+      "source": "fusion/qk_rmsnorm_mrope_m16d256_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "sdpa_masked_m16d256_f16",
+      "source": "attention/sdpa_masked_m16d256_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "attention"
+    },
+    {
+      "name": "down_allreduce_rmsnorm_m16n1024k256_acc32",
+      "source": "fusion/down_allreduce_rmsnorm_m16n1024k256_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        32,
+        16,
+        16,
+        16,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        34
+      ],
+      "admission": "candidate",
+      "module": "fusion",
+      "dependencies": [
+        "fusion/down_allreduce_rmsnorm_m16n1024k256_acc32_impl.h"
+      ]
+    },
+    {
+      "name": "gate_up_silu_m16n256k1024_acc32",
+      "source": "fusion/gate_up_silu_m16n256k1024_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        16,
+        16,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "qknorm_qkv_rope_m16k1024_acc32",
+      "source": "fusion/qknorm_qkv_rope_m16k1024_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "qkv_rope_bias_n384k1024",
+      "source": "fusion/qkv_rope_bias_n384k1024.rc",
+      "dependencies": [
+        "gemm/qkv_up_gemm_stream.h",
+        "gemm/qkv_up_gemm.h",
+        "fusion/mlp_fusion_epilogue.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16,
+        32,
+        32,
+        32,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        12,
+        14,
+        16
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "up_gelu_n512k1024",
+      "source": "fusion/up_gelu_n512k1024.rc",
+      "dependencies": [
+        "gemm/qkv_up_gemm_stream.h",
+        "gemm/qkv_up_gemm.h",
+        "fusion/mlp_fusion_epilogue.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "flash_attention_spm_d384",
+      "source": "fusion/flash_attention_spm_d384.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "all_reduce_residual_layernorm",
+      "source": "fusion/all_reduce_residual_layernorm.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        12,
+        14,
+        16,
+        18,
+        20,
+        22,
+        23,
+        24
+      ],
+      "admission": "candidate",
+      "module": "fusion",
+      "dependencies": [
+        "fusion/all_reduce_residual_layernorm_impl.h"
+      ]
+    },
+    {
+      "name": "fc1_gelu_n512k4096",
+      "source": "fusion/fc1_gelu_n512k4096.rc",
+      "dependencies": [
+        "gemm/mlp_projection.h",
+        "fusion/mlp_fusion_epilogue.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "gather_embedding_tp8_f16",
+      "source": "gemm/gather_embedding_tp8_f16.rc",
+      "argument_bits": [
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "qkv_zba_m512",
+      "source": "gemm/qkv_zba_m512.rc",
+      "dependencies": [
+        "gemm/streamed_m512.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "qkv_qgate_m512",
+      "source": "gemm/qkv_qgate_m512.rc",
+      "dependencies": [
+        "gemm/streamed_m512.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gateup_m512",
+      "source": "gemm/gateup_m512.rc",
+      "dependencies": [
+        "gemm/streamed_m512.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "all_reduce_residual_window",
+      "source": "comm/all_reduce_residual_window.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        16,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        4,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        16,
+        13,
+        18
+      ],
+      "module": "comm",
+      "dependencies": [
+        "comm/all_reduce_residual_impl.h"
+      ],
+      "admission": "candidate"
+    },
+    {
+      "name": "qkv_zba_m448_k128",
+      "source": "gemm/qkv_zba_m448_k128.rc",
+      "dependencies": [
+        "gemm/streamed_k128.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "qkv_qgate_m448_k128",
+      "source": "gemm/qkv_qgate_m448_k128.rc",
+      "dependencies": [
+        "gemm/streamed_k128.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gateup_m448_k128",
+      "source": "gemm/gateup_m448_k128.rc",
+      "dependencies": [
+        "gemm/streamed_k128.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "qkv_zba_m512_k128",
+      "source": "gemm/qkv_zba_m512_k128.rc",
+      "dependencies": [
+        "gemm/streamed_k128.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "qkv_qgate_m512_k128",
+      "source": "gemm/qkv_qgate_m512_k128.rc",
+      "dependencies": [
+        "gemm/streamed_k128.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "gateup_m512_k128",
+      "source": "gemm/gateup_m512_k128.rc",
+      "dependencies": [
+        "gemm/streamed_k128.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        16
+      ],
+      "admission": "candidate",
+      "module": "gemm"
+    },
+    {
+      "name": "rmsnorm_coeff_h2048_f16",
+      "source": "normalization/rmsnorm_coeff_h2048_f16.rc",
+      "admission": "candidate",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16
+      ],
+      "module": "normalization"
+    },
+    {
+      "name": "down_allreduce_rmsnorm_hw_m16n1024k256_acc32",
+      "source": "fusion/down_allreduce_rmsnorm_hw_m16n1024k256_acc32.rc",
+      "dependencies": [
+        "fusion/down_allreduce_rmsnorm_m16n1024k256_acc32_impl.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        32,
+        16,
+        16,
+        16,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        34
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "down_allreduce_rmsnorm_hw_window_m16n1024k256_acc32",
+      "source": "fusion/down_allreduce_rmsnorm_hw_window_m16n1024k256_acc32.rc",
+      "dependencies": [
+        "fusion/down_allreduce_rmsnorm_m16n1024k256_acc32_impl.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        32,
+        16,
+        16,
+        16,
+        32,
+        16,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        34,
+        33,
+        36
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    },
+    {
+      "name": "adaptive_rmsnorm_hw_m16h1024_f16",
+      "source": "normalization/adaptive_rmsnorm_hw_m16h1024_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16
+      ],
+      "admission": "candidate",
+      "module": "normalization",
+      "dependencies": [
+        "normalization/adaptive_rmsnorm_m16h1024_f16_impl.h"
+      ]
+    },
+    {
+      "name": "residual_gate_hw_m16h1024_f16",
+      "source": "denoise_output/residual_gate_hw_m16h1024_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "denoise_output",
+      "dependencies": [
+        "denoise_output/residual_gate_m16h1024_f16_impl.h"
+      ]
+    },
+    {
+      "name": "adaptive_rmsnorm_hw_m32h1024_f16",
+      "source": "normalization/adaptive_rmsnorm_hw_m32h1024_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        4,
+        6,
+        7,
+        8,
+        10
+      ],
+      "admission": "candidate",
+      "module": "normalization",
+      "dependencies": [
+        "normalization/adaptive_rmsnorm_m32h1024_f16_impl.h"
+      ]
+    },
+    {
+      "name": "residual_gate_hw_m32h1024_f16",
+      "source": "denoise_output/residual_gate_hw_m32h1024_f16.rc",
+      "argument_bits": [
+        32,
+        32,
+        32,
+        32,
+        32
+      ],
+      "admission": "candidate",
+      "module": "denoise_output",
+      "dependencies": [
+        "denoise_output/residual_gate_m32h1024_f16_impl.h"
+      ]
+    },
+    {
+      "name": "down_allreduce_rmsnorm_hw_m32n1024k256_acc32",
+      "source": "fusion/down_allreduce_rmsnorm_hw_m32n1024k256_acc32.rc",
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30
+      ],
+      "admission": "candidate",
+      "module": "fusion",
+      "dependencies": [
+        "fusion/down_allreduce_rmsnorm_m32n1024k256_acc32_impl.h"
+      ]
+    },
+    {
+      "name": "down_allreduce_rmsnorm_hw_window_m32n1024k256_acc32",
+      "source": "fusion/down_allreduce_rmsnorm_hw_window_m32n1024k256_acc32.rc",
+      "dependencies": [
+        "fusion/down_allreduce_rmsnorm_m32n1024k256_acc32_impl.h"
+      ],
+      "argument_bits": [
+        32,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        32,
+        32,
+        32,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        16,
+        32,
+        16,
+        16,
+        16,
+        32,
+        16,
+        16
+      ],
+      "argument_positions": [
+        0,
+        2,
+        3,
+        4,
+        6,
+        8,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        30,
+        31,
+        32,
+        34,
+        33,
+        36
+      ],
+      "admission": "candidate",
+      "module": "fusion"
+    }
+  ]
+}

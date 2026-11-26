@@ -8,11 +8,10 @@ and its checkpoint format. The RPU profile has no CPU, BF16 or MXFP8 execution
 fallback.
 
 This profile targets Rhino RPU (R1) through Rhino Launch SDK. Install the SDK
-separately and build the native operator backend from
-`xinfer/ops/backends/rpu/src`. Framework integration and native operators are
-reviewed separately; execution needs the complete matching operator change,
-including specifications, registry, RPU registration and backend, not only the
-RPU directory or shared library.
+separately and build the native operator backend and external `.ref` assets
+from `xinfer/ops/backends/rpu/src` (see [Native RPU operators](../rpu_ops.md)).
+Execution requires the matching RPU operator backend, specifications,
+registry registration, runtime shared library, and compiled `.ref` assets.
 
 Execution is experimental and requires both explicit candidate admission and
 a matching AOT `xinfer_rpu.so` library and external kernel assets. Host-side model plans, processing

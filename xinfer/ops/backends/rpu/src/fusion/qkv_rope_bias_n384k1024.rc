@@ -1,0 +1,53 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// qkv_bias_n384k1024 + rope_f16 on Q and K: one fused Q/K/V projection
+// A[M,1024] @ B[1024,384] + bias[384], M in [1,868], whose Q and K outputs
+// carry the 2D vision rotary embedding (heads 2, head_dim 64,
+// rotary_dim 64, rotate-half). The cos/sin tables are the position-selected
+// FP16 [rows, 32] LocalSPM tables rope_f16 reads with position_offset 0.
+//
+// Every block owns one complete 64-column head (N64; grid 6: Q0 Q1 K0 K1 V0
+// V1), so both halves of each rotate-half pair are in the same thread's VLM.
+// RoPE runs on the rounded FP16 rows before their only store with
+// rope_f16's exact VALU sequence: bit-identical to qkv_bias_n384k1024 followed by
+// in-place rope_f16 on Q and K. Rows <= 144 keep qkv_bias_n384k1024's K128 pipeline
+// with FP16 partials, 145..400 its eight-phase K stream, and larger M its
+// full K pass; only the column tile changes from N48 to N64 (same K order).
+// ABI: qkv_bias_n384k1024's A [0:1], W/256 [2:3], Q [4:5], bias [6:7], M [8],
+// K [10:11], V [12:13], plus cos [14:15], sin [16:17].
+#include "mlp_fusion_epilogue.h"
+#define QKV_UP_ENTRY qkv_rope_bias_n384k1024
+#define QKV_UP_SPLIT_QKV 1
+#define QKV_UP_N 384
+#define QKV_UP_K 1024
+#define QKV_UP_TN 64
+#define QKV_UP_STREAM_TN 64
+#define QKV_UP_TM 32
+#define QKV_UP_PIPELINE 2
+#define QKV_UP_TK 128
+#define QKV_UP_PHASES 8
+#define QKV_UP_PIPELINE_ROWS 144
+#define QKV_UP_EXTRA_PARAMS , half *cos_table, half *sin_table
+#define QKV_UP_EXTRA_ARGS , cos_table, sin_table
+#define QKV_UP_ENTRY_PROLOGUE \
+  rpu::vcfg_set_valu(rpu::vcfg_valu_target::imm2, (half)1.0f);
+// Stream path: rows are accumulator pairs (FP16 result in the low slot);
+// the high slots hold the four RoPE products, the tables use `scratch`.
+#define QKV_UP_EPILOGUE_TILE_VLM 4
+#define QKV_UP_STREAM_EPILOGUE(result, scratch, n_base, m0, m1, rows)        \
+  if ((n_base) < 16) {                                                       \
+    vf_rope_tables(cos_table, sin_table, scratch,                           \
+                   (scratch) + 2 * ((m1) - (m0)), m0, (m1) - (m0), rows);   \
+    vf_rope<2, 2 * VS_AN>((result) + 2 * (m0) * VS_AN,                      \
+                          (result) + 2 * (m0) * VS_AN + 1, scratch,         \
+                          (scratch) + 2 * ((m1) - (m0)), (m1) - (m0));      \
+  }
+// Pipeline/full-K paths: compact FP16 tiles r[m * 4 + n]; the free A
+// buffer holds the products (4 per tile) and then the tables (4 per tile).
+#define QKV_UP_TILE_EPILOGUE(r, scratch, n_base, m_tile, m_count, rows)      \
+  if ((n_base) < 16) {                                                       \
+    vf_rope_tables(cos_table, sin_table, (scratch) + 4 * (m_count),         \
+                   (scratch) + 6 * (m_count), m_tile, m_count, rows);       \
+    vf_rope<1, 4>(r, scratch, (scratch) + 4 * (m_count),                    \
+                  (scratch) + 6 * (m_count), m_count);                      \
+  }
+#include "../gemm/qkv_up_gemm_stream.h"

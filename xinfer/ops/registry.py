@@ -1,9 +1,9 @@
 """Operator registry and build-time selection (docs/design.md §14.2).
 
-A backend is the hardware an implementation runs on (``"cuda"``); the torch reference (``"reference"``) runs on every
-platform. Backend modules (``xinfer/ops/backends/<backend>/<category>.py``) import the kernel libraries they call
+A backend is the hardware an implementation runs on (``"cuda"``); an optional reference (``"reference"``) declares
+the platforms it supports. Backend modules (``xinfer/ops/backends/<backend>/<category>.py``) import their libraries
 (the CUDA kernel library, flash-attn) and declare their implementations with ``register``; an implementation whose
-library did not import is not registered, so the operator runs on its reference.
+library did not import is not registered, so selection uses another supported implementation when available.
 
 Implementations are selected once, when a model is built, not per call. The selection is recorded so that a service
 can report which backend, library, version and contract each operator uses.
@@ -36,7 +36,7 @@ BUILTIN_MODULES = ("xinfer.ops.backends.cuda.attn", "xinfer.ops.backends.cuda.ge
                    "xinfer.ops.backends.ascend.attn", "xinfer.ops.backends.ascend.norm",
                    "xinfer.ops.backends.ascend.rope", "xinfer.ops.backends.ascend.flow",
                    "xinfer.ops.backends.ascend.official",
-                   "xinfer.ops.backends.ascend.cann")
+                   "xinfer.ops.backends.ascend.cann", "xinfer.ops.backends.rpu.registration")
 STRICT_ENV = "XINFER_OPS_STRICT"
 
 
@@ -99,7 +99,7 @@ class Implementation:
     Attributes:
         op: operator name.
         backend: the hardware it runs on (``"cuda"``), or ``"reference"`` for the torch reference.
-        function: the callable layers bind to; same call signature as the operator's reference.
+        function: the callable layers bind to; same call signature as the reference when one exists.
         platforms: platform names (``"cuda-sm120"``), device types (``"cuda"``) or arch names (``"sm120"``)
             this implementation runs on; ``"*"`` matches any platform.
         contract: the numerical and runtime properties it guarantees.
@@ -154,7 +154,7 @@ def register(op: str, *, backend: str, requires: object = _NO_LIBRARY, platforms
         backend: the hardware it runs on (``"cuda"``).
         requires: the imported library it calls (a module such as ``flash_attn``), or None when that library did not
             import: then nothing is registered and the operator runs on another implementation, at the end its
-            reference. Omitted for an implementation that calls no library.
+            reference when available. Omitted for an implementation that calls no library.
         platforms: platform, device type or arch names it supports; None: ``(backend,)``.
         version: version string for the selection report; None: ``"<library> <library.__version__>"`` when the
             library has a version.
@@ -270,7 +270,7 @@ class OpTable:
 class OpRegistry:
     """Operator definitions and their registered implementations.
 
-    Operators are defined once (``define``) with their torch reference; implementations are added with ``add``
+    Operators are defined once (``define``) with an optional reference; implementations are added with ``add``
     (backend modules use ``register``, which adds to the process-wide instance ``registry``); ``build_table`` selects
     the implementations of every operator for a platform.
     """
@@ -282,9 +282,9 @@ class OpRegistry:
 
     # -- definition -------------------------------------------------------
     def define(self, spec: OpSpec) -> OpSpec:
-        """Define an operator and register its reference as the ``"reference"`` backend.
+        """Define an operator and register its reference, when provided, as the ``"reference"`` backend.
 
-        The reference supports every platform (``"*"``) with priority ``-1`` and the default ``Contract()``.
+        The reference supports ``spec.reference_platforms`` with priority ``-1`` and the default ``Contract()``.
 
         Args:
             spec: the operator specification.
@@ -298,16 +298,16 @@ class OpRegistry:
         if spec.name in self._specs:
             raise ValueError(f"operator {spec.name!r} is already defined")
         self._specs[spec.name] = spec
-        self._impls[spec.name] = [
-            Implementation(
+        self._impls[spec.name] = []
+        if spec.reference is not None:
+            self._impls[spec.name].append(Implementation(
                 op=spec.name,
                 backend=REFERENCE_BACKEND,
                 function=spec.reference,
-                platforms=("*",),
+                platforms=spec.reference_platforms,
                 contract=Contract(),
                 priority=-1,
-            )
-        ]
+            ))
         return spec
 
     def spec(self, name: str) -> OpSpec:
@@ -336,7 +336,7 @@ class OpRegistry:
 
         Args:
             op: name of a defined operator.
-            function: the implementation; same parameters (names and kinds) as the operator's reference.
+            function: the implementation; same parameters (names and kinds) as the reference when one exists.
             backend: backend name; at most one implementation per backend, library and operator.
             contract: the implementation's contract; ``numerics`` must be ``"bitwise"`` or ``"tolerance"``.
             platforms: platform names, device types or arch names it supports (``"*"``: any).
@@ -356,15 +356,17 @@ class OpRegistry:
         if backend == REFERENCE_BACKEND:
             raise ValueError("the reference backend is defined by OpSpec")
         if contract.numerics == "reference":
-            raise ValueError("backend implementations must declare bitwise or tolerance numerics")
+            raise ValueError("backend implementations must declare bitwise, tolerance or unqualified numerics")
         if op not in self._specs:
             raise KeyError(f"operator {op!r} is not defined")
         implementation = Implementation(op=op, backend=backend, function=function, platforms=tuple(platforms),
                                         contract=contract, priority=priority, version=version, library=library)
-        expected, got = _parameters(self._specs[op].reference), _parameters(function)
-        if expected is not None and got is not None and expected != got:
-            raise TypeError(f"{implementation.name} implements {op!r} with parameters {[n for n, _ in got]}, "
-                            f"the reference takes {[n for n, _ in expected]}")
+        reference = self._specs[op].reference
+        if reference is not None:
+            expected, got = _parameters(reference), _parameters(function)
+            if expected is not None and got is not None and expected != got:
+                raise TypeError(f"{implementation.name} implements {op!r} with parameters {[n for n, _ in got]}, "
+                                f"the reference takes {[n for n, _ in expected]}")
         implementations = self._impls[op]
         for index, existing in enumerate(implementations):
             if existing.name == implementation.name:
@@ -432,19 +434,21 @@ class OpRegistry:
         ``backends`` pins an implementation per operator, by backend (``"cuda"``), library (``"kernels"``) or both
         (``"cuda:kernels"``); the highest-priority match wins, and a pin that matches no implementation supporting
         the platform is an error. Otherwise the highest-priority supported implementation is selected and the
-        reference is the fallback.
+        reference is the fallback when it supports the platform. Operators without a supported implementation are
+        omitted unless explicitly pinned.
 
         Args:
             platform: the platform to select for.
             backends: operator name → pin; takes precedence over ``reference_only``.
-            reference_only: select the torch reference for every operator that is not pinned.
+            reference_only: select the reference for every supported operator that is not pinned.
 
         Returns:
             The ``OpTable`` for ``platform``.
 
         Raises:
             KeyError: ``backends`` names an operator that is not defined.
-            RuntimeError: a pin matches no implementation of the operator that supports ``platform``.
+            RuntimeError: a pinned operator has no supported implementation, or ``reference_only``
+                requests a reference for a supported operator that has none.
         """
         if self is registry:  # the backend modules register into the process-wide registry
             self.load_plugins()
@@ -462,8 +466,13 @@ class OpRegistry:
                 if not pinned:
                     raise RuntimeError(f"backend {pin!r} for {name!r} does not support {platform.name}")
                 selections[name] = pinned[0]
+            elif not candidates:
+                continue
             elif reference_only:
-                selections[name] = next(i for i in candidates if i.backend == REFERENCE_BACKEND)
+                reference = next((i for i in candidates if i.backend == REFERENCE_BACKEND), None)
+                if reference is None:
+                    raise RuntimeError(f"operator {name!r} has no reference implementation supporting {platform.name}")
+                selections[name] = reference
             else:
                 selections[name] = candidates[0]
         return OpTable(platform.name, selections)

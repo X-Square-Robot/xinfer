@@ -1,0 +1,4 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Compatibility alias: identical body to residual_gate_m16h1024_f16.
+#define XINFER_RESIDUAL_GATE_KERNEL residual_gate_hw_m16h1024_f16
+#include "residual_gate_m16h1024_f16_impl.h"

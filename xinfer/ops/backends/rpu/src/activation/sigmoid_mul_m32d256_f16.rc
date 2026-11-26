@@ -1,0 +1,33 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Gated-attention epilogue for one local Action head [32,256]:
+//   gate = round_fp16(sigmoid(gate));
+//   dst  = round_fp16(gate * value).
+// dst may alias value and gate may be overwritten by the caller after launch.
+__rprog__ void sigmoid_mul_m32d256_f16(
+    half *dst, half *gate, half *value) {
+  constexpr short chunks = 16;
+  unsigned short row = (unsigned short)blockIdx.x * 16 + threadId;
+  if (row >= 32) return;
+  __local__ f16v16 g[chunks], x[chunks];
+
+  vldSetTsize32B(chunks, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat_async(g, gate, (int)row * 256);
+  vldRepeat_async(x, value, (int)row * 256);
+  fenceVld(0);
+
+  valuSetTsize(chunks, 1);
+  valuSetTstep0(1, 1, 1);
+  valuSetTstep1(0, 0, 0);
+  valuRepeat(g, g, (half)0.0f, __ValuOpc::sigmoid);
+  valuRepeat(x, g, x, __ValuOpc::mul);
+
+  vstSetTsize32B(chunks, 1);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(0, 0);
+  vstRepeat(x, dst, (int)row * 256);
+}

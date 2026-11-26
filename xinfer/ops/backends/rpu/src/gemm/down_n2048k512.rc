@@ -1,0 +1,10 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// FP16 merger FC2+bias; local N2048 K512, dynamic M1..147.
+// Returns partials. The caller supplies nonzero bias only on core 0.
+#define PROJ_ENTRY down_n2048k512
+#define PROJ_N 2048
+#define PROJ_K 512
+#define PROJ_TN 96
+#define PROJ_TM 64
+#define PROJ_TK 512
+#include "mlp_projection.h"

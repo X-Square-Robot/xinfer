@@ -1,0 +1,7 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Action output projection: [32,1024] @ [64,1024]^T + bias.
+#define IO_ENTRY gemm_ddr_bias_m32n64k1024_acc32
+#define IO_N 64
+#define IO_K 1024
+#define IO_TN 32
+#include "io_gemm.h"

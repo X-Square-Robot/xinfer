@@ -6,10 +6,9 @@
 其他设备继续使用 GPU WALL-OSS-1.0-Nano 实现及其 checkpoint 格式。RPU 配置没有
 CPU、BF16 或 MXFP8 执行回退。
 
-此配置通过 Rhino Launch SDK 使用 Rhino RPU (R1)。SDK 单独安装，原生算子后端从
-`xinfer/ops/backends/rpu/src` 构建。框架接入与原生算子分别评审；实际执行需要
-匹配的整套算子变更，包括规格、注册表、RPU 注册和后端，仅有 RPU 目录或
-共享库并不够。
+此配置通过 Rhino Launch SDK 使用 Rhino RPU (R1)。SDK 单独安装，原生算子后端与
+外部 `.ref` 资产从 `xinfer/ops/backends/rpu/src` 构建（详见[原生 RPU 算子](../rpu_ops.zh-CN.md)）。
+实际执行需要匹配的 RPU 算子后端、规格定义、注册表注册、运行时共享库及编译后的 `.ref` 资产。
 
 执行属于实验特性，同时需要显式的候选准入和匹配的 AOT `xinfer_rpu.so` 库及外部算子资产。
 主机侧模型计划、处理与生命周期契约已经实现；用于生产前仍需完成板级数值、

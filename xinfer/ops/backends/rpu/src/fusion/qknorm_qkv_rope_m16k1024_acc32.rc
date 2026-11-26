@@ -1,0 +1,244 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Action fused attention input stage, TP8 column parallel:
+//   q,k,v,g = A x W{q,k,v,g}^T        local [16,256] each, K=1024, FP32 acc
+//   q,k     = qk_rmsnorm_mrope(q/k)   RMSNorm over head_dim 256, rotate-half
+//                                     M-RoPE over the first 64 values
+// Replaces four gemm_ddr_col launches plus two qk_rmsnorm_mrope_m16d256_f16
+// launches and is bit-identical to that chain: each output tile keeps the
+// production VMAT K order and FP16 output; the q/k epilogue is the
+// qk_rmsnorm_mrope code, row per thread, on the same FP16 values.
+//
+// ABI (32-bit slots unless noted): A LocalSPM [16,1024] [0:1]; W DDR
+// (address>>8) [2:3] = the four production transformed weights q,k,v,g back
+// to back (4 MiB each; built once at weight install); planes LocalSPM
+// [4][16,256] q,k,v,g outputs [4:5]; qk_weight LocalSPM [2][256] q then k
+// RMSNorm weights [6:7]; cosine/sine DDR FP16 [rows,32] (address>>8)
+// [8:9],[10:11]; position offset [12] (16-bit); FP32 1/256 bits low/high
+// [13],[14]; epsilon FP16 [15]. planes must not alias A or qk_weight.
+// Start each launch with both core-local atomic counters cleared.
+// Launch grid.x=8 on all eight cores: block b computes plane b/2 (q,k,v,g),
+// columns [128*(b%2), +128). The two q blocks and the two k blocks meet at a
+// core-local rendezvous once both halves are stored, then the first block normalizes and rotates
+// the 16 live rows in place. grid.x equals the eight resident warps, so
+// every waiting block's partner is resident.
+
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+__rprog__ void qknorm_qkv_rope_m16k1024_acc32(
+    half *av, DDR_large w_qkvg, half *planes, half *qk_weight,
+    DDR_large cosine, DDR_large sine, unsigned short position_offset,
+    unsigned short mean_scale_low, unsigned short mean_scale_high,
+    half epsilon) {
+  const short vlen = 16;
+  const short a_ld = 1024;
+  const short r_ld = 256;
+  const short M = 1;       // 1 x 16 rows
+  const short N = 2;       // 16-column blocks per group
+  const short K = 64;      // 64 x 16 reduction blocks
+  const short GROUPS = 4;  // 4 x 2 x 16 = 128 columns per grid block
+
+  // 194-vector native-M16 GEMM working set, plus the
+  // qk_rmsnorm_mrope epilogue (47 vectors): 241 f16v16 vectors per thread.
+  __local__ f16v16 a[M * K];
+  __local__ f16v16 b[N * K];
+  __local__ f16v16 r[M * N];
+  short loop[3];
+
+  const short block = (short)blockIdx.x;
+  const short plane = block >> 1;
+  const short half_index = block & 1;
+  // One 4 MiB plane is 16384 DDR_large (256-byte) units; one output plane is
+  // [16,256] FP16.
+  DDR_large w = w_qkvg + (int)plane * 16384;
+  half *rv = planes + (int)plane * (16 * 256);
+
+  LoopStepInfo a_dst_steps[2] = {
+      {&loop[1], (short)K}, {&loop[0], (short)1}};
+  FragVData a_dst(a, a_dst_steps);
+  LoopStepInfo a_src_steps[2] = {
+      {&loop[1], (int)(vlen * a_ld)}, {&loop[0], (int)vlen}};
+  FragSData a_src(av, a_src_steps);
+#pragma rpu_hwloop_ul
+  for (loop[1] = 0; loop[1] < M; ++loop[1]) {
+#pragma rpu_hwloop_ul
+    for (loop[0] = 0; loop[0] < K; ++loop[0])
+      vldExecute_async(a_dst, a_src, (short)(threadId * a_ld));
+  }
+  fenceVld((short)0);
+
+  const short core = (short)coreId_u;
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < GROUPS; ++group) {
+    const int local_nblock = (int)half_index * 8 + (int)group * (int)N;
+    const int weight_base_large = local_nblock * (int)K * 16 + (int)core * 2;
+    DDR_large b_base = w + weight_base_large;
+
+    LoopStepInfo b_dst_steps[2] = {
+        {&loop[1], (short)K}, {&loop[0], (short)1}};
+    FragVData b_dst(b, b_dst_steps);
+    LoopStepInfo b_src_steps[2] = {
+        {&loop[1], (int)262144, __AGran::a_g1B},
+        {&loop[0], (int)(8 * 256 * sizeof(half)), __AGran::a_g1B}};
+    FragSData b_src(b_base, b_src_steps);
+#pragma rpu_hwloop_ul
+    for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+      for (loop[0] = 0; loop[0] < K; ++loop[0])
+        vldExecute_async(b_dst, b_src, (short)(threadId * vlen * sizeof(half)));
+    }
+    fenceVld((short)0);
+
+    LoopStepInfo c_steps[3] = {
+        {&loop[2], (short)N}, {&loop[1], (short)1},
+        {&loop[0], (short)0}};
+    FragVData c_dst(r, c_steps);
+    LoopStepInfo ac_steps[3] = {
+        {&loop[2], (short)K}, {&loop[1], (short)0},
+        {&loop[0], (short)1}};
+    FragVData ac(a, ac_steps);
+    LoopStepInfo bc_steps[3] = {
+        {&loop[2], (short)0}, {&loop[1], (short)K},
+        {&loop[0], (short)1}};
+    FragVData bc(b, bc_steps);
+    LoopOutInfo out_info[1] = {{&loop[0]}};
+    // Each output tile starts a new K reduction before the normalization.
+    LoopClrInfo clear_info[1] = {{&loop[0]}};
+    LoopOutLPAttr out_attr(out_info);
+    LoopClrLPAttr clear_attr(clear_info);
+#pragma rpu_hwloop_ul
+    for (loop[2] = 0; loop[2] < M; ++loop[2]) {
+#pragma rpu_hwloop_ul
+      for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+        for (loop[0] = 0; loop[0] < K; ++loop[0])
+          vmatExecute_async(c_dst, ac, bc, &out_attr, &clear_attr);
+      }
+    }
+    fenceVmat((short)0);
+
+    half *group_r = rv + (int)half_index * 128 + (int)group * (int)N * 16;
+    LoopStepInfo r_src_steps[2] = {
+        {&loop[1], (short)N}, {&loop[0], (short)1}};
+    FragVData r_src(r, r_src_steps);
+    LoopStepInfo r_dst_steps[2] = {
+        {&loop[1], (int)(vlen * r_ld)}, {&loop[0], (int)vlen}};
+    FragSData r_dst(group_r, r_dst_steps);
+#pragma rpu_hwloop_ul
+    for (loop[1] = 0; loop[1] < M; ++loop[1]) {
+#pragma rpu_hwloop_ul
+      for (loop[0] = 0; loop[0] < N; ++loop[0])
+        vstExecute_async(r_src, r_dst, (short)(threadId * r_ld));
+    }
+    fenceVst((short)0);
+  }
+
+  if (plane >= 2) return;
+
+  // Both column halves of this plane are stored before either block reads a
+  // full 256-value row. Core counter `plane` counts the two arrivals.
+  watom((short)plane, 1, field_mode::core, modify_mode::add);
+  watoms((short)plane, 0, 1, field_mode::core, cmp_mode::gt, modify_mode::add);
+  fenceAtom((short)0);
+
+  // Only the first block normalizes the live 16 rows after both halves
+  // arrive. Its partner has completed every store and can leave.
+  if (half_index != 0) return;
+
+  // qk_rmsnorm_mrope_m16d256_f16, row = threadId.
+  constexpr short chunks = 16;
+  unsigned short row = (unsigned short)half_index * 16 + threadId;
+  half *weight = qk_weight + (int)plane * 256;
+
+  __local__ f16v16 x[chunks], gamma[chunks];
+  __local__ f16v16 gram[1], norm[1], reduction_scratch[1];
+  __local__ f16v16 cosv[2], sinv[2], rotated[4], product[4];
+
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vcfg_set_vmat(vcfg_vmat_target::acc_init_fp32_l, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::acc_init_fp32_h, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)mean_scale_low);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)mean_scale_high);
+
+  vldSetTsize32B(chunks, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat_async(x, rv, (int)row * 256);
+  vldRepeat_async(gamma, weight, (int)0);
+  const int table_byte_offset = ((int)position_offset + (int)row) * 64;
+  vldExecute_async(cosv + 0, cosine, table_byte_offset + 0);
+  vldExecute_async(cosv + 1, cosine, table_byte_offset + 32);
+  vldExecute_async(sinv + 0, sine, table_byte_offset + 0);
+  vldExecute_async(sinv + 1, sine, table_byte_offset + 32);
+  fenceVld(0);
+
+  vmatSetTsize(chunks, 1);
+  vmatSetTstep0(0, 1, 1);
+  vmatSetTstep1(0, 0, 0);
+  LoopOutInfo outlp[1] = {{(short)0}};
+  LoopClrInfo clrlp[1] = {{(short)0}};
+  LoopOutLPAttr out(outlp);
+  LoopClrLPAttr clr(clrlp);
+  vmatRepeat(gram, x, x, &out, &clr);
+
+  half mean_square;
+  vcfg_set_valu(vcfg_valu_target::imm2, gram, (short)threadId);
+  valuExecute(reduction_scratch, (half)1.0f, (half)0.0f, __ValuOpc::add);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vsfuScalar(mean_square, reduction_scratch, (short)0, __ShuffleMode::Psel);
+  const unsigned short bits = reinterpret_cast<unsigned short&>(mean_square);
+  const unsigned short any_small = sumint(bits);
+  const unsigned short any_large = sumint((unsigned short)(0xffffu - bits));
+
+  valuSetTsize(chunks, 1);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(0, 0, 0);
+  half adjusted_epsilon = epsilon;
+  if (any_small < 0x0400u || any_large <= 0x83ffu) {
+    half range_scale = (half)1.0f;
+    if (bits < 0x0400u) {
+      range_scale = (half)128.0f;
+      adjusted_epsilon = (half)0.016384f;
+    } else if (bits >= 0x7c00u) {
+      range_scale = (half)0.00390625f;
+      adjusted_epsilon = (half)0.0f;
+    }
+    valuRepeat(x, x, range_scale, __ValuOpc::mul);
+    vmatRepeat(gram, x, x, &out, &clr);
+    vcfg_set_valu(vcfg_valu_target::imm2, gram, (short)threadId);
+    valuExecute(reduction_scratch, (half)1.0f, (half)0.0f, __ValuOpc::add);
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+    vsfuScalar(mean_square, reduction_scratch, (short)0, __ShuffleMode::Psel);
+  }
+
+  valuExecute(norm, mean_square, adjusted_epsilon, __ValuOpc::add);
+  valuExecute(norm, norm, (half)0.0f, __ValuOpc::sqrt_reciprocal);
+  valuRepeat(x, x, norm, __ValuOpc::mul);
+  valuSetTstep0(1, 1, 1);
+  valuRepeat(x, x, gamma, __ValuOpc::mul);
+
+  // Keep the two rotate-half vector groups and their MUL/ADD ordering explicit.
+  valuExecute(rotated + 0, x + 0, cosv + 0, __ValuOpc::mul);
+  valuExecute(product + 0, x + 2, sinv + 0, __ValuOpc::mul);
+  valuExecute(rotated + 0, rotated + 0, product + 0, __ValuOpc::sub);
+  valuExecute(rotated + 2, x + 2, cosv + 0, __ValuOpc::mul);
+  valuExecute(product + 2, x + 0, sinv + 0, __ValuOpc::mul);
+  valuExecute(rotated + 2, rotated + 2, product + 2, __ValuOpc::add);
+
+  valuExecute(rotated + 1, x + 1, cosv + 1, __ValuOpc::mul);
+  valuExecute(product + 1, x + 3, sinv + 1, __ValuOpc::mul);
+  valuExecute(rotated + 1, rotated + 1, product + 1, __ValuOpc::sub);
+  valuExecute(rotated + 3, x + 3, cosv + 1, __ValuOpc::mul);
+  valuExecute(product + 3, x + 1, sinv + 1, __ValuOpc::mul);
+  valuExecute(rotated + 3, rotated + 3, product + 3, __ValuOpc::add);
+
+  vstSetTsize32B(4, 1);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(0, 0);
+  vstRepeat_async(rotated, rv, (int)row * 256);
+  vstSetTsize32B(chunks - 4, 1);
+  vstRepeat_async(x + 4, rv, (int)row * 256 + 64);
+  fenceVst(0);
+}

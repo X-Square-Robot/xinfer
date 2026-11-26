@@ -1,4 +1,4 @@
-# XInfer design (review draft v1)
+# XInfer design
 
 English | [简体中文](design.zh-CN.md)
 
@@ -866,9 +866,9 @@ Native operator implementation is maintained in `xinfer/ops/backends/<backend>/s
 | Binding | AOT libraries loaded through TVM-FFI: `xinfer_kernels.so` for CUDA tensor operators and `xinfer_rpu.so` for RPU prepared execution; `torch.library` adapters are added for concrete PyTorch integration needs (§14.2) |
 | Validation | Host contracts and build checks are separate from device-source compilation, real-device numerics, replay and model precision/performance gates (§14.1, §17); a host-only or SDK-stub test establishes no device acceptance |
 | Versioning and release | Record library identity, hash and supported capabilities, and validate the backend-specific ABI/build metadata; RPU also matches the native catalog and external asset manifest (§14.3) |
-| Third-party dependencies | Preserve upstream source attribution and applicable license copies; vendor SDKs, compilers and generated RPU assets remain external. Attribution and terms accompany the operator change in `THIRD_PARTY_NOTICES.md` |
+| Third-party dependencies | Preserve upstream source attribution and applicable license copies; vendor SDKs, compilers and generated RPU assets remain external. Attribution and terms are recorded in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) |
 
-The separate operator change's `docs/rpu_ops.md` documents the host-only build, runtime SDK build and explicit `.rc`-to-`.ref` asset build. Source availability does not supply the SDK or generated assets, or establish numerical or performance acceptance. RPU model/runtime integration supplies the selected operation factory and execution lifecycle; the operator package alone cannot run a model.
+[docs/rpu_ops.md](rpu_ops.md) documents the host-only build, runtime SDK build and explicit `.rc`-to-`.ref` asset build. Source availability does not supply the SDK or generated assets, or establish numerical or performance acceptance. RPU model/runtime integration supplies the selected operation factory and execution lifecycle; the operator package alone cannot run a model.
 
 ### 18.3 Extensions: plugin entry points
 

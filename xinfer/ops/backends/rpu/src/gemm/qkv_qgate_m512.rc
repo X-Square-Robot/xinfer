@@ -1,0 +1,7 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Full attention: local [Q256, Q_gate256, K256, V256], rows 448/512.
+#define STREAMED_ENTRY qkv_qgate_m512
+#define STREAMED_N 1024
+#define STREAMED_K 2048
+#define STREAMED_OUTPUT_QKV 1
+#include "streamed_m512.h"

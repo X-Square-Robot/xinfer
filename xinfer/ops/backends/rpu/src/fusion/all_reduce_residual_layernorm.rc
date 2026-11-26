@@ -1,0 +1,5 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Legacy entry keeps its original source ABI and local counters 0/1.
+#define XINFER_VISION_REDUCE_KERNEL all_reduce_residual_layernorm
+#define XINFER_VISION_REDUCE_WINDOW 0
+#include "all_reduce_residual_layernorm_impl.h"

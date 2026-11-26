@@ -1,0 +1,140 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Action column-parallel GEMM.
+//
+// Contract: global [M,N,K]=[16,2048,1024], TP8 column partition, local
+// [16,256,1024], FP16 input/weight/output, VMAT FP32 accumulation.  The host
+// packet matches ParallelLinearRegisterArgs: arg0 is LocalSPM A, arg1 is a
+// transformed HostDDR weight address encoded in 256-byte units, and arg2 is
+// LocalSPM C.  Launch grid.x=2 on all eight cores.
+
+#include "__clang_rpu_builtin_vars.h"
+
+#ifndef RF_B_TILE_STEP_BYTES
+#define RF_B_TILE_STEP_BYTES ((int)262144)
+#endif
+#ifndef RF_FENCE_A
+#define RF_FENCE_A 1
+#endif
+#ifndef RF_SYNC_VST
+#define RF_SYNC_VST 0
+#endif
+#ifndef RF_N_TILES
+#define RF_N_TILES 2
+#endif
+#ifndef RF_GROUPS
+#define RF_GROUPS 4
+#endif
+
+// ParallelLinear stores the transformed DDR base as address >> 8.  DDR_large
+// preserves that 256-byte address unit; a plain __DDR pointer would interpret
+// the same register value as a byte address.
+__rprog__ void gemm_ddr_col_m16n256k1024_acc32(
+    half *av, DDR_large wv, half *rv) {
+  const short vlen = 16;
+  const short a_ld = 1024;
+  const short r_ld = 256;
+  const short M = 1;            // 1 x 16 rows
+  const short N = RF_N_TILES;   // 16-column blocks per group
+  const short K = 64;           // 64 x 16 reduction blocks
+  const short GROUPS = RF_GROUPS;
+
+  __local__ f16v16 a[M * K];
+  __local__ f16v16 b[N * K];
+  __local__ f16v16 r[M * N];
+  short loop[3];
+
+  LoopStepInfo a_dst_steps[2] = {
+      {&loop[1], (short)K}, {&loop[0], (short)1}};
+  FragVData a_dst(a, a_dst_steps);
+  LoopStepInfo a_src_steps[2] = {
+      {&loop[1], (int)(vlen * a_ld)}, {&loop[0], (int)vlen}};
+  FragSData a_src(av, a_src_steps);
+#pragma rpu_hwloop_ul
+  for (loop[1] = 0; loop[1] < M; ++loop[1]) {
+#pragma rpu_hwloop_ul
+    for (loop[0] = 0; loop[0] < K; ++loop[0])
+      rpu::vldExecute_async(a_dst, a_src, (short)(threadId * a_ld));
+  }
+#if RF_FENCE_A
+  rpu::fenceVld((short)0);
+#endif
+
+  const short core = (short)coreId_u;
+  const short block = (short)blockIdx.x;
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < GROUPS; ++group) {
+    // Transformed weight layout:
+    // [local_nblock][kblock][core][16 output rows][16 K values].
+    const int local_nblock = (int)block * 8 + (int)group * (int)N;
+    const int weight_base_large =
+        local_nblock * (int)K * 16 + (int)core * 2;
+    DDR_large b_base = wv + weight_base_large;
+
+    LoopStepInfo b_dst_steps[2] = {
+        {&loop[1], (short)K}, {&loop[0], (short)1}};
+    FragVData b_dst(b, b_dst_steps);
+    LoopStepInfo b_src_steps[2] = {
+        {&loop[1], RF_B_TILE_STEP_BYTES, rpu::__AGran::a_g1B},
+        {&loop[0], (int)(8 * 256 * sizeof(half)), rpu::__AGran::a_g1B}};
+    FragSData b_src(b_base, b_src_steps);
+#pragma rpu_hwloop_ul
+    for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+      for (loop[0] = 0; loop[0] < K; ++loop[0])
+        rpu::vldExecute_async(
+            b_dst, b_src, (short)(threadId * vlen * sizeof(half)));
+    }
+    rpu::fenceVld((short)0);
+
+    LoopStepInfo c_steps[3] = {
+        {&loop[2], (short)N}, {&loop[1], (short)1},
+        {&loop[0], (short)0}};
+    FragVData c_dst(r, c_steps);
+    LoopStepInfo ac_steps[3] = {
+        {&loop[2], (short)K}, {&loop[1], (short)0},
+        {&loop[0], (short)1}};
+    FragVData ac(a, ac_steps);
+    LoopStepInfo bc_steps[3] = {
+        {&loop[2], (short)0}, {&loop[1], (short)K},
+        {&loop[0], (short)1}};
+    FragVData bc(b, bc_steps);
+    LoopOutInfo out_info[1] = {{&loop[0]}};
+    // Reset at the first K iteration of every output tile, not at N=0.
+    LoopClrInfo clear_info[1] = {{&loop[0]}};
+    LoopOutLPAttr out_attr(out_info);
+    LoopClrLPAttr clear_attr(clear_info);
+#pragma rpu_hwloop_ul
+    for (loop[2] = 0; loop[2] < M; ++loop[2]) {
+#pragma rpu_hwloop_ul
+      for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+        for (loop[0] = 0; loop[0] < K; ++loop[0])
+          rpu::vmatExecute_async(
+              c_dst, ac, bc, &out_attr, &clear_attr);
+      }
+    }
+    rpu::fenceVmat((short)0);
+
+    half *group_r =
+        rv + (int)block * 128 + (int)group * (int)N * 16;
+    LoopStepInfo r_src_steps[2] = {
+        {&loop[1], (short)N}, {&loop[0], (short)1}};
+    FragVData r_src(r, r_src_steps);
+    LoopStepInfo r_dst_steps[2] = {
+        {&loop[1], (int)(vlen * r_ld)}, {&loop[0], (int)vlen}};
+    FragSData r_dst(group_r, r_dst_steps);
+#pragma rpu_hwloop_ul
+    for (loop[1] = 0; loop[1] < M; ++loop[1]) {
+#pragma rpu_hwloop_ul
+      for (loop[0] = 0; loop[0] < N; ++loop[0])
+#if RF_SYNC_VST
+        rpu::vstExecute(r_src, r_dst, (short)(threadId * r_ld));
+#else
+        rpu::vstExecute_async(r_src, r_dst, (short)(threadId * r_ld));
+#endif
+    }
+#if !RF_SYNC_VST
+    rpu::fenceVst((short)0);
+#endif
+  }
+}

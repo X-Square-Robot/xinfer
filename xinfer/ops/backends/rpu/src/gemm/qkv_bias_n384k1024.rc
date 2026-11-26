@@ -1,0 +1,17 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// A[M,1024] @ B[1024,384] + bias[384], M in [1,868]; one fused Q/K/V projection.
+// Grid 8 (N48 blocks): K128 pipeline with FP16 partials up to 144 rows and
+// full K above 400 rows; in between, six N64 blocks stream K128 chunks in
+// eight row phases and blocks 6..7 exit.
+#define QKV_UP_ENTRY qkv_bias_n384k1024
+#define QKV_UP_SPLIT_QKV 1
+#define QKV_UP_N 384
+#define QKV_UP_K 1024
+#define QKV_UP_TN 48
+#define QKV_UP_STREAM_TN 64
+#define QKV_UP_TM 32
+#define QKV_UP_PIPELINE 2
+#define QKV_UP_TK 128
+#define QKV_UP_PHASES 8
+#define QKV_UP_PIPELINE_ROWS 144
+#include "qkv_up_gemm_stream.h"

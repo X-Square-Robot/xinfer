@@ -1,3 +1,5 @@
+# Portions adapted from RhinoForge, Copyright 2026 HUIXI-AI, Apache-2.0.
+# See NOTICE, licenses/NOTICE.rhinoforge and THIRD_PARTY_NOTICES.md.
 """Admission for the WALL-OSS-1.0-Nano Qwen3.5 FP16 profile.
 
 The constants describe the accepted WALL-OSS-1.0-Nano FP16 TP8 checkpoint profile.

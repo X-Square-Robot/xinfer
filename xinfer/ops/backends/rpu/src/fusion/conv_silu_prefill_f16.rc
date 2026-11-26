@@ -1,0 +1,124 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// TP8 language prefill, FP16 local width 256, causal depthwise K=4.
+// q/k/v pads are immutable [3+rows,256], raw projections begin at row 3.
+// history is immutable [3 paths,4,256]; only its first three rows are read.
+// q/k/v outputs are distinct token-major [rows,256]. Invalid rows are zero.
+// history_out is distinct [3 paths,4,256]: last three REAL raw inputs plus a
+// deterministic zero fourth row. No segment reads another segment's writes.
+// Conv has four separately rounded muls and three separately rounded adds;
+// SiLU has a separately rounded sigmoid and multiplication.
+// Launch grid=(1,3,8), broadcast to 8 cores; no atomic counter or scratch DMA.
+__rprog__ void conv_silu_prefill_f16(
+    half *qpad, half *kpad, half *vpad, half *history,
+    half *qout, half *kout, half *vout, half *history_out,
+    DDR_large qw, DDR_large kw, DDR_large vw,
+    unsigned short rows, unsigned short valid_rows, unsigned short initial) {
+  if (rows < 64 || rows > 512 || (rows & 63) ||
+      valid_rows < 1 || valid_rows > rows || initial > 1 ||
+      blockIdx.x != 0 || blockIdx.y >= 3 || blockIdx.z >= 8) return;
+
+  const unsigned short path = blockIdx.y;
+  const unsigned short segment = blockIdx.z;
+  const unsigned short count = rows / 8;
+  const unsigned short first = segment * count;
+  unsigned short live = valid_rows > first ? valid_rows - first : 0;
+  if (live > count) live = count;
+  const int channel = (int)threadId * 16;
+  half *pad = path == 0 ? qpad : (path == 1 ? kpad : vpad);
+  half *out = path == 0 ? qout : (path == 1 ? kout : vout);
+  half *old_state = history + (int)path * 4 * 256;
+  half *new_state = history_out + (int)path * 4 * 256;
+  DDR_large weights = path == 0 ? qw : (path == 1 ? kw : vw);
+  DDR_large core_weight = weights + (int)coreId_u * 8;
+
+  // rows/8 <= 64 rows per segment; 199 vectors keep every VLD Repeat
+  // destination below vector 256 in any allocation order.
+  __local__ f16v16 w0[1], w1[1], w2[1], w3[1];
+  __local__ f16v16 x[67], y[64], tmp[64];
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+
+  if (live) {
+    vldExecute(w0, core_weight, (short)channel * 2);
+    vldExecute(w1, core_weight + 2, (short)channel * 2);
+    vldExecute(w2, core_weight + 4, (short)channel * 2);
+    vldExecute(w3, core_weight + 6, (short)channel * 2);
+
+    vldSetTsize32B(3, 1);
+    vldSetTstep32B_0(1, 256);
+    vldSetTstep32B_1(0, 0);
+    if (segment) {
+      vldRepeat(x, pad, (int)first * 256 + channel);
+    } else if (!initial) {
+      vldRepeat(x, old_state, channel);
+    } else {
+      valuSetTsize(3, 1);
+      valuSetTstep0(1, 0, 0);
+      valuSetTstep1(0, 0, 0);
+      valuRepeat(x, (half)0.0f, (half)0.0f, __ValuOpc::add);
+    }
+    vldSetTsize32B(live, 1);
+    vldRepeat_async(x + 3, pad, ((int)first + 3) * 256 + channel);
+    fenceVld((short)0);
+
+    valuSetTsize(live, 1);
+    valuSetTstep0(1, 1, 0);
+    valuSetTstep1(0, 0, 0);
+    valuRepeat(y, x, w0, __ValuOpc::mul);
+    valuRepeat(tmp, x + 1, w1, __ValuOpc::mul);
+    valuSetTstep0(1, 1, 1);
+    valuRepeat(y, y, tmp, __ValuOpc::add);
+    valuSetTstep0(1, 1, 0);
+    valuRepeat(tmp, x + 2, w2, __ValuOpc::mul);
+    valuSetTstep0(1, 1, 1);
+    valuRepeat(y, y, tmp, __ValuOpc::add);
+    valuSetTstep0(1, 1, 0);
+    valuRepeat(tmp, x + 3, w3, __ValuOpc::mul);
+    valuSetTstep0(1, 1, 1);
+    valuRepeat(y, y, tmp, __ValuOpc::add);
+    valuRepeat(tmp, y, (half)0.0f, __ValuOpc::sigmoid);
+    valuRepeat(y, y, tmp, __ValuOpc::mul);
+
+    vstSetTsize32B(live, 1);
+    vstSetTstep32B_0(1, 256);
+    vstSetTstep32B_1(0, 0);
+    vstRepeat(y, out, (int)first * 256 + channel);
+  }
+
+  if (live < count) {
+    const unsigned short padding = count - live;
+    valuSetTsize(padding, 1);
+    valuSetTstep0(1, 0, 0);
+    valuSetTstep1(0, 0, 0);
+    valuRepeat(tmp, (half)0.0f, (half)0.0f, __ValuOpc::add);
+    vstSetTsize32B(padding, 1);
+    vstSetTstep32B_0(1, 256);
+    vstSetTstep32B_1(0, 0);
+    vstRepeat(tmp, out, ((int)first + live) * 256 + channel);
+  }
+
+  if (!segment) {
+    // Concatenated history[0:3] + raw_input[0:valid_rows] ends at index
+    // valid_rows+2. For valid_rows=1 or 2 the carry includes prior history.
+    valuExecute(tmp, (half)0.0f, (half)0.0f, __ValuOpc::add);
+    if (valid_rows >= 3)
+      vldExecute(x, pad, (int)valid_rows * 256 + channel);
+    else if (!initial)
+      vldExecute(x, old_state, (int)valid_rows * 256 + channel);
+    else
+      valuExecute(x, (half)0.0f, (half)0.0f, __ValuOpc::add);
+    if (valid_rows >= 2)
+      vldExecute(x + 1, pad, ((int)valid_rows + 1) * 256 + channel);
+    else if (!initial)
+      vldExecute(x + 1, old_state, ((int)valid_rows + 1) * 256 + channel);
+    else
+      valuExecute(x + 1, (half)0.0f, (half)0.0f, __ValuOpc::add);
+    vldExecute(x + 2, pad, ((int)valid_rows + 2) * 256 + channel);
+    vstExecute(x, new_state, channel);
+    vstExecute(x + 1, new_state, 256 + channel);
+    vstExecute(x + 2, new_state, 512 + channel);
+    vstExecute(tmp, new_state, 768 + channel);
+  }
+}

@@ -8,6 +8,7 @@ name = "xinfer"
 version = "0.0.1.dev0"
 description = "Inference serving for vision-language-action models"
 readme = "README.md"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
@@ -31,8 +32,8 @@ models = [
 gpu-image = [
     "nvidia-nvimgcodec-cu13>=0.10",
 ]
-# The CUDA kernel library (xinfer/ops/backends/cuda/src) is called through TVM-FFI; building it also needs CMake, the
-# CUDA toolkit and the CUTLASS submodule (docs/kernels.md).
+# Native operator libraries use TVM-FFI. CUDA builds need CMake, the CUDA toolkit and CUTLASS (docs/kernels.md);
+# RPU runtime builds need the external Rhino Launch SDK (docs/rpu_ops.md).
 kernels = [
     "apache-tvm-ffi>=0.1",
 ]
@@ -63,6 +64,13 @@ xinfer-profile = "xinfer.entrypoints.profile:main"
 
 [tool.setuptools.packages.find]
 include = ["xinfer*"]
+exclude = ["xinfer.ops.backends.rpu.src", "xinfer.ops.backends.rpu.src.*"]
+
+[tool.setuptools]
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md", "licenses/LICENSE.rhinoforge", "licenses/NOTICE.rhinoforge"]
+
+[tool.setuptools.exclude-package-data]
+"xinfer.ops.backends.rpu" = ["src/*", "src/**/*"]
 
 [tool.setuptools.package-data]
 xinfer = ["tuned/*/*.json", "ops/backends/cuda/xinfer_kernels.so"]
@@ -72,6 +80,7 @@ testpaths = ["tests"]
 markers = [
     "gpu: requires a CUDA device",
     "assets: requires external model assets (see docs/models)",
+    "rpu: requires explicit opt-in and an RPU board, native runtime and external kernel assets",
 ]
 
 [tool.ruff]

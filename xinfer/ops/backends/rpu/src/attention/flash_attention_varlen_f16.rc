@@ -1,0 +1,142 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// One source program, Q tiles of 64, one key tile up to 320 padded tokens.
+// All K/V, scores and probabilities remain in VLM; no SxS SPM/DDR temporary.
+// Native FP32 VMAT accumulators span full D for QK and full length for PV.
+// VLM score/probability/normalizer boundaries are FP16 (not FP32 vector math).
+// Grid = [ceil(max_length/16), 2 local heads, number of images], TP8 broadcast.
+// Three independent 7D caches are selected by blockIdx.z; absent slots are 0.
+__rprog__ void flash_attention_varlen_f16(half *dst, half *query,
+    DDR_large k0, DDR_large v0, DDR_large k1, DDR_large v1,
+    DDR_large k2, DDR_large v2, unsigned short len0, unsigned short len1,
+    unsigned short len2) {
+  unsigned short image = blockIdx.z, head = blockIdx.y;
+  // Select addresses sequentially and make the selected DDR base explicitly warp-uniform.
+  short selected_length = len2, selected_start = len0 + len1;
+  int selected_k = k2.addr, selected_v = v2.addr;
+  if (image == 0) { selected_length = len0; selected_start = 0; selected_k = k0.addr; selected_v = v0.addr; }
+  if (image == 1) { selected_length = len1; selected_start = len0; selected_k = k1.addr; selected_v = v1.addr; }
+  unsigned short length = sselt(selected_length, 0), start = sselt(selected_start, 0);
+  DDR_large kc(sselt(selected_k, 0)), vc(sselt(selected_v, 0));
+  unsigned short qfirst = (unsigned short)blockIdx.x * 64;
+  if (length == 0 || length > 308 || head > 1 || qfirst >= length) return;
+  const short blocks = (length + 15) / 16;
+  // Use one explicit scratch arena for up to 20 key blocks (308-row images).
+  // Place Q, outputs, scalars and scores before K and dimension-major V.
+  // Keep every vector load within its declared scratch region.
+  constexpr short key_blocks = 20;
+  __local__ f16v16 arena[4 + 4 + 4 + key_blocks + 4 * key_blocks + 4 * key_blocks];
+  auto *q = arena, *out = q + 4, *maximum = out + 4, *tmp = maximum + 1;
+  auto *denominator = tmp + 1, *ones = denominator + 1, *score = ones + 1;
+  auto *k = score + key_blocks, *v = k + 4 * key_blocks;
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1);
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < blocks; ++b) {
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 4; ++d) {
+      int block_units = (int)b * 128 + head * 64 + d * 16 + (int)coreId_u * 2;
+      vldExecute_async(k + b * 4 + d, kc + block_units, (short)(threadId * 32));
+      vldExecute_async(v + d * key_blocks + b, vc + block_units, (short)(threadId * 32));
+    }
+  }
+  fenceVld(0);
+  // Reuse the complete resident K/V tile for four independent Q16 groups.
+  // The frozen grid overdispatches a few blocks; qfirst rejects them above.
+#pragma rpu_hwloop_ul
+  for (short qgroup = 0; qgroup < 4; ++qgroup) {
+    if (qfirst + qgroup * 16 < length) {
+      unsigned short qrow = qfirst + qgroup * 16 + threadId;
+      unsigned short load_q = qrow < length ? qrow : length - 1;
+#pragma rpu_hwloop_ul
+      for (short d = 0; d < 4; ++d)
+        vldExecute_async(q + d, query, (int)(start + load_q) * 128 + head * 64 + d * 16);
+      fenceVld(0);
+  // 0.125f = float bits 0x3e000000. QK scaling occurs before FP16 writeback.
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)0x3e00);
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < blocks; ++b) {
+    vmatInit(score + b, q, k + b * 4, __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 4; ++d)
+      vmatExecute(score + b, q + d, k + b * 4 + d, __OutMode::outlp1);
+  }
+  // Mask invalid keys with a transpose: each thread owns one key after Trs.
+  // All warp threads participate even when their Q row is an inactive tail.
+  if ((length & 15) != 0) {
+    vsfuExecute(tmp, score + blocks - 1, (short)0, __ShuffleMode::Trs);
+    if (threadId >= (length & 15))
+      valuExecute(tmp, (half)-65504, (half)0, __ValuOpc::add);
+    vsfuExecute(score + blocks - 1, tmp, (short)0, __ShuffleMode::Trs);
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 4; ++d) {
+      vsfuExecute(tmp, v + d * key_blocks + blocks - 1, (short)0, __ShuffleMode::Trs);
+      if (threadId >= (length & 15))
+        valuExecute(tmp, (half)0, (half)0, __ValuOpc::add);
+      vsfuExecute(v + d * key_blocks + blocks - 1, tmp, (short)0, __ShuffleMode::Trs);
+    }
+  }
+  // First reduce over key blocks, then across the 16 key lanes per row.
+  valuExecute(maximum, (half)-65504, (half)0, __ValuOpc::add);
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < blocks; ++b)
+    valuExecute(maximum, maximum, score + b, __ValuOpc::max);
+#pragma rpu_hwloop_ul
+  for (short stage = 0; stage < 4; ++stage) {
+    short distance = 1 << stage;
+    vsfuExecute(tmp, maximum, distance, __ShuffleMode::Pselr);
+    valuExecute(maximum, maximum, tmp, __ValuOpc::max);
+  }
+  // Center in the FP32 VMAT accumulator before FP16 score writeback. The
+  // approximate first-pass maximum is only a common row shift; its error
+  // cancels under normalization. This avoids sharp logits losing low bits
+  // before a later FP16 subtraction. K remains resident for the second pass.
+  valuExecute(tmp, maximum, (half)-8, __ValuOpc::mul);
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < blocks; ++b) {
+    vmatInit(score + b, q, k + b * 4);
+    vcfg_set_vmat(vcfg_vmat_target::acc_init_fp16, tmp);
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 4; ++d)
+      vmatExecute(score + b, q + d, k + b * 4 + d, __OutMode::outlp1);
+  }
+  if ((length & 15) != 0) {
+    vsfuExecute(tmp, score + blocks - 1, (short)0, __ShuffleMode::Trs);
+    if (threadId >= (length & 15))
+      valuExecute(tmp, (half)-65504, (half)0, __ValuOpc::add);
+    vsfuExecute(score + blocks - 1, tmp, (short)0, __ShuffleMode::Trs);
+  }
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < blocks; ++b)
+    valuExecute(score + b, score + b, (half)0, __ValuOpc::exp);
+  // FP32 sum of all probabilities. Every ones-row is identical, so each
+  // denominator output lane is the same row-specific scalar.
+  valuExecute(ones, (half)1, (half)0, __ValuOpc::add);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)0x3f80);
+  vmatInit(denominator, score, ones, __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < blocks; ++b)
+    vmatExecute(denominator, score + b, ones, __OutMode::outlp1);
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < blocks; ++b)
+    valuExecute(score + b, score + b, denominator, __ValuOpc::div);
+#pragma rpu_hwloop_ul
+  for (short d = 0; d < 4; ++d) {
+    vmatInit(out + d, score, v + d * key_blocks, __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+    for (short b = 0; b < blocks; ++b)
+      vmatExecute(out + d, score + b, v + d * key_blocks + b, __OutMode::outlp1);
+  }
+  if (qrow < length) {
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 4; ++d)
+      vstExecute_async(out + d, dst, (int)(start + qrow) * 128 + head * 64 + d * 16);
+  }
+  fenceVst(0);
+    }
+  }
+}

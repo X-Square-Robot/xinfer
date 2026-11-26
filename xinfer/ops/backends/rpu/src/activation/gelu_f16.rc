@@ -1,0 +1,104 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// LocalSPM, contiguous FP16. approximate: 0 = erf/none, 1 = tanh.
+// elements must be divisible by 16. Exact src == dst is supported.
+// Each block processes up to 4096 elements, each thread one vector per step.
+// ABI: dst[0:1], src[2:3], elements[4:5], approximate[6].
+// Launch grid.x = ceil(elements/4096), Core 0.
+__rprog__ void gelu_f16(half *dst, half *src, unsigned int elements,
+                      unsigned short approximate) {
+  if (elements == 0 || (elements & 15) != 0 || approximate > 1) return;
+  unsigned int base = (unsigned int)blockIdx.x * 4096;
+  if (base >= elements) return;
+  unsigned short count = elements - base < 4096 ? elements - base : 4096;
+  // Batch independent vectors through the hardware Repeat engine. One
+  // thread owns every 256th element-vector; the entire input tile is loaded
+  // before the in-place store. The polynomial uses scaled VALU Repeat stages.
+  // For finite FP16 inputs, the sigmoid saturates correctly even when the
+  // polynomial overflows; validated over every finite binary16 encoding.
+  if (approximate == 1 && (count & 255) == 0) {
+    unsigned short vectors = count / 256;
+    int offset = (int)(base + threadId * 16);
+    __local__ f16v16 rx[16], rt[16];
+    vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+    vcfg_set_valu(vcfg_valu_target::imm1, (half)1.0f);
+    vldSetTsize32B(vectors, 1);
+    vldSetTstep32B_0(1, 256);
+    vldSetTstep32B_1(0, 0);
+    vldRepeat(rx, src, offset);
+    valuSetTsize(vectors, 1);
+    valuSetTstep1(0, 0, 0);
+    valuSetTstep0(1, 1, 1);
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)0.044715f);
+    valuRepeat(rt, rx, rx, __ValuOpc::mul);
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)1.5957691216f);
+    valuSetTstep0(1, 1, 0);
+    valuRepeat(rt, rt, (half)1.0f, __ValuOpc::add);
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+    valuSetTstep0(1, 1, 1);
+    valuRepeat(rt, rt, rx, __ValuOpc::mul);
+    valuSetTstep0(1, 1, 0);
+    valuRepeat(rt, rt, (half)0.0f, __ValuOpc::sigmoid);
+    valuSetTstep0(1, 1, 1);
+    valuRepeat(rx, rx, rt, __ValuOpc::mul);
+    vstSetTsize32B(vectors, 1);
+    vstSetTstep32B_0(1, 256);
+    vstSetTstep32B_1(0, 0);
+    vstRepeat(rx, dst, offset);
+    return;
+  }
+  __local__ f16v16 x[1], a[1], t[1], p[1], q[1], y[1];
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+#pragma rpu_hwloop_ul
+  for (unsigned short step = 0; step < count; step += 256) {
+    unsigned short local = step + threadId * 16;
+    if (local < count) {
+      int offset = (int)(base + local);
+      vldExecute(x, src, offset);
+      // Bound the nonlinear intermediate for all finite FP16 inputs. For
+      // |x| >= 10 both definitions round to max(x, 0) in this precision.
+      valuExecute(a, x, (half)-10.0f, __ValuOpc::max);
+      valuExecute(a, a, (half)10.0f, __ValuOpc::min);
+      if (approximate == 1) {
+        // x * sigmoid(2*sqrt(2/pi)*(x + 0.044715*x^3)). Algebraically
+        // equivalent to the tanh GELU; avoids subtracting almost equal values.
+        valuExecute(t, a, a, __ValuOpc::mul);
+        valuExecute(t, t, (half)0.044715f, __ValuOpc::mul);
+        valuExecute(t, t, (half)1.0f, __ValuOpc::add);
+        valuExecute(t, t, a, __ValuOpc::mul);
+        valuExecute(t, t, (half)1.5957691216f, __ValuOpc::mul);
+        valuExecute(t, t, (half)0.0f, __ValuOpc::sigmoid);
+        valuExecute(y, x, t, __ValuOpc::mul);
+      } else {
+        // Normal CDF approximation (A&S 26.2.17), evaluated symmetrically:
+        // GELU(x) = max(x,0) - |x| * Phi(-|x|). The erf definition is the
+        // reference; this polynomial is an FP16 implementation of its CDF.
+        valuExecute(t, (half)0.0f, a, __ValuOpc::sub);
+        valuExecute(a, a, t, __ValuOpc::max);
+        valuExecute(t, a, (half)0.2316419f, __ValuOpc::mul);
+        valuExecute(t, t, (half)1.0f, __ValuOpc::add);
+        valuExecute(t, t, (half)0.0f, __ValuOpc::reciprocal);
+        valuExecute(p, t, (half)1.330274429f, __ValuOpc::mul);
+        valuExecute(p, p, (half)-1.821255978f, __ValuOpc::add);
+        valuExecute(p, p, t, __ValuOpc::mul);
+        valuExecute(p, p, (half)1.781477937f, __ValuOpc::add);
+        valuExecute(p, p, t, __ValuOpc::mul);
+        valuExecute(p, p, (half)-0.356563782f, __ValuOpc::add);
+        valuExecute(p, p, t, __ValuOpc::mul);
+        valuExecute(p, p, (half)0.319381530f, __ValuOpc::add);
+        valuExecute(p, p, t, __ValuOpc::mul);
+        valuExecute(q, a, a, __ValuOpc::mul);
+        valuExecute(q, q, (half)-0.5f, __ValuOpc::mul);
+        valuExecute(q, q, (half)0.0f, __ValuOpc::exp);
+        valuExecute(p, p, q, __ValuOpc::mul);
+        valuExecute(p, p, (half)0.3989422804f, __ValuOpc::mul);
+        valuExecute(p, p, a, __ValuOpc::mul);
+        valuExecute(y, x, (half)0.0f, __ValuOpc::max);
+        valuExecute(y, y, p, __ValuOpc::sub);
+      }
+      vstExecute(y, dst, offset);
+    }
+  }
+}

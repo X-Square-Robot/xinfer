@@ -75,6 +75,7 @@ def cuda_ops(tmp_path, monkeypatch):
 
     reg = _registry()
     monkeypatch.setattr(importlib.import_module("xinfer.ops.registry"), "registry", reg)
+    monkeypatch.setattr(importlib.import_module("xinfer.ops.registry"), "BUILTIN_MODULES", ())
     (tmp_path / "cuda_ops.py").write_text(BACKEND)
     monkeypatch.syspath_prepend(str(tmp_path))
     yield reg
@@ -154,7 +155,7 @@ def test_reference_only_and_pinned_backends():
 
 def test_backends_must_declare_their_numerics():
     reg = _registry()
-    with pytest.raises(ValueError, match="bitwise or tolerance"):
+    with pytest.raises(ValueError, match="bitwise, tolerance or unqualified"):
         reg.add("double", lambda x: x, backend="x", contract=Contract())
     with pytest.raises(ValueError, match="numerics"):
         Contract(numerics="close enough")
@@ -245,3 +246,56 @@ def test_cuda_checks_composed_references_when_the_kernel_library_is_absent():
         catalog.define(ops.registry.spec(name))
     table = catalog.build_table(_platform())
     assert ops.warn_slow_fallbacks("tiny", table, {"stage": names}, "cuda") == sorted(names[1:])
+
+
+@pytest.fixture
+def prepared_registry():
+    reg = OpRegistry()
+    reg.define(OpSpec("prepare", "prepare(context, *, tensors) -> Operation"))
+    assert reg.implementations("prepare") == ()
+
+    def prepare(context, *, tensors):
+        return context, tensors
+
+    reg.add("prepare", prepare, backend="rpu", platforms=("rpu",),
+            contract=Contract(numerics="unqualified", graph_safe=False))
+    return reg
+
+
+def test_prepared_operator_selects_backend_factory_without_a_reference(prepared_registry):
+    table = prepared_registry.build_table(_platform("rpu", None, "rpu"))
+    context, tensors = object(), {"out": object()}
+    selected_context, selected_tensors = table.prepare(context, tensors=tensors)
+    assert selected_context is context and selected_tensors is tensors
+    assert table.report() == [dict(op="prepare", backend="rpu", library=None, version=None,
+                                   numerics="unqualified", deterministic=True, graph_safe=False)]
+
+
+def test_operators_without_platform_candidates_are_omitted(prepared_registry):
+    prepared_registry.define(OpSpec("unavailable", "unavailable()"))
+    table = prepared_registry.build_table(_platform("cpu", None, "cpu"), reference_only=True)
+    assert table.report() == []
+    with pytest.raises(AttributeError, match="not in this op table"):
+        table.prepare
+
+
+def test_reference_only_rejects_supported_prepared_operator_but_pin_takes_precedence(prepared_registry):
+    platform = _platform("rpu", None, "rpu")
+    with pytest.raises(RuntimeError, match="'prepare' has no reference implementation supporting rpu"):
+        prepared_registry.build_table(platform, reference_only=True)
+    table = prepared_registry.build_table(platform, reference_only=True, backends={"prepare": "rpu"})
+    assert table.selection("prepare").backend == "rpu"
+
+
+def test_pinned_operators_cannot_silently_disappear(prepared_registry):
+    platform = _platform("cpu", None, "cpu")
+    with pytest.raises(RuntimeError, match="backend 'rpu' for 'prepare' does not support cpu"):
+        prepared_registry.build_table(platform, backends={"prepare": "rpu"})
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "cuda", "ascend"])
+def test_global_torch_references_are_limited_to_torch_platforms(device_type):
+    reg = OpRegistry()
+    reg.define(ops.registry.spec("linear"))
+    assert reg.build_table(_platform(device_type, None, device_type)).selection("linear").backend == "reference"
+    assert reg.build_table(_platform("rpu", None, "rpu")).report() == []

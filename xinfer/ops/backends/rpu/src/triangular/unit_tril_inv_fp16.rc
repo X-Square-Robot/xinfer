@@ -1,0 +1,135 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Invert I-M for strict-lower FP16 [batch,64,64] in each core's local SPM.
+// Keep all ten lower input and result tiles in VLM through the complete solve.
+// Input is fully loaded before any output store, preserving exact in-place alias.
+// ABI: src[0:1], dst[2:3], batch[4]. Grid x=batch.
+__rprog__ void unit_tril_inv_fp16(half *src, half *dst,
+                                  unsigned short batch) {
+  if (batch == 0 || batch > 16) return;
+  const short z = (short)blockIdx.x;
+  if (z >= batch) return;
+  half *m = src + (int)z * 4096;
+  half *x = dst + (int)z * 4096;
+  __local__ f16v16 mt[10], xt[10], xtt[10];
+  __local__ f16v16 work[4], wt[1], zero[1];
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+
+#define ID(B,C) ((B) * ((B) + 1) / 2 + (C))
+#define LOAD(B,C) vldExecute_async(mt + ID(B,C), m, ((B) * 16 + threadId) * 64 + (C) * 16)
+  LOAD(0,0);
+  LOAD(1,0); LOAD(1,1);
+  LOAD(2,0); LOAD(2,1); LOAD(2,2);
+  LOAD(3,0); LOAD(3,1); LOAD(3,2); LOAD(3,3);
+  fenceVld(0);
+
+// Update one strict-lower row of the diagonal tile at a time.  At iteration r, rows < r already contain the inverse recurrence,
+// while row r still contains M, so X[r,:] = M[r,:] + (X*X)[r,:].
+#define COPY_DIAG(B) \
+  valuExecute_async(xt + ID(B,B), mt + ID(B,B), (half)0.0f, __ValuOpc::add)
+  COPY_DIAG(0); COPY_DIAG(1); COPY_DIAG(2); COPY_DIAG(3);
+  fenceValu(0);
+#define TRS_DIAG(B) \
+  vsfuExecute_async(xtt + ID(B,B), xt + ID(B,B), (short)0, __ShuffleMode::Trs)
+  TRS_DIAG(0); TRS_DIAG(1); TRS_DIAG(2); TRS_DIAG(3);
+  fenceVsfu(0);
+
+  vmatInit(xt, xt, xtt);
+  valuInit(xt, xt, mt);
+  vsfuInit(xtt, xt);
+#pragma rpu_hwloop_ul
+  for (short row = 2; row < 16; ++row) {
+    // VMAT is a warp collective: all threads must execute it together.
+    // Select only the current row's writeback through the per-thread vector
+    // strobe, preserving the row recurrence and its two FP16 rounding stages.
+    __builtin_rhvm_set_strbs(threadId == row ? (short)0xffff : (short)0);
+#define ROW_MUL(B) \
+      vmatExecute_async(xt + ID(B,B), xt + ID(B,B), xtt + ID(B,B), \
+                        __OutMode::outon, __ClrMode::clron, __StrbMode::strbs)
+      ROW_MUL(0); ROW_MUL(1); ROW_MUL(2); ROW_MUL(3);
+      fenceVmat(0);
+#define ROW_ADD(B) \
+      valuExecute_async(xt + ID(B,B), xt + ID(B,B), mt + ID(B,B), \
+                        __ValuOpc::add, __StrbMode::strbs)
+      ROW_ADD(0); ROW_ADD(1); ROW_ADD(2); ROW_ADD(3);
+      fenceValu(0);
+    TRS_DIAG(0); TRS_DIAG(1); TRS_DIAG(2); TRS_DIAG(3);
+    fenceVsfu(0);
+  }
+
+  __builtin_rhvm_set_strbs((short)(1u << threadId));
+#define SEED_DIAG(B) valuExecute_async(xt + ID(B,B), (half)1.0f, (half)0.0f, \
+    __ValuOpc::add, __ClrMode::clron, __OutMode::outon, __StrbMode::strbs)
+  SEED_DIAG(0); SEED_DIAG(1); SEED_DIAG(2); SEED_DIAG(3);
+  fenceValu(0);
+  TRS_DIAG(0); TRS_DIAG(1); TRS_DIAG(2);
+  fenceVsfu(0);
+
+#undef COPY_DIAG
+#undef TRS_DIAG
+#undef ROW_MUL
+#undef ROW_ADD
+#undef SEED_DIAG
+
+// Compute T_bc=sum_k M_bk X_kc into one FP32 accumulator, then X_bc=X_bb T_bc.
+#define TERM(B,C,K,MODE) vmatExecute_async(work, mt + ID(B,K), xtt + ID(K,C), __OutMode::MODE)
+#define FINISH(B,C) { \
+  vsfuExecute(wt, work, (short)0, __ShuffleMode::Trs); \
+  vmatInit(xt + ID(B,C), xt + ID(B,B), wt, __AclrMode::aclr); \
+  vmatExecute(xt + ID(B,C), xt + ID(B,B), wt, __OutMode::outon); \
+  if ((B) < 3) \
+    vsfuExecute(xtt + ID(B,C), xt + ID(B,C), (short)0, __ShuffleMode::Trs); \
+}
+#define SUM1(B,C,K0) { \
+  vmatInit(work, mt + ID(B,K0), xtt + ID(K0,C), __AclrMode::aclr); \
+  TERM(B,C,K0,outon); fenceVmat(0); FINISH(B,C); \
+}
+#define SUM2(B,C,K0,K1) { \
+  vmatInit(work, mt + ID(B,K0), xtt + ID(K0,C), __AclrMode::aclr); \
+  TERM(B,C,K0,outoff); TERM(B,C,K1,outon); fenceVmat(0); FINISH(B,C); \
+}
+#define SUM3(B,C,K0,K1,K2) { \
+  vmatInit(work, mt + ID(B,K0), xtt + ID(K0,C), __AclrMode::aclr); \
+  TERM(B,C,K0,outoff); TERM(B,C,K1,outoff); TERM(B,C,K2,outon); fenceVmat(0); FINISH(B,C); \
+}
+
+  SUM1(1,0,0);
+  SUM2(2,0,0,1);
+  SUM1(2,1,1);
+  SUM3(3,0,0,1,2);
+  SUM2(3,1,1,2);
+  SUM1(3,2,2);
+
+#define STORE(B,C) vstExecute_async(xt + ID(B,C), x, ((B) * 16 + threadId) * 64 + (C) * 16)
+  STORE(0,0);
+  STORE(1,0); STORE(1,1);
+  STORE(2,0); STORE(2,1); STORE(2,2);
+  STORE(3,0); STORE(3,1); STORE(3,2); STORE(3,3);
+  if (src != dst) {
+    valuExecute(zero, (half)0.0f, (half)0.0f, __ValuOpc::add);
+#define ZERO_UP(B,C) vstExecute_async(zero, x, ((B) * 16 + threadId) * 64 + (C) * 16)
+    ZERO_UP(0,1); ZERO_UP(0,2); ZERO_UP(0,3);
+    ZERO_UP(1,2); ZERO_UP(1,3); ZERO_UP(2,3);
+#undef ZERO_UP
+  }
+  fenceVst(0);
+
+#undef ID
+#undef LOAD
+#undef COPY_DIAG
+#undef SEED_DIAG
+#undef ROUND_TRS
+#undef ROUND_SQ
+#undef ROUND_MUL
+#undef ROUND_ADD
+#undef ROUND_ALL
+#undef TERM
+#undef FINISH
+#undef SUM1
+#undef SUM2
+#undef SUM3
+#undef STORE
+}

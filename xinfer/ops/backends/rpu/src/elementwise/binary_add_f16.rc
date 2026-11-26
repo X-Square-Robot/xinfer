@@ -1,0 +1,49 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// language local-SPM binary add, exact FP16 alpha=1.
+// The host validates the local-SPM bounds and exact/disjoint aliases.
+__rprog__ void binary_add_f16(half* dst, half* x, half* y,
+                       unsigned int elements) {
+  const unsigned int base = (unsigned int)blockIdx.x * 16384U;
+  if (base >= elements) return;
+  const unsigned int remaining = elements - base;
+  const unsigned short count =
+      (unsigned short)(remaining < 16384U ? remaining : 16384U);
+  const int offset = (int)(base + threadId * 16U);
+  __local__ f16v16 a[64], b[64];
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  if ((count & 255U) == 0) {
+    const unsigned short repeats = count / 256U;
+    vldSetTsize32B(repeats, 1);
+    vldSetTstep32B_0(1, 256);
+    vldSetTstep32B_1(0, 0);
+    vldRepeat_async(a, x, offset);
+    vldRepeat_async(b, y, offset);
+    fenceVld((short)0);
+    valuSetTsize(repeats, 1);
+    valuSetTstep0(1, 1, 1);
+    valuSetTstep1(0, 0, 0);
+    valuRepeat(a, a, b, __ValuOpc::add);
+    vstSetTsize32B(repeats, 1);
+    vstSetTstep32B_0(1, 256);
+    vstSetTstep32B_1(0, 0);
+    vstRepeat(a, dst, offset);
+  } else {
+#pragma rpu_hwloop_ul
+    for (unsigned short step = 0; step < count; step += 256) {
+      const unsigned short local = step + threadId * 16U;
+      if (local < count) {
+        const unsigned short valid = count - local < 16 ? count - local : 16;
+        LoopStrbInfo tail((short)bmsk(0, valid));
+        LoopStrbLPAttr mask(&tail);
+        const int tail_offset = (int)(base + local);
+        vldExecute(a, x, tail_offset, &mask);
+        vldExecute(b, y, tail_offset, &mask);
+        valuExecute(a, a, b, __ValuOpc::add);
+        vstExecute(a, dst, tail_offset, &mask);
+      }
+    }
+  }
+}

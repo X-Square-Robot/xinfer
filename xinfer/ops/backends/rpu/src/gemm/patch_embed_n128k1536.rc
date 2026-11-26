@@ -1,0 +1,9 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// FP16 Patch embedding+bias; local N128 K1536, dynamic M1..868.
+#define PROJ_ENTRY patch_embed_n128k1536
+#define PROJ_N 128
+#define PROJ_K 1536
+#define PROJ_TN 48
+#define PROJ_TM 16
+#define PROJ_TK 1536
+#include "mlp_projection.h"

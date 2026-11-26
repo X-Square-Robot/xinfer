@@ -1,0 +1,34 @@
+include LICENSE
+include NOTICE
+include THIRD_PARTY_NOTICES.md
+include licenses/LICENSE.rhinoforge
+include licenses/NOTICE.rhinoforge
+include tools/build_rpu_assets.py
+include docs/rpu_ops.md
+include docs/rpu_ops.zh-CN.md
+include xinfer/ops/backends/rpu/src/CMakeLists.txt
+include xinfer/ops/backends/rpu/src/generate_catalog.py
+include xinfer/ops/backends/rpu/src/common/rpu/catalog.json
+include xinfer/ops/backends/rpu/src/activation/*.cc xinfer/ops/backends/rpu/src/activation/*.rc
+include xinfer/ops/backends/rpu/src/attention/*.rc
+include xinfer/ops/backends/rpu/src/comm/*.h xinfer/ops/backends/rpu/src/comm/*.rc
+include xinfer/ops/backends/rpu/src/common/rpu/*.cc xinfer/ops/backends/rpu/src/common/rpu/*.hpp xinfer/ops/backends/rpu/src/common/rpu/*.inc
+include xinfer/ops/backends/rpu/src/conv/*.rc
+include xinfer/ops/backends/rpu/src/denoise_output/*.h xinfer/ops/backends/rpu/src/denoise_output/*.rc
+include xinfer/ops/backends/rpu/src/elementwise/*.rc
+include xinfer/ops/backends/rpu/src/fusion/*.h xinfer/ops/backends/rpu/src/fusion/*.rc
+include xinfer/ops/backends/rpu/src/gemm/*.cc xinfer/ops/backends/rpu/src/gemm/*.h xinfer/ops/backends/rpu/src/gemm/*.rc
+include xinfer/ops/backends/rpu/src/gemm/batched/*.rc
+include xinfer/ops/backends/rpu/src/gemm/projection/*.rc
+include xinfer/ops/backends/rpu/src/layernorm/*.rc
+include xinfer/ops/backends/rpu/src/layout/*.rc
+include xinfer/ops/backends/rpu/src/normalization/*.cc xinfer/ops/backends/rpu/src/normalization/*.h xinfer/ops/backends/rpu/src/normalization/*.rc
+include xinfer/ops/backends/rpu/src/rope/*.rc
+include xinfer/ops/backends/rpu/src/scan/*.rc
+include xinfer/ops/backends/rpu/src/triangular/*.rc
+include tests/rpu/CMakeLists.txt tests/rpu/check_host_library.py tests/rpu/*_test.cpp
+include tests/rpu/fixtures/catalog_metadata.hpp tests/rpu/fixtures/rhino_launch_program.h
+include tests/rpu/fixtures/runtime/runtime_sdk.hpp tests/rpu/fixtures/runtime/rhino_launch_*.h
+include tests/ops/rpu/test_*.py
+include tests/unit/test_rpu_assets_build.py
+recursive-exclude xinfer/ops/backends/rpu *.ref *.so *.o *.a

@@ -1,0 +1,117 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Action Q/K post-projection transform for one local head:
+// RMSNorm [32,256], followed by rotate-half M-RoPE over the first 64 values.
+// The cosine/sine tables are DDR FP16 [rows,32]. The suffix [64,256) is
+// preserved. Separate FP16 multiplies and add/sub retain the reference RoPE
+// rounding boundaries.
+__rprog__ void qk_rmsnorm_mrope_m32d256_f16(
+    half *dst, half *src, half *weight,
+    DDR_large cosine, DDR_large sine,
+    unsigned short position_offset,
+    unsigned short mean_scale_low, unsigned short mean_scale_high,
+    half epsilon) {
+  constexpr short chunks = 16;
+  // Each block owns 16 complete rows. Keep the bounds guard warp-uniform
+  // so every lane participates in the VMAT square-sum operations below.
+  if ((unsigned short)blockIdx.x >= 2) return;
+  unsigned short row = (unsigned short)blockIdx.x * 16 + threadId;
+
+  __local__ f16v16 x[chunks], gamma[chunks];
+  __local__ f16v16 gram[1], norm[1], reduction_scratch[1];
+  __local__ f16v16 cosv[2], sinv[2], rotated[4], product[4];
+
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vcfg_set_vmat(vcfg_vmat_target::acc_init_fp32_l, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::acc_init_fp32_h, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)mean_scale_low);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)mean_scale_high);
+
+  vldSetTsize32B(chunks, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat_async(x, src, (int)row * 256);
+  vldRepeat_async(gamma, weight, (int)0);
+  const int table_byte_offset =
+      ((int)position_offset + (int)row) * 64;
+  vldExecute_async(cosv + 0, cosine, table_byte_offset + 0);
+  vldExecute_async(cosv + 1, cosine, table_byte_offset + 32);
+  vldExecute_async(sinv + 0, sine, table_byte_offset + 0);
+  vldExecute_async(sinv + 1, sine, table_byte_offset + 32);
+  fenceVld(0);
+
+  vmatSetTsize(chunks, 1);
+  vmatSetTstep0(0, 1, 1);
+  vmatSetTstep1(0, 0, 0);
+  LoopOutInfo outlp[1] = {{(short)0}};
+  LoopClrInfo clrlp[1] = {{(short)0}};
+  LoopOutLPAttr out(outlp);
+  LoopClrLPAttr clr(clrlp);
+  vmatRepeat(gram, x, x, &out, &clr);
+
+  half mean_square;
+  vcfg_set_valu(vcfg_valu_target::imm2, gram, (short)threadId);
+  valuExecute(reduction_scratch, (half)1.0f, (half)0.0f, __ValuOpc::add);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vsfuScalar(mean_square, reduction_scratch, (short)0, __ShuffleMode::Psel);
+  const unsigned short bits = reinterpret_cast<unsigned short&>(mean_square);
+  const unsigned short any_small = sumint(bits);
+  const unsigned short any_large = sumint((unsigned short)(0xffffu - bits));
+
+  valuSetTsize(chunks, 1);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(0, 0, 0);
+  half adjusted_epsilon = epsilon;
+  if (any_small < 0x0400u || any_large <= 0x83ffu) {
+    half range_scale = (half)1.0f;
+    if (bits < 0x0400u) {
+      range_scale = (half)128.0f;
+      adjusted_epsilon = (half)0.016384f;
+    } else if (bits >= 0x7c00u) {
+      range_scale = (half)0.00390625f;
+      adjusted_epsilon = (half)0.0f;
+    }
+    valuRepeat(x, x, range_scale, __ValuOpc::mul);
+    vmatRepeat(gram, x, x, &out, &clr);
+    vcfg_set_valu(vcfg_valu_target::imm2, gram, (short)threadId);
+    valuExecute(reduction_scratch, (half)1.0f, (half)0.0f,
+                __ValuOpc::add);
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+    vsfuScalar(mean_square, reduction_scratch, (short)0,
+               __ShuffleMode::Psel);
+  }
+
+  valuExecute(norm, mean_square, adjusted_epsilon, __ValuOpc::add);
+  valuExecute(norm, norm, (half)0.0f, __ValuOpc::sqrt_reciprocal);
+  valuRepeat(x, x, norm, __ValuOpc::mul);
+  valuSetTstep0(1, 1, 1);
+  valuRepeat(x, x, gamma, __ValuOpc::mul);
+
+  // rotate_half([a0,a1,b0,b1]) = [-b0,-b1,a0,a1].
+  // Keep the two vector groups and their MUL/ADD ordering explicit.
+  valuExecute(rotated + 0, x + 0, cosv + 0, __ValuOpc::mul);
+  valuExecute(product + 0, x + 2, sinv + 0, __ValuOpc::mul);
+  valuExecute(rotated + 0, rotated + 0, product + 0, __ValuOpc::sub);
+  valuExecute(rotated + 2, x + 2, cosv + 0, __ValuOpc::mul);
+  valuExecute(product + 2, x + 0, sinv + 0, __ValuOpc::mul);
+  valuExecute(rotated + 2, rotated + 2, product + 2, __ValuOpc::add);
+
+  valuExecute(rotated + 1, x + 1, cosv + 1, __ValuOpc::mul);
+  valuExecute(product + 1, x + 3, sinv + 1, __ValuOpc::mul);
+  valuExecute(rotated + 1, rotated + 1, product + 1, __ValuOpc::sub);
+  valuExecute(rotated + 3, x + 3, cosv + 1, __ValuOpc::mul);
+  valuExecute(product + 3, x + 1, sinv + 1, __ValuOpc::mul);
+  valuExecute(rotated + 3, rotated + 3, product + 3, __ValuOpc::add);
+
+  vstSetTsize32B(4, 1);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(0, 0);
+  vstRepeat_async(rotated, dst, (int)row * 256);
+  vstSetTsize32B(chunks - 4, 1);
+  vstRepeat_async(x + 4, dst, (int)row * 256 + 64);
+  fenceVst(0);
+}

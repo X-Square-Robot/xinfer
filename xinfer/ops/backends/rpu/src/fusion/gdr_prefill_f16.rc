@@ -1,0 +1,96 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "gdr_helpers.h"
+
+// Exact H16/D128/TP8 profile. Four resident warps per local head
+// independently prepare chunks. Two owners then evaluate recurrence in order.
+// Initialize core-local counters 0 and 1 to zero before each launch.
+// Exactly8blocks/core: no owner waits for a nonresident producer.
+// Inputs q/k/v/z are token-major [rows,256]; raw a/b are [rows,16]. dt/negA
+// have two live scalars. norm is [128]. State is [2,128,128] and updated in
+// place. Scratch is private per(head,chunk):49408half, 2*rows/64 chunks/core.
+// ABI: 12 u32 SPM pointers followed by rows, valid_rows, initial (u16).
+// FP16 intermediates retain the unfused source algorithm's rounding points.
+__rprog__ void gdr_prefill_f16(
+    half *q_in,half *k_in,half *v_in,half *z,half *a,half *b,
+    half *dt,half *negA,half *norm,half *state,half *output,half *scratch,
+    unsigned short rows,unsigned short valid_rows,unsigned short initial,
+    half *raw_out,half *norm_out,unsigned short debug) {
+  if(rows<64 || rows>512 || (rows&63) || valid_rows==0 || valid_rows>rows || blockIdx.x>=8) return;
+  const short head=blockIdx.x/4;
+  const short shard=blockIdx.x%4;
+  const short chunks=rows/64;
+  half *s=state+(int)head*16384;
+  __local__ f16v16 pool[192];
+  gd_reset();
+#pragma rpu_hwloop_ul
+  for(short chunk=shard;chunk<chunks;chunk+=4) {
+    const short start=chunk*64;
+  half *w=scratch+((int)head*chunks+chunk)*49408;
+  // Scratch reuse follows last consumers, with no arithmetic reordering:
+  // V dies after Vbeta; Vbeta dies after Vnew; Kbeta dies after Kcd;
+  // Kcd dies after Kcd*S; Q dies after Q*S. The final state product can
+  // overwrite the contiguous Q + former Kcd slots; gated output uses out.
+  half *q=w,*vb=q+8192,*k=vb+8192,*v=k+8192,*kb=v+8192;
+  half *attn=kb+8192,*decay=attn+4096;
+  half *vn=v,*kcd=vb,*out=kb,*tmp=vb,*rec=q;
+  half *beta=decay+4096,*g=beta+64,*gc=g+64,*ge=gc+64;
+    gd_reset();
+    gd_prepare_qk(q_in,q,head,start,valid_rows,true,pool);
+    gd_prepare_qk(k_in,k,head,start,valid_rows,false,pool);
+    gd_prepare_v(v_in,v,head,start,valid_rows,pool);
+    gd_prepare_bg(a,b,dt,negA,beta,g,head,start,valid_rows,pool);
+    gd_bcast_mul<64,128>(kb,k,beta,pool);
+    gd_bcast_mul<64,128>(vb,v,beta,pool);
+    gd_scan(g,gc,pool);
+    gd_decay(gc,decay,pool);
+    gd_bmm_rr(kb,k,attn,pool);
+    gd_strict_neg(attn,decay,pool);
+    gd_tril(attn,attn,pool);
+    gd_bmm_rc64(attn,vb,vn,pool);
+    gd_expg(gc,ge,false,pool);
+    gd_bcast_mul<64,128>(kb,kb,ge,pool);
+    gd_bmm_rc64(attn,kb,kcd,pool);
+  }
+  // Each producer has drained all writes before publishing completion. Every
+  // block arrives even when this bucket assigns it no preparation work.
+  fenceVst(0);
+  watom((short)head,1,field_mode::core,modify_mode::add);
+  if(shard!=0) return;
+  watoms((short)head,0,(short)3,field_mode::core,cmp_mode::gt,modify_mode::add);
+  fenceAtom((short)0);
+  gd_reset();
+  if(initial) {
+    valuSetTsize(64,1); valuSetTstep0(1,0,0); valuSetTstep1(0,0,0);
+    valuRepeat(pool,(half)0.0f,(half)0.0f,__ValuOpc::add);
+    vstSetTsize32B(64,1); vstSetTstep32B_0(1,256); vstSetTstep32B_1(0,0);
+    vstRepeat(pool,s,(int)threadId*16); fenceVst(0);
+  }
+#pragma rpu_hwloop_ul
+  for(short chunk=0;chunk<chunks;++chunk) {
+    const short start=chunk*64;
+  half *w=scratch+((int)head*chunks+chunk)*49408;
+  // Scratch reuse follows last consumers, with no arithmetic reordering:
+  // V dies after Vbeta; Vbeta dies after Vnew; Kbeta dies after Kcd;
+  // Kcd dies after Kcd*S; Q dies after Q*S. The final state product can
+  // overwrite the contiguous Q + former Kcd slots; gated output uses out.
+  half *q=w,*vb=q+8192,*k=vb+8192,*v=k+8192,*kb=v+8192;
+  half *attn=kb+8192,*decay=attn+4096;
+  half *vn=v,*kcd=vb,*out=kb,*tmp=vb,*rec=q;
+  half *beta=decay+4096,*g=beta+64,*gc=g+64,*ge=gc+64;
+    gd_reset();
+    gd_bmm_rr(q,k,attn,pool);
+    gd_binary<4096,2>(attn,attn,decay,pool);
+    gd_bmm_rc128(kcd,s,out,pool);
+    gd_binary<8192,1>(vn,vn,out,pool);
+    gd_bcast_mul<64,128>(q,q,ge,pool);
+    gd_bmm_rc128(q,s,out,pool);
+    gd_bmm_rc64(attn,vn,tmp,pool);
+    gd_binary<8192,0>(out,out,tmp,pool);
+    gd_scalar_mul(s,s,ge+63,pool);
+    gd_expg(gc,ge,true,pool);
+    gd_bcast_mul<64,128>(k,k,ge,pool);
+    gd_bmm_cc(k,vn,rec,pool);
+    gd_binary<16384,0>(s,s,rec,pool);
+    gd_norm_gate(out,z,norm,output,head,start,raw_out,norm_out,debug!=0,pool);
+  }
+}

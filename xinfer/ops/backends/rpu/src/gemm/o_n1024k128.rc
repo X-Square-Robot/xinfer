@@ -1,0 +1,150 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// A[M,128] @ B[128,1024] + bias[1024], M in [1,868]; per-core partial before
+// the all-reduce (bias nonzero only on core 0).
+// Eight N128 blocks. Row-major stores run fast only for long per-row runs,
+// so a block holds all of its W (8 N16 tiles x K128) and the A rows of one
+// super-chunk (at most 37 M16 tiles; larger buckets use equal super-chunks,
+// two of 28 tiles at 868 rows) in VLM and writes complete 256-byte rows. The eight blocks issue their W loads
+// together, which keeps DDR busy; A is issued first and does not wait for
+// DDR. Row groups alternate between two VLM halves, so a group is computed
+// while the previous one is written back. Every output is one bias-seeded
+// K128 VMAT Repeat rounded to FP16 once, as in the full-K kernel.
+// ABI: A LocalSPM bytes [0:1], W DDR/256 [2:3], C [4:5], bias [6:7], M [8].
+// W: [N/16][K/16][8][16 N][16 K].
+#include "__clang_rpu_builtin_vars.h"
+#define QKV_UP_ENTRY o_n1024k128
+#define QKV_UP_N 1024
+#define QKV_UP_K 128
+#define QKV_UP_TN 128
+#define QKV_UP_TM 16
+#define QKV_UP_PIPELINE 1
+#define QKV_UP_TK 128
+
+constexpr short VO_AK = QKV_UP_K / 16, VO_AN = QKV_UP_TN / 16;
+constexpr short VO_MT = 37;  // resident M16 tiles per A super-chunk
+constexpr short VO_ARENA = 400;
+// W (64), bias (8), A (8 per M16 tile), then two output groups of >= 1 row.
+static_assert(VO_AN * VO_AK + VO_AN + VO_MT * VO_AK + 2 * VO_AN <= VO_ARENA,
+              "VLM budget");
+
+__attribute__((always_inline)) inline void vo_vmat(
+    __local__ f16v16 *out, __local__ f16v16 *a, __local__ f16v16 *w,
+    __local__ f16v16 *bias, short count, short *lp) {
+  LoopOutInfo oi[1] = {{(short)0}};
+  LoopOutLPAttr oa(oi);
+  LoopStepInfo bias_steps[1] = {{&lp[1], 1}};
+  FragVData seed(bias, bias_steps);
+#pragma rpu_hwloop_ul
+  for (lp[2] = 0; lp[2] < count; ++lp[2]) {
+#pragma rpu_hwloop_ul
+    for (lp[1] = 0; lp[1] < VO_AN; ++lp[1]) {
+      rpu::vcfg_set_vmat(rpu::vcfg_vmat_target::acc_init_fp16, seed);
+      rpu::vmatRepeat_async(out + lp[2] * VO_AN + lp[1], a + lp[2] * VO_AK,
+                            w + lp[1] * VO_AK, &oa);
+    }
+  }
+}
+
+// Complete 256-byte rows of M16 tiles [m0, m0 + count); rows_t masks this
+// thread's tail rows.
+__attribute__((always_inline)) inline void vo_store(
+    __local__ f16v16 *out, half *cg, short m0, short count, short rows_t,
+    short *lp) {
+  const short end = m0 + count < rows_t ? m0 + count : rows_t;
+  const short valid = end - m0;
+  LoopStepInfo rs[2] = {{&lp[1], VO_AN}, {&lp[0], 1}};
+  FragVData vr(out, rs);
+  LoopStepInfo ds[2] = {{&lp[1], (int)16 * QKV_UP_N}, {&lp[0], (int)16}};
+  FragSData sd(cg + ((int)m0 * 16 + (int)threadId) * QKV_UP_N, ds);
+#pragma rpu_hwloop_ul
+  for (lp[1] = 0; lp[1] < valid; ++lp[1]) {
+#pragma rpu_hwloop_ul
+    for (lp[0] = 0; lp[0] < VO_AN; ++lp[0])
+      rpu::vstExecute_async(vr, sd, (short)0);
+  }
+}
+
+// This thread's A rows of M16 tiles [m0, m0 + count) into VLM.
+__attribute__((always_inline)) inline void vo_load_a(
+    __local__ f16v16 *a, half *av, short m0, short count, short *lp) {
+  LoopStepInfo ad[2] = {{&lp[1], VO_AK}, {&lp[0], 1}};
+  FragVData va(a, ad);
+  LoopStepInfo as[2] = {{&lp[1], (int)16 * QKV_UP_K}, {&lp[0], (int)16}};
+  FragSData sa(av + ((int)m0 * 16 + (int)threadId) * QKV_UP_K, as);
+#pragma rpu_hwloop_ul
+  for (lp[1] = 0; lp[1] < count; ++lp[1]) {
+#pragma rpu_hwloop_ul
+    for (lp[0] = 0; lp[0] < VO_AK; ++lp[0])
+      rpu::vldExecute_async(va, sa, (short)0);
+  }
+}
+
+__rprog__ void QKV_UP_ENTRY(half *av, DDR_large wv, half *cv, half *bias,
+                            unsigned short rows) {
+  const short n_base = (short)blockIdx.x * VO_AN;
+  // A stale grid larger than N/TN must not touch memory beyond N.
+  if (n_base >= QKV_UP_N / 16) return;
+  const short mt = (rows + 15) / 16;
+  const short rows_t = (rows + 15 - threadId) / 16;
+  // Equal super-chunks of at most VO_MT tiles; one chunk up to 588 rows.
+  const short chunks = (mt + VO_MT - 1) / VO_MT;
+  const short sc = (mt + chunks - 1) / chunks;
+  __local__ f16v16 arena[VO_ARENA];
+  auto *w = arena, *biasv = w + VO_AN * VO_AK, *a = biasv + VO_AN;
+  auto *out = a + sc * VO_AK;
+  // M16 tiles per output group; two groups fit in the rest of the arena.
+  const short group = (VO_ARENA - VO_AN * VO_AK - VO_AN - sc * VO_AK) / (2 * VO_AN);
+  short lp[3];
+  DDR_large bg = wv + (int)n_base * VO_AK * 16 + (int)coreId_u * 2;
+  half *cg = cv + (int)n_base * 16;
+
+  vo_load_a(a, av, 0, rows_t < sc ? rows_t : sc, lp);
+  LoopStepInfo bias_dst[1] = {{&lp[0], 1}};
+  FragVData vbias(biasv, bias_dst);
+  LoopStepInfo bias_src[1] = {{&lp[0], (int)16}};
+  FragSData sbias(bias + (int)n_base * 16, bias_src);
+#pragma rpu_hwloop_ul
+  for (lp[0] = 0; lp[0] < VO_AN; ++lp[0])
+    rpu::vldExecute_async(vbias, sbias, (short)0);
+  LoopStepInfo bd[2] = {{&lp[1], VO_AK}, {&lp[0], 1}};
+  FragVData vb(w, bd);
+  LoopStepInfo bs[2] = {{&lp[1], (int)VO_AK * 4096, rpu::__AGran::a_g1B},
+                        {&lp[0], (int)4096, rpu::__AGran::a_g1B}};
+  FragSData sb(bg, bs);
+#pragma rpu_hwloop_ul
+  for (lp[1] = 0; lp[1] < VO_AN; ++lp[1]) {
+#pragma rpu_hwloop_ul
+    for (lp[0] = 0; lp[0] < VO_AK; ++lp[0])
+      rpu::vldExecute_async(vb, sb, (short)(threadId * 32));
+  }
+  rpu::fenceVld(0);
+
+  rpu::vmatSetTsize(VO_AK, 1);
+  rpu::vmatSetTstep0(0, 1, 1);
+  rpu::vmatSetTstep1(0, 0, 0);
+  // Group g computes into half g&1 while group g-1 is written back. The
+  // previous iteration's store fence retired group g-2, the last reader of
+  // half g&1.
+  short g = 0, m0, s0;
+#pragma rpu_hwloop_ul
+  for (s0 = 0; s0 < mt; s0 += sc) {
+    const short scount = mt - s0 < sc ? mt - s0 : sc;
+    if (s0 > 0) {
+      // Every VMAT reading the previous super-chunk's A has been fenced.
+      const short live = rows_t - s0;
+      vo_load_a(a, av, s0, live < scount ? (live > 0 ? live : 0) : scount, lp);
+      rpu::fenceVld(0);
+    }
+#pragma rpu_hwloop_ul
+    for (m0 = 0; m0 < scount; m0 += group) {
+      const short count = scount - m0 < group ? scount - m0 : group;
+      auto *dst = out + (g & 1) * group * VO_AN;
+      vo_vmat(dst, a + m0 * VO_AK, w, biasv, count, lp);
+      rpu::fenceVmat(0);
+      rpu::fenceVst(0);
+      vo_store(dst, cg, s0 + m0, count, rows_t, lp);
+      ++g;
+    }
+  }
+  rpu::fenceVst(0);
+}

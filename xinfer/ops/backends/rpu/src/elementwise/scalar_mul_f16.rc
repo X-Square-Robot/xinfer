@@ -1,0 +1,49 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// GDN local-SPM FP16 multiplication by -1 or 1/sqrt(128).
+// A mask keeps two-element Decode spans inside their declared SPM bounds.
+__rprog__ void scalar_mul_f16(half* dst, half* src,
+                                   unsigned int elements, half scalar) {
+  const unsigned int base = (unsigned int)blockIdx.x * 4096U;
+  if (base >= elements) return;
+  const unsigned int remaining = elements - base;
+  const unsigned short count =
+      (unsigned short)(remaining < 4096U ? remaining : 4096U);
+  __local__ f16v16 value[16];
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  if ((count & 255U) == 0) {
+    const unsigned short repeats = count / 256U;
+    const int offset = (int)(base + threadId * 16U);
+    vldSetTsize32B(repeats, 1);
+    vldSetTstep32B_0(1, 256);
+    vldSetTstep32B_1(0, 0);
+    vldRepeat_async(value, src, offset);
+    fenceVld((short)0);
+    valuSetTsize(repeats, 1);
+    // Scalar parameter stays fixed across every 256-element vector repeat.
+    valuSetTstep0(1, 1, 0);
+    valuSetTstep1(0, 0, 0);
+    valuRepeat(value, value, scalar, __ValuOpc::mul);
+    vstSetTsize32B(repeats, 1);
+    vstSetTstep32B_0(1, 256);
+    vstSetTstep32B_1(0, 0);
+    vstRepeat(value, dst, offset);
+  } else {
+#pragma rpu_hwloop_ul
+    for (unsigned short step = 0; step < count; step += 256) {
+      const unsigned short local = step + threadId * 16U;
+      if (local < count) {
+        const unsigned short valid = count - local < 16 ? count - local : 16;
+        LoopStrbInfo tail((short)bmsk(0, valid));
+        LoopStrbLPAttr mask(&tail);
+        const int offset = (int)(base + local);
+        vldExecute(value, src, offset, &mask);
+        valuExecute(value, value, scalar, __ValuOpc::mul);
+        vstExecute(value, dst, offset, &mask);
+      }
+    }
+  }
+  fenceVst((short)0);
+}

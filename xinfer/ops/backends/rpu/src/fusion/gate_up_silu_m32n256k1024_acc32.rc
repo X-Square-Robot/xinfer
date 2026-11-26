@@ -1,0 +1,142 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Action fused MLP input stage, TP8 column parallel:
+//   gate = A x Wg^T, up = A x Wu^T      local [32,256] each, K=1024, FP32 acc
+//   out  = silu(gate) * up              FP16 steps of silu_mul_fp16
+// Replaces gemm_ddr_col(gate) + gemm_ddr_col(up) + silu_mul_fp16 and is
+// bit-identical to that chain: every output tile keeps the production VMAT
+// K order and FP16 VMAT output, and the epilogue repeats silu_mul's sigmoid,
+// x*sigmoid(x), *y sequence on the same FP16 values.
+//
+// ABI (32-bit slots): A LocalSPM [32,1024] [0:1]; Wg, Wu production
+// transformed DDR weights ([local_nblock][kblock][core][16][16], address>>8)
+// [2:3], [4:5]; out LocalSPM [32,256] [6:7]. out must not alias A.
+// Launch grid.x=8 on all eight cores. Block b owns output columns
+// [32b,32b+32) as two 16-column groups; eight resident warps per core keep
+// four times the weight requests of the grid.x=2 production GEMM in flight.
+
+#include "__clang_rpu_builtin_vars.h"
+
+__rprog__ void gate_up_silu_m32n256k1024_acc32(
+    half *av, DDR_large wg, DDR_large wu, half *rv) {
+  const short vlen = 16;
+  const short a_ld = 1024;
+  const short r_ld = 256;
+  const short M = 2;       // 2 x 16 rows
+  const short N = 1;       // one 16-column block per group
+  const short K = 64;      // 64 x 16 reduction blocks
+  const short GROUPS = 2;  // 2 x 16 columns per grid block
+
+  __local__ f16v16 a[M * K];
+  __local__ f16v16 bg[N * K], bu[N * K];
+  __local__ f16v16 rg[M * N], ru[M * N], sig[M * N];
+  short loop[3];
+
+  LoopStepInfo a_dst_steps[2] = {
+      {&loop[1], (short)K}, {&loop[0], (short)1}};
+  FragVData a_dst(a, a_dst_steps);
+  LoopStepInfo a_src_steps[2] = {
+      {&loop[1], (int)(vlen * a_ld)}, {&loop[0], (int)vlen}};
+  FragSData a_src(av, a_src_steps);
+#pragma rpu_hwloop_ul
+  for (loop[1] = 0; loop[1] < M; ++loop[1]) {
+#pragma rpu_hwloop_ul
+    for (loop[0] = 0; loop[0] < K; ++loop[0])
+      rpu::vldExecute_async(a_dst, a_src, (short)(threadId * a_ld));
+  }
+  rpu::fenceVld((short)0);
+
+  const short core = (short)coreId_u;
+  const short block = (short)blockIdx.x;
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < GROUPS; ++group) {
+    const int local_nblock = (int)block * GROUPS + (int)group;
+    // [local_nblock][kblock][core][16][16]; one 16x16 tile is 512 B and one
+    // (nblock,kblock) row of eight core tiles is 4 KiB (16 DDR_large units).
+    const int weight_base_large = local_nblock * (int)K * 16 + (int)core * 2;
+    DDR_large g_base = wg + weight_base_large;
+    DDR_large u_base = wu + weight_base_large;
+
+    LoopStepInfo b_dst_steps[2] = {
+        {&loop[1], (short)K}, {&loop[0], (short)1}};
+    FragVData bg_dst(bg, b_dst_steps);
+    FragVData bu_dst(bu, b_dst_steps);
+    LoopStepInfo b_src_steps[2] = {
+        {&loop[1], (int)262144, rpu::__AGran::a_g1B},
+        {&loop[0], (int)(8 * 256 * sizeof(half)), rpu::__AGran::a_g1B}};
+    FragSData g_src(g_base, b_src_steps);
+    FragSData u_src(u_base, b_src_steps);
+#pragma rpu_hwloop_ul
+    for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+      for (loop[0] = 0; loop[0] < K; ++loop[0]) {
+        rpu::vldExecute_async(
+            bg_dst, g_src, (short)(threadId * vlen * sizeof(half)));
+        rpu::vldExecute_async(
+            bu_dst, u_src, (short)(threadId * vlen * sizeof(half)));
+      }
+    }
+    rpu::fenceVld((short)0);
+
+    // Production VMAT order: out after the full K loop, clear per tile.
+    LoopStepInfo c_steps[3] = {
+        {&loop[2], (short)N}, {&loop[1], (short)1},
+        {&loop[0], (short)0}};
+    FragVData cg(rg, c_steps);
+    FragVData cu(ru, c_steps);
+    LoopStepInfo ac_steps[3] = {
+        {&loop[2], (short)K}, {&loop[1], (short)0},
+        {&loop[0], (short)1}};
+    FragVData ac(a, ac_steps);
+    LoopStepInfo bc_steps[3] = {
+        {&loop[2], (short)0}, {&loop[1], (short)K},
+        {&loop[0], (short)1}};
+    FragVData bgc(bg, bc_steps);
+    FragVData buc(bu, bc_steps);
+    LoopOutInfo out_info[1] = {{&loop[0]}};
+    LoopClrInfo clear_info[1] = {{&loop[1]}};
+    LoopOutLPAttr out_attr(out_info);
+    LoopClrLPAttr clear_attr(clear_info);
+#pragma rpu_hwloop_ul
+    for (loop[2] = 0; loop[2] < M; ++loop[2]) {
+#pragma rpu_hwloop_ul
+      for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+        for (loop[0] = 0; loop[0] < K; ++loop[0])
+          rpu::vmatExecute_async(cg, ac, bgc, &out_attr, &clear_attr);
+      }
+    }
+#pragma rpu_hwloop_ul
+    for (loop[2] = 0; loop[2] < M; ++loop[2]) {
+#pragma rpu_hwloop_ul
+      for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+        for (loop[0] = 0; loop[0] < K; ++loop[0])
+          rpu::vmatExecute_async(cu, ac, buc, &out_attr, &clear_attr);
+      }
+    }
+    rpu::fenceVmat((short)0);
+
+    // silu_mul_fp16: sig = sigmoid(g); g = g*sig; g = g*u.
+    rpu::valuSetTsize(M * N, 1);
+    rpu::valuSetTstep0(1, 1, 1);
+    rpu::valuSetTstep1(0, 0, 0);
+    rpu::valuRepeat(sig, rg, (half)0.0f, rpu::__ValuOpc::sigmoid);
+    rpu::valuRepeat(rg, rg, sig, rpu::__ValuOpc::mul);
+    rpu::valuRepeat(rg, rg, ru, rpu::__ValuOpc::mul);
+
+    half *group_r = rv + local_nblock * 16;
+    LoopStepInfo r_src_steps[2] = {
+        {&loop[1], (short)N}, {&loop[0], (short)1}};
+    FragVData r_src(rg, r_src_steps);
+    LoopStepInfo r_dst_steps[2] = {
+        {&loop[1], (int)(vlen * r_ld)}, {&loop[0], (int)vlen}};
+    FragSData r_dst(group_r, r_dst_steps);
+#pragma rpu_hwloop_ul
+    for (loop[1] = 0; loop[1] < M; ++loop[1]) {
+#pragma rpu_hwloop_ul
+      for (loop[0] = 0; loop[0] < N; ++loop[0])
+        rpu::vstExecute_async(r_src, r_dst, (short)(threadId * r_ld));
+    }
+    rpu::fenceVst((short)0);
+  }
+}

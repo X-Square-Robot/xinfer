@@ -1,0 +1,38 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+// Local SPM; each core owns contiguous FP16 operands. Exact aliases are safe;
+// partial overlaps are rejected by the host. No DDR traffic or persistent state.
+// ABI slots: dst0:1,x2:3,pos4:5,elements6:7,vectors8; TP8 broadcast.
+__rprog__ void add_vpb_f16(half* dst, half* x, half* position,
+                              unsigned int elements, unsigned short vectors) {
+  if (elements == 0 || elements > 888832U || vectors == 0 || vectors > 64) return;
+  unsigned int base = (unsigned int)blockIdx.x * (unsigned int)vectors * 256U;
+  if (base >= elements) return;
+  unsigned short count = elements-base < vectors*256U ? elements-base : vectors*256U;
+  __local__ f16v16 a[64], b[64];
+  vcfg_set_valu(vcfg_valu_target::imm2,(half)1.0f);
+  if ((count & 255) == 0) {
+    unsigned short reps=count/256;
+    int off=(int)(base+threadId*16);
+    vldSetTsize32B(reps,1);vldSetTstep32B_0(1,256);vldSetTstep32B_1(0,0);
+    vldRepeat_async(a,x,off);vldRepeat_async(b,position,off);fenceVld((short)0);
+    valuSetTsize(reps,1);valuSetTstep0(1,1,1);valuSetTstep1(0,0,0);
+    valuRepeat(a,a,b,__ValuOpc::add);
+    vstSetTsize32B(reps,1);vstSetTstep32B_0(1,256);vstSetTstep32B_1(0,0);
+    vstRepeat(a,dst,off);
+  } else {
+#pragma rpu_hwloop_ul
+    for (unsigned short step=0;step<count;step+=256) {
+      unsigned short local=step+threadId*16;
+      if (local<count) {
+        unsigned short valid=count-local<16?count-local:16;
+        LoopStrbInfo tail((short)bmsk(0,valid));LoopStrbLPAttr mask(&tail);
+        int off=(int)(base+local);
+        vldExecute(a,x,off,&mask);vldExecute(b,position,off,&mask);
+        valuExecute(a,a,b,__ValuOpc::add);
+        vstExecute(a,dst,off,&mask);
+      }
+    }
+  }
+}

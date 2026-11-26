@@ -1,0 +1,41 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Inclusive FP16 [rows,64] row scan in local SPM, FP32 VALU accumulator.
+// Each thread owns one row; two VSFU Repeat passes interleave lanes,
+// VALU accumulates in FP32, and VST writes the 64 prefixes.
+__rprog__ void cumsum_fp16(half *src, half *dst, unsigned short rows) {
+  if (rows == 0 || rows > 16) return;
+  const unsigned short row = (unsigned short)blockIdx.x * 16 + threadId;
+  if (row >= rows) return;
+  __local__ f16v16 input[4], expanded[64], prefix[64];
+  vldSetTsize32B(4, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat(input, src, (int)row * 64);
+
+  // Psel Repeat advances the selector by two half lanes per src1 step.
+  // Interleave even and odd selectors into consecutive expanded entries.
+  vsfuSetTsize32B(8, 4);
+  vsfuSetTstep32B_0(2, 0, 1);
+  vsfuSetTstep32B_1(16, 1, 0);
+  vsfuRepeat(expanded, input, (short)0, __ShuffleMode::Psel);
+  vsfuRepeat(expanded + 1, input, (short)1, __ShuffleMode::Psel);
+
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  valuExecute(prefix, expanded, (half)0.0f, __ValuOpc::acc,
+              __ClrMode::clron, __OutMode::outon);
+  valuSetTsize(63, 1);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(0, 0, 0);
+  valuRepeat(prefix + 1, expanded + 1, (half)0.0f, __ValuOpc::acc,
+             __ClrMode::clroff, __OutMode::outon);
+
+  __builtin_rhvm_set_strbs((short)1);
+  vstSetTsize32B(64, 1);
+  vstSetTstep32B_0(1, 1);
+  vstSetTstep32B_1(0, 0);
+  vstRepeat(prefix, dst, (int)row * 64, __StrbMode::strbs);
+}

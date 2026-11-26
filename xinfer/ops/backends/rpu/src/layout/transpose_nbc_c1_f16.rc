@@ -1,0 +1,16 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// GDN [64,2,1] -> [2,64,1], preserving FP16 bits.
+__rprog__ void transpose_nbc_c1_f16(half* dst, half* src) {
+  const unsigned int row = (unsigned int)blockIdx.x * 16U + threadId;
+  const unsigned int n_index = row >> 6;
+  const unsigned int b_index = row & 63U;
+  const unsigned int input_index = b_index * 2U + n_index;
+  __local__ f16v16 value[1];
+  LoopStrbInfo tail((short)0x0001);
+  LoopStrbLPAttr mask(&tail);
+  vldExecute(value, src, (int)input_index, &mask);
+  vstExecute(value, dst, (int)row, &mask);
+}

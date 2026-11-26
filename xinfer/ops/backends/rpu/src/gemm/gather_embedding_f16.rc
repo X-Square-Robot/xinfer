@@ -1,0 +1,122 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+
+using namespace rpu;
+
+// token embedding gather.
+//
+// ids and vocab are DDR_large addresses encoded in 256-byte units.  dst is a
+// core-local SPM byte address.  Vocab is compact row-major FP16 [V,2048] and
+// ids is compact little-endian int32 [valid_rows].  One block handles at most
+// 32 output rows and all sixteen threads cooperate on each 4096-byte row.
+// Rows [valid_rows,output_rows) are positive-zero padded.  Invalid ids are
+// also zeroed as a device-side backstop; the host contract rejects them before
+// enqueue so this path must never hide bad caller input.
+__rprog__ void gather_embedding_f16(
+    DDR_large ids, DDR_large vocab, half *dst, unsigned int vocab_rows,
+    unsigned short valid_rows, unsigned short output_rows) {
+  if (vocab_rows == 0 || valid_rows == 0 || valid_rows > output_rows ||
+      output_rows > 512)
+    return;
+
+  const unsigned short first_row = (unsigned short)blockIdx.x * 32;
+  if (first_row >= output_rows) return;
+
+  __local__ i16v16 id_words[1];
+  __local__ f16v16 row_data[8];
+  __local__ f16v16 zero[1];
+  valuExecute(zero, (half)0.0f, (half)0.0f, __ValuOpc::add);
+
+#pragma rpu_hwloop_ul
+  for (unsigned short group = 0; group < 4; ++group) {
+    const unsigned short group_row = first_row + group * 8;
+    unsigned short group_valid = 0;
+    if (group_row < valid_rows) {
+      group_valid = valid_rows - group_row;
+      if (group_valid > 8) group_valid = 8;
+      // A group contains eight int32 ids (32 bytes).  The tail strobe avoids
+      // reading beyond a compact ids allocation on the final partial group.
+      if (group_valid == 1) {
+        LoopStrbInfo words((short)0x0003); LoopStrbLPAttr mask{&words};
+        vldExecute(id_words, ids, (int)group_row * 4, &mask);
+      } else if (group_valid == 2) {
+        LoopStrbInfo words((short)0x000f); LoopStrbLPAttr mask{&words};
+        vldExecute(id_words, ids, (int)group_row * 4, &mask);
+      } else if (group_valid == 3) {
+        LoopStrbInfo words((short)0x003f); LoopStrbLPAttr mask{&words};
+        vldExecute(id_words, ids, (int)group_row * 4, &mask);
+      } else if (group_valid == 4) {
+        LoopStrbInfo words((short)0x00ff); LoopStrbLPAttr mask{&words};
+        vldExecute(id_words, ids, (int)group_row * 4, &mask);
+      } else if (group_valid == 5) {
+        LoopStrbInfo words((short)0x03ff); LoopStrbLPAttr mask{&words};
+        vldExecute(id_words, ids, (int)group_row * 4, &mask);
+      } else if (group_valid == 6) {
+        LoopStrbInfo words((short)0x0fff); LoopStrbLPAttr mask{&words};
+        vldExecute(id_words, ids, (int)group_row * 4, &mask);
+      } else if (group_valid == 7) {
+        LoopStrbInfo words((short)0x3fff); LoopStrbLPAttr mask{&words};
+        vldExecute(id_words, ids, (int)group_row * 4, &mask);
+      } else {
+        vldExecute(id_words, ids, (int)group_row * 4);
+      }
+    }
+
+#pragma rpu_hwloop_ul
+    for (unsigned short item = 0; item < 8; ++item) {
+      const unsigned short row = group_row + item;
+      if (row >= output_rows) continue;
+
+      if (item >= group_valid) {
+#pragma rpu_hwloop_ul
+        for (short chunk = 0; chunk < 8; ++chunk)
+          vstExecute_async(zero, dst,
+                           (int)row * 2048 + (int)chunk * 256 +
+                               (int)threadId * 16);
+        fenceVst((short)0);
+        continue;
+      }
+
+      unsigned short low = 0;
+      unsigned short high = 0;
+      vsfuScalar(low, id_words, (short)(item * 2), __ShuffleMode::Psel);
+      vsfuScalar(high, id_words, (short)(item * 2 + 1),
+                 __ShuffleMode::Psel);
+
+      // Compare the high and low halves with direct unsigned 16-bit control flow.
+      // Keep the complete range guard before forming or reading the selected row.
+      const unsigned short vocab_low = (unsigned short)vocab_rows;
+      const unsigned short vocab_high = (unsigned short)(vocab_rows >> 16);
+      if (high > vocab_high ||
+          (high == vocab_high && low >= vocab_low)) {
+#pragma rpu_hwloop_ul
+        for (short chunk = 0; chunk < 8; ++chunk)
+          vstExecute_async(zero, dst,
+                           (int)row * 2048 + (int)chunk * 256 +
+                               (int)threadId * 16);
+        fenceVst((short)0);
+        continue;
+      }
+
+      const unsigned int id =
+          (unsigned int)low | ((unsigned int)high << 16);
+      // A vocabulary row spans 16 DDR_large address units.
+      // Use unsigned packed-address addition and make the selected base warp-uniform.
+      const unsigned int selected_bits =
+          static_cast<unsigned int>(vocab.addr) + id * 16u;
+      const int selected = __builtin_bit_cast(int, selected_bits);
+      DDR_large vocab_row(sselt(selected, 0));
+#pragma rpu_hwloop_ul
+      for (short chunk = 0; chunk < 8; ++chunk)
+        vldExecute_async(row_data + chunk, vocab_row,
+                         (int)chunk * 512 + (int)threadId * 32);
+      fenceVld((short)0);
+#pragma rpu_hwloop_ul
+      for (short chunk = 0; chunk < 8; ++chunk)
+        vstExecute_async(row_data + chunk, dst,
+                         (int)row * 2048 + (int)chunk * 256 +
+                             (int)threadId * 16);
+      fenceVst((short)0);
+    }
+  }
+}

@@ -1,0 +1,182 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// H <= 2048: cache X/weight/bias in VLM and use Repeat for the unchanged
+// staged FP16 algorithm. M <= 128 uses 16 rows/block; larger M uses 32.
+// Wider rows use bounded streaming storage, 16 rows per block.
+// Launch on Core 0: ceil(M / (H <= 2048 && M > 128 ? 32 : 16)).
+// M is the full tensor row count; all buffers reside in Core 0 LocalSPM.
+__rprog__ void layernorm_f16(
+    half *dst, half *src, half *weight, half *bias,
+    unsigned short dst_rows, unsigned short dst_cols,
+    unsigned short weight_cols, unsigned short bias_cols,
+    unsigned short mean_scale_low, unsigned short mean_scale_high,
+    half epsilon) {
+  if (dst_rows == 0 || dst_cols == 0 || (dst_cols & 15) != 0 ||
+      weight_cols != dst_cols || (bias_cols != 0 && bias_cols != dst_cols)) return;
+  if (dst_cols <= 2048) {
+    unsigned short tid = threadId;
+    unsigned short chunks = dst_cols / 16;
+    __local__ f16v16 x[128], gamma[128], beta[128];
+    __local__ f16v16 ones[1], mean_hi[1], mean_lo[1], inv_std[1];
+    vldSetTsize32B(chunks, 1);
+    vldSetTstep32B_0(1, 16);
+    vldSetTstep32B_1(0, 0);
+    vldRepeat(gamma, weight, (int)0);
+    if (bias_cols != 0) vldRepeat(beta, bias, (int)0);
+    valuExecute(ones, (half)1.0f, (half)0.0f, __ValuOpc::add);
+    vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)mean_scale_low);
+    vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)mean_scale_high);
+    vmatSetTsize(chunks, 1);
+    vmatSetTstep1(0, 0, 0);
+    valuSetTsize(chunks, 1);
+    valuSetTstep1(0, 0, 0);
+    vstSetTsize32B(chunks, 1);
+    vstSetTstep32B_0(1, 16);
+    vstSetTstep32B_1(0, 0);
+    unsigned short rows_per_block = dst_rows > 128 ? 32 : 16;
+    unsigned int first_row = (unsigned int)blockIdx.x * rows_per_block;
+    // Avoid computing a completely inactive second group in the final block.
+    unsigned short tile_count = rows_per_block == 32 && dst_rows - first_row > 16 ? 2 : 1;
+#pragma rpu_hwloop_ul
+    for (unsigned short tile = 0; tile < tile_count; ++tile) {
+      unsigned int row = first_row + (unsigned int)tile * 16 + tid;
+      unsigned int load_row = row < dst_rows ? row : (unsigned int)dst_rows - 1;
+      int row_offset = (int)(load_row * (unsigned int)dst_cols);
+      vldRepeat(x, src, row_offset);
+      vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+      vmatSetTstep0(0, 1, 0);
+      LoopOutInfo outlp[1] = {{(short)0}};
+      LoopClrInfo clrlp[1] = {{(short)0}};
+      LoopOutLPAttr out(outlp);
+      LoopClrLPAttr clr(clrlp);
+      // Preserve the high/low mean correction and centered variance.
+      vmatRepeat(mean_hi, x, ones, &out, &clr);
+      valuSetTstep0(1, 1, 0);
+      valuRepeat(x, x, mean_hi, __ValuOpc::sub);
+      vmatRepeat(mean_lo, x, ones, &out, &clr);
+      valuRepeat(x, x, mean_lo, __ValuOpc::sub);
+      vmatSetTstep0(0, 1, 1);
+      vmatRepeat(inv_std, x, x, &out, &clr);
+
+      // Extract each row's diagonal through VALU before constant-lane Psel.
+      // A dynamic scalar Psel is not a per-thread selector on this SDK.
+      // mean_hi/mean_lo are dead after centering and serve as scratch here.
+      half variance;
+      vcfg_set_valu(vcfg_valu_target::imm2, inv_std, (short)tid);
+      valuExecute(mean_hi, (half)1.0f, (half)0.0f, __ValuOpc::add);
+      vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+      vsfuScalar(variance, mean_hi, (short)0, __ShuffleMode::Psel);
+      unsigned short variance_bits = reinterpret_cast<unsigned short&>(variance);
+      // sumint is the warp's unsigned minimum, not an arithmetic sum.
+      unsigned short min_complement = sumint((unsigned short)(0xffffu - variance_bits));
+      if (min_complement < 0x8400u) {
+        // Keep centered X unchanged. Recompute the Gram tile cooperatively,
+        // scaling the FP32 accumulator before its FP16 writeback. Dividing
+        // by 2^16 covers centered values up to 65504 without variance overflow.
+        vcfg_set_vmat(vcfg_vmat_target::scale_allch_h,
+                      (short)(mean_scale_high - 0x0800u));
+        vmatRepeat(mean_lo, x, x, &out, &clr);
+        vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)mean_scale_high);
+        vcfg_set_valu(vcfg_valu_target::imm2, mean_lo, (short)tid);
+        valuExecute(mean_hi, (half)1.0f, (half)0.0f, __ValuOpc::add);
+        vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+        half scaled_variance;
+        vsfuScalar(scaled_variance, mean_hi, (short)0, __ShuffleMode::Psel);
+        half chosen_variance = variance_bits >= 0x7c00u ? scaled_variance : variance;
+        half epsilon_scale = variance_bits >= 0x7c00u ? (half)0.0000152587890625f : (half)1.0f;
+        half inverse_scale = variance_bits >= 0x7c00u ? (half)0.00390625f : (half)1.0f;
+        valuExecute(mean_hi, epsilon, epsilon_scale, __ValuOpc::mul);
+        valuExecute(inv_std, chosen_variance, mean_hi, __ValuOpc::add);
+        valuExecute(inv_std, inv_std, (half)0.0f, __ValuOpc::sqrt_reciprocal);
+        valuExecute(inv_std, inv_std, inverse_scale, __ValuOpc::mul);
+      } else {
+        // Preserve the original staged rounding for every non-overflow warp.
+        valuExecute(inv_std, inv_std, epsilon, __ValuOpc::add);
+        valuExecute(inv_std, inv_std, (half)0.0f, __ValuOpc::sqrt_reciprocal);
+      }
+      vcfg_set_valu(vcfg_valu_target::imm2, inv_std, (short)tid);
+      valuSetTstep0(1, 1, 1);
+      valuRepeat(x, x, gamma, __ValuOpc::mul);
+      if (bias_cols != 0) {
+        vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+        valuRepeat(x, x, beta, __ValuOpc::add);
+      }
+      if (row < dst_rows) vstRepeat(x, dst, row_offset);
+    }
+    return;
+  }
+  unsigned short tid = threadId;
+  unsigned short chunks = dst_cols / 16;
+  __local__ f16v16 x[1], gamma[1], beta[1], inv_std[1], y[1];
+  __local__ f16v16 ones[1], mean_hi[1], mean_lo[1];
+
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)mean_scale_low);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)mean_scale_high);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  valuExecute(&ones[0], (half)1.0f, (half)0.0f, __ValuOpc::add);
+
+  unsigned short tile = blockIdx.x;
+  {
+    unsigned int row = (unsigned int)tile * 16 + tid;
+    // All 16 threads must participate in the Gram reduction. Inactive tail
+    // threads read the last valid row, but never store. No padded SPM needed.
+    unsigned int load_row = row < dst_rows ? row : (unsigned int)dst_rows - 1;
+    int row_offset = (int)(load_row * (unsigned int)dst_cols);
+
+    // X * ones^T yields the same mean in every lane of this thread's row.
+    // Keep all threads active for VMAT, including the duplicated tail rows.
+    vmatInit(mean_hi, x, ones, __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+    for (unsigned short i = 0; i < chunks; ++i) {
+      vldExecute(&x[0], src + i * 16, row_offset);
+      vmatExecute(&mean_hi[0], &x[0], &ones[0], __OutMode::outlp1);
+    }
+
+    // Recover the low part of the mean from residuals. A single FP16 mean
+    // would lose small differences around a large offset (e.g. 128 + 0.0625).
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+    vmatInit(mean_lo, x, ones, __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+    for (unsigned short i = 0; i < chunks; ++i) {
+      vldExecute(&x[0], src + i * 16, row_offset);
+      valuExecute(&x[0], &x[0], &mean_hi[0], __ValuOpc::sub);
+      vmatExecute(&mean_lo[0], &x[0], &ones[0], __OutMode::outlp1);
+    }
+
+    // Center before squaring to avoid cancellation in E[x^2] - E[x]^2.
+    // VMAT accumulates in FP32 and applies 1/H before FP16 writeback.
+    vmatInit(inv_std, x, x, __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+    for (unsigned short i = 0; i < chunks; ++i) {
+      vldExecute(&x[0], src + i * 16, row_offset);
+      valuExecute(&x[0], &x[0], &mean_hi[0], __ValuOpc::sub);
+      valuExecute(&x[0], &x[0], &mean_lo[0], __ValuOpc::sub);
+      vmatExecute(&inv_std[0], &x[0], &x[0], __OutMode::outlp1);
+    }
+    valuExecute(&inv_std[0], &inv_std[0], epsilon, __ValuOpc::add);
+    valuExecute(&inv_std[0], &inv_std[0], (half)0.0f,
+                __ValuOpc::sqrt_reciprocal);
+
+#pragma rpu_hwloop_ul
+    for (unsigned short i = 0; i < chunks; ++i) {
+      vldExecute(&x[0], src + i * 16, row_offset);
+      vldExecute(&gamma[0], weight + i * 16, (int)0);
+      vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+      valuExecute(&x[0], &x[0], &mean_hi[0], __ValuOpc::sub);
+      valuExecute(&x[0], &x[0], &mean_lo[0], __ValuOpc::sub);
+      // Select this thread's variance diagonal and normalize centered x.
+      vcfg_set_valu(vcfg_valu_target::imm2, &inv_std[0], (short)tid);
+      valuExecute(&y[0], &x[0], &gamma[0], __ValuOpc::mul);
+      if (bias_cols != 0) {
+        vldExecute(&beta[0], bias + i * 16, (int)0);
+        vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+        valuExecute(&y[0], &y[0], &beta[0], __ValuOpc::add);
+      }
+      if (row < dst_rows) {
+        vstExecute(&y[0], dst + i * 16, row_offset);
+      }
+    }
+  }
+}

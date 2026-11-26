@@ -1,0 +1,4 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Primary Action M16 adaptive RMSNorm entry: hardware sqrt_reciprocal path.
+#define XINFER_ACTION_NORM_KERNEL adaptive_rmsnorm_m16h1024_f16
+#include "adaptive_rmsnorm_m16h1024_f16_impl.h"

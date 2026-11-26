@@ -8,6 +8,7 @@ the ``xinfer.ops`` entry point group.
 """
 
 import logging
+from dataclasses import replace
 
 from xinfer.ops import reference
 from xinfer.ops.reference import attn, flow, gemm, mxfp8, norm, nvfp4, rope
@@ -119,7 +120,7 @@ for _spec in (
         reference.varlen_attention,
     ),
 ):
-    registry.define(_spec)
+    registry.define(replace(_spec, reference_platforms=("cpu", "cuda", "ascend")))
 
 # These public operators have dedicated CUDA kernels or low-precision implementations.
 # Their torch references can execute several operations for a single registered call.
@@ -309,7 +310,7 @@ _cuda_kernel_specs = (
 )
 CUDA_FUSED_OPS = frozenset(spec.name for spec in _cuda_kernel_specs)
 for _spec in _cuda_kernel_specs:
-    registry.define(_spec)
+    registry.define(replace(_spec, reference_platforms=("cpu", "cuda", "ascend")))
 del _spec, _cuda_kernel_specs
 
 

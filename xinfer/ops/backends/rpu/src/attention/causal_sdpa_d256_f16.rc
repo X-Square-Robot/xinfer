@@ -1,0 +1,209 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// One Q/K/V D256 head per core, Q [query_rows,256] and output in local SPM.
+// K: [ceil(capacity/16),1,16,8,16 token,16 dimension] DDR.
+// V: [ceil(capacity/16),1,16,8,16 dimension,16 token] DDR.
+// Grid x is ceil(query_rows/48). Three adjacent query groups share every
+// K/V DDR tile. The absolute query slot is kv_length-query_rows+query_row.
+// Softmax is causal over [0,absolute_slot].
+// One QK pass retains up to 49 raw score tiles, then uses their row maximum
+// to form probabilities. VMAT accumulates denominator and PV over all keys
+// in FP32; only the final result crosses an FP16 VLM boundary.
+__rprog__ void causal_sdpa_d256_f16(half *dst, half *query,
+    DDR_large key_cache, DDR_large value_cache,
+    unsigned short query_rows, unsigned short kv_length) {
+  constexpr short query_groups = 3;
+  unsigned short first_query = (unsigned short)blockIdx.x * 48;
+  if (first_query >= query_rows || query_rows == 0 ||
+      kv_length < query_rows || kv_length > 780) return;
+  unsigned short first_absolute_query = kv_length - query_rows + first_query;
+  short blocks = (kv_length + 15) / 16;
+  short tile_blocks = (first_absolute_query + query_groups * 16 + 15) / 16;
+  if (tile_blocks > blocks) tile_blocks = blocks;
+  __local__ f16v16 q[query_groups * 16], k[16], v[2 * 49];
+  __local__ f16v16 score[query_groups * 49];
+  __local__ f16v16 maximum[query_groups], tile_max[1];
+  __local__ f16v16 scratch[query_groups], ones[1];
+  __local__ f16v16 denominator[query_groups];
+  // QK and denominator use fixed VMAT destinations. PV uses a hardware loop
+  // address fragment to write directly into q[] after QK has finished.
+  __local__ f16v16 score_temp[1], denominator_temp[1];
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)0x3d80); // 1/sqrt(256)
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < query_groups; ++group) {
+    unsigned short query_row = first_query + group * 16 + threadId;
+    unsigned short load_row = query_row < query_rows ? query_row : query_rows - 1;
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 16; ++d)
+      vldExecute_async(q + group * 16 + d, query,
+                       (int)load_row * 256 + d * 16);
+  }
+  fenceVld(0);
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < query_groups; ++group)
+    valuExecute(maximum + group, (half)-65504, (half)0, __ValuOpc::add);
+
+  // Store each raw FP16 score tile and find the row maximum in the same pass.
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < tile_blocks; ++b) {
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 16; ++d) {
+      DDR_large key_block = key_cache + (int)b * 256 + d * 16
+                                     + (int)coreId_u * 2;
+      vldExecute_async(k + d, key_block, (short)(threadId * 32));
+    }
+    fenceVld(0);
+    // One K load serves all three independent 16-row query groups.
+#pragma rpu_hwloop_ul
+    for (short group = 0; group < query_groups; ++group) {
+    short group_blocks = (first_absolute_query + group * 16 + 31) / 16;
+    if (group_blocks > blocks) group_blocks = blocks;
+    if (b < group_blocks) {
+    vmatInit(score_temp, q + group * 16, k, __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 16; ++d)
+      vmatExecute(score_temp, q + group * 16 + d, k + d,
+                  __OutMode::outon);
+    // VMAT's score rows belong to query threads. Transpose as in the proven
+    // noncausal attention path so each thread owns one key and the vector
+    // lanes address successive query rows. For key j, mask query lanes with
+    // first_absolute_query+lane < j.
+    vsfuExecute(tile_max, score_temp, (short)0, __ShuffleMode::Trs);
+    short key = b * 16 + threadId;
+    short absolute_query = first_absolute_query + group * 16;
+    short invalid_rows = key > absolute_query
+        ? key - absolute_query : 0;
+    if (invalid_rows > 16) invalid_rows = 16;
+    if (invalid_rows) {
+      LoopStrbInfo invalid_lanes((short)bmsk(0, invalid_rows));
+      LoopStrbLPAttr mask{&invalid_lanes};
+      valuExecute(tile_max, (half)-65504, (half)0, __ValuOpc::add, &mask);
+    }
+    vsfuExecute(score_temp, tile_max, (short)0, __ShuffleMode::Trs);
+    valuExecute(score + group * 49 + b, score_temp, (half)0,
+                __ValuOpc::add);
+    valuExecute(tile_max, score_temp, (half)0, __ValuOpc::add);
+#pragma rpu_hwloop_ul
+    for (short stage = 0; stage < 4; ++stage) {
+      vsfuExecute(scratch, tile_max, (short)(1 << stage), __ShuffleMode::Pselr);
+      valuExecute(tile_max, tile_max, scratch, __ValuOpc::max);
+    }
+    valuExecute(maximum + group, maximum + group, tile_max, __ValuOpc::max);
+    }
+    }
+  }
+
+  valuExecute(ones, (half)1, (half)0, __ValuOpc::add);
+  // Center the resident FP16 logits and retain the probabilities.
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < query_groups; ++group) {
+    short group_blocks = (first_absolute_query + group * 16 + 31) / 16;
+    if (group_blocks > blocks) group_blocks = blocks;
+#pragma rpu_hwloop_ul
+    for (short b = 0; b < group_blocks; ++b) {
+      valuExecute(score + group * 49 + b, score + group * 49 + b,
+                  maximum + group, __ValuOpc::sub);
+      valuExecute(score + group * 49 + b, score + group * 49 + b,
+                  (half)0, __ValuOpc::exp);
+    }
+  }
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)0x3f80);
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < query_groups; ++group) {
+  short group_blocks = (first_absolute_query + group * 16 + 31) / 16;
+  if (group_blocks > blocks) group_blocks = blocks;
+  vmatInit(denominator_temp, score + group * 49, ones,
+           __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+  for (short b = 0; b < group_blocks; ++b)
+    vmatExecute(denominator_temp, score + group * 49 + b,
+                ones, __OutMode::outon);
+  valuExecute(denominator + group, denominator_temp, (half)0,
+              __ValuOpc::add);
+  }
+
+  // Two dimension vectors share one V load phase with all three query groups.
+  // Each output vector spans all key tiles in one FP32 VMAT accumulator.
+  // Keep padded V tokens zero so stale cache bytes cannot contaminate a
+  // masked product.
+#pragma rpu_hwloop_ul
+  for (short dimension_group = 0; dimension_group < 8; ++dimension_group) {
+    // Hardware loop address fragments avoid rebuilding the 7D V cache
+    // pointer and the VLM tile offset on every V load.
+    short vlp[2];
+    LoopStepInfo vdst_steps[2] = {{&vlp[1], 1}, {&vlp[0], 49}};
+    FragVData vdst(v, vdst_steps);
+    DDR_large vbase = value_cache + (int)dimension_group * 32
+                                  + (int)coreId_u * 2;
+    LoopStepInfo vsrc_steps[2] = {
+        {&vlp[1], 65536, __AGran::a_g1B},
+        {&vlp[0], 4096, __AGran::a_g1B}};
+    FragSData vsrc(vbase, vsrc_steps);
+#pragma rpu_hwloop_ul
+    for (vlp[1] = 0; vlp[1] < tile_blocks; ++vlp[1]) {
+#pragma rpu_hwloop_ul
+      for (vlp[0] = 0; vlp[0] < 2; ++vlp[0]) {
+        vldExecute_async(vdst, vsrc, (short)(threadId * 32));
+      }
+    }
+    fenceVld(0);
+    if (tile_blocks == blocks && (kv_length & 15) != 0) {
+      // V's thread axis is dimension; its vector lanes are token positions.
+      // Mask the padded token lanes, never whole dimension threads.
+      short valid = kv_length & 15;
+      LoopStrbInfo invalid_lanes((short)(0xffffU << valid));
+      LoopStrbLPAttr mask{&invalid_lanes};
+#pragma rpu_hwloop_ul
+      for (short d = 0; d < 2; ++d)
+        valuExecute(v + d * 49 + tile_blocks - 1, (half)0, (half)0,
+                    __ValuOpc::add, &mask);
+    }
+#pragma rpu_hwloop_ul
+    for (short query_group = 0; query_group < query_groups; ++query_group) {
+    short group_blocks = (first_absolute_query + query_group * 16 + 31) / 16;
+    if (group_blocks > blocks) group_blocks = blocks;
+    short plp[2];
+    LoopStepInfo pdst_steps[2] = {{&plp[1], 1}, {&plp[0], 0}};
+    LoopStepInfo pscore_steps[2] = {{&plp[1], 0}, {&plp[0], 1}};
+    LoopStepInfo pvalue_steps[2] = {{&plp[1], 49}, {&plp[0], 1}};
+    FragVData pdst(q + query_group * 16 + dimension_group * 2,
+                   pdst_steps);
+    FragVData pscore(score + query_group * 49, pscore_steps);
+    FragVData pvalue(v, pvalue_steps);
+    LoopOutInfo poi[1] = {{&plp[0]}};
+    // KV is the reduction axis; output dimensions own independent accumulators.
+    LoopClrInfo pci[1] = {{&plp[0]}};
+    LoopOutLPAttr poa(poi);
+    LoopClrLPAttr pca(pci);
+#pragma rpu_hwloop_ul
+    for (plp[1] = 0; plp[1] < 2; ++plp[1]) {
+#pragma rpu_hwloop_ul
+      for (plp[0] = 0; plp[0] < group_blocks; ++plp[0])
+        vmatExecute_async(pdst, pscore, pvalue, &poa, &pca);
+    }
+    fenceVmat(0);
+    }
+  }
+  // Only the live query rows reach SPM output. Inactive groups still execute
+  // the same warp-uniform compute schedule, with Q clamped to the last row.
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < query_groups; ++group) {
+    unsigned short query_row = first_query + group * 16 + threadId;
+  if (query_row < query_rows) {
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 16; ++d) {
+      valuExecute(q + group * 16 + d, q + group * 16 + d,
+                  denominator + group, __ValuOpc::div);
+      vstExecute_async(q + group * 16 + d, dst,
+                       (int)query_row * 256 + d * 16);
+    }
+    fenceVst(0);
+  }
+  }
+}

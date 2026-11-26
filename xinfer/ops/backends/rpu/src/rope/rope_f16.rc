@@ -1,0 +1,124 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// LocalSPM, contiguous src/dst[tokens, heads, head_dim]. Tables are already
+// position-selected FP16 [table_rows, rotary_dim/2], shared across heads.
+// This also accepts host-interleaved M-RoPE and host-expanded 2D vision tables.
+// Rotate-half is WITHIN rotary_dim, not head_dim. Copy the unrotated suffix.
+// Exact src == dst is supported. Launch grid.x = ceil(tokens/16), Core 0.
+// ABI: dst[0:1], src[2:3], cos[4:5], sin[6:7], tokens[8], heads[9],
+// head_dim[10], rotary_dim[11], position_offset[12:13].
+__rprog__ void rope_f16(
+    half *dst, half *src, half *cos_table, half *sin_table,
+    unsigned short tokens, unsigned short heads,
+    unsigned short head_dim, unsigned short rotary_dim,
+    unsigned int position_offset) {
+  if (tokens == 0 || heads == 0 || head_dim == 0 ||
+      (head_dim & 15) != 0 || rotary_dim == 0 ||
+      (rotary_dim & 31) != 0 || rotary_dim > head_dim) return;
+  unsigned int token = (unsigned int)blockIdx.x * 16 + threadId;
+  if (token >= tokens) return;
+  unsigned short half_dim = rotary_dim / 2;
+  unsigned int table_offset = (position_offset + token) * half_dim;
+  // Vision geometry: cache the table once and rotate both heads with a
+  // two-dimensional Repeat. The outer table stride is zero (head sharing).
+  if (head_dim == 64 && rotary_dim == 64 && heads == 2) {
+    int base = (int)(token * 128);
+    __local__ f16v16 vx[8], vc[2], vs[2];
+    __local__ f16v16 ac[4], bs[4], as[4], bc[4];
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+    vldSetTsize32B(2, 1);
+    vldSetTstep32B_0(1, 16);
+    vldSetTstep32B_1(0, 0);
+    vldRepeat_async(vc, cos_table, (int)table_offset);
+    vldRepeat_async(vs, sin_table, (int)table_offset);
+    vldSetTsize32B(8, 1);
+    vldRepeat_async(vx, src, base);
+    fenceVld(0);
+    valuSetTsize(2, 2);
+    valuSetTstep0(1, 1, 1);
+    valuSetTstep1(2, 4, 0);
+    valuRepeat_async(ac, vx, vc, __ValuOpc::mul);
+    valuRepeat_async(bs, vx + 2, vs, __ValuOpc::mul);
+    valuRepeat_async(as, vx, vs, __ValuOpc::mul);
+    valuRepeat_async(bc, vx + 2, vc, __ValuOpc::mul);
+    fenceValu(0);
+    valuSetTstep1(2, 2, 2);
+    valuRepeat_async(ac, ac, bs, __ValuOpc::sub);
+    valuRepeat_async(bc, bc, as, __ValuOpc::add);
+    fenceValu(0);
+    vstSetTsize32B(2, 2);
+    vstSetTstep32B_0(1, 16);
+    vstSetTstep32B_1(2, 64);
+    vstRepeat_async(ac, dst, base);
+    vstRepeat_async(bc, dst + 32, base);
+    fenceVst(0);
+    return;
+  }
+  // Language partial RoPE: load the complete D256 row before any store so the
+  // same Repeat schedule is safe for exact src==dst.  Keeping the twelve
+  // unrotated suffix vectors in VLM removes the per-vector load/store loop.
+  if (head_dim == 256 && rotary_dim == 64 && heads == 1) {
+    int base = (int)(token * 256);
+    __local__ f16v16 vx[16], vc[2], vs[2];
+    __local__ f16v16 ac[2], bs[2], as[2], bc[2];
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+    vldSetTstep32B_0(1, 16);
+    vldSetTstep32B_1(0, 0);
+    vldSetTsize32B(16, 1);
+    vldRepeat_async(vx, src, base);
+    vldSetTsize32B(2, 1);
+    vldRepeat_async(vc, cos_table, (int)table_offset);
+    vldRepeat_async(vs, sin_table, (int)table_offset);
+    fenceVld(0);
+
+    valuSetTsize(2, 1);
+    valuSetTstep0(1, 1, 1);
+    valuSetTstep1(0, 0, 0);
+    valuRepeat_async(ac, vx, vc, __ValuOpc::mul);
+    valuRepeat_async(bs, vx + 2, vs, __ValuOpc::mul);
+    valuRepeat_async(as, vx, vs, __ValuOpc::mul);
+    valuRepeat_async(bc, vx + 2, vc, __ValuOpc::mul);
+    fenceValu(0);
+    valuRepeat_async(ac, ac, bs, __ValuOpc::sub);
+    valuRepeat_async(bc, bc, as, __ValuOpc::add);
+    fenceValu(0);
+
+    vstSetTstep32B_0(1, 16);
+    vstSetTstep32B_1(0, 0);
+    vstSetTsize32B(2, 1);
+    vstRepeat(ac, dst, base);
+    vstRepeat(bc, dst + 32, base);
+    vstSetTsize32B(12, 1);
+    vstRepeat(vx + 4, dst + 64, base);
+    return;
+  }
+  __local__ f16v16 a[1], b[1], c[1], s[1], ac[1], bs[1], as[1], bc[1];
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+#pragma rpu_hwloop_ul
+  for (unsigned short head = 0; head < heads; ++head) {
+    unsigned int base = (token * heads + head) * head_dim;
+#pragma rpu_hwloop_ul
+    for (unsigned short j = 0; j < half_dim; j += 16) {
+      // Load both halves before either store, including for in-place calls.
+      vldExecute(a, src + j, (int)base);
+      vldExecute(b, src + half_dim + j, (int)base);
+      vldExecute(c, cos_table + j, (int)table_offset);
+      vldExecute(s, sin_table + j, (int)table_offset);
+      valuExecute(ac, a, c, __ValuOpc::mul);
+      valuExecute(bs, b, s, __ValuOpc::mul);
+      valuExecute(as, a, s, __ValuOpc::mul);
+      valuExecute(bc, b, c, __ValuOpc::mul);
+      valuExecute(ac, ac, bs, __ValuOpc::sub);
+      valuExecute(bc, bc, as, __ValuOpc::add);
+      vstExecute(ac, dst + j, (int)base);
+      vstExecute(bc, dst + half_dim + j, (int)base);
+    }
+#pragma rpu_hwloop_ul
+    for (unsigned short j = rotary_dim; j < head_dim; j += 16) {
+      vldExecute(a, src + j, (int)base);
+      vstExecute(a, dst + j, (int)base);
+    }
+  }
+}

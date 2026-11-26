@@ -1,0 +1,49 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+// Read each owner's [M,128] shard once; push to all eight [M,1024] outputs.
+// Each thread holds a vector in one of two adjacent rows. Row-pair Repeat
+// advances the source by 256 and destination by 2048 FP16 elements.
+// Input/output must be disjoint on every bank. All eight grids must complete
+// before consuming output or restaging input. There is no inter-replay state.
+// ABI dst core0 global0:1,src local2:3,rows4,stride_hi5,row_pairs6.
+__rprog__ void all_gather_f16(__SRAM half* dst,half* src,
+    unsigned short rows,unsigned short stride_hi,unsigned short row_pairs) {
+  if (rows==0 || rows>868 || row_pairs==0 || row_pairs>64) return;
+  unsigned short first=blockIdx.x*row_pairs*2;
+  if (first>=rows) return;
+  unsigned short available=rows-first;
+  unsigned short pairs=available/2;
+  if (pairs>row_pairs) pairs=row_pairs;
+  unsigned short owner=coreId_u;
+  unsigned short lane=threadId&7;
+  unsigned short lane_row=threadId>>3;
+  __local__ f16v16 tile[64];
+  if (pairs) {
+    vldSetTsize32B(pairs,1);vldSetTstep32B_0(1,256);vldSetTstep32B_1(0,0);
+    vldRepeat(tile,src,(int)first*128+threadId*16);
+    vstSetTsize32B(pairs,1);vstSetTstep32B_0(1,2048);vstSetTstep32B_1(0,0);
+    int off=(int)(first+lane_row)*1024+owner*128+lane*16;
+#pragma rpu_hwloop_ul
+    for (short peer=0;peer<8;++peer) {
+      unsigned short target=(owner+peer)&7;
+      int bank=(int)(unsigned short)(target*stride_hi)<<16;
+      auto out=reinterpret_cast<__SRAM half*>(reinterpret_cast<int>(dst)+bank);
+      vstRepeat_async(tile,out,off);
+    }
+    fenceVst((short)0);
+  }
+  if (available<row_pairs*2 && (available&1) && threadId<8) {
+    unsigned short row=first+pairs*2;
+    vldExecute(tile,src,(int)row*128+threadId*16);
+    int off=(int)row*1024+owner*128+threadId*16;
+#pragma rpu_hwloop_ul
+    for (short peer=0;peer<8;++peer) {
+      unsigned short target=(owner+peer)&7;
+      int bank=(int)(unsigned short)(target*stride_hi)<<16;
+      auto out=reinterpret_cast<__SRAM half*>(reinterpret_cast<int>(dst)+bank);
+      vstExecute_async(tile,out,off);
+    }
+    fenceVst((short)0);
+  }
+}

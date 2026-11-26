@@ -1,0 +1,70 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// language broadcast binary for long rows. Each block owns one 4096-
+// element tile of one X[rows,cols] row in every active core's LocalSPM.
+//   mode 0: A[rows] broadcasts along each row (Nx1 op NxC)
+//   mode 1: A[cols] broadcasts along every row (1xC op NxC)
+// control = op | mode << 2 | x_first << 4, op 0/1/2 = add/sub/mul. The host
+// admits cols as a multiple of 4096, exact X==Y aliasing, and no Y/A overlap.
+__rprog__ void bcast_tiles_f16(half *dst, half *x, half *a,
+                                    unsigned short rows, unsigned short cols,
+                                    unsigned short control) {
+  const unsigned short op = control & 3U;
+  const unsigned short mode = (control >> 2) & 3U;
+  const unsigned short x_first = (control >> 4) & 1U;
+  const unsigned short tiles = cols / 4096U;
+  const unsigned short row = (unsigned short)blockIdx.x / tiles;
+  if (row >= rows) return;
+  const unsigned int column = (unsigned int)((unsigned short)blockIdx.x -
+                                             row * tiles) * 4096U;
+  const int offset = (int)((unsigned int)row * cols + column + threadId * 16U);
+
+  __local__ f16v16 value[16], operand[16], splat[1];
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vldSetTsize32B(16, 1);
+  vldSetTstep32B_0(1, 256);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat_async(value, x, offset);
+  valuSetTsize(16, 1);
+  valuSetTstep1(0, 0, 0);
+  if (mode == 0) {
+    LoopStrbInfo one((short)0x0001);
+    LoopStrbLPAttr one_mask(&one);
+    vldExecute(splat, a, (int)row, &one_mask);
+    vsfuExecute(operand, splat, (short)0, __ShuffleMode::Psel);
+    fenceVld((short)0);
+    if (x_first) {
+      valuSetTstep0(1, 1, 0);
+      if (op == 0) valuRepeat(value, value, operand, __ValuOpc::add);
+      else if (op == 1) valuRepeat(value, value, operand, __ValuOpc::sub);
+      else valuRepeat(value, value, operand, __ValuOpc::mul);
+    } else {
+      valuSetTstep0(1, 0, 1);
+      if (op == 0) valuRepeat(value, operand, value, __ValuOpc::add);
+      else if (op == 1) valuRepeat(value, operand, value, __ValuOpc::sub);
+      else valuRepeat(value, operand, value, __ValuOpc::mul);
+    }
+  } else {
+    vldRepeat_async(operand, a, (int)(column + threadId * 16U));
+    fenceVld((short)0);
+    valuSetTstep0(1, 1, 1);
+    if (x_first) {
+      if (op == 0) valuRepeat(value, value, operand, __ValuOpc::add);
+      else if (op == 1) valuRepeat(value, value, operand, __ValuOpc::sub);
+      else valuRepeat(value, value, operand, __ValuOpc::mul);
+    } else {
+      if (op == 0) valuRepeat(value, operand, value, __ValuOpc::add);
+      else if (op == 1) valuRepeat(value, operand, value, __ValuOpc::sub);
+      else valuRepeat(value, operand, value, __ValuOpc::mul);
+    }
+  }
+  vstSetTsize32B(16, 1);
+  vstSetTstep32B_0(1, 256);
+  vstSetTstep32B_1(0, 0);
+  vstRepeat(value, dst, offset);
+  fenceVst((short)0);
+}

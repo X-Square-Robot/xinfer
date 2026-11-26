@@ -1,0 +1,10 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// A[M,512] @ B[512,1024] + bias[1024], M in [1,868]; partial before all-reduce.
+#define QKV_UP_ENTRY down_n1024k512
+#define QKV_UP_N 1024
+#define QKV_UP_K 512
+#define QKV_UP_TN 96
+#define QKV_UP_TM 64
+#define QKV_UP_PIPELINE 2
+#define QKV_UP_TK 512
+#include "qkv_up_gemm.h"

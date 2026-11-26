@@ -1,0 +1,18 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Local A[384,256] @ W[256,2048], on each of eight TP cores.
+#define STREAMED_ENTRY o_n2048k256
+#define STREAMED_N 2048
+#define STREAMED_K 256
+#ifndef STREAMED_TN
+#define STREAMED_TN 160
+#endif
+#ifndef STREAMED_TM
+#define STREAMED_TM 128
+#endif
+#ifndef STREAMED_TK
+#define STREAMED_TK 256
+#endif
+#ifndef STREAMED_PIPELINE
+#define STREAMED_PIPELINE 2
+#endif
+#include "streamed_gemm.h"

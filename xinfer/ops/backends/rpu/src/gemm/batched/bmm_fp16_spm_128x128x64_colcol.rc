@@ -1,0 +1,61 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Exact SPM FP16 column-by-column matmul: A[64,128]^T @ B[64,128].
+// Batch is exactly 2; VMAT uses FP32 accumulation before FP16 output.
+__rprog__ void bmm_fp16_spm_128x128x64_colcol(half *av, half *bv, half *cv,
+                            unsigned short M, unsigned short N,
+                            unsigned short K, unsigned short batch,
+                            unsigned short mode) {
+  if (M != 128 || N != 128 || K != 64 || mode != 3 || batch != 2) return;
+  const short AM = M / 16, AN = N / 16, AK = K / 16;
+  const short z = (short)blockIdx.z;
+  if (z >= batch) return;
+  half *aa = av + (int)z * M * K;
+  half *bb = bv + (int)z * N * K;
+  half *cc = cv + (int)z * M * N;
+  __local__ f16v16 a[32], b[32], r[64], tmp[32];
+  short lp[3];
+  vldSetTsize32B(AM, AK);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(AM, (short)(16 * M));
+  vldRepeat(tmp, aa, (int)threadId * M);
+  vsfuSetTsize32B(AK, AM);
+  vsfuSetTstep32B_0(1, AM, 0);
+  vsfuSetTstep32B_1(AK, 1, 0);
+  vsfuRepeat(a, tmp, (short)0, __ShuffleMode::Trs);
+  vldSetTsize32B(AN, AK);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(AN, (short)(16 * N));
+  vldRepeat(tmp, bb, (int)threadId * N);
+  vsfuSetTsize32B(AK, AN);
+  vsfuSetTstep32B_0(1, AN, 0);
+  vsfuSetTstep32B_1(AK, 1, 0);
+  vsfuRepeat(b, tmp, (short)0, __ShuffleMode::Trs);
+  LoopStepInfo cs[3] = {{&lp[2], AN}, {&lp[1], 1}, {&lp[0], 0}};
+  FragVData vc(r, cs);
+  LoopStepInfo as[3] = {{&lp[2], AK}, {&lp[1], 0}, {&lp[0], 1}};
+  FragVData fa(a, as);
+  LoopStepInfo bs[3] = {{&lp[2], 0}, {&lp[1], AK}, {&lp[0], 1}};
+  FragVData fb(b, bs);
+  LoopOutInfo oi[1] = {{&lp[0]}};
+  // Reset the FP32 accumulator at the start of each K reduction.
+  LoopClrInfo ci[1] = {{&lp[0]}};
+  LoopOutLPAttr out{oi};
+  LoopClrLPAttr clr{ci};
+#pragma rpu_hwloop_ul
+  for (lp[2] = 0; lp[2] < AM; ++lp[2]) {
+#pragma rpu_hwloop_ul
+    for (lp[1] = 0; lp[1] < AN; ++lp[1]) {
+#pragma rpu_hwloop_ul
+      for (lp[0] = 0; lp[0] < AK; ++lp[0])
+        vmatExecute_async(vc, fa, fb, &out, &clr);
+    }
+  }
+  fenceVmat(0);
+  vstSetTsize32B(AN, AM);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(AN, (short)(16 * N));
+  vstRepeat(r, cc, (int)threadId * N);
+}

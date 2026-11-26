@@ -1,0 +1,23 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// up_n512k1024 + gelu_f16 (tanh): C = gelu(A[M,1024] @ B[1024,512] + bias[512]),
+// M in [1,868]. Same tiles, phases and ABI as up_n512k1024; the GELU runs on
+// each phase's rounded rows in VLM before their only store (the high FP32
+// accumulator slots are its scratch), so the result is bit-identical to
+// up_n512k1024 followed by an in-place gelu_f16 with approximate=1.
+#include "mlp_fusion_epilogue.h"
+#define QKV_UP_ENTRY up_gelu_n512k1024
+#define QKV_UP_N 512
+#define QKV_UP_K 1024
+#define QKV_UP_TN 64
+#define QKV_UP_TM 32
+#define QKV_UP_PIPELINE 2
+#define QKV_UP_TK 128
+#define QKV_UP_PHASES 4
+#define QKV_UP_SMALL_ROWS 208
+#define QKV_UP_ENTRY_PROLOGUE vf_gelu_config();
+#define QKV_UP_STREAM_EPILOGUE(result, scratch, n_base, m0, m1, rows)        \
+  vf_gelu<2, 2>((result) + 2 * (m0) * VS_AN, (result) + 2 * (m0) * VS_AN + 1, \
+                ((m1) - (m0)) * VS_AN)
+#define QKV_UP_TILE_EPILOGUE(r, scratch, n_base, m_tile, m_count, rows)      \
+  vf_gelu<1, 1>(r, scratch, (m_count) * (QKV_UP_TN / 16))
+#include "../gemm/qkv_up_gemm_stream.h"
