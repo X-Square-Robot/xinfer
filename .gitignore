@@ -14,6 +14,12 @@ htmlcov/
 
 # The CUDA kernel library built from xinfer/ops/backends/cuda/src
 /xinfer/ops/backends/cuda/xinfer_kernels.so
+/xinfer/ops/backends/rpu/xinfer_rpu.so
+*.ref
+/rpu-assets/
+/tests/perf/rpu_hwperf_points.json
+/tests/perf/rpu_perf_points.json
+/tests/perf/rpu_peaks.json
 
 # Local configuration and credentials
 .env

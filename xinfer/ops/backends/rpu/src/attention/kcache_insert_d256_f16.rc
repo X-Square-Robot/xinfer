@@ -1,0 +1,30 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// One FP16 D256 head per core. Source is compact [rows,256] in local SPM.
+// K cache is [ceil(capacity/16),1,16,8,16 token,16 dimension] in DDR.
+// DDR_large arithmetic is in 256-byte units; the vector offset is in bytes.
+__rprog__ void kcache_insert_d256_f16(half *src, DDR_large cache,
+    unsigned short rows, unsigned short position) {
+  unsigned short row = (unsigned short)blockIdx.x * 16 + threadId;
+  if (row >= rows) return;
+  unsigned short first_token = position + (unsigned short)blockIdx.x * 16;
+  unsigned short token = first_token + threadId;
+  __local__ f16v16 x[16];
+#pragma rpu_hwloop_ul
+  for (short d = 0; d < 16; ++d)
+    vldExecute_async(x + d, src, (int)row * 256 + d * 16);
+  fenceVld(0);
+#pragma rpu_hwloop_ul
+  for (short d = 0; d < 16; ++d) {
+    // Keep the DDR_large base uniform across the warp.
+    DDR_large block = cache + (int)(first_token / 16) * 256
+                            + d * 16 + (int)coreId_u * 2;
+    if (threadId < 16 - (first_token % 16))
+      vstExecute_async(x + d, block, (short)((token % 16) * 32));
+    else
+      vstExecute(x + d, block + 256, (short)((token % 16) * 32));
+  }
+  fenceVst(0);
+}

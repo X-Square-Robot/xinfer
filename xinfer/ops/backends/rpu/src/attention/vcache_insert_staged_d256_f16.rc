@@ -1,0 +1,53 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Exact initial-prefill D256 V insert for one physical bucket M in 64..512
+// (step 64). Source is compact [M,256] in local SPM. The public V cache is
+// written in the physical DDR layout and the same transposed tile is
+// published to value_spm as [256,M] for a following same-core attention node. LocalSPM and DDR stores are completed in separate
+// phases; they are never issued concurrently.
+__rprog__ void vcache_insert_staged_d256_f16(
+    half *src, half *value_spm, DDR_large cache,
+    unsigned short rows, unsigned short position) {
+  if (rows < 64 || rows > 512 || (rows & 63) != 0 || position != 0 ||
+      blockIdx.x >= rows / 16) return;
+  unsigned short tile = (unsigned short)blockIdx.x;
+  unsigned short token = tile * 16 + threadId;
+  __local__ f16v16 x[16], trans[16];
+
+  vldSetTsize32B(8, 1);
+  vldSetTstep32B_0(1, (short)16);
+  vldSetTstep32B_1(0, (short)0);
+  vsfuSetTsize32B(8, 1);
+  vsfuSetTstep32B_0(1, 1, 0);
+  vsfuSetTstep32B_1(0, 0, 0);
+  vstSetTsize32B(8, 1);
+  vstSetTstep32B_0(1, (int)4096, __AGran::a_g1B);
+  vstSetTstep32B_1(0, (short)0);
+
+  // Keep LocalSPM stores and DDR stores in separate, complete phases.
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < 2; ++group) {
+    vldRepeat(x + group * 8, src,
+              (int)token * 256 + group * 128);
+    vsfuRepeat(trans + group * 8, x + group * 8,
+               (short)0, __ShuffleMode::Trs);
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 8; ++d) {
+      int dimension = ((int)group * 8 + d) * 16 + threadId;
+      int value_offset = dimension * (int)rows + (int)tile * 16;
+      vstExecute_async(trans + group * 8 + d, value_spm, value_offset);
+    }
+  }
+  fenceVst(0);
+
+  // Complete local writes before publishing the transposed values to DDR.
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < 2; ++group) {
+    DDR_large block = cache + (int)tile * 256 + group * 128
+                            + (int)coreId_u * 2;
+    vstRepeat_async(trans + group * 8, block, (short)(threadId * 32));
+  }
+  fenceVst(0);
+}

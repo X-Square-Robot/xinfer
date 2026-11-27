@@ -1,0 +1,37 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// TP8 Hlocal=2 D64. Input compact [S,2,64] local SPM.
+// Cache [ceil(capacity/16),2,4,8,16 tokens,16 dimensions] DDR.
+// DDR_large is packed in 256-byte units; scalar offset below is bytes.
+__rprog__ void kcache_insert_f16(half *src, DDR_large cache,
+    unsigned short rows, unsigned short position) {
+  unsigned short row = (unsigned short)blockIdx.x * 16 + threadId;
+  if (row >= rows) return;
+  unsigned short first_token = position + (unsigned short)blockIdx.x * 16;
+  unsigned short token = first_token + threadId;
+  __local__ f16v16 x[8];
+#pragma rpu_hwloop_ul
+  for (short h = 0; h < 2; ++h) {
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 4; ++d) {
+      short i = h * 4 + d;
+      vldExecute_async(x + i, src, (int)row * 128 + h * 64 + d * 16);
+    }
+  }
+  fenceVld(0);
+#pragma rpu_hwloop_ul
+  for (short h = 0; h < 2; ++h) {
+#pragma rpu_hwloop_ul
+    for (short d = 0; d < 4; ++d) {
+      // Keep the DDR_large base uniform across the warp.
+      DDR_large block = cache + (int)(first_token / 16) * 128 + h * 64 + d * 16 + (int)coreId_u * 2;
+      if (threadId < 16 - (first_token % 16))
+        vstExecute_async(x + h * 4 + d, block, (short)((token % 16) * 32));
+      else
+        vstExecute(x + h * 4 + d, block + 128, (short)((token % 16) * 32));
+    }
+  }
+  fenceVst(0);
+}

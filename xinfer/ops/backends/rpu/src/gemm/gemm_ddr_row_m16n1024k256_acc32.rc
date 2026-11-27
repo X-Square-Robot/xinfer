@@ -1,0 +1,122 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Action row-parallel GEMM.
+//
+// Contract: global [M,N,K]=[16,1024,2048], TP8 row partition, local
+// [16,1024,256], FP16 input/weight/output, VMAT FP32 accumulation.  Each core
+// emits its partial C; the following all-reduce/residual owns the cross-core
+// reduction.  The host pointer packet matches ParallelLinearRegisterArgs and
+// the launch uses grid.x=8 on all eight cores.
+
+#include "__clang_rpu_builtin_vars.h"
+
+#ifndef RF_SYNC_VST
+#define RF_SYNC_VST 0
+#endif
+#ifndef RF_FENCE_A
+#define RF_FENCE_A 1
+#endif
+
+__rprog__ void gemm_ddr_row_m16n1024k256_acc32(
+    half *av, DDR_large wv, half *rv) {
+  const short vlen = 16;
+  const short a_ld = 256;
+  const short r_ld = 1024;
+  const short M = 1;   // 1 x 16 rows
+  const short N = 8;   // 8 x 16 columns per grid block
+  const short K = 16;  // 16 x 16 local reduction blocks
+
+  __local__ f16v16 a[M * K];
+  __local__ f16v16 b[N * K];
+  __local__ f16v16 r[M * N];
+  short loop[3];
+
+  LoopStepInfo a_dst_steps[2] = {
+      {&loop[1], (short)K}, {&loop[0], (short)1}};
+  FragVData a_dst(a, a_dst_steps);
+  LoopStepInfo a_src_steps[2] = {
+      {&loop[1], (int)(vlen * a_ld)}, {&loop[0], (int)vlen}};
+  FragSData a_src(av, a_src_steps);
+#pragma rpu_hwloop_ul
+  for (loop[1] = 0; loop[1] < M; ++loop[1]) {
+#pragma rpu_hwloop_ul
+    for (loop[0] = 0; loop[0] < K; ++loop[0])
+      rpu::vldExecute_async(a_dst, a_src, (short)(threadId * a_ld));
+  }
+#if RF_FENCE_A
+  rpu::fenceVld((short)0);
+#endif
+
+  const short core = (short)coreId_u;
+  const short block = (short)blockIdx.x;
+  const int local_nblock = (int)block * N;
+  const int weight_base_large =
+      local_nblock * (int)K * 16 + (int)core * 2;
+  DDR_large b_base = wv + weight_base_large;
+
+  LoopStepInfo b_dst_steps[2] = {
+      {&loop[1], (short)K}, {&loop[0], (short)1}};
+  FragVData b_dst(b, b_dst_steps);
+  LoopStepInfo b_src_steps[2] = {
+      {&loop[1], (int)K * 8 * 256 * (int)sizeof(half),
+       rpu::__AGran::a_g1B},
+      {&loop[0], (int)(8 * 256 * sizeof(half)), rpu::__AGran::a_g1B}};
+  FragSData b_src(b_base, b_src_steps);
+#pragma rpu_hwloop_ul
+  for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+    for (loop[0] = 0; loop[0] < K; ++loop[0])
+      rpu::vldExecute_async(
+          b_dst, b_src, (short)(threadId * vlen * sizeof(half)));
+  }
+  rpu::fenceVld((short)0);
+
+  LoopStepInfo c_steps[3] = {
+      {&loop[2], (short)N}, {&loop[1], (short)1},
+      {&loop[0], (short)0}};
+  FragVData c_dst(r, c_steps);
+  LoopStepInfo ac_steps[3] = {
+      {&loop[2], (short)K}, {&loop[1], (short)0},
+      {&loop[0], (short)1}};
+  FragVData ac(a, ac_steps);
+  LoopStepInfo bc_steps[3] = {
+      {&loop[2], (short)0}, {&loop[1], (short)K},
+      {&loop[0], (short)1}};
+  FragVData bc(b, bc_steps);
+  LoopOutInfo out_info[1] = {{&loop[0]}};
+  // Each output tile starts a new K reduction; N is not the reduction loop.
+  LoopClrInfo clear_info[1] = {{&loop[0]}};
+  LoopOutLPAttr out_attr(out_info);
+  LoopClrLPAttr clear_attr(clear_info);
+#pragma rpu_hwloop_ul
+  for (loop[2] = 0; loop[2] < M; ++loop[2]) {
+#pragma rpu_hwloop_ul
+    for (loop[1] = 0; loop[1] < N; ++loop[1]) {
+#pragma rpu_hwloop_ul
+      for (loop[0] = 0; loop[0] < K; ++loop[0])
+        rpu::vmatExecute_async(c_dst, ac, bc, &out_attr, &clear_attr);
+    }
+  }
+  rpu::fenceVmat((short)0);
+
+  half *block_r = rv + (int)block * 128;
+  LoopStepInfo r_src_steps[2] = {
+      {&loop[1], (short)N}, {&loop[0], (short)1}};
+  FragVData r_src(r, r_src_steps);
+  LoopStepInfo r_dst_steps[2] = {
+      {&loop[1], (int)(vlen * r_ld)}, {&loop[0], (int)vlen}};
+  FragSData r_dst(block_r, r_dst_steps);
+#pragma rpu_hwloop_ul
+  for (loop[1] = 0; loop[1] < M; ++loop[1]) {
+#pragma rpu_hwloop_ul
+    for (loop[0] = 0; loop[0] < N; ++loop[0]) {
+#if RF_SYNC_VST
+      rpu::vstExecute(r_src, r_dst, (short)(threadId * r_ld));
+#else
+      rpu::vstExecute_async(r_src, r_dst, (short)(threadId * r_ld));
+#endif
+    }
+  }
+#if !RF_SYNC_VST
+  rpu::fenceVst((short)0);
+#endif
+}

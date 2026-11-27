@@ -1,0 +1,50 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Fixed 64x64x128, A[M,K] @ B[N,K]^T, FP32 VMAT accumulate.
+__rprog__ void bmm_fp16_spm_64x64x128_rowrow(half *av, half *bv, half *cv,
+                            unsigned short M, unsigned short N,
+                            unsigned short K, unsigned short batch,
+                            unsigned short mode) {
+  if (M != 64 || N != 64 || K != 128 || mode != 1 ||
+      batch < 2 || batch > 16 || (batch & 1)) return;
+  const short z = (short)blockIdx.z;
+  if (z >= batch) return;
+  half *aa = av + (int)z * 8192;
+  half *bb = bv + (int)z * 8192;
+  half *cc = cv + (int)z * 4096;
+  __local__ f16v16 a[32], b[32], r[16];
+  short lp[3];
+  vldSetTsize32B(8, 4);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(8, 2048);
+  vldRepeat_async(a, aa, (int)threadId * 128);
+  vldRepeat_async(b, bb, (int)threadId * 128);
+  fenceVld(0);
+  LoopStepInfo cs[3] = {{&lp[2], 4}, {&lp[1], 1}, {&lp[0], 0}};
+  FragVData vc(r, cs);
+  LoopStepInfo as[3] = {{&lp[2], 8}, {&lp[1], 0}, {&lp[0], 1}};
+  FragVData fa(a, as);
+  LoopStepInfo bs[3] = {{&lp[2], 0}, {&lp[1], 8}, {&lp[0], 1}};
+  FragVData fb(b, bs);
+  LoopOutInfo oi[1] = {{&lp[0]}};
+  // Reset the FP32 accumulator at the start of each K reduction.
+  LoopClrInfo ci[1] = {{&lp[0]}};
+  LoopOutLPAttr out{oi};
+  LoopClrLPAttr clr{ci};
+#pragma rpu_hwloop_ul
+  for (lp[2] = 0; lp[2] < 4; ++lp[2]) {
+#pragma rpu_hwloop_ul
+    for (lp[1] = 0; lp[1] < 4; ++lp[1]) {
+#pragma rpu_hwloop_ul
+      for (lp[0] = 0; lp[0] < 8; ++lp[0])
+        vmatExecute_async(vc, fa, fb, &out, &clr);
+    }
+  }
+  fenceVmat(0);
+  vstSetTsize32B(4, 4);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(4, 1024);
+  vstRepeat(r, cc, (int)threadId * 64);
+}

@@ -1,0 +1,8 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Local A[rows,2048] @ W[2048,1056] on each of eight TP cores, rows 448/512.
+// B and A each occupy one padded N16 block; lanes 2..15 must be zero.
+#define STREAMED_ENTRY qkv_zba_m512
+#define STREAMED_N 1056
+#define STREAMED_K 2048
+#define STREAMED_OUTPUT_QKV_ZBA 1
+#include "streamed_m512.h"

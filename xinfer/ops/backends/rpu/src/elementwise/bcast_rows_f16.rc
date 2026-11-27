@@ -1,0 +1,101 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// language broadcast binary, one row per thread. X[rows,cols] and the
+// output live in each active core's LocalSPM at the same offsets.
+//   mode 0: A[rows]           broadcasts along each row    (Nx1 op NxC)
+//   mode 1: A[cols]           broadcasts along every row   (1xC op NxC)
+//   mode 2: A[rows/group,cols] broadcasts inside each group (Bx1xC op BxNxC)
+// control = op | mode << 2 | x_first << 4, op 0/1/2 = add/sub/mul. With
+// x_first=0 the result is A op X, otherwise X op A. The host admits cols 2 or
+// 16..256 in 16-element steps, exact X==Y aliasing, and never Y/A overlap.
+__rprog__ void bcast_rows_f16(half *dst, half *x, half *a,
+                                   unsigned short rows, unsigned short cols,
+                                   unsigned short group_rows,
+                                   unsigned short control) {
+  const unsigned short op = control & 3U;
+  const unsigned short mode = (control >> 2) & 3U;
+  const unsigned short x_first = (control >> 4) & 1U;
+  const unsigned int row = (unsigned int)blockIdx.x * 16U + threadId;
+  const unsigned int load_row = row < rows ? row : (unsigned int)rows - 1U;
+  const int row_offset = (int)(load_row * (unsigned int)cols);
+  int a_offset = 0;
+  if (mode == 2)
+    a_offset = (int)((load_row / group_rows) * (unsigned int)cols);
+
+  __local__ f16v16 value[16], operand[16], splat[1];
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+
+  if (cols == 2) {
+    LoopStrbInfo pair((short)0x0003);
+    LoopStrbLPAttr pair_mask(&pair);
+    vldExecute(value, x, row_offset, &pair_mask);
+    if (mode == 0) {
+      LoopStrbInfo one((short)0x0001);
+      LoopStrbLPAttr one_mask(&one);
+      vldExecute(splat, a, (int)load_row, &one_mask);
+      vsfuExecute(operand, splat, (short)0, __ShuffleMode::Psel);
+    } else {
+      vldExecute(operand, a, a_offset, &pair_mask);
+    }
+    if (x_first) {
+      if (op == 0) valuExecute(value, value, operand, __ValuOpc::add);
+      else if (op == 1) valuExecute(value, value, operand, __ValuOpc::sub);
+      else valuExecute(value, value, operand, __ValuOpc::mul);
+    } else {
+      if (op == 0) valuExecute(value, operand, value, __ValuOpc::add);
+      else if (op == 1) valuExecute(value, operand, value, __ValuOpc::sub);
+      else valuExecute(value, operand, value, __ValuOpc::mul);
+    }
+    if (row < rows) vstExecute(value, dst, row_offset, &pair_mask);
+    fenceVst((short)0);
+    return;
+  }
+
+  const unsigned short chunks = cols / 16U;
+  vldSetTsize32B(chunks, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat(value, x, row_offset);
+  valuSetTsize(chunks, 1);
+  valuSetTstep1(0, 0, 0);
+  if (mode == 0) {
+    // A dynamic Psel lane does not select per thread on this SDK: load this
+    // row's scalar into lane 0, then splat the fixed lane.
+    LoopStrbInfo one((short)0x0001);
+    LoopStrbLPAttr one_mask(&one);
+    vldExecute(splat, a, (int)load_row, &one_mask);
+    vsfuExecute(operand, splat, (short)0, __ShuffleMode::Psel);
+    if (x_first) {
+      valuSetTstep0(1, 1, 0);
+      if (op == 0) valuRepeat(value, value, operand, __ValuOpc::add);
+      else if (op == 1) valuRepeat(value, value, operand, __ValuOpc::sub);
+      else valuRepeat(value, value, operand, __ValuOpc::mul);
+    } else {
+      valuSetTstep0(1, 0, 1);
+      if (op == 0) valuRepeat(value, operand, value, __ValuOpc::add);
+      else if (op == 1) valuRepeat(value, operand, value, __ValuOpc::sub);
+      else valuRepeat(value, operand, value, __ValuOpc::mul);
+    }
+  } else {
+    vldRepeat(operand, a, a_offset);
+    valuSetTstep0(1, 1, 1);
+    if (x_first) {
+      if (op == 0) valuRepeat(value, value, operand, __ValuOpc::add);
+      else if (op == 1) valuRepeat(value, value, operand, __ValuOpc::sub);
+      else valuRepeat(value, value, operand, __ValuOpc::mul);
+    } else {
+      if (op == 0) valuRepeat(value, operand, value, __ValuOpc::add);
+      else if (op == 1) valuRepeat(value, operand, value, __ValuOpc::sub);
+      else valuRepeat(value, operand, value, __ValuOpc::mul);
+    }
+  }
+  vstSetTsize32B(chunks, 1);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(0, 0);
+  if (row < rows) vstRepeat(value, dst, row_offset);
+  fenceVst((short)0);
+}

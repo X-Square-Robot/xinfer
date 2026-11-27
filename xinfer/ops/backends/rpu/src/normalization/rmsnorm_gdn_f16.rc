@@ -1,0 +1,71 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// GDN C128 FP16 RMSNorm. One independent X[M,128], W[128], Y[M,128]
+// lives in each active core's LocalSPM. One block owns 16 rows. VMAT
+// accumulates the 128x pre-scaled squares in FP32, then emits a FP16 mean.
+// The host ABI admits exact X==Y, but never partial aliasing or Y/W aliasing.
+__rprog__ void rmsnorm_gdn_f16(
+    half *dst, half *src, half *weight,
+    unsigned short rows, unsigned short cols,
+    unsigned short mean_scale_low, unsigned short mean_scale_high,
+    half epsilon) {
+  // Shapes and the GDN input envelope are admitted by the host profile.
+  (void)epsilon;
+  const unsigned short tid = threadId;
+  const unsigned short chunks = cols / 16;
+  const unsigned int row = (unsigned int)blockIdx.x * 16 + tid;
+  const unsigned int load_row = row < rows ? row : (unsigned int)rows - 1;
+  const int row_offset = (int)(load_row * (unsigned int)cols);
+
+  __local__ f16v16 x[128], gamma[128];
+  __local__ f16v16 gram[1], norm[1], scratch[1];
+
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vcfg_set_vmat(vcfg_vmat_target::acc_init_fp32_l, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::acc_init_fp32_h, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)mean_scale_low);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)mean_scale_high);
+
+  vldSetTsize32B(chunks, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat(x, src, row_offset);
+  vldRepeat(gamma, weight, (int)0);
+
+  // GDN source contract admits |X| <= 1. Scaling by 128 before VMAT
+  // keeps its FP16 mean-square normal for the observed small activations.
+  valuSetTsize(chunks, 1);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(0, 0, 0);
+  valuRepeat(x, x, (half)128.0f, __ValuOpc::mul);
+  vmatSetTsize(chunks, 1);
+  vmatSetTstep0(0, 1, 1);
+  vmatSetTstep1(0, 0, 0);
+  LoopOutInfo outlp[1] = {{(short)0}};
+  LoopClrInfo clrlp[1] = {{(short)0}};
+  LoopOutLPAttr out(outlp);
+  LoopClrLPAttr clr(clrlp);
+  vmatRepeat(gram, x, x, &out, &clr);
+
+  // Fixed-lane Psel extracts the VMAT FP16 row mean after diagonal
+  // broadcast. Epsilon is scaled by 128^2 to match the pre-scaled X.
+  half mean_square;
+  vcfg_set_valu(vcfg_valu_target::imm2, gram, (short)tid);
+  valuExecute(scratch, (half)1.0f, (half)0.0f, __ValuOpc::add);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vsfuScalar(mean_square, scratch, (short)0, __ShuffleMode::Psel);
+  valuExecute(norm, mean_square, (half)0.016384f, __ValuOpc::add);
+  valuExecute(norm, norm, (half)0.0f, __ValuOpc::sqrt_reciprocal);
+  // Keep the two FP16 epilogue boundaries explicit for Graph replay parity.
+  valuRepeat(x, x, norm, __ValuOpc::mul);
+  valuSetTstep0(1, 1, 1);
+  valuRepeat(x, x, gamma, __ValuOpc::mul);
+  vstSetTsize32B(chunks, 1);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(0, 0);
+  if (row < rows) vstRepeat(x, dst, row_offset);
+}

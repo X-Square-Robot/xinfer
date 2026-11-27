@@ -1,0 +1,45 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// One exact Action Euler update for [32,64]. Every VALU instruction is
+// an FP16 boundary, preserving the reference sequence:
+//   velocity = mask * velocity
+//   velocity = velocity + padding_velocity
+//   velocity = delta_t * velocity
+//   action    = action + velocity
+__rprog__ void euler_update_m32d64_f16(
+    half *action, half *velocity, half *keep_mask,
+    half *padding_velocity, half delta_t) {
+  constexpr short chunks = 4;
+  unsigned short row = (unsigned short)blockIdx.x * 16 + threadId;
+  if (row >= 32) return;
+  __local__ f16v16 a[chunks], v[chunks], m[chunks], p[chunks];
+
+  vldSetTsize32B(chunks, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat_async(a, action, (int)row * 64);
+  vldRepeat_async(v, velocity, (int)row * 64);
+  vldRepeat_async(m, keep_mask, (int)0);
+  vldRepeat_async(p, padding_velocity, (int)row * 64);
+  fenceVld(0);
+
+  valuSetTsize(chunks, 1);
+  valuSetTstep0(1, 1, 1);
+  valuSetTstep1(0, 0, 0);
+  valuRepeat(v, v, m, __ValuOpc::mul);
+  valuRepeat(v, v, p, __ValuOpc::add);
+  // Scalar delta_t must remain fixed across the four vector chunks.
+  valuSetTstep0(1, 1, 0);
+  valuRepeat(v, v, delta_t, __ValuOpc::mul);
+  valuSetTstep0(1, 1, 1);
+  valuRepeat(a, a, v, __ValuOpc::add);
+
+  vstSetTsize32B(chunks, 1);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(0, 0);
+  vstRepeat_async(v, velocity, (int)row * 64);
+  vstRepeat_async(a, action, (int)row * 64);
+  fenceVst(0);
+}

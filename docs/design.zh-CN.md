@@ -1,4 +1,4 @@
-# XInfer 设计文档（评审稿 v1）
+# XInfer 设计文档
 
 [English](design.md) | 简体中文
 
@@ -863,9 +863,9 @@ XInfer/
 | 绑定 | 经 TVM-FFI 加载 AOT 库：CUDA 张量算子使用 `xinfer_kernels.so`，RPU 预构建执行使用 `xinfer_rpu.so`；按明确的 PyTorch 集成需求增加 `torch.library` 适配（§14.2） |
 | 验证 | 主机契约与构建检查独立于设备源码编译、真机数值、重放和模型精度／性能门禁（§14.1、§17）；host-only 或 SDK stub 测试不能证明设备验收通过 |
 | 版本与发布 | 记录库身份、哈希和支持能力，验证后端特定的 ABI／构建元数据；RPU 还需匹配原生 catalog 与外部资产 manifest（§14.3） |
-| 第三方依赖 | 保留上游源码归属和适用的原许可证副本；厂商 SDK、编译器与生成的 RPU 资产仍为外部依赖。归属及条款见对应算子变更随附的 `THIRD_PARTY_NOTICES.md` |
+| 第三方依赖 | 保留上游源码归属和适用的原许可证副本；厂商 SDK、编译器与生成的 RPU 资产仍为外部依赖。归属及条款见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) |
 
-独立算子变更中的 `docs/rpu_ops.zh-CN.md` 说明 host-only 构建、运行时 SDK 构建和显式的 `.rc` 到 `.ref` 资产构建。提供源码并不附带 SDK 或生成资产，也不表示数值或性能验收通过。RPU 模型／运行时接入负责所选算子工厂注入和执行生命周期；仅有算子包不能运行模型。
+[docs/rpu_ops.zh-CN.md](rpu_ops.zh-CN.md) 说明 host-only 构建、运行时 SDK 构建和显式的 `.rc` 到 `.ref` 资产构建。提供源码并不附带 SDK 或生成资产，也不表示数值或性能验收通过。RPU 模型／运行时接入负责所选算子工厂注入和执行生命周期；仅有算子包不能运行模型。
 
 ### 18.3 扩展方式：插件入口
 

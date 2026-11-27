@@ -1,0 +1,8 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Action input projection and its exact FP16 /4 boundary:
+// round_fp16(round_fp16(A @ W.T + bias) * 0.25).
+#define IO_ENTRY gemm_ddr_bias_scale_m32n1024k64_acc32
+#define IO_N 1024
+#define IO_K 64
+#define IO_OUTPUT_SCALE 0.25f
+#include "io_gemm.h"

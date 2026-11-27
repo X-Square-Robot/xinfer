@@ -1,0 +1,8 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Local A[rows,2048] @ W[2048,1536] on each of eight TP cores, rows 385..448.
+#define STREAMED_ENTRY gateup_m448_k128
+#define STREAMED_N 1536
+#define STREAMED_K 2048
+#define STREAMED_TM 448
+#define STREAMED_OUTPUT_GATEUP 1
+#include "streamed_k128.h"

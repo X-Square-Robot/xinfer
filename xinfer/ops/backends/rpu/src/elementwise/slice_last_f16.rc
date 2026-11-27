@@ -1,0 +1,28 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// GDN slice of the last dimension. Every core owns independent local SPM
+// storage at the same offsets; one physical warp handles up to 16 rows.
+// The host admits [M,16]->[M,2] at column 0 and [2,64]->[2,1] at column 63.
+// Masked loads/stores preserve FP16 bits, including NaNs and signed zero.
+__rprog__ void slice_last_f16(half* dst, half* src,
+                                   unsigned short rows,
+                                   unsigned short src_cols,
+                                   unsigned short dst_cols,
+                                   unsigned short col_offset) {
+  const unsigned int row = (unsigned int)blockIdx.x * 16U + threadId;
+  if (row >= rows) return;
+  __local__ f16v16 value[1];
+  if (dst_cols == 2) {
+    LoopStrbInfo tail((short)0x0003);
+    LoopStrbLPAttr mask(&tail);
+    vldExecute(value, src, (int)(row * src_cols + col_offset), &mask);
+    vstExecute(value, dst, (int)(row * dst_cols), &mask);
+  } else {
+    LoopStrbInfo tail((short)0x0001);
+    LoopStrbLPAttr mask(&tail);
+    vldExecute(value, src, (int)(row * src_cols + col_offset), &mask);
+    vstExecute(value, dst, (int)(row * dst_cols), &mask);
+  }
+}

@@ -1,0 +1,9 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// FP16 merger FC1+bias; local N512 K4096, dynamic M1..147.
+#define PROJ_ENTRY fc1_n512k4096
+#define PROJ_N 512
+#define PROJ_K 4096
+#define PROJ_TN 16
+#define PROJ_TM 16
+#define PROJ_TK 1024
+#include "mlp_projection.h"

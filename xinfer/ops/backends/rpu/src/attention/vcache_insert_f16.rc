@@ -1,0 +1,36 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Cache [ceil(capacity/16),2,4,8,16 dimensions,16 tokens].
+// Eight head/dimension tiles share the same regular DDR stride. Batch their
+// load, warp transpose and store with Repeat; partial tiles preserve all bits.
+__rprog__ void vcache_insert_f16(half *src, DDR_large cache,
+    unsigned short rows, unsigned short position) {
+  unsigned short tile = position / 16 + (unsigned short)blockIdx.x;
+  unsigned short token = tile * 16 + threadId;
+  bool full = tile * 16 >= position && tile * 16 + 16 <= position + rows;
+  bool live = token >= position && token < position + rows;
+  __local__ f16v16 x[8], trans[8];
+  DDR_large block = cache + (int)tile * 128 + (int)coreId_u * 2;
+  vldSetTsize32B(8, 1);
+  vldSetTstep32B_1(0, (short)0);
+  vsfuSetTsize32B(8, 1);
+  vsfuSetTstep32B_0(1, 1, 0);
+  vsfuSetTstep32B_1(0, 0, 0);
+  if (!full) {
+    vldSetTstep32B_0(1, (int)4096, __AGran::a_g1B);
+    vldRepeat(trans, block, (short)(threadId * 32));
+    vsfuRepeat(x, trans, (short)0, __ShuffleMode::Trs);
+  }
+  if (live) {
+    vldSetTstep32B_0(1, (short)16);
+    vldRepeat(x, src, (int)(token - position) * 128);
+  }
+  vsfuRepeat(trans, x, (short)0, __ShuffleMode::Trs);
+  vstSetTsize32B(8, 1);
+  vstSetTstep32B_0(1, (int)4096, __AGran::a_g1B);
+  vstSetTstep32B_1(0, (short)0);
+  vstRepeat_async(trans, block, (short)(threadId * 32));
+  fenceVst(0);
+}

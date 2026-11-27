@@ -1,0 +1,8 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Compatibility alias for down_allreduce_rmsnorm_m16n1024k256_acc32.
+// The kernel body is the hardware sqrt_reciprocal + valuRepeat path shared
+// with the plain entry. RSQRT_LUT=1 keeps the trailing rsqrt_lut formal as
+// ABI padding. Native callers pass zero for this unused argument.
+#define XINFER_ACTION_DOWN_KERNEL down_allreduce_rmsnorm_hw_m16n1024k256_acc32
+#define XINFER_ACTION_DOWN_RSQRT_LUT 1
+#include "down_allreduce_rmsnorm_m16n1024k256_acc32_impl.h"

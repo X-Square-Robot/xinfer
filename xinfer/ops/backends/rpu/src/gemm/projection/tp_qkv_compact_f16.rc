@@ -1,0 +1,13 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// TP8 compact Q/Qgate/K/V projection. Each core owns Q256, Qgate256 and one
+// nonduplicated K64/V64 slice. The caller packs the 640 columns for each core
+// in that order using the common ParallelLinear weight layout.
+// Follow with qkv_expand_kv_f16 before consumers needing a full K/V head.
+#define STREAMED_ENTRY tp_qkv_compact_f16
+#define STREAMED_N 640
+#define STREAMED_K 2048
+#define STREAMED_TN 32
+#define STREAMED_TM 16
+#define STREAMED_TK 2048
+#define STREAMED_PIPELINE 2
+#include "../streamed_gemm.h"

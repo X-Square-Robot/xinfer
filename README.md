@@ -26,7 +26,7 @@
 - **Ultra-low single-robot latency.** WALL-OSS-1.0-Nano in BF16 measured 20.1 ms P50 per request on an RTX 5090.
 - **Multi-robot serving on one accelerator.** Fine-grained stage scheduling lets inference stages from different requests overlap asynchronously on multiple CUDA streams.
 - **Low-precision quantization.** Apply MXFP8 or NVFP4 to selected groups of linear layers.
-- **Hardware backends.** NVIDIA RTX 5090, Jetson Thor, Ascend 950DT, and Huixi Rhino RPU (R1) support in development.
+- **Hardware backends.** NVIDIA RTX 5090, Jetson Thor, Ascend 950DT, and HUIXI-AI Rhino RPU (R1) support in development.
 - **High-performance kernels.** Use optimized fused kernels and optional FlashAttention, or plug in another kernel library.
 
 ## Quick start
@@ -86,7 +86,7 @@ WALL-OSS-0.5 requires the [internal checkpoint layout](docs/models/wall_oss_0_5.
 | NVIDIA GPUs · RTX 5090 (SM120) | `cuda` | PyTorch + CUDA |
 | NVIDIA Jetson Thor (SM110) | `cuda` | PyTorch + CUDA |
 | Huawei Ascend 950DT NPU | `npu` | PyTorch + `torch_npu` + CANN · [Setup](docs/ascend950dt.md) |
-| Rhino RPU (R1, experimental) | `rpu` | Rhino Launch SDK AOT · [Profile](docs/models/wall_oss_1_0_nano_rpu.md) |
+| Rhino RPU (R1, experimental) | `rpu` | Rhino Launch SDK AOT · [Operators](docs/rpu_ops.md) · [Profile](docs/models/wall_oss_1_0_nano_rpu.md) |
 | CPU | `cpu` | Reference implementations and tests |
 
 ## Performance
@@ -161,15 +161,15 @@ Server P50 / P95 is measured at the listed robot capacity. Peak throughput is th
 | Hardware | Parcel throughput (parcels/h) |
 |---|---:|
 | NVIDIA RTX 5090 | 2,231 |
-| Huixi | 2,190 |
+| HUIXI-AI Rhino RPU (R1) | 2,190 |
 
 ## How it works
 
 <p align="center">
-  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. The operator registry supports optimized fused kernels, optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. Huixi R1 uses a separate experimental native path from Python Policy." width="100%">
+  <img src="docs/assets/xinfer-architecture.svg" alt="Model stages call operators bound at load time. The operator registry supports optimized fused kernels, optional CUDA FlashAttention, PyTorch references and third-party plugins. The stage engine serves RTX 5090, Jetson AGX Thor, Ascend 950DT and CPU. HUIXI-AI Rhino RPU (R1) uses a separate experimental native path from Python Policy." width="100%">
 </p>
 
-The engine schedules model stages. The operator registry selects device kernels at load time. The dashed line marks the experimental Huixi R1 path. See the [engine guide](docs/engine.md) for scheduling details.
+The engine schedules model stages. The operator registry selects device kernels at load time. The dashed line marks the experimental HUIXI-AI Rhino RPU (R1) path. See the [engine guide](docs/engine.md) for scheduling details.
 
 ## Benchmarks
 
@@ -180,7 +180,7 @@ See the [benchmark guide](docs/benchmark.md) for commands and the [Nano validati
 | Task | Guides |
 |---|---|
 | Deploy | [Serving](docs/serving.md) · [Configuration](docs/configuration.md) · [Metrics](docs/metrics.md) |
-| Optimize | [Kernels](docs/kernels.md) · [Quantization](docs/quantization.md) · [Precision](docs/precision.md) · [Profiling](docs/profiling.md) |
+| Optimize | [Kernels](docs/kernels.md) · [RPU operators](docs/rpu_ops.md) · [Quantization](docs/quantization.md) · [Precision](docs/precision.md) · [Profiling](docs/profiling.md) |
 | Extend | [Architecture and design](docs/design.md) · [Model interface](xinfer/models/interface.py) |
 
 ## Citation

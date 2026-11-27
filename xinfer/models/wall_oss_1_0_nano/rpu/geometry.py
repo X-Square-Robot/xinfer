@@ -1,3 +1,5 @@
+# Portions adapted from RhinoForge, Copyright 2026 HUIXI-AI, Apache-2.0.
+# See NOTICE, licenses/NOTICE.rhinoforge and THIRD_PARTY_NOTICES.md.
 """CPU evaluation geometry for the WALL-OSS-1.0-Nano FP16 TP8 relative26 profile.
 
 Adapted from RhinoForge's evaluation helpers; public source links are listed

@@ -1,0 +1,5 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Shared implementation preserves the legacy source ABI; LUT is a private variant.
+#define XINFER_ACTION_DOWN_KERNEL down_allreduce_rmsnorm_m16n1024k256_acc32
+#define XINFER_ACTION_DOWN_RSQRT_LUT 0
+#include "down_allreduce_rmsnorm_m16n1024k256_acc32_impl.h"

@@ -1,0 +1,20 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// GDN [64,2,128] or [2,64,128] -> swapped N/B axes.
+__rprog__ void transpose_nbc_c128_f16(half* dst, half* src,
+                                            unsigned short b) {
+  const unsigned int vector = (unsigned int)blockIdx.x * 16U + threadId;
+  const unsigned int row = vector >> 3;
+  const unsigned int lane_vector = vector & 7U;
+  const unsigned int n_index = b == 64 ? row >> 6 : row >> 1;
+  const unsigned int b_index = b == 64 ? row & 63U : row & 1U;
+  const unsigned int n = b == 64 ? 2U : 64U;
+  const unsigned int input_index = (b_index * n + n_index) * 128U +
+                                    lane_vector * 16U;
+  const unsigned int output_index = row * 128U + lane_vector * 16U;
+  __local__ f16v16 value[1];
+  vldExecute(value, src, (int)input_index);
+  vstExecute(value, dst, (int)output_index);
+}

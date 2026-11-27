@@ -1,0 +1,8 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Compatibility alias for the WINDOW occurrence of the Action M32
+// down+all-reduce+norm fusion. Body is identical to the plain M32 entry
+// plus the private-window counter ABI.
+#define XINFER_ACTION_DOWN_KERNEL down_allreduce_rmsnorm_hw_window_m32n1024k256_acc32
+#define XINFER_ACTION_DOWN_RSQRT_LUT 1
+#define XINFER_ACTION_DOWN_WINDOW 1
+#include "down_allreduce_rmsnorm_m32n1024k256_acc32_impl.h"

@@ -1,0 +1,5 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Private window entry appends two explicit local counter ids.
+#define XINFER_REDUCE_KERNEL all_reduce_residual_window
+#define XINFER_REDUCE_WINDOW 1
+#include "all_reduce_residual_impl.h"

@@ -1,0 +1,46 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// One FP16 D256 head per core. Source is compact [rows,256] in local SPM.
+// V cache is [ceil(capacity/16),1,16,8,16 dimension,16 token] in DDR.
+// Partial destination tiles are read/modified/written to preserve every
+// untouched FP16 bit, including unused tail positions.
+__rprog__ void vcache_insert_d256_f16(half *src, DDR_large cache,
+    unsigned short rows, unsigned short position) {
+  unsigned short tile = position / 16 + (unsigned short)blockIdx.x;
+  unsigned short token = tile * 16 + threadId;
+  bool full = tile * 16 >= position && tile * 16 + 16 <= position + rows;
+  bool live = token >= position && token < position + rows;
+  // The proven transpose/Repeat footprint is eight dimension vectors. Split
+  // D256 into two disjoint D128 groups instead of extending that footprint.
+  __local__ f16v16 x[8], trans[8];
+  vldSetTsize32B(8, 1);
+  vldSetTstep32B_1(0, (short)0);
+  vsfuSetTsize32B(8, 1);
+  vsfuSetTstep32B_0(1, 1, 0);
+  vsfuSetTstep32B_1(0, 0, 0);
+  vstSetTsize32B(8, 1);
+  vstSetTstep32B_0(1, (int)4096, __AGran::a_g1B);
+  vstSetTstep32B_1(0, (short)0);
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < 2; ++group) {
+    DDR_large block = cache + (int)tile * 256 + group * 128
+                            + (int)coreId_u * 2;
+    if (!full) {
+      vldSetTstep32B_0(1, (int)4096, __AGran::a_g1B);
+      vldRepeat(trans, block, (short)(threadId * 32));
+      vsfuRepeat(x, trans, (short)0, __ShuffleMode::Trs);
+    }
+    if (live) {
+      // Source vectors remain adjacent (16 FP16 elements) at D256 as at D64.
+      // The scalar row offset below, not this Repeat step, carries the D256
+      // row pitch.
+      vldSetTstep32B_0(1, (short)16);
+      vldRepeat(x, src, (int)(token - position) * 256 + group * 128);
+    }
+    vsfuRepeat(trans, x, (short)0, __ShuffleMode::Trs);
+    vstRepeat_async(trans, block, (short)(threadId * 32));
+    fenceVst(0);
+  }
+}

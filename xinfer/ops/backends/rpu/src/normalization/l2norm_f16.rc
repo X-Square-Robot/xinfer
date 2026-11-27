@@ -1,0 +1,90 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Rowwise FP16 L2 normalization, Y = X * rsqrt(sum(X^2) + epsilon). One
+// independent X[M,C], Y[M,C] lives in each active core's LocalSPM. One block
+// owns 16 rows. VMAT accumulates squares in FP32 before its FP16 row sum;
+// range-conditioned re-reduction keeps that sum finite and normal. Scaling X
+// by a power of two scales the sum by its square, so epsilon follows it and
+// the product with the scaled X is unchanged. The host admits exact X==Y.
+__rprog__ void l2norm_f16(half *dst, half *src,
+                               unsigned short rows, unsigned short cols,
+                               half epsilon) {
+  const unsigned short tid = threadId;
+  const unsigned short chunks = cols / 16;
+  const unsigned int row = (unsigned int)blockIdx.x * 16 + tid;
+  const unsigned int load_row = row < rows ? row : (unsigned int)rows - 1;
+  const int row_offset = (int)(load_row * (unsigned int)cols);
+
+  __local__ f16v16 x[16];
+  __local__ f16v16 gram[1], norm[1], scratch[1];
+
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vcfg_set_vmat(vcfg_vmat_target::acc_init_fp32_l, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::acc_init_fp32_h, (short)0);
+  // FP32 1.0: VMAT emits the row sum of squares, not the mean.
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)0x3f80);
+
+  vldSetTsize32B(chunks, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat(x, src, row_offset);
+
+  vmatSetTsize(chunks, 1);
+  vmatSetTstep0(0, 1, 1);
+  vmatSetTstep1(0, 0, 0);
+  LoopOutInfo outlp[1] = {{(short)0}};
+  LoopClrInfo clrlp[1] = {{(short)0}};
+  LoopOutLPAttr out(outlp);
+  LoopClrLPAttr clr(clrlp);
+  vmatRepeat(gram, x, x, &out, &clr);
+
+  // Same diagonal extraction as rmsnorm_f16: broadcast this thread's VMAT
+  // diagonal through VALU imm2, then read fixed lane 0.
+  half sum_square;
+  vcfg_set_valu(vcfg_valu_target::imm2, gram, (short)tid);
+  valuExecute(scratch, (half)1.0f, (half)0.0f, __ValuOpc::add);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  vsfuScalar(sum_square, scratch, (short)0, __ShuffleMode::Psel);
+  const unsigned short bits = reinterpret_cast<unsigned short&>(sum_square);
+  const unsigned short any_small = sumint(bits);
+  const unsigned short any_large = sumint((unsigned short)(0xffffu - bits));
+
+  valuSetTsize(chunks, 1);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(0, 0, 0);
+  half adjusted_epsilon = epsilon;
+  if (any_small < 0x0400u || any_large <= 0x83ffu) {
+    // This is a sum, not RMSNorm's mean: for C=128, 1/4096 bounds
+    // sum((X * scale)^2) by 128*(65504/4096)^2 < 32737 for finite FP16 X.
+    // The former 1/256 retry could overflow again and produce all-zero Y.
+    // 128 lifts subnormal sums into normal range; epsilon scales by 128^2.
+    // Keep the scale and epsilon choices in explicit assignments.
+    half scale = (half)1.0f;
+    if (bits < 0x0400u) {
+      scale = (half)128.0f;
+      adjusted_epsilon = (half)0.016384f;
+    } else if (bits >= 0x7c00u) {
+      scale = (half)0.000244140625f;
+      adjusted_epsilon = (half)0.0f;
+    }
+    valuRepeat(x, x, scale, __ValuOpc::mul);
+    vmatRepeat(gram, x, x, &out, &clr);
+    vcfg_set_valu(vcfg_valu_target::imm2, gram, (short)tid);
+    valuExecute(scratch, (half)1.0f, (half)0.0f, __ValuOpc::add);
+    vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+    vsfuScalar(sum_square, scratch, (short)0, __ShuffleMode::Psel);
+  }
+
+  valuExecute(norm, sum_square, adjusted_epsilon, __ValuOpc::add);
+  valuExecute(norm, norm, (half)0.0f, __ValuOpc::sqrt_reciprocal);
+  valuRepeat(x, x, norm, __ValuOpc::mul);
+  vstSetTsize32B(chunks, 1);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(0, 0);
+  if (row < rows) vstRepeat(x, dst, row_offset);
+}

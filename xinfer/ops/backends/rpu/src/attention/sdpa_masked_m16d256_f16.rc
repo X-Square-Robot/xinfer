@@ -1,0 +1,303 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Action attention. Each core owns one D256 Q/K/V head.
+// Q/output are compact LocalSPM [16,256]. K and V use the runtime's physical
+// TP8 cache layouts. The LocalSPM mask is FP16 row-major [16,kv_length] and
+// carries the [real prefix | masked bucket gap | 16 action tokens] contract.
+// kv_length is one of 80,144,...,528 (bucket + 16) and is therefore tile aligned.
+// One live 16-row query group consumes every K/V DDR tile.
+__rprog__ void sdpa_masked_m16d256_f16(
+    half *dst, half *query,
+    DDR_large key_cache, DDR_large value_cache,
+    half *mask, unsigned short kv_length) {
+  constexpr short query_groups = 1;
+  constexpr short max_blocks = 33;
+  constexpr short score_blocks = 64;
+  constexpr short key_tile_blocks = 13;
+  constexpr short value_tile_dims = 4;
+  if (kv_length < 80 || kv_length > 528 || (kv_length & 15)) return;
+  short blocks = kv_length / 16;
+
+  // Keep the scratch regions disjoint and preserve their declared bounds.
+  // K and V use the shared tile window; the mask uses explicit vector loads.
+  constexpr short q_vectors = query_groups * 16;
+  constexpr short kv_vectors = key_tile_blocks * 16;
+  constexpr short score_vectors = query_groups * score_blocks;
+  constexpr short mask_vectors = query_groups * key_tile_blocks;
+  __local__ f16v16 arena[
+      q_vectors + kv_vectors + score_vectors + mask_vectors];
+  auto *q = arena;
+  auto *kv = q + q_vectors;
+  // Pad each row to 64 vectors. Besides simplifying the fixed six-stage max
+  // tree, this lets every supported bucket share one Repeat schedule. Together
+  // q/kv/score/mask occupy 301 vectors and stay within the 384-vector VLM.
+  auto *score = kv + kv_vectors;
+  auto *mask_tile = score + score_vectors;
+  auto *scalars = kv + kv_vectors - 8;
+  static_assert(value_tile_dims * max_blocks <= kv_vectors - 8 &&
+                    3 * query_groups + query_groups <= 8,
+                "V tile and softmax scalars must not overlap");
+  // Softmax scalars (maxima, Pselr scratch, ones, denominators) live at the
+  // top of the K/V window: V tiles use only value_tile_dims*max_blocks of it,
+  // and every scalar base stays below the 8-bit VMAT constant-base limit.
+  constexpr short maximum_offset = 0;
+  constexpr short scratch_offset = query_groups;
+  constexpr short ones_offset = 2 * query_groups;
+  constexpr short denominator_offset = 3 * query_groups;
+
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_l, (short)0);
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h,
+                (short)0x3d80);  // 1/sqrt(256)
+
+  // Reference uses two-dimensional Repeat transfers for the one M16 query
+  // group. LocalSPM source steps are expressed in FP16 elements.
+  vldSetTsize32B(16, query_groups);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(16, 4096);
+  vldRepeat_async(q, query, (int)threadId * 256);
+  fenceVld(0);
+
+  // -65504 is the max identity for the model's finite scaled logits. The
+  // live score vectors are overwritten by QK; padding remains the identity.
+  valuSetTsize(score_blocks, query_groups);
+  valuSetTstep0(1, 0, 0);
+  valuSetTstep1(score_blocks, 0, 0);
+  valuRepeat(score, (half)-65504, (half)0, __ValuOpc::add);
+
+  // Materialize FP16 logits because the global row maximum is needed before
+  // exponentiation. The mask add is an explicit FP16 boundary as in the
+  // reference masked SDPA path.
+  short key_tiles = (blocks + key_tile_blocks - 1) / key_tile_blocks;
+#pragma rpu_hwloop_ul
+  for (short tile = 0; tile < key_tiles; ++tile) {
+    short first_block = tile * key_tile_blocks;
+    short live_blocks = blocks - first_block;
+    if (live_blocks > key_tile_blocks) live_blocks = key_tile_blocks;
+    // K is [token-block, dimension-block, core, token-lane, dimension-lane].
+    // Keep the DDR_large pointer arithmetic explicit: applying a_g1B to the
+    // Repeat step a second time changes the effective physical K stride.
+#pragma rpu_hwloop_ul
+    for (short b = 0; b < live_blocks; ++b) {
+#pragma rpu_hwloop_ul
+      for (short d = 0; d < 16; ++d) {
+        DDR_large key_block = key_cache
+            + (int)(first_block + b) * 256 + d * 16
+            + (int)coreId_u * 2;
+        vldExecute_async(kv + b * 16 + d, key_block,
+                         (short)(threadId * 32));
+      }
+    }
+
+    // Each thread owns one query row. Explicit issues preserve the full VLM
+    // destination address; a Repeat would truncate mask_tile's base (256).
+#pragma rpu_hwloop_ul
+    for (short group = 0; group < query_groups; ++group) {
+#pragma rpu_hwloop_ul
+      for (short b = 0; b < live_blocks; ++b) {
+        int source = ((int)group * 16 + threadId) * kv_length
+                   + (first_block + b) * 16;
+        vldExecute_async(mask_tile + group * key_tile_blocks + b,
+                         mask, source);
+      }
+    }
+    fenceVld(0);
+
+    // Clamp mask values to finite inputs before exp. Process the mask vectors
+    // with one VALU Repeat while the independent QK VMAT runs.
+    valuSetTsize(live_blocks, query_groups);
+    valuSetTstep0(1, 1, 0);
+    valuSetTstep1(key_tile_blocks, key_tile_blocks, 0);
+    valuRepeat_async(mask_tile, mask_tile, (half)-65504, __ValuOpc::max);
+
+    // Match the reference's layer-addressed VMAT Repeat: D16 is the reduction
+    // layer, key block selects the published accumulator, and query group
+    // advances by one M16 row group. K itself stays on the explicit load path;
+    // DDR_large Repeat stepping is not equivalent to the cache's byte layout.
+    short qlp[3];
+    LoopStepInfo qdst_steps[3] = {
+        {&qlp[2], score_blocks}, {&qlp[1], 1}, {&qlp[0], 0}};
+    LoopStepInfo qquery_steps[3] = {
+        {&qlp[2], 16}, {&qlp[1], 0}, {&qlp[0], 1}};
+    LoopStepInfo qkey_steps[3] = {
+        {&qlp[2], 0}, {&qlp[1], 16}, {&qlp[0], 1}};
+    FragVData qdst(score + first_block, qdst_steps);
+    FragVData qquery(q, qquery_steps);
+    FragVData qkey(kv, qkey_steps);
+    LoopOutInfo qoi[1] = {{&qlp[0]}};
+    // D256 is the reduction axis, independent of the published key tile.
+    LoopClrInfo qci[1] = {{&qlp[0]}};
+    LoopOutLPAttr qoa(qoi);
+    LoopClrLPAttr qca(qci);
+#pragma rpu_hwloop_ul
+    for (qlp[2] = 0; qlp[2] < query_groups; ++qlp[2]) {
+#pragma rpu_hwloop_ul
+      for (qlp[1] = 0; qlp[1] < live_blocks; ++qlp[1]) {
+#pragma rpu_hwloop_ul
+        for (qlp[0] = 0; qlp[0] < 16; ++qlp[0])
+          vmatExecute_async(qdst, qquery, qkey, &qoa, &qca);
+      }
+    }
+    fenceVmat(0);
+    fenceValu(0);
+
+    // Add the query group with one Repeat. A clamped masked logit becomes
+    // the exact zero probability after max subtraction and FP16 exp.
+    valuSetTsize(live_blocks, query_groups);
+    valuSetTstep0(1, 1, 1);
+    valuSetTstep1(score_blocks, score_blocks, key_tile_blocks);
+    valuRepeat_async(score + first_block, score + first_block, mask_tile,
+                     __ValuOpc::add);
+    fenceValu(0);
+  }
+
+  // QK no longer needs its K tile. Start the max tree out-of-place from score
+  // into that dead storage, preserving every logit without first copying all
+  // 64 padded vectors. The first-stage results use a compact 32-vector stride
+  // per query group; later stages reduce those values in place.
+  valuSetTsize(score_blocks / 2, query_groups);
+  valuSetTstep0(1, 2, 2);
+  valuSetTstep1(score_blocks / 2, score_blocks, score_blocks);
+  valuRepeat_async(kv, score, score + 1, __ValuOpc::max);
+  fenceValu(0);
+
+  // Max is exact and associative for these finite inputs.
+#define RF_SCORE_MAX_STAGE(COUNT, STRIDE)                                  \
+  valuSetTsize((COUNT), query_groups);                                     \
+  valuSetTstep0((STRIDE) * 2, (STRIDE) * 2, (STRIDE) * 2);                \
+  valuSetTstep1(score_blocks / 2, score_blocks / 2, score_blocks / 2);    \
+  valuRepeat_async(kv, kv, kv + (STRIDE), __ValuOpc::max);                \
+  fenceValu(0)
+  RF_SCORE_MAX_STAGE(16, 1);
+  RF_SCORE_MAX_STAGE(8, 2);
+  RF_SCORE_MAX_STAGE(4, 4);
+  RF_SCORE_MAX_STAGE(2, 8);
+  RF_SCORE_MAX_STAGE(1, 16);
+#undef RF_SCORE_MAX_STAGE
+
+  valuSetTsize(1, query_groups);
+  valuSetTstep0(1, score_blocks / 2, 0);
+  valuSetTstep1(1, score_blocks / 2, 0);
+  valuRepeat(scalars + maximum_offset, kv, (half)0, __ValuOpc::add);
+
+  // Reduce the sixteen token lanes for the query group between each fence.
+#pragma rpu_hwloop_ul
+  for (short stage = 0; stage < 4; ++stage) {
+#pragma rpu_hwloop_ul
+    for (short group = 0; group < query_groups; ++group)
+      vsfuExecute_async(scalars + scratch_offset + group,
+                        scalars + maximum_offset + group,
+                        (short)(1 << stage), __ShuffleMode::Pselr);
+    fenceVsfu(0);
+#pragma rpu_hwloop_ul
+    for (short group = 0; group < query_groups; ++group)
+      valuExecute_async(scalars + maximum_offset + group,
+                        scalars + maximum_offset + group,
+                        scalars + scratch_offset + group, __ValuOpc::max);
+    fenceValu(0);
+  }
+
+  valuExecute(scalars + ones_offset, (half)1, (half)0, __ValuOpc::add);
+  valuSetTsize(blocks, query_groups);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(score_blocks, score_blocks, 1);
+  valuRepeat_async(score, score, scalars + maximum_offset, __ValuOpc::sub);
+  fenceValu(0);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(score_blocks, score_blocks, 0);
+  valuRepeat_async(score, score, (half)0, __ValuOpc::exp);
+  fenceValu(0);
+
+  // QK uses 1/sqrt(256), but the probability sum and PV must be unscaled.
+  // Restoring the scale after the denominator would divide the denominator by
+  // sixteen and amplify every attention result by sixteen.
+  vcfg_set_vmat(vcfg_vmat_target::scale_allch_h, (short)0x3f80);
+#pragma rpu_hwloop_ul
+  for (short group = 0; group < query_groups; ++group) {
+    vmatInit(scalars + denominator_offset + group,
+             score + group * score_blocks, scalars + ones_offset,
+             __AclrMode::aclr);
+#pragma rpu_hwloop_ul
+    for (short b = 0; b < blocks; ++b)
+      vmatExecute_async(scalars + denominator_offset + group,
+                        score + group * score_blocks + b,
+                        scalars + ones_offset, __OutMode::outlp1);
+  }
+  fenceVmat(0);
+
+  // QK Repeat leaves layer clear state programmed for its reduction. Reset it
+  // before the independent PV Repeat so all sixteen output D16 vectors publish.
+  vmatSetLclr();
+
+  // V is transposed in DDR. Four dimension vectors share one load phase, then
+  // feed independent FP32 PV accumulators for the one query group.
+#pragma rpu_hwloop_ul
+  for (short dimension_group = 0; dimension_group < 16 / value_tile_dims;
+       ++dimension_group) {
+    short vlp[2];
+    LoopStepInfo vdst_steps[2] = {
+        {&vlp[1], 1}, {&vlp[0], max_blocks}};
+    FragVData vdst(kv, vdst_steps);
+    DDR_large vbase = value_cache + (int)dimension_group * (value_tile_dims * 16)
+                                  + (int)coreId_u * 2;
+    LoopStepInfo vsrc_steps[2] = {
+        {&vlp[1], 65536, __AGran::a_g1B},
+        {&vlp[0], 4096, __AGran::a_g1B}};
+    FragSData vsrc(vbase, vsrc_steps);
+#pragma rpu_hwloop_ul
+    for (vlp[1] = 0; vlp[1] < blocks; ++vlp[1]) {
+#pragma rpu_hwloop_ul
+      for (vlp[0] = 0; vlp[0] < value_tile_dims; ++vlp[0])
+        vldExecute_async(vdst, vsrc, (short)(threadId * 32));
+    }
+    fenceVld(0);
+
+#pragma rpu_hwloop_ul
+    for (short group = 0; group < query_groups; ++group) {
+      short plp[2];
+      LoopStepInfo pdst_steps[2] = {
+          {&plp[1], 1}, {&plp[0], 0}};
+      LoopStepInfo pscore_steps[2] = {
+          {&plp[1], 0}, {&plp[0], 1}};
+      LoopStepInfo pvalue_steps[2] = {
+          {&plp[1], max_blocks}, {&plp[0], 1}};
+      FragVData pdst(
+          q + group * 16 + dimension_group * value_tile_dims,
+          pdst_steps);
+      FragVData pscore(score + group * score_blocks, pscore_steps);
+      FragVData pvalue(kv, pvalue_steps);
+      LoopOutInfo poi[1] = {{&plp[0]}};
+      // KV is the reduction axis; output dimensions own independent accumulators.
+    LoopClrInfo pci[1] = {{&plp[0]}};
+      LoopOutLPAttr poa(poi);
+      LoopClrLPAttr pca(pci);
+#pragma rpu_hwloop_ul
+      for (plp[1] = 0; plp[1] < value_tile_dims; ++plp[1]) {
+#pragma rpu_hwloop_ul
+        for (plp[0] = 0; plp[0] < blocks; ++plp[0])
+          vmatExecute_async(pdst, pscore, pvalue, &poa, &pca);
+      }
+    }
+    fenceVmat(0);
+  }
+
+  // Normalize all D256 outputs with one Repeat. Denominator advances once per
+  // query group and is broadcast across that group's sixteen D16 vectors.
+  valuSetTsize(16, query_groups);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(16, 16, 1);
+  valuRepeat_async(q, q, scalars + denominator_offset, __ValuOpc::div);
+  fenceValu(0);
+
+  // The output is compact row-major LocalSPM [16,256], matching the query
+  // transfer with source/destination roles reversed.
+  vstSetTsize32B(16, query_groups);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(16, 4096);
+  vstRepeat_async(q, dst, (int)threadId * 256);
+  fenceVst(0);
+}

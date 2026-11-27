@@ -1,0 +1,29 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+// Local SPM fill, finite binary16 scalar, bit-preserving including signed zero
+// and subnormals. Tail stores never touch padding. TP8 broadcast.
+// ABI dst[0:1],elements[2:3],value[4],vectors[5].
+__rprog__ void fill_f16(half* dst,unsigned int elements,half value,unsigned short vectors) {
+  if (elements==0 || elements>3670016U || vectors==0 || vectors>64) return;
+  unsigned int base=(unsigned int)blockIdx.x*(unsigned int)vectors*256U;
+  if (base>=elements) return;
+  unsigned short count=elements-base<vectors*256U?elements-base:vectors*256U;
+  __local__ f16v16 data[1];
+  // VSFU bypass is a copy, with no floating-point arithmetic/rounding.
+  vsfuExecute(data,value,(half)0.0f,__ShuffleMode::Bypass);
+  if ((count&255)==0) {
+    vstSetTsize32B(count/256,1);vstSetTstep32B_0(0,256);vstSetTstep32B_1(0,0);
+    vstRepeat(data,dst,(int)(base+threadId*16));
+  } else {
+#pragma rpu_hwloop_ul
+    for (unsigned short step=0;step<count;step+=256) {
+      unsigned short local=step+threadId*16;
+      if (local<count) {
+        unsigned short valid=count-local<16?count-local:16;
+        LoopStrbInfo tail((short)bmsk(0,valid));LoopStrbLPAttr mask(&tail);
+        vstExecute(data,dst,(int)(base+local),&mask);
+      }
+    }
+  }
+}

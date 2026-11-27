@@ -1,0 +1,53 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// One grid block covers 65536 elements as at most two hardware Repeat tiles.
+// FP16 rounding occurs after sigmoid and after each multiplication.
+// The caller supplies a multiple-of-256 LocalSPM extent and an alias-safe dst.
+
+__rprog__ void silu_mul_fp16(half* dst, half* x, half* y,
+                            unsigned int elements) {
+  if (!elements || (elements & 255U)) return;
+  unsigned int base = (unsigned int)blockIdx.x * 65536U;
+  if (base >= elements) return;
+  unsigned int remaining = elements - base;
+  if (remaining > 65536U) remaining = 65536U;
+  unsigned short reps = (unsigned short)(remaining / 256U);
+  unsigned short first_reps = reps > 128 ? 128 : reps;
+  int offset = (int)(base + threadId * 16);
+  __local__ f16v16 vx[128], tmp[128];
+  vldSetTsize32B(first_reps, 1);
+  vldSetTstep32B_0(1, 256);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat_async(vx, x, offset);
+  fenceVld((short)0);
+  valuSetTsize(first_reps, 1);
+  valuSetTstep0(1, 1, 1);
+  valuSetTstep1(0, 0, 0);
+  valuRepeat(tmp, vx, (half)0.0f, __ValuOpc::sigmoid);
+  valuRepeat(vx, vx, tmp, __ValuOpc::mul);
+  // Reuse the sigmoid tile only after x*sigmoid(x) has completed. Loading all
+  // y values before the store keeps dst==y and x==y aliasing safe.
+  vldRepeat(tmp, y, offset);
+  valuRepeat(vx, vx, tmp, __ValuOpc::mul);
+  vstSetTsize32B(first_reps, 1);
+  vstSetTstep32B_0(1, 256);
+  vstSetTstep32B_1(0, 0);
+  vstRepeat(vx, dst, offset);
+
+  if (reps > 128) {
+    unsigned short second_reps = reps - 128;
+    int second_offset = offset + 32768;
+    vldSetTsize32B(second_reps, 1);
+    vldRepeat_async(vx, x, second_offset);
+    fenceVld((short)0);
+    valuSetTsize(second_reps, 1);
+    valuRepeat(tmp, vx, (half)0.0f, __ValuOpc::sigmoid);
+    valuRepeat(vx, vx, tmp, __ValuOpc::mul);
+    vldRepeat(tmp, y, second_offset);
+    valuRepeat(vx, vx, tmp, __ValuOpc::mul);
+    vstSetTsize32B(second_reps, 1);
+    vstRepeat(vx, dst, second_offset);
+  }
+}

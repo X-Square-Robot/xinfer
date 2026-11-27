@@ -1,0 +1,88 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// language SIGMOID/EXP/SILU/SOFTPLUS source candidate.
+// Each core owns its own contiguous FP16 LocalSPM span. Exact in-place alias
+// or disjoint output is permitted. The host must validate the address range.
+__rprog__ void unary_f16(half* dst, half* src,
+                              unsigned int elements, unsigned short op) {
+  if (op > 3) return;
+  const unsigned int base = (unsigned int)blockIdx.x * 4096U;
+  if (base >= elements) return;
+  const unsigned int remaining = elements - base;
+  const unsigned short count =
+      (unsigned short)(remaining < 4096U ? remaining : 4096U);
+  __local__ f16v16 x[16], a[16], t[16];
+  vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm1, (half)1.0f);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  if ((count & 255U) == 0) {
+    const unsigned short repeats = count / 256U;
+    const int offset = (int)(base + threadId * 16U);
+    vldSetTsize32B(repeats, 1);
+    vldSetTstep32B_0(1, 256);
+    vldSetTstep32B_1(0, 0);
+    vldRepeat_async(x, src, offset);
+    fenceVld((short)0);
+    valuSetTsize(repeats, 1);
+    valuSetTstep1(0, 0, 0);
+    valuSetTstep0(1, 1, 0);
+    if (op == 0) {
+      valuRepeat(x, x, (half)0.0f, __ValuOpc::sigmoid);
+    } else if (op == 1) {
+      valuRepeat(x, x, (half)0.0f, __ValuOpc::exp);
+    } else if (op == 2) {
+      valuRepeat(a, x, (half)0.0f, __ValuOpc::sigmoid);
+      valuSetTstep0(1, 1, 1);
+      valuRepeat(x, x, a, __ValuOpc::mul);
+    } else {
+      // Stable softplus: max(x,0) - log(sigmoid(|x|)), where
+      // |x| = 2*max(x,0) - x uses scale_a=2 for that subtraction only.
+      valuRepeat(a, x, (half)0.0f, __ValuOpc::max);
+      valuSetTstep0(1, 1, 1);
+      vcfg_set_valu(vcfg_valu_target::imm0, (half)2.0f);
+      valuRepeat(t, a, x, __ValuOpc::sub);
+      vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+      valuSetTstep0(1, 1, 0);
+      valuRepeat(t, t, (half)0.0f, __ValuOpc::sigmoid);
+      valuRepeat(t, t, (half)0.0f, __ValuOpc::log);
+      valuSetTstep0(1, 1, 1);
+      valuRepeat(x, a, t, __ValuOpc::sub);
+    }
+    vstSetTsize32B(repeats, 1);
+    vstSetTstep32B_0(1, 256);
+    vstSetTstep32B_1(0, 0);
+    vstRepeat(x, dst, offset);
+  } else {
+#pragma rpu_hwloop_ul
+    for (unsigned short step = 0; step < count; step += 256) {
+      const unsigned short local = step + threadId * 16U;
+      if (local < count) {
+        const unsigned short valid = count - local < 16 ? count - local : 16;
+        LoopStrbInfo tail((short)bmsk(0, valid));
+        LoopStrbLPAttr mask(&tail);
+        const int offset = (int)(base + local);
+        vldExecute(x, src, offset, &mask);
+        if (op == 0) {
+          valuExecute(x, x, (half)0.0f, __ValuOpc::sigmoid);
+        } else if (op == 1) {
+          valuExecute(x, x, (half)0.0f, __ValuOpc::exp);
+        } else if (op == 2) {
+          valuExecute(a, x, (half)0.0f, __ValuOpc::sigmoid);
+          valuExecute(x, x, a, __ValuOpc::mul);
+        } else {
+          valuExecute(a, x, (half)0.0f, __ValuOpc::max);
+          vcfg_set_valu(vcfg_valu_target::imm0, (half)2.0f);
+          valuExecute(t, a, x, __ValuOpc::sub);
+          vcfg_set_valu(vcfg_valu_target::imm0, (half)1.0f);
+          valuExecute(t, t, (half)0.0f, __ValuOpc::sigmoid);
+          valuExecute(t, t, (half)0.0f, __ValuOpc::log);
+          valuExecute(x, a, t, __ValuOpc::sub);
+        }
+        vstExecute(x, dst, offset, &mask);
+      }
+    }
+  }
+  fenceVst((short)0);
+}

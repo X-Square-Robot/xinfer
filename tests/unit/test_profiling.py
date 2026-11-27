@@ -51,7 +51,8 @@ def test_plain_tables_bind_the_selected_functions_without_a_wrapper():
     reg, fast, _ = _registry()
     assert reg.build_table(resolve_platform("cpu")).mm is fast
     reference = ops.registry.build_table(resolve_platform("cpu"), reference_only=True)
-    for name in ops.registry.names():
+    for row in reference.report():
+        name = row["op"]
         assert getattr(reference, name) is ops.registry.spec(name).reference, name
 
 

@@ -1,0 +1,147 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+
+using namespace rpu;
+
+// action-prefix transfer for the six full-attention layers
+// (logical layers 3, 7, 11, 15, 19, and 23).  Every cache is contiguous FP16
+// with physical shape [1, blocks, 1, 16, 8, 16, 16].  K interprets the final
+// two axes as [token, dim], while V interprets them as [dim, token].
+//
+// All DDR_large arguments are 256-byte packed device addresses.  ABI slots:
+//   layer i: src_k[8*i+0:1], src_v[8*i+2:3],
+//            dst_k[8*i+4:5], dst_v[8*i+6:7]
+//   prefix_len[48], bucket_len[49]
+// Grid [ceil(bucket_len/16), 2 (K/V), 6 (layer)], broadcast to eight cores.
+//
+// bucket_len may equal prefix_len (the exact-prefix path) or ceil64(prefix).
+// The exact path deliberately copies the complete final physical block and
+// does not clear its logically invisible tail, matching the framework's
+// existing copy_ semantics.  Only the bucketed path clears [prefix, bucket).
+__rprog__ void copy_physical_prefix_f16(
+    DDR_large src_k0, DDR_large src_v0, DDR_large dst_k0, DDR_large dst_v0,
+    DDR_large src_k1, DDR_large src_v1, DDR_large dst_k1, DDR_large dst_v1,
+    DDR_large src_k2, DDR_large src_v2, DDR_large dst_k2, DDR_large dst_v2,
+    DDR_large src_k3, DDR_large src_v3, DDR_large dst_k3, DDR_large dst_v3,
+    DDR_large src_k4, DDR_large src_v4, DDR_large dst_k4, DDR_large dst_v4,
+    DDR_large src_k5, DDR_large src_v5, DDR_large dst_k5, DDR_large dst_v5,
+    unsigned short prefix_len, unsigned short bucket_len) {
+  const unsigned short block = blockIdx.x;
+  const unsigned short kind = blockIdx.y;
+  const unsigned short layer = blockIdx.z;
+  const unsigned short rounded_bucket =
+      (unsigned short)(((unsigned int)prefix_len + 63U) & ~63U);
+  if (prefix_len == 0 || prefix_len > 512 || bucket_len < prefix_len ||
+      bucket_len > 512 ||
+      (bucket_len != prefix_len && bucket_len != rounded_bucket) ||
+      kind > 1 || layer > 5 ||
+      block >= (unsigned short)(((unsigned int)bucket_len + 15U) / 16U))
+    return;
+
+  // Select addresses sequentially and make the selected DDR base explicitly warp-uniform.
+  int selected_sk = src_k5.addr;
+  int selected_sv = src_v5.addr;
+  int selected_dk = dst_k5.addr;
+  int selected_dv = dst_v5.addr;
+  if (layer == 0) {
+    selected_sk = src_k0.addr;
+    selected_sv = src_v0.addr;
+    selected_dk = dst_k0.addr;
+    selected_dv = dst_v0.addr;
+  }
+  if (layer == 1) {
+    selected_sk = src_k1.addr;
+    selected_sv = src_v1.addr;
+    selected_dk = dst_k1.addr;
+    selected_dv = dst_v1.addr;
+  }
+  if (layer == 2) {
+    selected_sk = src_k2.addr;
+    selected_sv = src_v2.addr;
+    selected_dk = dst_k2.addr;
+    selected_dv = dst_v2.addr;
+  }
+  if (layer == 3) {
+    selected_sk = src_k3.addr;
+    selected_sv = src_v3.addr;
+    selected_dk = dst_k3.addr;
+    selected_dv = dst_v3.addr;
+  }
+  if (layer == 4) {
+    selected_sk = src_k4.addr;
+    selected_sv = src_v4.addr;
+    selected_dk = dst_k4.addr;
+    selected_dv = dst_v4.addr;
+  }
+
+  int selected_src = selected_sk;
+  int selected_dst = selected_dk;
+  if (kind == 1) {
+    selected_src = selected_sv;
+    selected_dst = selected_dv;
+  }
+  DDR_large src(sselt(selected_src, 0));
+  DDR_large dst(sselt(selected_dst, 0));
+
+  // One physical block is 64 KiB globally.  Each core owns 512 bytes at each
+  // of sixteen head-dimension tiles: block=256, dim-tile=16, core=2 in
+  // DDR_large's 256-byte units.  threadId selects one contiguous 32-byte row.
+  const int block_base = (int)block * 256 + (int)coreId_u * 2;
+  const short lane_offset = (short)(threadId * 32);
+  const unsigned short copy_blocks =
+      (unsigned short)(((unsigned int)prefix_len + 15U) / 16U);
+  const bool padded = bucket_len != prefix_len;
+  const unsigned short tail = prefix_len & 15;
+  __local__ f16v16 tile[16];
+  __local__ f16v16 zero[1];
+  __local__ f16v16 transposed[1];
+  valuExecute(zero, (half)0.0f, (half)0.0f, __ValuOpc::add);
+
+  if (block < copy_blocks) {
+    vldSetTsize32B(16, 1);
+    vldSetTstep32B_0(1, (int)4096, __AGran::a_g1B);
+    vldSetTstep32B_1(0, (short)0);
+    vldRepeat_async(tile, src + block_base, lane_offset);
+    fenceVld((short)0);
+    vstSetTsize32B(16, 1);
+    vstSetTstep32B_0(1, (int)4096, __AGran::a_g1B);
+    vstSetTstep32B_1(0, (short)0);
+    vstRepeat_async(tile, dst + block_base, lane_offset);
+    fenceVst((short)0);
+  } else {
+    // Complete padding blocks have identical raw K/V layout.
+    vstSetTsize32B(16, 1);
+    vstSetTstep32B_0(0, (int)4096, __AGran::a_g1B);
+    vstSetTstep32B_1(0, (short)0);
+    vstRepeat_async(zero, dst + block_base, lane_offset);
+    fenceVst((short)0);
+  }
+
+  if (padded && tail != 0 && block == prefix_len / 16) {
+    if (kind == 0) {
+      // K: threadId is the token lane; clear complete dim vectors.
+      if (threadId >= tail) {
+        vstSetTsize32B(16, 1);
+        vstSetTstep32B_0(0, (int)4096, __AGran::a_g1B);
+        vstSetTstep32B_1(0, (short)0);
+        vstRepeat_async(zero, dst + block_base, lane_offset);
+        fenceVst((short)0);
+      }
+    } else {
+      // V: threadId is the dim lane and vector lanes are tokens.  Transpose
+      // each 16x16 tile so invalid tokens become complete thread vectors,
+      // clear those vectors, and transpose back before the final store.
+#pragma rpu_hwloop_ul
+      for (short d = 0; d < 16; ++d) {
+        vsfuExecute(transposed, tile + d, (short)0, __ShuffleMode::Trs);
+        if (threadId >= tail)
+          valuExecute(transposed, (half)0.0f, (half)0.0f,
+                      __ValuOpc::add);
+        vsfuExecute(tile + d, transposed, (short)0, __ShuffleMode::Trs);
+        vstExecute_async(tile + d, dst + block_base + (int)d * 16,
+                         lane_offset);
+      }
+      fenceVst((short)0);
+    }
+  }
+}

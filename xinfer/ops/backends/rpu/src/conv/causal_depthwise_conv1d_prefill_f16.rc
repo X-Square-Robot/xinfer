@@ -1,0 +1,77 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// FP16 causal depthwise K=4; each core owns D=256 channels. Input pad is
+// [3+rows,256] in local SPM, with the first three rows holding prior inputs.
+// On return, pad[3:] contains convolution outputs and carry[0:3] contains
+// the last three original inputs. No bias or activation is applied.
+// For eight segments, halo[segment,3,256] must contain the three original
+// inputs immediately before that segment. Segment 0 reads pad[0:3].
+// DDR weights are [8 cores,4 taps,256 channels] and are packed in 256B units.
+// Launch grid=(1,1,segments), broadcast to eight cores.
+__rprog__ void causal_depthwise_conv1d_prefill_f16(
+    half *pad, half *carry, half *halo, DDR_large weights,
+    unsigned short rows, unsigned short segments) {
+  if (rows < 2 || rows > 512 ||
+      segments != (rows >= 32 ? 8 : 1) || blockIdx.z >= segments) return;
+
+  const unsigned short segment = blockIdx.z;
+  const unsigned short base = rows / segments;
+  const unsigned short rem = rows % segments;
+  // Spread the remainder over the first segments. Putting the complete
+  // remainder in segment 0 can make that segment 70 rows at rows=511, which
+  // exceeds the 64-row Repeat buffers below.
+  const unsigned short extra_before = segment < rem ? segment : rem;
+  const unsigned short first = segment * base + extra_before;
+  const unsigned short count = base + (segment < rem ? 1 : 0);
+  const int channel = (int)threadId * 16;
+  DDR_large core_weight = weights + (int)coreId_u * 8;
+  // Balanced eight-way segmentation bounds count at 64 rows. Keep the
+  // complete input window resident before overwriting pad, then evaluate the
+  // four taps along the row axis with seven Repeat commands. 199
+  // vectors/thread fit in VLM, all below vector 256.
+  __local__ f16v16 w0[1], w1[1], w2[1], w3[1];
+  __local__ f16v16 x[67], y[64], tmp[64];
+  vldExecute(w0, core_weight, (short)channel * 2);
+  vldExecute(w1, core_weight + 2, (short)channel * 2);
+  vldExecute(w2, core_weight + 4, (short)channel * 2);
+  vldExecute(w3, core_weight + 6, (short)channel * 2);
+
+  half *history = segment == 0 ? pad : halo + (int)segment * 3 * 256;
+  vldSetTsize32B(3, 1);
+  vldSetTstep32B_0(1, 256);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat_async(x, history, channel);
+  vldSetTsize32B(count, 1);
+  vldRepeat_async(x + 3, pad, ((int)first + 3) * 256 + channel);
+  fenceVld((short)0);
+
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  valuSetTsize(count, 1);
+  valuSetTstep0(1, 1, 0);
+  valuSetTstep1(0, 0, 0);
+  valuRepeat(y, x, w0, __ValuOpc::mul);
+  valuRepeat(tmp, x + 1, w1, __ValuOpc::mul);
+  valuSetTstep0(1, 1, 1);
+  valuRepeat(y, y, tmp, __ValuOpc::add);
+  valuSetTstep0(1, 1, 0);
+  valuRepeat(tmp, x + 2, w2, __ValuOpc::mul);
+  valuSetTstep0(1, 1, 1);
+  valuRepeat(y, y, tmp, __ValuOpc::add);
+  valuSetTstep0(1, 1, 0);
+  valuRepeat(tmp, x + 3, w3, __ValuOpc::mul);
+  valuSetTstep0(1, 1, 1);
+  valuRepeat(y, y, tmp, __ValuOpc::add);
+
+  vstSetTsize32B(count, 1);
+  vstSetTstep32B_0(1, 256);
+  vstSetTstep32B_1(0, 0);
+  vstRepeat(y, pad, ((int)first + 3) * 256 + channel);
+
+  if (segment + 1 == segments) {
+    vstExecute(x + count, carry, channel);
+    vstExecute(x + count + 1, carry, 256 + channel);
+    vstExecute(x + count + 2, carry, 512 + channel);
+  }
+}

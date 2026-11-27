@@ -1,0 +1,40 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// One causal K=4 FP16 token. Each core owns 256 channels. state is [4,256]
+// local SPM: state[0:3] is the prior three original inputs. input is [256].
+// Return state=[old state[1],old state[2],input,convolution output].
+// DDR weights are [8 cores,4 taps,256 channels], 256B packed base.
+// Launch grid=(1,1,1), broadcast to eight cores.
+__rprog__ void causal_depthwise_conv1d_step_f16(
+    half *state, half *input, DDR_large weights) {
+  const int channel = (int)threadId * 16;
+  DDR_large core_weight = weights + (int)coreId_u * 8;
+  __local__ f16v16 w0[1], w1[1], w2[1], w3[1];
+  __local__ f16v16 x0[1], x1[1], x2[1], x3[1];
+  __local__ f16v16 p0[1], p1[1], p2[1], p3[1], y[1];
+  vldExecute_async(w0, core_weight, (short)channel * 2);
+  vldExecute_async(w1, core_weight + 2, (short)channel * 2);
+  vldExecute_async(w2, core_weight + 4, (short)channel * 2);
+  vldExecute_async(w3, core_weight + 6, (short)channel * 2);
+  vldExecute_async(x0, state, channel);
+  vldExecute_async(x1, state, 256 + channel);
+  vldExecute_async(x2, state, 512 + channel);
+  vldExecute_async(x3, input, channel);
+  fenceVld(0);
+  vcfg_set_valu(vcfg_valu_target::imm2, (half)1.0f);
+  valuExecute_async(p0, x0, w0, __ValuOpc::mul);
+  valuExecute_async(p1, x1, w1, __ValuOpc::mul);
+  valuExecute_async(p2, x2, w2, __ValuOpc::mul);
+  valuExecute_async(p3, x3, w3, __ValuOpc::mul);
+  fenceValu(0);
+  valuExecute(y, p0, p1, __ValuOpc::add);
+  valuExecute(y, y, p2, __ValuOpc::add);
+  valuExecute(y, y, p3, __ValuOpc::add);
+  vstExecute_async(x1, state, channel);
+  vstExecute_async(x2, state, 256 + channel);
+  vstExecute_async(x3, state, 512 + channel);
+  vstExecute_async(y, state, 768 + channel);
+  fenceVst(0);
+}

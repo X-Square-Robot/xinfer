@@ -1,0 +1,14 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// A[M,1024] @ B[1024,512] + bias[512], M in [1,868].
+// Eight N64 blocks stream K128 chunks in two row phases up to 208 rows, then
+// four, and use full K above 400 rows.
+#define QKV_UP_ENTRY up_n512k1024
+#define QKV_UP_N 512
+#define QKV_UP_K 1024
+#define QKV_UP_TN 64
+#define QKV_UP_TM 32
+#define QKV_UP_PIPELINE 2
+#define QKV_UP_TK 128
+#define QKV_UP_PHASES 4
+#define QKV_UP_SMALL_ROWS 208
+#include "qkv_up_gemm_stream.h"

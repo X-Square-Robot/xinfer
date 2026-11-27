@@ -1,0 +1,54 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// Input per core: [M,640] = [Q256,Qgate256,K64,V64]. Core groups 0..3 and
+// 4..7 each own one complete 256-column K/V head in four 64-column slices.
+// Output per core: [M,1024] = [Q256,Qgate256,K256,V256]. Every core copies
+// its own Q/Qgate and writes its K/V slice to each of four group members.
+// The two SPM ranges must be disjoint on every core. Broadcast the complete
+// grid to all eight cores and wait for all cores before consuming output.
+// ABI: dst core-0 global SPM [0:1], src local SPM [2:3], rows [4],
+// core stride in 64 KiB units [5]. Physical rows are 64..384 in 64-row buckets.
+__rprog__ void qkv_expand_kv_f16(__SRAM half *dst, half *src,
+                                 unsigned short rows,
+                                 unsigned short stride_hi) {
+  if (rows < 64 || rows > 384 || rows % 64 || stride_hi == 0) return;
+  const unsigned short row = (unsigned short)blockIdx.x * 16 + threadId;
+  if (row >= rows) return;
+
+  __local__ f16v16 x[40];
+  vldSetTsize32B(40, 1);
+  vldSetTstep32B_0(1, 16);
+  vldSetTstep32B_1(0, 0);
+  vldRepeat_async(x, src, (int)row * 640);
+  fenceVld((short)0);
+
+  const unsigned short owner = coreId_u;
+  const unsigned short group = owner & 4;
+  const unsigned short shard = owner & 3;
+  const int own_bank = (int)(unsigned short)(owner * stride_hi) << 16;
+  auto own = reinterpret_cast<__SRAM half *>(reinterpret_cast<int>(dst) + own_bank);
+  vstSetTsize32B(32, 1);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(0, 0);
+  // Finish Q before switching the shared VST Repeat configuration to four
+  // vectors for the K/V broadcasts.
+  vstRepeat(x, own, (int)row * 1024);
+
+  vstSetTsize32B(4, 1);
+  // Remote stores must not overlap within one core. The launch initializes
+  // the per-core handoff counter at zero; atomic handoff serializes stores.
+  watoms(0, 1, 0, field_mode::core, cmp_mode::eq, modify_mode::set);
+#pragma rpu_hwloop_ul
+  for (short peer = 0; peer < 4; ++peer) {
+    const unsigned short target = group + peer;
+    const int bank = (int)(unsigned short)(target * stride_hi) << 16;
+    auto out = reinterpret_cast<__SRAM half *>(reinterpret_cast<int>(dst) + bank);
+    const int base = (int)row * 1024 + (int)shard * 64;
+    vstRepeat_async(x + 32, out, base + 512);
+    vstRepeat_async(x + 36, out, base + 768);
+  }
+  fenceVst((short)0);
+  watom(0, 0, field_mode::core, modify_mode::set);
+}

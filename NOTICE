@@ -1,0 +1,19 @@
+XInfer
+Copyright 2026 X-Square Robot
+
+This product includes software adapted from the following third-party project:
+
+1. RhinoForge (Apache-2.0)
+The XInfer RPU backend for WALL-OSS-1.0-Nano (`xinfer/models/wall_oss_1_0_nano/rpu/`)
+adapts checkpoint handling, camera preprocessing, and evaluation geometry helpers
+from RhinoForge (revision 2535a27756486bdb139b06764975edbe00004d63).
+The following notice is reproduced from RhinoForge:
+
+RhinoForge
+Copyright 2026 HUIXI-AI
+
+This product includes software developed by HUIXI-AI.
+
+The Huixi logo shown in the project README identifies the project organization.
+The Apache License 2.0 does not grant trademark rights beyond the uses stated
+in that license.

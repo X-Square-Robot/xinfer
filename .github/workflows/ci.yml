@@ -41,5 +41,13 @@ jobs:
           python-version: "3.10"
           cache: pip
       - run: pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install -e ".[test]"
+      - run: pip install -e ".[test,kernels]"
+      - name: Build the RPU host resolver and contract tests
+        run: |
+          cmake -S xinfer/ops/backends/rpu/src -B build/rpu-host -DPython_EXECUTABLE="$(command -v python)"
+          cmake --build build/rpu-host --parallel 2
+          ctest --test-dir build/rpu-host --output-on-failure
       - run: pytest -q
+        env:
+          XINFER_RPU_LIBRARY: ${{ github.workspace }}/build/rpu-host/lib/xinfer_rpu.so
+          XINFER_RPU_TEST_LIBRARY: ${{ github.workspace }}/build/rpu-host/lib/xinfer_rpu.so

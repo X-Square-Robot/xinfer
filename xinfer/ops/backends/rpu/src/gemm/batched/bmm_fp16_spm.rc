@@ -1,0 +1,91 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+#include "__clang_rpu_builtin_vars.h"
+using namespace rpu;
+
+// SPM FP16 batched matmul, full-K FP32 VMAT accumulation.
+// mode 0: A[M,K] @ B[K,N]
+// mode 1: A[M,K] @ B[N,K]^T
+// mode 3: A[K,M]^T @ B[K,N]
+__rprog__ void bmm_fp16_spm(half *av, half *bv, half *cv,
+                            unsigned short M, unsigned short N,
+                            unsigned short K, unsigned short batch,
+                            unsigned short mode) {
+  if ((M != 64 && M != 128) || (N != 64 && N != 128) ||
+      (K != 64 && K != 128) || (mode != 0 && mode != 1 && mode != 3) ||
+      batch == 0 || batch > 12) return;
+  const short AM = M / 16, AN = N / 16, AK = K / 16;
+  const short z = (short)blockIdx.z;
+  if (z >= batch) return;
+  half *aa = av + (int)z * M * K;
+  half *bb = bv + (int)z * N * K;
+  half *cc = cv + (int)z * M * N;
+  __local__ f16v16 a[64], b[64], r[64], tmp[64];
+  short lp[3];
+  if (mode == 3) {
+    vldSetTsize32B(AM, AK);
+    vldSetTstep32B_0(1, 16);
+    vldSetTstep32B_1(AM, (short)(16 * M));
+    vldRepeat_async(tmp, aa, (int)threadId * M);
+  } else {
+    vldSetTsize32B(AK, AM);
+    vldSetTstep32B_0(1, 16);
+    vldSetTstep32B_1(AK, (short)(16 * K));
+    vldRepeat_async(a, aa, (int)threadId * K);
+  }
+  if (mode == 1) {
+    vldSetTsize32B(AK, AN);
+    vldSetTstep32B_0(1, 16);
+    vldSetTstep32B_1(AK, (short)(16 * K));
+    vldRepeat_async(b, bb, (int)threadId * K);
+  } else {
+    vldSetTsize32B(AN, AK);
+    vldSetTstep32B_0(1, 16);
+    vldSetTstep32B_1(AN, (short)(16 * N));
+    if (mode == 3)
+      vldRepeat_async(tmp + 32, bb, (int)threadId * N);
+    else
+      vldRepeat_async(tmp, bb, (int)threadId * N);
+  }
+  fenceVld(0);
+  if (mode == 3) {
+    vsfuSetTsize32B(AK, AM);
+    vsfuSetTstep32B_0(1, AM, 0);
+    vsfuSetTstep32B_1(AK, 1, 0);
+    vsfuRepeat_async(a, tmp, (short)0, __ShuffleMode::Trs);
+  }
+  if (mode != 1) {
+    vsfuSetTsize32B(AK, AN);
+    vsfuSetTstep32B_0(1, AN, 0);
+    vsfuSetTstep32B_1(AK, 1, 0);
+    if (mode == 3)
+      vsfuRepeat_async(b, tmp + 32, (short)0, __ShuffleMode::Trs);
+    else
+      vsfuRepeat_async(b, tmp, (short)0, __ShuffleMode::Trs);
+    fenceVsfu(0);
+  }
+  LoopStepInfo cs[3] = {{&lp[2], AN}, {&lp[1], 1}, {&lp[0], 0}};
+  FragVData vc(r, cs);
+  LoopStepInfo as[3] = {{&lp[2], AK}, {&lp[1], 0}, {&lp[0], 1}};
+  FragVData fa(a, as);
+  LoopStepInfo bs[3] = {{&lp[2], 0}, {&lp[1], AK}, {&lp[0], 1}};
+  FragVData fb(b, bs);
+  LoopOutInfo oi[1] = {{&lp[0]}};
+  // Reset the FP32 accumulator at the start of each K reduction.
+  LoopClrInfo ci[1] = {{&lp[0]}};
+  LoopOutLPAttr out{oi};
+  LoopClrLPAttr clr{ci};
+#pragma rpu_hwloop_ul
+  for (lp[2] = 0; lp[2] < AM; ++lp[2]) {
+#pragma rpu_hwloop_ul
+    for (lp[1] = 0; lp[1] < AN; ++lp[1]) {
+#pragma rpu_hwloop_ul
+      for (lp[0] = 0; lp[0] < AK; ++lp[0])
+        vmatExecute_async(vc, fa, fb, &out, &clr);
+    }
+  }
+  fenceVmat(0);
+  vstSetTsize32B(AN, AM);
+  vstSetTstep32B_0(1, 16);
+  vstSetTstep32B_1(AN, (short)(16 * N));
+  vstRepeat(r, cc, (int)threadId * N);
+}

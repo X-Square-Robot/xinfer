@@ -1,0 +1,5 @@
+// Copyright 2026 X-Square Robot. SPDX-License-Identifier: Apache-2.0
+// Compatibility alias: identical body to adaptive_rmsnorm_m16h1024_f16.
+// Both names resolve to the same hardware sqrt_reciprocal kernel.
+#define XINFER_ACTION_NORM_KERNEL adaptive_rmsnorm_hw_m16h1024_f16
+#include "adaptive_rmsnorm_m16h1024_f16_impl.h"
